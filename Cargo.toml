@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["homestead-core", "homestead-server", "homestead-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+homestead-core = { path = "homestead-core" }
+proptest = "1"
