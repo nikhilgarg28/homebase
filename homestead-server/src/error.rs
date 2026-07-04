@@ -2,6 +2,7 @@
 
 use crate::storage::StorageError;
 use homestead_core::messages::KernelError;
+use homestead_core::space::SpaceError;
 use std::fmt;
 
 /// Either the kernel said no (an invariant refused to bend — report to the
@@ -22,6 +23,18 @@ impl From<KernelError> for Error {
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         Self::Storage(e)
+    }
+}
+
+/// The client-facing projection: kernel rejections pass through verbatim,
+/// storage faults collapse to [`SpaceError::Unavailable`] (infrastructure
+/// detail is the operator's business, not the client's).
+impl From<Error> for SpaceError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Kernel(e) => SpaceError::Kernel(e),
+            Error::Storage(e) => SpaceError::unavailable(e.to_string()),
+        }
     }
 }
 

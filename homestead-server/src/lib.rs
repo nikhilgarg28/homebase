@@ -5,15 +5,19 @@
 //! - [`Server`] — hosts many spaces; routes `SpaceId` → space. Token
 //!   verification (token → `SpaceId` + prefix scope) sits at the wire layer
 //!   above this.
+//! - [`actor::SpaceActor`] / [`actor::SpaceHandle`] — the runtime shell:
+//!   one mailbox per space, verbs dequeued one at a time with `now` stamped
+//!   at dequeue. The handle implements the core `Space` trait; the run loop
+//!   is runtime-agnostic (tokio in production, the deterministic sim's
+//!   stepper in torture tests).
 //! - [`space::Space`] — one space's complete verb state machine (lease
 //!   table + data plane), deterministic: explicit `now: Timestamp`, verbs
-//!   executed one at a time, proptested and torture-simmed directly. It
-//!   will grow into the async facade implementing the core `Space` trait
-//!   once it owns a store, a clock, and request serialization.
+//!   executed one at a time, proptested and torture-simmed directly.
 //! - [`storage::OrderedStore`] — the async ordered map underneath (slatedb
 //!   in prod, [`storage::MemoryStore`] in tests); determinism holds because
 //!   verbs never interleave and the test store resolves futures immediately.
 
+pub mod actor;
 pub mod error;
 pub mod schema;
 pub mod space;
@@ -84,6 +88,7 @@ impl<S: Space> Default for Server<S> {
 mod tests {
     use super::*;
     use homestead_core::messages::*;
+    use homestead_core::space::SpaceError;
     use std::future::Future;
 
     /// Minimal `Space` impl: proves the trait is implementable and keeps the
@@ -95,19 +100,20 @@ mod tests {
         fn acquire(
             &self,
             req: AcquireRequest,
-        ) -> impl Future<Output = Result<AcquireResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<AcquireResponse, SpaceError>> + Send {
             async move {
                 Err(KernelError::Contended {
                     prefix: req.specs[0].prefix.clone(),
                     retry_after: None,
-                })
+                }
+                .into())
             }
         }
 
         fn renew(
             &self,
             req: RenewRequest,
-        ) -> impl Future<Output = Result<RenewResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<RenewResponse, SpaceError>> + Send {
             async move {
                 Ok(RenewResponse {
                     granted: Vec::new(),
@@ -119,25 +125,26 @@ mod tests {
         fn release(
             &self,
             _req: ReleaseRequest,
-        ) -> impl Future<Output = Result<ReleaseResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<ReleaseResponse, SpaceError>> + Send {
             async move { Ok(ReleaseResponse {}) }
         }
 
         fn put_batch(
             &self,
             req: PutBatchRequest,
-        ) -> impl Future<Output = Result<PutBatchResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send {
             async move {
                 Err(KernelError::NotCovered {
                     key: req.entries[0].key.clone(),
-                })
+                }
+                .into())
             }
         }
 
         fn get(
             &self,
             req: GetRequest,
-        ) -> impl Future<Output = Result<GetResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
             async move {
                 Ok(GetResponse {
                     entries: req.keys.iter().map(|_| None).collect(),
@@ -148,7 +155,7 @@ mod tests {
         fn list(
             &self,
             _req: ListRequest,
-        ) -> impl Future<Output = Result<ListResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<ListResponse, SpaceError>> + Send {
             async move {
                 Ok(ListResponse {
                     entries: Vec::new(),
@@ -160,7 +167,7 @@ mod tests {
         fn read_at(
             &self,
             req: ReadAtRequest,
-        ) -> impl Future<Output = Result<ReadAtResponse, KernelError>> + Send {
+        ) -> impl Future<Output = Result<ReadAtResponse, SpaceError>> + Send {
             async move {
                 Ok(ReadAtResponse {
                     at: homestead_core::AdmissionSeq(0),

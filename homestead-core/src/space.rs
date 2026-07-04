@@ -30,6 +30,51 @@ impl fmt::Debug for SpaceId {
     }
 }
 
+/// Why a verb call failed.
+///
+/// Two very different failure planes share this type so the [`Space`] trait
+/// can be honest about both:
+///
+/// - [`Kernel`](SpaceError::Kernel): a semantic rejection — the space is
+///   healthy and *decided* no (contended, fenced, regression…). Meaningful
+///   to the caller; retry per that error's own rules.
+/// - [`Unavailable`](SpaceError::Unavailable): the space could not serve
+///   the request at all — storage fault, shutdown mid-request, dead
+///   mailbox. Says nothing about the request's validity. Reads may be
+///   retried blindly; a retried `put_batch` that was actually admitted
+///   before the failure is caught by the `device_seq` replay fence, so
+///   clients treat that rejection as "already applied".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpaceError {
+    Kernel(KernelError),
+    Unavailable { reason: String },
+}
+
+impl SpaceError {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<KernelError> for SpaceError {
+    fn from(err: KernelError) -> Self {
+        Self::Kernel(err)
+    }
+}
+
+impl fmt::Display for SpaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kernel(err) => write!(f, "{err}"),
+            Self::Unavailable { reason } => write!(f, "space unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SpaceError {}
+
 /// The seven verbs — the contract between the server's implementation, the
 /// in-process client used by tests and the torture sim, and (later, behind
 /// the wire) the remote client.
@@ -47,32 +92,32 @@ pub trait Space {
     fn acquire(
         &self,
         req: AcquireRequest,
-    ) -> impl Future<Output = Result<AcquireResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<AcquireResponse, SpaceError>> + Send;
 
     fn renew(
         &self,
         req: RenewRequest,
-    ) -> impl Future<Output = Result<RenewResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<RenewResponse, SpaceError>> + Send;
 
     fn release(
         &self,
         req: ReleaseRequest,
-    ) -> impl Future<Output = Result<ReleaseResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<ReleaseResponse, SpaceError>> + Send;
 
     fn put_batch(
         &self,
         req: PutBatchRequest,
-    ) -> impl Future<Output = Result<PutBatchResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send;
 
-    fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, KernelError>> + Send;
+    fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send;
 
     fn list(
         &self,
         req: ListRequest,
-    ) -> impl Future<Output = Result<ListResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<ListResponse, SpaceError>> + Send;
 
     fn read_at(
         &self,
         req: ReadAtRequest,
-    ) -> impl Future<Output = Result<ReadAtResponse, KernelError>> + Send;
+    ) -> impl Future<Output = Result<ReadAtResponse, SpaceError>> + Send;
 }

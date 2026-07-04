@@ -28,7 +28,7 @@ use homestead_core::messages::{
 };
 use homestead_core::space::SpaceId;
 use homestead_core::tag::{AdmissionSeq, DeviceId, Epoch};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Lease verbs for one space, over any [`OrderedStore`].
 ///
@@ -38,14 +38,14 @@ use std::collections::HashSet;
 /// acquire re-registers it.
 pub struct LeaseManager {
     space: SpaceId,
-    demand: HashSet<LeaseId>,
+    demand: BTreeSet<LeaseId>,
 }
 
 impl LeaseManager {
     pub fn new(space: SpaceId) -> Self {
         Self {
             space,
-            demand: HashSet::new(),
+            demand: BTreeSet::new(),
         }
     }
 

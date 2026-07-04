@@ -5,7 +5,13 @@ edition.workspace = true
 
 [dependencies]
 homestead-core.workspace = true
+# Runtime-agnostic channel primitives only — the actor loop must be drivable
+# by tokio in production and by the deterministic sim's stepper identically,
+# so no executor is ever a dependency of this crate.
+futures-channel.workspace = true
+futures-core.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 pollster.workspace = true
+futures.workspace = true
