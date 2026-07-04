@@ -6,13 +6,22 @@
 //! one contiguous key range (space deletion = one range delete). Layout:
 //!
 //! ```text
-//! (space, Data,          k1, k2, …)             → data record
-//! (space, Changelog,     seq_be, k1, k2, …)     → ∅
+//! (space, Data,          k1, k2, …)             → DataRecord (tag + value)
+//! (space, Changelog,     seq_be, k1, k2, …)     → DataRecord (same bytes)
 //! (space, LeaseByPrefix, depth, p1…pd, id_be)   → LeaseRecord
 //! (space, LeaseById,     id_be)                 → LeaseRecord
 //! (space, Meta,          "counters")            → CountersRecord
-//! (space, Device,        device_id)             → device record
+//! (space, Device,        device_id)             → DeviceRecord
 //! ```
+//!
+//! **The changelog holds exactly one record per key**, keyed by the
+//! admission seq of the key's *latest* change: a put deletes the key's old
+//! changelog entry (its location is known — the previous data record carries
+//! its admission seq) and inserts the new one, all in the same atomic batch.
+//! A delta since cursor `c` is then a scan of seqs `> c`: every key changed
+//! after `c` appears exactly once, already at its current state (tombstones
+//! included). No garbage collection, no compaction-on-read. The record bytes
+//! duplicate the data record so a delta never needs point lookups.
 //!
 //! The by-prefix index carries an explicit **depth** component (number of
 //! prefix components). That makes both conflict-check queries ordinary
@@ -29,10 +38,10 @@
 //! [`encode_components`] rather than [`Key::encode`].
 
 use homestead_core::clock::Timestamp;
-use homestead_core::key::{Key, KeyComponent, encode_components};
+use homestead_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homestead_core::lease::{LeaseId, LeaseMode};
 use homestead_core::space::SpaceId;
-use homestead_core::tag::{DeviceId, Epoch};
+use homestead_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Epoch, Tag, Value, Ver};
 use std::time::Duration;
 
 /// Record kind: the second component of every space-scoped storage key.
@@ -59,6 +68,62 @@ fn space_component(space: SpaceId) -> KeyComponent {
 
 fn u64_component(v: u64) -> KeyComponent {
     KeyComponent::new(v.to_be_bytes().to_vec()).expect("8-byte component")
+}
+
+/// `(space, Data, k1, k2, …)`. Also the scan prefix for data at or under a
+/// user prefix — by prefix correspondence they are the same bytes.
+pub fn data_key(space: SpaceId, key: &Key) -> Vec<u8> {
+    let mut components = vec![space_component(space), RecordKind::Data.component()];
+    components.extend(key.components().iter().cloned());
+    encode_components(&components)
+}
+
+/// Recovers the user key from a Data storage key.
+pub fn user_key_from_data(storage_key: &[u8]) -> Option<Key> {
+    let components = decode_components(storage_key).ok()?;
+    Key::new(components.get(2..)?.to_vec()).ok()
+}
+
+/// `(space, Changelog, seq_be, k1, k2, …)`
+pub fn changelog_key(space: SpaceId, seq: AdmissionSeq, key: &Key) -> Vec<u8> {
+    let mut components = vec![
+        space_component(space),
+        RecordKind::Changelog.component(),
+        u64_component(seq.0),
+    ];
+    components.extend(key.components().iter().cloned());
+    encode_components(&components)
+}
+
+/// Byte prefix of a space's whole changelog keyspace.
+pub fn changelog_scan_all(space: SpaceId) -> Vec<u8> {
+    encode_components(&[space_component(space), RecordKind::Changelog.component()])
+}
+
+/// Scan **start** for changelog entries with seq strictly greater than
+/// `since` (pair with [`changelog_scan_all`]'s successor as the end bound).
+pub fn changelog_scan_after(space: SpaceId, since: AdmissionSeq) -> Vec<u8> {
+    encode_components(&[
+        space_component(space),
+        RecordKind::Changelog.component(),
+        u64_component(since.0.saturating_add(1)),
+    ])
+}
+
+/// Recovers the user key from a Changelog storage key (component 2 is the
+/// admission seq; the user key follows).
+pub fn user_key_from_changelog(storage_key: &[u8]) -> Option<Key> {
+    let components = decode_components(storage_key).ok()?;
+    Key::new(components.get(3..)?.to_vec()).ok()
+}
+
+/// `(space, Device, device_id)`
+pub fn device_key(space: SpaceId, device: DeviceId) -> Vec<u8> {
+    encode_components(&[
+        space_component(space),
+        RecordKind::Device.component(),
+        KeyComponent::new(device.0.to_vec()).expect("16-byte component"),
+    ])
 }
 
 /// `(space, LeaseById, id_be)`
@@ -127,6 +192,8 @@ pub fn counters_key(space: SpaceId) -> Vec<u8> {
 
 const LEASE_RECORD_VERSION: u8 = 1;
 const COUNTERS_RECORD_VERSION: u8 = 1;
+const DATA_RECORD_VERSION: u8 = 1;
+const DEVICE_RECORD_VERSION: u8 = 1;
 
 /// The full server-side state of one lease grant. Stored identically under
 /// both lease keys so the conflict check never needs a second lookup.
@@ -221,6 +288,83 @@ impl CountersRecord {
     }
 }
 
+/// One stored key's tag and value. The same bytes live under the Data key
+/// (current state) and the key's single Changelog entry (delta feed), so a
+/// delta scan never needs a second lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataRecord {
+    pub tag: Tag,
+    pub value: Value,
+}
+
+impl DataRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let value_len = match &self.value {
+            Value::Present(bytes) => bytes.len(),
+            Value::Absent => 0,
+        };
+        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 1 + value_len);
+        out.push(DATA_RECORD_VERSION);
+        out.extend_from_slice(&self.tag.device.0);
+        out.extend_from_slice(&self.tag.device_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.tag.epoch.0.to_be_bytes());
+        out.extend_from_slice(&self.tag.ver.0.to_be_bytes());
+        out.extend_from_slice(&self.tag.admission_seq.0.to_be_bytes());
+        match &self.value {
+            Value::Absent => out.push(0),
+            Value::Present(bytes) => {
+                out.push(1);
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != DATA_RECORD_VERSION {
+            return None;
+        }
+        let tag = Tag {
+            device: DeviceId(r.bytes16()?),
+            device_seq: DeviceSeq(r.u64()?),
+            epoch: Epoch(r.u64()?),
+            ver: Ver(r.u64()?),
+            admission_seq: AdmissionSeq(r.u64()?),
+        };
+        let value = match r.u8()? {
+            0 => Value::Absent,
+            1 => Value::Present(r.rest().to_vec()),
+            _ => return None,
+        };
+        Some(Self { tag, value })
+    }
+}
+
+/// Per-device admission state: the high-water `device_seq`, for replay and
+/// out-of-order rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRecord {
+    pub last_seq: DeviceSeq,
+}
+
+impl DeviceRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 8);
+        out.push(DEVICE_RECORD_VERSION);
+        out.extend_from_slice(&self.last_seq.0.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != DEVICE_RECORD_VERSION {
+            return None;
+        }
+        Some(Self { last_seq: DeviceSeq(r.u64()?) })
+    }
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -284,6 +428,56 @@ mod tests {
             admission_high_water: 3,
         };
         assert_eq!(CountersRecord::decode(&rec.encode()), Some(rec));
+    }
+
+    #[test]
+    fn data_record_roundtrips() {
+        let tag = Tag {
+            device: DeviceId([3; 16]),
+            device_seq: DeviceSeq(7),
+            epoch: Epoch(2),
+            ver: Ver(11),
+            admission_seq: AdmissionSeq(99),
+        };
+        let present = DataRecord { tag: tag.clone(), value: Value::Present(b"ct".to_vec()) };
+        assert_eq!(DataRecord::decode(&present.encode()), Some(present));
+        let tombstone = DataRecord { tag, value: Value::Absent };
+        assert_eq!(DataRecord::decode(&tombstone.encode()), Some(tombstone));
+    }
+
+    #[test]
+    fn device_record_roundtrips() {
+        let rec = DeviceRecord { last_seq: DeviceSeq(41) };
+        assert_eq!(DeviceRecord::decode(&rec.encode()), Some(rec));
+    }
+
+    #[test]
+    fn data_keys_recover_user_keys_and_scan_by_prefix() {
+        let space = SpaceId([1; 16]);
+        let key = Key::from_bytes([&b"db"[..], &b"pay"[..], &b"r1"[..]]).unwrap();
+        let storage = data_key(space, &key);
+        assert_eq!(user_key_from_data(&storage), Some(key.clone()));
+
+        // Data scan for a user prefix is the same bytes as the prefix's key.
+        let prefix = Key::from_bytes([&b"db"[..], &b"pay"[..]]).unwrap();
+        assert!(storage.starts_with(&data_key(space, &prefix)));
+        let sibling = Key::from_bytes([&b"db"[..], &b"payroll"[..]]).unwrap();
+        assert!(!data_key(space, &sibling).starts_with(&data_key(space, &prefix)));
+    }
+
+    #[test]
+    fn changelog_keys_order_by_seq_and_scan_after_excludes_cursor() {
+        let space = SpaceId([1; 16]);
+        let key = Key::from_bytes([&b"k"[..]]).unwrap();
+        let at5 = changelog_key(space, AdmissionSeq(5), &key);
+        let at6 = changelog_key(space, AdmissionSeq(6), &key);
+        assert!(at5 < at6);
+        assert_eq!(user_key_from_changelog(&at6), Some(key));
+
+        let after5 = changelog_scan_after(space, AdmissionSeq(5));
+        assert!(at5 < after5, "cursor's own seq is excluded");
+        assert!(after5 <= at6, "the next seq is included");
+        assert!(at6.starts_with(&changelog_scan_all(space)));
     }
 
     #[test]

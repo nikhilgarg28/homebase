@@ -16,7 +16,7 @@ use homestead_core::lease::{LeaseId, LeaseMode};
 use homestead_core::messages::{AcquireRequest, LeaseSpec, ReleaseRequest, RenewRequest};
 use homestead_core::space::SpaceId;
 use homestead_core::tag::DeviceId;
-use homestead_server::leases::LeaseManager;
+use homestead_server::space::lease::LeaseManager;
 use homestead_server::schema::{LeaseRecord, lease_by_id_scan, lease_by_prefix_scan_all};
 use homestead_server::storage::{MemoryStore, OrderedStore, collect_scan};
 use pollster::block_on;

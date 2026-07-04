@@ -113,39 +113,49 @@ impl Key {
     /// Decodes a flat-encoded key. Rejects malformed escapes, truncated
     /// input, and keys violating the component/count limits.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let mut components = Vec::new();
-        let mut current = Vec::new();
-        let mut at_boundary = true;
-        let mut i = 0;
-        while i < bytes.len() {
-            at_boundary = false;
-            match bytes[i] {
-                0x00 => match bytes.get(i + 1) {
-                    Some(0x00) => {
-                        let component = KeyComponent::new(std::mem::take(&mut current))
-                            .map_err(DecodeError::InvalidKey)?;
-                        components.push(component);
-                        at_boundary = true;
-                        i += 2;
-                    }
-                    Some(0x01) => {
-                        current.push(0x00);
-                        i += 2;
-                    }
-                    Some(&byte) => return Err(DecodeError::InvalidEscape { offset: i, byte }),
-                    None => return Err(DecodeError::Truncated),
-                },
-                b => {
-                    current.push(b);
-                    i += 1;
+        Self::new(decode_components(bytes)?).map_err(DecodeError::InvalidKey)
+    }
+}
+
+/// Decodes a flat-encoded component sequence *without* enforcing the
+/// [`MAX_COMPONENTS`] count limit — the inverse of [`encode_components`].
+///
+/// The storage layer decodes tuples longer than any user key (space id ⊕
+/// record kind ⊕ user components ⊕ suffixes); per-component length limits
+/// still apply. Empty input decodes to an empty sequence.
+pub fn decode_components(bytes: &[u8]) -> Result<Vec<KeyComponent>, DecodeError> {
+    let mut components = Vec::new();
+    let mut current = Vec::new();
+    let mut at_boundary = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        at_boundary = false;
+        match bytes[i] {
+            0x00 => match bytes.get(i + 1) {
+                Some(0x00) => {
+                    let component = KeyComponent::new(std::mem::take(&mut current))
+                        .map_err(DecodeError::InvalidKey)?;
+                    components.push(component);
+                    at_boundary = true;
+                    i += 2;
                 }
+                Some(0x01) => {
+                    current.push(0x00);
+                    i += 2;
+                }
+                Some(&byte) => return Err(DecodeError::InvalidEscape { offset: i, byte }),
+                None => return Err(DecodeError::Truncated),
+            },
+            b => {
+                current.push(b);
+                i += 1;
             }
         }
-        if !at_boundary && !bytes.is_empty() {
-            return Err(DecodeError::Truncated);
-        }
-        Self::new(components).map_err(DecodeError::InvalidKey)
     }
+    if !at_boundary && !bytes.is_empty() {
+        return Err(DecodeError::Truncated);
+    }
+    Ok(components)
 }
 
 /// Encodes a component sequence into the order-preserving flat form

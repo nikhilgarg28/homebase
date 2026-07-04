@@ -5,17 +5,18 @@
 //! - [`Server`] — hosts many spaces; routes `SpaceId` → space. Token
 //!   verification (token → `SpaceId` + prefix scope) sits at the wire layer
 //!   above this.
-//! - `Space` implementations — async facade over the state machine.
-//! - The deterministic state machine (lease table, admission) — explicit
-//!   `now: Timestamp`, verbs executed one at a time, proptested and
-//!   torture-simmed directly. It reads and writes through the async
-//!   [`storage::OrderedStore`] (slatedb in prod, [`storage::MemoryStore`]
-//!   in tests); determinism holds because verbs never interleave and the
-//!   test store resolves futures immediately.
+//! - [`space::Space`] — one space's complete verb state machine (lease
+//!   table + data plane), deterministic: explicit `now: Timestamp`, verbs
+//!   executed one at a time, proptested and torture-simmed directly. It
+//!   will grow into the async facade implementing the core `Space` trait
+//!   once it owns a store, a clock, and request serialization.
+//! - [`storage::OrderedStore`] — the async ordered map underneath (slatedb
+//!   in prod, [`storage::MemoryStore`] in tests); determinism holds because
+//!   verbs never interleave and the test store resolves futures immediately.
 
 pub mod error;
-pub mod leases;
 pub mod schema;
+pub mod space;
 pub mod storage;
 
 use homestead_core::space::{Space, SpaceId};

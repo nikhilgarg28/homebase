@@ -240,6 +240,9 @@ pub enum KernelError {
     NotCovered { key: Key },
     /// Per-key version monotonicity violated.
     VerRegression { key: Key, current: Ver, attempted: Ver },
+    /// Per-device batch sequence monotonicity violated: replay or
+    /// out-of-order submission (client-assigned, strictly increasing).
+    DeviceSeqRegression { current: DeviceSeq, attempted: DeviceSeq },
     /// Outside the token's prefix scope (enforced on reads AND writes).
     /// Reserved for the wire layer; the in-process kernel never emits it.
     Unauthorized { prefix: Key },
@@ -258,6 +261,10 @@ impl fmt::Display for KernelError {
             Self::VerRegression { key, current, attempted } => write!(
                 f,
                 "ver regression on {key:?}: attempted {attempted:?} ≤ current {current:?}"
+            ),
+            Self::DeviceSeqRegression { current, attempted } => write!(
+                f,
+                "device_seq regression: attempted {attempted:?} ≤ current {current:?}"
             ),
             Self::Unauthorized { prefix } => {
                 write!(f, "token does not cover prefix {prefix:?}")

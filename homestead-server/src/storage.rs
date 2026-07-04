@@ -86,18 +86,24 @@ pub async fn collect_scan<I: ScanIter>(
     Ok(out)
 }
 
-/// An ordered byte-keyed map with prefix scans and atomic batches.
+/// An ordered byte-keyed map with range scans and atomic batches.
 pub trait OrderedStore {
     fn get(
         &self,
         key: &[u8],
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send;
 
-    /// Streams all entries whose key starts with `prefix`, in key order.
-    /// The iterator borrows the store; drop it before calling [`apply`].
+    /// Streams entries with keys in `[start, end)` — `end: None` means
+    /// unbounded — in ascending key order. The iterator borrows the store;
+    /// drop it before calling [`apply`](OrderedStore::apply).
     ///
-    /// [`apply`]: OrderedStore::apply
-    fn scan_prefix(&self, prefix: &[u8]) -> impl ScanIter;
+    /// `start > end` is caller error; implementations may panic.
+    fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter;
+
+    /// Streams all entries whose key starts with `prefix`, in key order.
+    fn scan_prefix(&self, prefix: &[u8]) -> impl ScanIter {
+        self.scan(prefix.to_vec(), prefix_successor(prefix))
+    }
 
     /// Applies a batch atomically.
     fn apply(
@@ -161,14 +167,13 @@ impl OrderedStore for MemoryStore {
         std::future::ready(Ok(self.map.get(key).cloned()))
     }
 
-    fn scan_prefix(&self, prefix: &[u8]) -> impl ScanIter {
-        let start = Bound::Included(prefix.to_vec());
-        let end = match prefix_successor(prefix) {
-            Some(succ) => Bound::Excluded(succ),
+    fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter {
+        let end = match end {
+            Some(end) => Bound::Excluded(end),
             None => Bound::Unbounded,
         };
         MemoryScan {
-            inner: self.map.range((start, end)),
+            inner: self.map.range((Bound::Included(start), end)),
         }
     }
 
@@ -213,6 +218,7 @@ pub mod conformance {
         batch_ops_apply_in_order(fresh()).await;
         empty_batch_is_a_noop(fresh()).await;
         scan_filters_and_orders(fresh()).await;
+        scan_range_bounds_are_half_open(fresh()).await;
         scan_boundaries_are_exact(fresh()).await;
         scan_handles_high_prefixes(fresh()).await;
         scan_observes_all_prior_batches(fresh()).await;
@@ -306,6 +312,29 @@ pub mod conformance {
         let all = scan_all(&store, &[]).await;
         assert_eq!(all.len(), 6);
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "empty prefix scans everything in order");
+    }
+
+    pub async fn scan_range_bounds_are_half_open<S: OrderedStore>(mut store: S) {
+        put_all(&mut store, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")]).await;
+
+        let collect = |iter| async { collect_scan(iter).await.unwrap() };
+        let keys = |entries: Vec<(Vec<u8>, Vec<u8>)>| {
+            entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        };
+
+        // [b, d): start inclusive, end exclusive.
+        let hits = keys(collect(store.scan(b"b".to_vec(), Some(b"d".to_vec()))).await);
+        assert_eq!(hits, vec![b"b".to_vec(), b"c".to_vec()]);
+
+        // Unbounded end runs to the last key.
+        let hits = keys(collect(store.scan(b"c".to_vec(), None)).await);
+        assert_eq!(hits, vec![b"c".to_vec(), b"d".to_vec()]);
+
+        // Start needn't be an existing key; empty ranges are empty.
+        let hits = keys(collect(store.scan(b"aa".to_vec(), Some(b"b".to_vec()))).await);
+        assert!(hits.is_empty());
+        let hits = keys(collect(store.scan(b"b".to_vec(), Some(b"b".to_vec()))).await);
+        assert!(hits.is_empty());
     }
 
     pub async fn scan_boundaries_are_exact<S: OrderedStore>(mut store: S) {
