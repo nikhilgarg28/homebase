@@ -2,14 +2,17 @@
 //!
 //! Layering, outermost in:
 //!
-//! - [`Server`] — hosts many spaces; routes `SpaceId` → space. Token
-//!   verification (token → `SpaceId` + prefix scope) sits at the wire layer
-//!   above this.
+//! - [`Server`] — owns one shard: the shared [`storage::OrderedStore`], the
+//!   [`Clock`](homestead_core::clock::Clock), and the `SpaceId` →
+//!   [`actor::SpaceHandle`] table. Routes requests and spawns space actors
+//!   lazily on first touch. Token verification (token → `SpaceId` + prefix
+//!   scope) sits at the wire layer above this.
 //! - [`actor::SpaceActor`] / [`actor::SpaceHandle`] — the runtime shell:
 //!   one mailbox per space, verbs dequeued one at a time with `now` stamped
 //!   at dequeue. The handle implements the core `Space` trait; the run loop
 //!   is runtime-agnostic (tokio in production, the deterministic sim's
-//!   stepper in torture tests).
+//!   stepper in torture tests) and reaches its executor only through
+//!   [`actor::Spawner`].
 //! - [`space::Space`] — one space's complete verb state machine (lease
 //!   table + data plane), deterministic: explicit `now: Timestamp`, verbs
 //!   executed one at a time, proptested and torture-simmed directly.
@@ -23,180 +26,237 @@ pub mod schema;
 pub mod space;
 pub mod storage;
 
-use homestead_core::space::{Space, SpaceId};
-use std::collections::HashMap;
-use std::sync::Arc;
+use actor::{SpaceActor, SpaceHandle, Spawner};
+use homestead_core::clock::Clock;
+use homestead_core::space::SpaceId;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use storage::OrderedStore;
 
-/// Hosts many spaces behind one endpoint.
+/// One shard: many spaces behind one store, one clock, one endpoint.
 ///
-/// Spaces are fully isolated: no verb spans two spaces, so the server layer
-/// is pure routing plus space lifecycle. Lifecycle is deliberately *not* one
-/// of the seven data-plane verbs: creating a space is a **tenant-plane**
-/// action — cheap, token-authorized, quota-checked, done constantly by apps
-/// (per-user/per-document dbs) — exposed via its own surface, not the space
-/// wire protocol. Tenants themselves (keys, quotas, billing) are control
-/// plane; the kernel stays tenant-oblivious (tenant never appears in
-/// storage keys or verbs).
+/// Spaces are fully isolated (no verb spans two spaces), so this layer is
+/// pure routing plus lifecycle:
 ///
-/// Handles are `Arc`s because `Space` methods take `&self`; concurrent
-/// requests to one space serialize inside its implementation, not here.
-pub struct Server<S> {
-    spaces: HashMap<SpaceId, Arc<S>>,
+/// - **Registration** ([`create_space`](Server::create_space)) marks a space
+///   as existing — a directory action. It is deliberately *not* one of the
+///   seven data-plane verbs: it's a tenant-plane operation (token-authorized
+///   and quota-checked at the layer above), and it costs the shard nothing.
+/// - **Actors are lazy** ([`space`](Server::space)): the first touch of a
+///   registered space builds its [`SpaceActor`] over the shared store and
+///   hands the run loop to the [`Spawner`]. All state lives in the store, so
+///   an actor is pure runtime machinery — nothing is lost if a future
+///   version parks idle actors and respawns them.
+///
+/// The server holds a handle clone per live actor, so actors run until the
+/// server itself is dropped (idle parking is a later optimization).
+pub struct Server<S, C, P> {
+    store: Arc<S>,
+    clock: Arc<C>,
+    spawner: P,
+    /// Registered spaces; `None` until first touch spawns the actor.
+    spaces: Mutex<BTreeMap<SpaceId, Option<SpaceHandle>>>,
 }
 
-impl<S: Space> Server<S> {
-    pub fn new() -> Self {
+impl<S, C, P> Server<S, C, P>
+where
+    S: OrderedStore + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    P: Spawner,
+{
+    pub fn new(store: Arc<S>, clock: Arc<C>, spawner: P) -> Self {
         Self {
-            spaces: HashMap::new(),
+            store,
+            clock,
+            spawner,
+            spaces: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Registers a pre-built space (e.g. rehydrated from persistence).
-    /// Returns `false` (and leaves the existing space untouched) if the id
-    /// is already taken.
-    pub fn insert_space(&mut self, id: SpaceId, space: S) -> bool {
-        match self.spaces.entry(id) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(Arc::new(space));
+    /// Registers a space id. Returns `false` (and changes nothing) if the
+    /// id is already registered. Spawns nothing.
+    pub fn create_space(&self, id: SpaceId) -> bool {
+        let mut spaces = self.spaces.lock().unwrap();
+        match spaces.entry(id) {
+            std::collections::btree_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(None);
                 true
             }
         }
     }
 
-    /// Looks up a space handle for request routing.
-    pub fn space(&self, id: &SpaceId) -> Option<Arc<S>> {
-        self.spaces.get(id).cloned()
-    }
-}
-
-impl<S: Space + Default> Server<S> {
-    /// Creates a fresh, empty space under `id`. Returns `false` (and leaves
-    /// the existing space untouched) if the id is already taken.
-    pub fn create_space(&mut self, id: SpaceId) -> bool {
-        self.insert_space(id, S::default())
-    }
-}
-
-impl<S: Space> Default for Server<S> {
-    fn default() -> Self {
-        Self::new()
+    /// Looks up a space for request routing, spawning its actor on first
+    /// touch. `None` for unregistered ids.
+    pub fn space(&self, id: &SpaceId) -> Option<SpaceHandle> {
+        let mut spaces = self.spaces.lock().unwrap();
+        let slot = spaces.get_mut(id)?;
+        if let Some(handle) = slot {
+            return Some(handle.clone());
+        }
+        let (space_actor, handle) =
+            SpaceActor::new(*id, Arc::clone(&self.store), Arc::clone(&self.clock));
+        self.spawner.spawn(Box::pin(space_actor.run()));
+        *slot = Some(handle.clone());
+        Some(handle)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use homestead_core::messages::*;
-    use homestead_core::space::SpaceError;
-    use std::future::Future;
+    use futures::executor::{LocalPool, LocalSpawner};
+    use futures::task::SpawnExt;
+    use homestead_core::clock::{ManualClock, Timestamp};
+    use homestead_core::key::Key;
+    use homestead_core::lease::{LeaseMode, LeaseRef};
+    use homestead_core::messages::{
+        AcquireRequest, GetRequest, LeaseSpec, PutBatchRequest, PutEntry,
+    };
+    use homestead_core::space::Space as _;
+    use homestead_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::time::Duration;
+    use storage::MemoryStore;
 
-    /// Minimal `Space` impl: proves the trait is implementable and keeps the
-    /// server generics honest. Every verb answers "empty".
-    #[derive(Default)]
-    struct NullSpace;
+    /// Test spawner: counts spawns, runs tasks on the pool.
+    #[derive(Clone)]
+    struct CountingSpawner {
+        inner: LocalSpawner,
+        count: Rc<Cell<usize>>,
+    }
 
-    impl Space for NullSpace {
-        fn acquire(
-            &self,
-            req: AcquireRequest,
-        ) -> impl Future<Output = Result<AcquireResponse, SpaceError>> + Send {
-            async move {
-                Err(KernelError::Contended {
-                    prefix: req.specs[0].prefix.clone(),
-                    retry_after: None,
-                }
-                .into())
-            }
-        }
-
-        fn renew(
-            &self,
-            req: RenewRequest,
-        ) -> impl Future<Output = Result<RenewResponse, SpaceError>> + Send {
-            async move {
-                Ok(RenewResponse {
-                    granted: Vec::new(),
-                    invalid: req.leases,
-                })
-            }
-        }
-
-        fn release(
-            &self,
-            _req: ReleaseRequest,
-        ) -> impl Future<Output = Result<ReleaseResponse, SpaceError>> + Send {
-            async move { Ok(ReleaseResponse {}) }
-        }
-
-        fn put_batch(
-            &self,
-            req: PutBatchRequest,
-        ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send {
-            async move {
-                Err(KernelError::NotCovered {
-                    key: req.entries[0].key.clone(),
-                }
-                .into())
-            }
-        }
-
-        fn get(
-            &self,
-            req: GetRequest,
-        ) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
-            async move {
-                Ok(GetResponse {
-                    entries: req.keys.iter().map(|_| None).collect(),
-                })
-            }
-        }
-
-        fn list(
-            &self,
-            _req: ListRequest,
-        ) -> impl Future<Output = Result<ListResponse, SpaceError>> + Send {
-            async move {
-                Ok(ListResponse {
-                    entries: Vec::new(),
-                    truncated: false,
-                })
-            }
-        }
-
-        fn read_at(
-            &self,
-            req: ReadAtRequest,
-        ) -> impl Future<Output = Result<ReadAtResponse, SpaceError>> + Send {
-            async move {
-                Ok(ReadAtResponse {
-                    at: homestead_core::AdmissionSeq(0),
-                    ranges: req.ranges.iter().map(|_| RangeCut::Snapshot(Vec::new())).collect(),
-                })
-            }
+    impl Spawner for CountingSpawner {
+        fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            self.count.set(self.count.get() + 1);
+            self.inner.spawn(task).unwrap();
         }
     }
 
+    fn server(
+        pool: &LocalPool,
+    ) -> (Server<MemoryStore, ManualClock, CountingSpawner>, Rc<Cell<usize>>) {
+        let count = Rc::new(Cell::new(0));
+        let spawner = CountingSpawner {
+            inner: pool.spawner(),
+            count: Rc::clone(&count),
+        };
+        let server = Server::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(ManualClock::new(Timestamp(0))),
+            spawner,
+        );
+        (server, count)
+    }
+
+    fn dev(n: u8) -> DeviceId {
+        DeviceId([n; 16])
+    }
+
+    fn key(components: &[&[u8]]) -> Key {
+        Key::from_bytes(components.iter().copied()).unwrap()
+    }
+
+    /// Acquire a write lease on `("db",)` and put one key through a handle.
+    async fn write_marker(handle: &SpaceHandle, marker: &[u8]) -> AdmissionSeq {
+        let granted = handle
+            .acquire(AcquireRequest {
+                device: dev(1),
+                steal: false,
+                specs: vec![LeaseSpec {
+                    prefix: key(&[b"db"]),
+                    mode: LeaseMode::Write,
+                    ttl: Duration::from_secs(60),
+                    stealable: false,
+                }],
+            })
+            .await
+            .unwrap();
+        let lease = LeaseRef {
+            id: granted.leases[0].id,
+            epoch: granted.leases[0].epoch,
+        };
+        handle
+            .put_batch(PutBatchRequest {
+                device: dev(1),
+                device_seq: DeviceSeq(1),
+                leases: vec![lease],
+                entries: vec![PutEntry {
+                    key: key(&[b"db", b"marker"]),
+                    value: Value::Present(marker.to_vec()),
+                    ver: Ver(1),
+                }],
+            })
+            .await
+            .unwrap()
+            .admission_seq
+    }
+
+    async fn read_marker(handle: &SpaceHandle) -> Option<Vec<u8>> {
+        let got = handle
+            .get(GetRequest { keys: vec![key(&[b"db", b"marker"])] })
+            .await
+            .unwrap();
+        got.entries[0].as_ref().map(|e| match &e.value {
+            Value::Present(v) => v.clone(),
+            Value::Absent => panic!("tombstone in get"),
+        })
+    }
+
     #[test]
-    fn routes_by_space_id() {
+    fn registration_is_idempotent_and_routing_is_exact() {
+        let pool = LocalPool::new();
+        let (server, _count) = server(&pool);
         let a = SpaceId([1; 16]);
         let b = SpaceId([2; 16]);
 
-        let mut server = Server::new();
-        assert!(server.insert_space(a, NullSpace));
-        assert!(!server.insert_space(a, NullSpace), "duplicate id must be rejected");
+        assert!(server.create_space(a));
+        assert!(!server.create_space(a), "duplicate id must be rejected");
 
         assert!(server.space(&a).is_some());
-        assert!(server.space(&b).is_none());
+        assert!(server.space(&b).is_none(), "unregistered space must not route");
     }
 
     #[test]
-    fn create_space_builds_empty_spaces() {
+    fn actors_spawn_lazily_and_exactly_once() {
+        let pool = LocalPool::new();
+        let (server, count) = server(&pool);
         let a = SpaceId([1; 16]);
 
-        let mut server = Server::<NullSpace>::new();
-        assert!(server.create_space(a));
-        assert!(!server.create_space(a), "duplicate id must be rejected");
-        assert!(server.space(&a).is_some());
+        server.create_space(a);
+        assert_eq!(count.get(), 0, "registration must spawn nothing");
+
+        server.space(&a);
+        assert_eq!(count.get(), 1, "first touch spawns the actor");
+        server.space(&a);
+        assert_eq!(count.get(), 1, "second touch reuses it");
+    }
+
+    #[test]
+    fn spaces_are_isolated_end_to_end() {
+        let mut pool = LocalPool::new();
+        let (server, _count) = server(&pool);
+        let a = SpaceId([1; 16]);
+        let b = SpaceId([2; 16]);
+        server.create_space(a);
+        server.create_space(b);
+
+        let ha = server.space(&a).unwrap();
+        let hb = server.space(&b).unwrap();
+
+        pool.run_until(async move {
+            // Same key, same device, both spaces on one shared store: each
+            // space sees only its own write, and admission seqs are
+            // per-space (both batches are seq 1).
+            let seq_a = write_marker(&ha, b"from-a").await;
+            let seq_b = write_marker(&hb, b"from-b").await;
+            assert_eq!(seq_a, AdmissionSeq(1));
+            assert_eq!(seq_b, AdmissionSeq(1), "admission sequences must not couple");
+
+            assert_eq!(read_marker(&ha).await, Some(b"from-a".to_vec()));
+            assert_eq!(read_marker(&hb).await, Some(b"from-b".to_vec()));
+        });
     }
 }

@@ -37,6 +37,16 @@ use homestead_core::space::{Space as SpaceApi, SpaceError, SpaceId};
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// The one hook through which anything in this crate reaches an executor.
+///
+/// The library never spawns on its own (the DST contract): production hands
+/// this to tokio (`handle.spawn(task)`), tests to a `LocalPool`, the sim to
+/// its seeded stepper. Futures are boxed `Send` — [`SpaceActor::run`] is
+/// `Send` by construction (asserted in tests).
+pub trait Spawner {
+    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>);
+}
+
 type Reply<T> = oneshot::Sender<Result<T, SpaceError>>;
 
 /// One queued verb: the request plus the reply slot. The oneshot is the
