@@ -217,7 +217,7 @@ fn to_key(prefix: &Prefix) -> Key {
 proptest! {
     #[test]
     fn lease_state_machine_matches_model(cmds in prop::collection::vec(arb_cmd(), 1..=40)) {
-        let mut store = MemoryStore::new();
+        let store = MemoryStore::new();
         let mut mgr = LeaseManager::new(SPACE);
         let mut model = Model::default();
 
@@ -237,7 +237,7 @@ proptest! {
                             })
                             .collect(),
                     };
-                    let result = block_on(mgr.acquire(&mut store, Timestamp(model.now), &req));
+                    let result = block_on(mgr.acquire(&store, Timestamp(model.now), &req));
                     let expected_conflict = model.acquire_would_conflict(*steal, specs);
                     prop_assert_eq!(
                         result.is_err(),
@@ -288,7 +288,7 @@ proptest! {
                         .map(|l| LeaseId(l.id))
                         .collect();
                     let resp = block_on(mgr.renew(
-                        &mut store,
+                        &store,
                         Timestamp(model.now),
                         &RenewRequest { device: dev(*device), leases: ids.clone() },
                     ))
@@ -324,7 +324,7 @@ proptest! {
                         .map(|l| LeaseId(l.id))
                         .collect();
                     block_on(mgr.release(
-                        &mut store,
+                        &store,
                         Timestamp(model.now),
                         &ReleaseRequest { device: dev(*device), leases: ids.clone() },
                     ))

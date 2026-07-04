@@ -59,7 +59,7 @@ use std::collections::BTreeMap;
 pub async fn put_batch<S: OrderedStore>(
     space: SpaceId,
     leases: &LeaseManager,
-    store: &mut S,
+    store: &S,
     now: Timestamp,
     req: &PutBatchRequest,
 ) -> Result<PutBatchResponse, Error> {

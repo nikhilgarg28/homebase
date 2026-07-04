@@ -48,7 +48,7 @@ impl Space {
 
     pub async fn acquire<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &AcquireRequest,
     ) -> Result<AcquireResponse, Error> {
@@ -58,7 +58,7 @@ impl Space {
 
     pub async fn renew<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &RenewRequest,
     ) -> Result<RenewResponse, Error> {
@@ -67,7 +67,7 @@ impl Space {
 
     pub async fn release<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &ReleaseRequest,
     ) -> Result<ReleaseResponse, Error> {
@@ -79,7 +79,7 @@ impl Space {
 
     pub async fn put_batch<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &PutBatchRequest,
     ) -> Result<PutBatchResponse, Error> {
@@ -143,9 +143,9 @@ mod tests {
     /// Space + store + a write lease over `("db",)` held by device 1.
     fn setup() -> (Space, MemoryStore, LeaseRef) {
         let mut space = Space::new(SPACE);
-        let mut store = MemoryStore::new();
+        let store = MemoryStore::new();
         let resp = block_on(space.acquire(
-            &mut store,
+            &store,
             Timestamp(0),
             &AcquireRequest {
                 device: dev(1),
@@ -165,7 +165,7 @@ mod tests {
 
     fn put_batch(
         space: &mut Space,
-        store: &mut MemoryStore,
+        store: &MemoryStore,
         lease: LeaseRef,
         device_seq: u64,
         entries: Vec<PutEntry>,
@@ -184,9 +184,9 @@ mod tests {
 
     #[test]
     fn put_then_get_roundtrips_with_tags() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let k = key(&[b"db", b"t", b"r1"]);
-        let resp = put_batch(&mut space, &mut store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
+        let resp = put_batch(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
         assert_eq!(resp.admission_seq, AdmissionSeq(1));
 
         let got = block_on(space.get(&store, &GetRequest { keys: vec![k.clone()] })).unwrap();
@@ -211,7 +211,7 @@ mod tests {
                 .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
         };
 
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let k1 = key(&[b"db", b"t", b"r1"]);
         let k2 = key(&[b"db", b"t", b"r2"]);
         let root = key(&[b"db"]);
@@ -221,8 +221,8 @@ mod tests {
         assert_eq!(meta(&store, &root), None);
 
         // Two live keys: every ancestor counts both, at seq 2.
-        put_batch(&mut space, &mut store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
-        put_batch(&mut space, &mut store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
+        put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
+        put_batch(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
         let expect = PrefixMetaRecord { max_admission_seq: 2, live_count: 2 };
         assert_eq!(meta(&store, &root), Some(expect));
         assert_eq!(meta(&store, &table), Some(expect));
@@ -233,15 +233,15 @@ mod tests {
         );
 
         // Overwrite: max seq advances, live count doesn't.
-        put_batch(&mut space, &mut store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
+        put_batch(&mut space, &store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
         assert_eq!(
             meta(&store, &root),
             Some(PrefixMetaRecord { max_admission_seq: 3, live_count: 2 })
         );
 
         // Tombstone: count drops; the record persists at live_count 0.
-        put_batch(&mut space, &mut store, lease, 4, vec![del(&k1, 3)]).unwrap();
-        put_batch(&mut space, &mut store, lease, 5, vec![del(&k2, 2)]).unwrap();
+        put_batch(&mut space, &store, lease, 4, vec![del(&k1, 3)]).unwrap();
+        put_batch(&mut space, &store, lease, 5, vec![del(&k2, 2)]).unwrap();
         assert_eq!(
             meta(&store, &root),
             Some(PrefixMetaRecord { max_admission_seq: 5, live_count: 0 })
@@ -255,7 +255,7 @@ mod tests {
         let k3 = key(&[b"db", b"t", b"r3"]);
         put_batch(
             &mut space,
-            &mut store,
+            &store,
             lease,
             6,
             vec![put(&k3, b"blip", 1), del(&k3, 2)],
@@ -269,15 +269,15 @@ mod tests {
 
     #[test]
     fn batch_is_atomic_on_rejection() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let k1 = key(&[b"db", b"a"]);
         let k2 = key(&[b"db", b"b"]);
-        put_batch(&mut space, &mut store, lease, 1, vec![put(&k1, b"v", 5)]).unwrap();
+        put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v", 5)]).unwrap();
 
         // Second batch: valid write to k2, then a ver regression on k1.
         let err = put_batch(
             &mut space,
-            &mut store,
+            &store,
             lease,
             2,
             vec![put(&k2, b"v", 1), put(&k1, b"v", 5)],
@@ -288,20 +288,20 @@ mod tests {
         // Nothing from the rejected batch landed — k2 unwritten, device seq unmoved.
         let got = block_on(space.get(&store, &GetRequest { keys: vec![k2.clone()] })).unwrap();
         assert!(got.entries[0].is_none());
-        put_batch(&mut space, &mut store, lease, 2, vec![put(&k2, b"v", 1)])
+        put_batch(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)])
             .expect("device_seq 2 still available after rejected batch");
     }
 
     #[test]
     fn device_seq_replays_rejected() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let k = key(&[b"db", b"k"]);
-        put_batch(&mut space, &mut store, lease, 3, vec![put(&k, b"v", 1)]).unwrap();
+        put_batch(&mut space, &store, lease, 3, vec![put(&k, b"v", 1)]).unwrap();
 
         for replayed in [3, 2] {
             let err = put_batch(
                 &mut space,
-                &mut store,
+                &store,
                 lease,
                 replayed,
                 vec![put(&k, b"v", 2)],
@@ -316,12 +316,12 @@ mod tests {
 
     #[test]
     fn intra_batch_ver_checks_are_sequential() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let k = key(&[b"db", b"k"]);
         // Same key twice in one batch: second must exceed the first…
         put_batch(
             &mut space,
-            &mut store,
+            &store,
             lease,
             1,
             vec![put(&k, b"v1", 1), put(&k, b"v2", 2)],
@@ -333,7 +333,7 @@ mod tests {
         // …and an equal ver within the batch is a regression.
         let err = put_batch(
             &mut space,
-            &mut store,
+            &store,
             lease,
             2,
             vec![put(&k, b"v3", 3), put(&k, b"v4", 3)],
@@ -344,20 +344,20 @@ mod tests {
 
     #[test]
     fn list_hides_tombstones_and_paginates() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let keys: Vec<Key> = [b"a" as &[u8], b"b", b"c", b"d"]
             .iter()
             .map(|s| key(&[b"db", s]))
             .collect();
         put_batch(
             &mut space,
-            &mut store,
+            &store,
             lease,
             1,
             keys.iter().map(|k| put(k, b"v", 1)).collect(),
         )
         .unwrap();
-        put_batch(&mut space, &mut store, lease, 2, vec![del(&keys[1], 2)]).unwrap();
+        put_batch(&mut space, &store, lease, 2, vec![del(&keys[1], 2)]).unwrap();
 
         // Tombstoned "b" is hidden.
         let all = block_on(space.list(
@@ -406,10 +406,10 @@ mod tests {
 
     #[test]
     fn read_at_snapshot_then_delta_reconstructs() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let ka = key(&[b"db", b"a"]);
         let kb = key(&[b"db", b"b"]);
-        put_batch(&mut space, &mut store, lease, 1, vec![put(&ka, b"a1", 1), put(&kb, b"b1", 1)])
+        put_batch(&mut space, &store, lease, 1, vec![put(&ka, b"a1", 1), put(&kb, b"b1", 1)])
             .unwrap();
 
         // Snapshot at seq 1.
@@ -423,8 +423,8 @@ mod tests {
         assert_eq!(state.len(), 2);
 
         // Two more batches: overwrite a, tombstone b.
-        put_batch(&mut space, &mut store, lease, 2, vec![put(&ka, b"a2", 2)]).unwrap();
-        put_batch(&mut space, &mut store, lease, 3, vec![del(&kb, 2)]).unwrap();
+        put_batch(&mut space, &store, lease, 2, vec![put(&ka, b"a2", 2)]).unwrap();
+        put_batch(&mut space, &store, lease, 3, vec![del(&kb, 2)]).unwrap();
 
         // Delta since the snapshot: each key exactly once, at final state,
         // tombstone visible.
@@ -460,10 +460,10 @@ mod tests {
 
     #[test]
     fn read_at_delta_filters_by_prefix() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         let ka = key(&[b"db", b"t1", b"r"]);
         let kb = key(&[b"db", b"t2", b"r"]);
-        put_batch(&mut space, &mut store, lease, 1, vec![put(&ka, b"a", 1), put(&kb, b"b", 1)])
+        put_batch(&mut space, &store, lease, 1, vec![put(&ka, b"a", 1), put(&kb, b"b", 1)])
             .unwrap();
 
         let resp = block_on(space.read_at(
@@ -484,12 +484,12 @@ mod tests {
 
     #[test]
     fn acquire_barrier_tracks_admissions() {
-        let (mut space, mut store, lease) = setup();
-        put_batch(&mut space, &mut store, lease, 1, vec![put(&key(&[b"db", b"k"]), b"v", 1)])
+        let (mut space, store, lease) = setup();
+        put_batch(&mut space, &store, lease, 1, vec![put(&key(&[b"db", b"k"]), b"v", 1)])
             .unwrap();
 
         let resp = block_on(space.acquire(
-            &mut store,
+            &store,
             Timestamp(2),
             &AcquireRequest {
                 device: dev(2),
@@ -508,10 +508,10 @@ mod tests {
 
     #[test]
     fn writes_without_write_lease_rejected() {
-        let (mut space, mut store, lease) = setup();
+        let (mut space, store, lease) = setup();
         // Key outside the leased prefix.
         let outside = key(&[b"elsewhere"]);
-        let err = put_batch(&mut space, &mut store, lease, 1, vec![put(&outside, b"v", 1)])
+        let err = put_batch(&mut space, &store, lease, 1, vec![put(&outside, b"v", 1)])
             .unwrap_err();
         assert!(matches!(err, Error::Kernel(KernelError::NotCovered { .. })));
     }

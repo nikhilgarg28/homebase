@@ -12,11 +12,18 @@
 //! a pull-based async iterator, so a large range never has to materialize.
 //!
 //! Every verb applies exactly one atomic [`WriteBatch`].
+//!
+//! All methods take `&self`: one shard store is shared by every space actor
+//! on the shard (slatedb is naturally `&self`; [`MemoryStore`] locks
+//! internally). Atomicity is the [`WriteBatch`] contract, not `&mut`
+//! exclusivity — per-space serialization comes from the space actor, and
+//! spaces never share keys.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::ops::Bound;
+use std::sync::RwLock;
 
 /// A storage-backend failure (object store IO, corruption, …). Distinct from
 /// [`KernelError`](homestead_core::messages::KernelError): kernel errors are
@@ -94,8 +101,10 @@ pub trait OrderedStore {
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send;
 
     /// Streams entries with keys in `[start, end)` — `end: None` means
-    /// unbounded — in ascending key order. The iterator borrows the store;
-    /// drop it before calling [`apply`](OrderedStore::apply).
+    /// unbounded — in ascending key order. The scan observes the store as of
+    /// its creation; whether batches applied *after* creation are visible is
+    /// backend-defined (callers must not rely on it — the kernel never
+    /// interleaves a scan with its own writes).
     ///
     /// `start > end` is caller error; implementations may panic.
     fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter;
@@ -107,7 +116,7 @@ pub trait OrderedStore {
 
     /// Applies a batch atomically.
     fn apply(
-        &mut self,
+        &self,
         batch: WriteBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
@@ -127,9 +136,14 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// In-memory store: the reference implementation for tests and the sim.
+///
+/// Interior locking makes it shareable (`&self` everywhere) like the
+/// production store. Scans snapshot their range at creation — the cheapest
+/// way to satisfy the "observes the store as of creation" contract through
+/// a lock, and fine at test scale.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    map: BTreeMap<Vec<u8>, Vec<u8>>,
+    map: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl MemoryStore {
@@ -138,24 +152,24 @@ impl MemoryStore {
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.read().unwrap().is_empty()
     }
 }
 
-/// Scan over a [`MemoryStore`]: a `BTreeMap` range wrapped in ready futures.
-struct MemoryScan<'a> {
-    inner: std::collections::btree_map::Range<'a, Vec<u8>, Vec<u8>>,
+/// Scan over a [`MemoryStore`]: a range snapshot wrapped in ready futures.
+struct MemoryScan {
+    inner: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
 }
 
-impl ScanIter for MemoryScan<'_> {
+impl ScanIter for MemoryScan {
     fn next(
         &mut self,
     ) -> impl Future<Output = Result<Option<(Vec<u8>, Vec<u8>)>, StorageError>> + Send {
-        std::future::ready(Ok(self.inner.next().map(|(k, v)| (k.clone(), v.clone()))))
+        std::future::ready(Ok(self.inner.next()))
     }
 }
 
@@ -164,7 +178,7 @@ impl OrderedStore for MemoryStore {
         &self,
         key: &[u8],
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send {
-        std::future::ready(Ok(self.map.get(key).cloned()))
+        std::future::ready(Ok(self.map.read().unwrap().get(key).cloned()))
     }
 
     fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter {
@@ -172,22 +186,30 @@ impl OrderedStore for MemoryStore {
             Some(end) => Bound::Excluded(end),
             None => Bound::Unbounded,
         };
+        let snapshot: Vec<(Vec<u8>, Vec<u8>)> = self
+            .map
+            .read()
+            .unwrap()
+            .range((Bound::Included(start), end))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         MemoryScan {
-            inner: self.map.range((Bound::Included(start), end)),
+            inner: snapshot.into_iter(),
         }
     }
 
     fn apply(
-        &mut self,
+        &self,
         batch: WriteBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        let mut map = self.map.write().unwrap();
         for op in batch.ops {
             match op {
                 Op::Put { key, value } => {
-                    self.map.insert(key, value);
+                    map.insert(key, value);
                 }
                 Op::Delete { key } => {
-                    self.map.remove(&key);
+                    map.remove(&key);
                 }
             }
         }
@@ -231,7 +253,7 @@ pub mod conformance {
         collect_scan(store.scan_prefix(prefix)).await.unwrap()
     }
 
-    async fn put_all<S: OrderedStore>(store: &mut S, entries: &[(&[u8], &[u8])]) {
+    async fn put_all<S: OrderedStore>(store: &S, entries: &[(&[u8], &[u8])]) {
         let mut batch = WriteBatch::new();
         for (k, v) in entries {
             batch.put(k.to_vec(), v.to_vec());
@@ -245,22 +267,22 @@ pub mod conformance {
         assert!(scan_all(&store, b"pfx").await.is_empty());
     }
 
-    pub async fn put_then_get<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"k1", b"v1"), (b"k2", b"v2")]).await;
+    pub async fn put_then_get<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"k1", b"v1"), (b"k2", b"v2")]).await;
         assert_eq!(store.get(b"k1").await.unwrap(), Some(b"v1".to_vec()));
         assert_eq!(store.get(b"k2").await.unwrap(), Some(b"v2".to_vec()));
         assert_eq!(store.get(b"k3").await.unwrap(), None);
     }
 
-    pub async fn overwrite_replaces<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"k", b"old")]).await;
-        put_all(&mut store, &[(b"k", b"new")]).await;
+    pub async fn overwrite_replaces<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"k", b"old")]).await;
+        put_all(&store, &[(b"k", b"new")]).await;
         assert_eq!(store.get(b"k").await.unwrap(), Some(b"new".to_vec()));
         assert_eq!(scan_all(&store, b"k").await.len(), 1, "overwrite must not duplicate");
     }
 
-    pub async fn delete_removes_and_tolerates_missing<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"k", b"v")]).await;
+    pub async fn delete_removes_and_tolerates_missing<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"k", b"v")]).await;
 
         let mut batch = WriteBatch::new();
         batch.delete(b"k".to_vec());
@@ -271,7 +293,7 @@ pub mod conformance {
         assert!(scan_all(&store, &[]).await.is_empty());
     }
 
-    pub async fn batch_ops_apply_in_order<S: OrderedStore>(mut store: S) {
+    pub async fn batch_ops_apply_in_order<S: OrderedStore>(store: S) {
         // Last op on a key wins: put-delete-put …
         let mut batch = WriteBatch::new();
         batch.put(b"a".to_vec(), b"v1".to_vec());
@@ -286,16 +308,16 @@ pub mod conformance {
         assert_eq!(store.get(b"b").await.unwrap(), None);
     }
 
-    pub async fn empty_batch_is_a_noop<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"k", b"v")]).await;
+    pub async fn empty_batch_is_a_noop<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"k", b"v")]).await;
         store.apply(WriteBatch::new()).await.unwrap();
         assert_eq!(store.get(b"k").await.unwrap(), Some(b"v".to_vec()));
     }
 
-    pub async fn scan_filters_and_orders<S: OrderedStore>(mut store: S) {
+    pub async fn scan_filters_and_orders<S: OrderedStore>(store: S) {
         // Inserted deliberately out of order, across two batches.
-        put_all(&mut store, &[(b"b/2", b"v3"), (b"a", b"v0"), (b"c", b"v5")]).await;
-        put_all(&mut store, &[(b"b/1", b"v2"), (b"b", b"v1"), (b"b/3", b"v4")]).await;
+        put_all(&store, &[(b"b/2", b"v3"), (b"a", b"v0"), (b"c", b"v5")]).await;
+        put_all(&store, &[(b"b/1", b"v2"), (b"b", b"v1"), (b"b/3", b"v4")]).await;
 
         let hits = scan_all(&store, b"b").await;
         let expected: Vec<(Vec<u8>, Vec<u8>)> = [
@@ -314,8 +336,8 @@ pub mod conformance {
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "empty prefix scans everything in order");
     }
 
-    pub async fn scan_range_bounds_are_half_open<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")]).await;
+    pub async fn scan_range_bounds_are_half_open<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")]).await;
 
         let collect = |iter| async { collect_scan(iter).await.unwrap() };
         let keys = |entries: Vec<(Vec<u8>, Vec<u8>)>| {
@@ -337,9 +359,9 @@ pub mod conformance {
         assert!(hits.is_empty());
     }
 
-    pub async fn scan_boundaries_are_exact<S: OrderedStore>(mut store: S) {
+    pub async fn scan_boundaries_are_exact<S: OrderedStore>(store: S) {
         put_all(
-            &mut store,
+            &store,
             &[
                 (&[0x00u8] as &[u8], b"below" as &[u8]),
                 (&[0x01], b"exact"),
@@ -364,10 +386,10 @@ pub mod conformance {
         );
     }
 
-    pub async fn scan_handles_high_prefixes<S: OrderedStore>(mut store: S) {
+    pub async fn scan_handles_high_prefixes<S: OrderedStore>(store: S) {
         // An all-0xff prefix has no successor: the scan must run unbounded.
         put_all(
-            &mut store,
+            &store,
             &[
                 (&[0xfeu8, 0xff] as &[u8], b"below" as &[u8]),
                 (&[0xff], b"a"),
@@ -382,8 +404,8 @@ pub mod conformance {
         assert_eq!(scan_all(&store, &[0xff, 0xff]).await.len(), 2);
     }
 
-    pub async fn scan_observes_all_prior_batches<S: OrderedStore>(mut store: S) {
-        put_all(&mut store, &[(b"k1", b"v1"), (b"k2", b"v2")]).await;
+    pub async fn scan_observes_all_prior_batches<S: OrderedStore>(store: S) {
+        put_all(&store, &[(b"k1", b"v1"), (b"k2", b"v2")]).await;
 
         let mut batch = WriteBatch::new();
         batch.delete(b"k1".to_vec());

@@ -27,9 +27,12 @@ use std::sync::Arc;
 ///
 /// Spaces are fully isolated: no verb spans two spaces, so the server layer
 /// is pure routing plus space lifecycle. Lifecycle is deliberately *not* one
-/// of the seven data-plane verbs — creating a space is a control-plane
-/// action (provisioning, quotas, tokens) and will be exposed via an admin
-/// surface, not the space wire protocol.
+/// of the seven data-plane verbs: creating a space is a **tenant-plane**
+/// action — cheap, token-authorized, quota-checked, done constantly by apps
+/// (per-user/per-document dbs) — exposed via its own surface, not the space
+/// wire protocol. Tenants themselves (keys, quotas, billing) are control
+/// plane; the kernel stays tenant-oblivious (tenant never appears in
+/// storage keys or verbs).
 ///
 /// Handles are `Arc`s because `Space` methods take `&self`; concurrent
 /// requests to one space serialize inside its implementation, not here.

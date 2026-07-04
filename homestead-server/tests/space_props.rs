@@ -143,11 +143,11 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let mut space = Space::new(SPACE);
-        let mut store = MemoryStore::new();
+        let store = MemoryStore::new();
         let mut leases = Vec::new();
         for d in 0..DEVICES {
             let resp = block_on(space.acquire(
-                &mut store,
+                &store,
                 Timestamp(0),
                 &AcquireRequest {
                     device: dev(d),
@@ -173,7 +173,7 @@ impl Harness {
         entries: Vec<PutEntry>,
     ) -> Result<AdmissionSeq, Error> {
         block_on(self.space.put_batch(
-            &mut self.store,
+            &self.store,
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(device),

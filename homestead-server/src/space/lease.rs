@@ -59,7 +59,7 @@ impl LeaseManager {
     /// blocker contends the whole request, as usual.
     pub async fn acquire<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &AcquireRequest,
     ) -> Result<(Vec<Lease>, AdmissionSeq), Error> {
@@ -156,7 +156,7 @@ impl LeaseManager {
     /// piggybacks on the grants.
     pub async fn renew<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &RenewRequest,
     ) -> Result<RenewResponse, Error> {
@@ -196,7 +196,7 @@ impl LeaseManager {
     /// leases are purged regardless of who asks.
     pub async fn release<S: OrderedStore>(
         &mut self,
-        store: &mut S,
+        store: &S,
         now: Timestamp,
         req: &ReleaseRequest,
     ) -> Result<(), Error> {
@@ -350,7 +350,7 @@ mod tests {
 
     fn acquire_one(
         mgr: &mut LeaseManager,
-        store: &mut MemoryStore,
+        store: &MemoryStore,
         now: u64,
         device: u8,
         prefix: &Key,
@@ -370,7 +370,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn acquire_flags(
         mgr: &mut LeaseManager,
-        store: &mut MemoryStore,
+        store: &MemoryStore,
         now: u64,
         device: u8,
         prefix: &Key,
@@ -403,47 +403,47 @@ mod tests {
 
     #[test]
     fn write_excludes_read_shares() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let parent = key(&[b"db"]);
         let child = key(&[b"db", b"t1"]);
         let sibling = key(&[b"db2"]);
 
-        acquire_one(&mut mgr, &mut store, 0, 1, &parent, LeaseMode::Read, 100).unwrap();
+        acquire_one(&mut mgr, &store, 0, 1, &parent, LeaseMode::Read, 100).unwrap();
         // Read shares with read, exact and nested.
-        acquire_one(&mut mgr, &mut store, 0, 2, &parent, LeaseMode::Read, 100).unwrap();
-        acquire_one(&mut mgr, &mut store, 0, 3, &child, LeaseMode::Read, 100).unwrap();
+        acquire_one(&mut mgr, &store, 0, 2, &parent, LeaseMode::Read, 100).unwrap();
+        acquire_one(&mut mgr, &store, 0, 3, &child, LeaseMode::Read, 100).unwrap();
         // Read blocks write, at ancestor and descendant.
         assert!(matches!(
-            acquire_one(&mut mgr, &mut store, 0, 4, &child, LeaseMode::Write, 100),
+            acquire_one(&mut mgr, &store, 0, 4, &child, LeaseMode::Write, 100),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
         // Unrelated prefix is free.
-        acquire_one(&mut mgr, &mut store, 0, 4, &sibling, LeaseMode::Write, 100).unwrap();
+        acquire_one(&mut mgr, &store, 0, 4, &sibling, LeaseMode::Write, 100).unwrap();
         // Write blocks read and write below it.
         assert!(matches!(
-            acquire_one(&mut mgr, &mut store, 0, 5, &sibling, LeaseMode::Read, 100),
+            acquire_one(&mut mgr, &store, 0, 5, &sibling, LeaseMode::Read, 100),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
     }
 
     #[test]
     fn no_upgrade_even_for_own_device() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
-        acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Read, 100).unwrap();
+        acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Read, 100).unwrap();
         assert!(matches!(
-            acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, 100),
+            acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 100),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
     }
 
     #[test]
     fn steal_denied_pre_deadline_allowed_after_with_fresh_epoch() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
-        let first = acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
+        let first = acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
 
-        let denied = acquire_one(&mut mgr, &mut store, 49, 2, &p, LeaseMode::Write, 50);
+        let denied = acquire_one(&mut mgr, &store, 49, 2, &p, LeaseMode::Write, 50);
         match denied {
             Err(Error::Kernel(KernelError::Contended { retry_after, .. })) => {
                 assert_eq!(retry_after, Some(Duration::from_millis(1)));
@@ -452,7 +452,7 @@ mod tests {
         }
 
         // Strict local expiry: dead exactly at the deadline.
-        let stolen = acquire_one(&mut mgr, &mut store, 50, 2, &p, LeaseMode::Write, 50).unwrap();
+        let stolen = acquire_one(&mut mgr, &store, 50, 2, &p, LeaseMode::Write, 50).unwrap();
         assert!(stolen.epoch > first.epoch);
         assert!(stolen.id > first.id);
         // The expired record was purged when touched.
@@ -461,21 +461,21 @@ mod tests {
 
     #[test]
     fn steal_preempts_stealable_and_fences_the_victim() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"account"]);
         let first =
-            acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
+            acquire_flags(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
 
         // Pre-deadline steal succeeds with a fresh id and epoch.
         let second =
-            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, true, true).unwrap();
+            acquire_flags(&mut mgr, &store, 10, 2, &p, LeaseMode::Write, true, true).unwrap();
         assert!(second.epoch > first.epoch);
         assert!(second.id > first.id);
         assert_eq!(live_record_count(&store, 10), 1, "victim purged");
 
         // The victim is fenced: renew reports invalid, puts fail.
         let resp = block_on(mgr.renew(
-            &mut store,
+            &store,
             Timestamp(10),
             &RenewRequest { device: dev(1), leases: vec![first.id] },
         ))
@@ -490,23 +490,23 @@ mod tests {
 
     #[test]
     fn steal_denied_by_any_non_stealable_blocker() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"account"]);
 
         // Non-stealable holder: steal is just a normal contended acquire.
-        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, false, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, false, false).unwrap();
         assert!(matches!(
-            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, true, true),
+            acquire_flags(&mut mgr, &store, 10, 2, &p, LeaseMode::Write, true, true),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
 
         // Mixed blockers: one stealable read + one non-stealable read block
         // a stealing write.
         let q = key(&[b"docs"]);
-        acquire_flags(&mut mgr, &mut store, 0, 3, &q, LeaseMode::Read, true, false).unwrap();
-        acquire_flags(&mut mgr, &mut store, 0, 4, &q, LeaseMode::Read, false, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 3, &q, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 4, &q, LeaseMode::Read, false, false).unwrap();
         assert!(matches!(
-            acquire_flags(&mut mgr, &mut store, 10, 2, &q, LeaseMode::Write, true, true),
+            acquire_flags(&mut mgr, &store, 10, 2, &q, LeaseMode::Write, true, true),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
         assert_eq!(live_record_count(&store, 10), 3, "nothing stolen on denial");
@@ -514,40 +514,40 @@ mod tests {
 
     #[test]
     fn stealable_without_steal_flag_still_contends() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"account"]);
-        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
         assert!(matches!(
-            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, false, false),
+            acquire_flags(&mut mgr, &store, 10, 2, &p, LeaseMode::Write, false, false),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
     }
 
     #[test]
     fn steal_flag_without_blockers_is_a_plain_grant() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"free"]);
-        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, false, true).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, false, true).unwrap();
         assert_eq!(live_record_count(&store, 0), 1);
     }
 
     #[test]
     fn steal_preempts_multiple_stealable_readers() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let parent = key(&[b"docs"]);
         let child = key(&[b"docs", b"a"]);
-        acquire_flags(&mut mgr, &mut store, 0, 1, &parent, LeaseMode::Read, true, false).unwrap();
-        acquire_flags(&mut mgr, &mut store, 0, 2, &child, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 1, &parent, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(&mut mgr, &store, 0, 2, &child, LeaseMode::Read, true, false).unwrap();
 
         // A stealing write on the parent takes out both readers at once.
-        acquire_flags(&mut mgr, &mut store, 10, 3, &parent, LeaseMode::Write, false, true)
+        acquire_flags(&mut mgr, &store, 10, 3, &parent, LeaseMode::Write, false, true)
             .unwrap();
         assert_eq!(live_record_count(&store, 10), 1);
     }
 
     #[test]
     fn intra_batch_self_conflict_denied() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let req = AcquireRequest {
             device: dev(1),
             specs: vec![
@@ -557,7 +557,7 @@ mod tests {
             steal: false,
         };
         assert!(matches!(
-            block_on(mgr.acquire(&mut store, Timestamp(0), &req)),
+            block_on(mgr.acquire(&store, Timestamp(0), &req)),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
         assert_eq!(live_record_count(&store, 0), 0, "all-or-nothing");
@@ -565,13 +565,13 @@ mod tests {
 
     #[test]
     fn renew_extends_and_piggybacks_contention() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
-        let lease = acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
+        let lease = acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
 
         // No demand yet.
         let resp = block_on(mgr.renew(
-            &mut store,
+            &store,
             Timestamp(40),
             &RenewRequest { device: dev(1), leases: vec![lease.id] },
         ))
@@ -580,9 +580,9 @@ mod tests {
         assert!(!resp.granted[0].contended);
 
         // A failed acquire registers demand; the holder hears about it.
-        let _ = acquire_one(&mut mgr, &mut store, 60, 2, &p, LeaseMode::Write, 50);
+        let _ = acquire_one(&mut mgr, &store, 60, 2, &p, LeaseMode::Write, 50);
         let resp = block_on(mgr.renew(
-            &mut store,
+            &store,
             Timestamp(80), // would be past the original deadline (50) without renewal
             &RenewRequest { device: dev(1), leases: vec![lease.id] },
         ))
@@ -593,13 +593,13 @@ mod tests {
 
     #[test]
     fn renew_rejects_expired_foreign_and_unknown() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
-        let lease = acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
+        let lease = acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
 
         // Foreign device.
         let resp = block_on(mgr.renew(
-            &mut store,
+            &store,
             Timestamp(10),
             &RenewRequest { device: dev(2), leases: vec![lease.id] },
         ))
@@ -608,7 +608,7 @@ mod tests {
 
         // Expired (and gets purged), plus an unknown id.
         let resp = block_on(mgr.renew(
-            &mut store,
+            &store,
             Timestamp(50),
             &RenewRequest { device: dev(1), leases: vec![lease.id, LeaseId(999)] },
         ))
@@ -619,13 +619,13 @@ mod tests {
 
     #[test]
     fn release_is_idempotent_and_owner_only() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
-        let lease = acquire_one(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, 100).unwrap();
+        let lease = acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 100).unwrap();
 
         // Foreign release of a live lease is a no-op.
         block_on(mgr.release(
-            &mut store,
+            &store,
             Timestamp(10),
             &ReleaseRequest { device: dev(2), leases: vec![lease.id] },
         ))
@@ -634,20 +634,20 @@ mod tests {
 
         // Owner release frees the prefix; releasing again is fine.
         let req = ReleaseRequest { device: dev(1), leases: vec![lease.id] };
-        block_on(mgr.release(&mut store, Timestamp(10), &req)).unwrap();
-        block_on(mgr.release(&mut store, Timestamp(10), &req)).unwrap();
-        acquire_one(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, 100).unwrap();
+        block_on(mgr.release(&store, Timestamp(10), &req)).unwrap();
+        block_on(mgr.release(&store, Timestamp(10), &req)).unwrap();
+        acquire_one(&mut mgr, &store, 10, 2, &p, LeaseMode::Write, 100).unwrap();
     }
 
     #[test]
     fn validate_put_enforces_all_invariants() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let table = key(&[b"db", b"t1"]);
         let row = key(&[b"db", b"t1", b"r1"]);
         let other_row = key(&[b"db", b"t2", b"r1"]);
 
-        let write = acquire_one(&mut mgr, &mut store, 0, 1, &table, LeaseMode::Write, 50).unwrap();
-        let read = acquire_one(&mut mgr, &mut store, 0, 1, &other_row, LeaseMode::Read, 50).unwrap();
+        let write = acquire_one(&mut mgr, &store, 0, 1, &table, LeaseMode::Write, 50).unwrap();
+        let read = acquire_one(&mut mgr, &store, 0, 1, &other_row, LeaseMode::Read, 50).unwrap();
         let wref = LeaseRef { id: write.id, epoch: write.epoch };
         let rref = LeaseRef { id: read.id, epoch: read.epoch };
 
@@ -692,13 +692,13 @@ mod tests {
 
     #[test]
     fn acquire_reports_admission_barrier() {
-        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let req = AcquireRequest {
             device: dev(1),
             specs: vec![spec(&key(&[b"db"]), LeaseMode::Write, 100)],
             steal: false,
         };
-        let (_, barrier) = block_on(mgr.acquire(&mut store, Timestamp(0), &req)).unwrap();
+        let (_, barrier) = block_on(mgr.acquire(&store, Timestamp(0), &req)).unwrap();
         assert_eq!(barrier, AdmissionSeq(0), "nothing admitted yet");
     }
 }
