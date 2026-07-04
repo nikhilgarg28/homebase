@@ -1,0 +1,18 @@
+[package]
+name = "homestead-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+homestead-core.workspace = true
+homestead-server = { workspace = true, default-features = true }
+rand.workspace = true
+pollster.workspace = true
+
+[features]
+default = ["slatedb"]
+slatedb = ["homestead-server/slatedb"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true

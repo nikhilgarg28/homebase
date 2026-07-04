@@ -19,6 +19,9 @@
 //! exclusivity — per-space serialization comes from the space actor, and
 //! spaces never share keys.
 
+#[cfg(feature = "slatedb")]
+mod slate;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -135,6 +138,9 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+#[cfg(feature = "slatedb")]
+pub use slate::SlateStore;
+
 /// In-memory store: the reference implementation for tests and the sim.
 ///
 /// Interior locking makes it shareable (`&self` everywhere) like the
@@ -244,6 +250,26 @@ pub mod conformance {
         scan_boundaries_are_exact(fresh()).await;
         scan_handles_high_prefixes(fresh()).await;
         scan_observes_all_prior_batches(fresh()).await;
+    }
+
+    /// Like [`run_all`], but the factory is async — for backends (slatedb)
+    /// that need a tokio runtime even to open.
+    pub async fn run_all_async<S: OrderedStore, F, Fut>(mut fresh: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = S>,
+    {
+        empty_store_reads_nothing(fresh().await).await;
+        put_then_get(fresh().await).await;
+        overwrite_replaces(fresh().await).await;
+        delete_removes_and_tolerates_missing(fresh().await).await;
+        batch_ops_apply_in_order(fresh().await).await;
+        empty_batch_is_a_noop(fresh().await).await;
+        scan_filters_and_orders(fresh().await).await;
+        scan_range_bounds_are_half_open(fresh().await).await;
+        scan_boundaries_are_exact(fresh().await).await;
+        scan_handles_high_prefixes(fresh().await).await;
+        scan_observes_all_prior_batches(fresh().await).await;
     }
 
     async fn scan_all<S: OrderedStore>(

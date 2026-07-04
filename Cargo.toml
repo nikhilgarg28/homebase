@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["homestead-core", "homestead-server", "homestead-client"]
+members = ["homestead-core", "homestead-server", "homestead-client", "homestead-sim"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,8 +8,12 @@ edition = "2024"
 
 [workspace.dependencies]
 homestead-core = { path = "homestead-core" }
+homestead-server = { path = "homestead-server" }
+rand = "0.9"
 proptest = "1"
 pollster = "0.4"
 futures-channel = "0.3"
 futures-core = "0.3"
 futures = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
