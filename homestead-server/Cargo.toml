@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 homestead-core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+pollster.workspace = true

@@ -107,19 +107,7 @@ impl Key {
 
     /// Encodes this key into its order-preserving flat form.
     pub fn encode(&self) -> Vec<u8> {
-        let cap: usize = self.0.iter().map(|c| c.0.len() + 2).sum();
-        let mut out = Vec::with_capacity(cap);
-        for component in &self.0 {
-            for &b in &component.0 {
-                if b == 0x00 {
-                    out.extend_from_slice(&[0x00, 0x01]);
-                } else {
-                    out.push(b);
-                }
-            }
-            out.extend_from_slice(&[0x00, 0x00]);
-        }
-        out
+        encode_components(&self.0)
     }
 
     /// Decodes a flat-encoded key. Rejects malformed escapes, truncated
@@ -158,6 +146,29 @@ impl Key {
         }
         Self::new(components).map_err(DecodeError::InvalidKey)
     }
+}
+
+/// Encodes a component sequence into the order-preserving flat form
+/// *without* enforcing the [`MAX_COMPONENTS`] count limit.
+///
+/// [`Key`] enforces the limit for user-facing keys; the server's storage
+/// layer composes longer tuples (space id ⊕ record kind ⊕ user components ⊕
+/// suffixes) and encodes them through this function. All encoding properties
+/// (order preservation, prefix correspondence) hold regardless of count.
+pub fn encode_components(components: &[KeyComponent]) -> Vec<u8> {
+    let cap: usize = components.iter().map(|c| c.0.len() + 2).sum();
+    let mut out = Vec::with_capacity(cap);
+    for component in components {
+        for &b in &component.0 {
+            if b == 0x00 {
+                out.extend_from_slice(&[0x00, 0x01]);
+            } else {
+                out.push(b);
+            }
+        }
+        out.extend_from_slice(&[0x00, 0x00]);
+    }
+    out
 }
 
 /// Key validation errors.

@@ -6,9 +6,17 @@
 //!   verification (token → `SpaceId` + prefix scope) sits at the wire layer
 //!   above this.
 //! - `Space` implementations — async facade over the state machine.
-//! - The deterministic state machine (lease table, admission, ordered map,
-//!   augmented range-max tree) — synchronous, explicit `now: Timestamp`,
-//!   proptested and torture-simmed directly. Lands in upcoming batches.
+//! - The deterministic state machine (lease table, admission) — explicit
+//!   `now: Timestamp`, verbs executed one at a time, proptested and
+//!   torture-simmed directly. It reads and writes through the async
+//!   [`storage::OrderedStore`] (slatedb in prod, [`storage::MemoryStore`]
+//!   in tests); determinism holds because verbs never interleave and the
+//!   test store resolves futures immediately.
+
+pub mod error;
+pub mod leases;
+pub mod schema;
+pub mod storage;
 
 use homestead_core::space::{Space, SpaceId};
 use std::collections::HashMap;
