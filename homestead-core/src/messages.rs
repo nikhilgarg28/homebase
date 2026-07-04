@@ -35,6 +35,9 @@ pub struct LeaseSpec {
     /// Requested TTL; the grant may be shorter (kernel cap → class default
     /// → app pin).
     pub ttl: Duration,
+    /// Opt in to pre-deadline preemption by a later `steal = true` acquire
+    /// (see [`crate::lease`] module docs).
+    pub stealable: bool,
 }
 
 /// Batch lease acquisition. **All-or-nothing**: if any spec conflicts with a
@@ -45,6 +48,10 @@ pub struct LeaseSpec {
 pub struct AcquireRequest {
     pub device: DeviceId,
     pub specs: Vec<LeaseSpec>,
+    /// Preempt stealable blockers pre-deadline. A spec still contends if
+    /// *any* of its incompatible live blockers is not stealable; a
+    /// successful steal purges the victims, and the fresh epochs fence them.
+    pub steal: bool,
 }
 
 /// Successful batch grant.
@@ -222,7 +229,8 @@ pub struct ReadAtResponse {
 pub enum KernelError {
     /// Acquire denied: a requested lease overlaps a live lease in an
     /// incompatible mode (write conflicts with everything; read conflicts
-    /// with write). Steals are denied until the holder's deadline.
+    /// with write). Steals are denied until the holder's deadline unless
+    /// the blocker was granted stealable and the acquire passes `steal`.
     Contended {
         prefix: Key,
         /// Hint: remaining TTL of the blocking lease, if the server chooses

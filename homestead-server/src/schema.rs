@@ -12,6 +12,7 @@
 //! (space, LeaseById,     id_be)                 → LeaseRecord
 //! (space, Meta,          "counters")            → CountersRecord
 //! (space, Device,        device_id)             → DeviceRecord
+//! (space, PrefixMeta,    depth, p1…pd)          → PrefixMetaRecord
 //! ```
 //!
 //! **The changelog holds exactly one record per key**, keyed by the
@@ -22,6 +23,12 @@
 //! after `c` appears exactly once, already at its current state (tombstones
 //! included). No garbage collection, no compaction-on-read. The record bytes
 //! duplicate the data record so a delta never needs point lookups.
+//!
+//! **PrefixMeta is the durable augmented tree**: per `(depth, prefix)`, the
+//! max admission seq and live-key count under that prefix, updated along
+//! every written key's full prefix path in the same atomic batch as the
+//! write. Reads use it to answer "anything new under this prefix since my
+//! cursor?" and "any live keys here?" without scanning.
 //!
 //! The by-prefix index carries an explicit **depth** component (number of
 //! prefix components). That makes both conflict-check queries ordinary
@@ -54,6 +61,7 @@ pub enum RecordKind {
     LeaseById = 3,
     Meta = 4,
     Device = 5,
+    PrefixMeta = 6,
 }
 
 impl RecordKind {
@@ -82,6 +90,28 @@ pub fn data_key(space: SpaceId, key: &Key) -> Vec<u8> {
 pub fn user_key_from_data(storage_key: &[u8]) -> Option<Key> {
     let components = decode_components(storage_key).ok()?;
     Key::new(components.get(2..)?.to_vec()).ok()
+}
+
+/// Byte prefix of a space's whole Data keyspace.
+pub fn data_scan_all(space: SpaceId) -> Vec<u8> {
+    encode_components(&[space_component(space), RecordKind::Data.component()])
+}
+
+/// `(space, PrefixMeta, depth, p1…pd)` for the first `depth` components of
+/// `head`.
+pub fn prefix_meta_key(space: SpaceId, head: &[KeyComponent]) -> Vec<u8> {
+    let mut components = vec![
+        space_component(space),
+        RecordKind::PrefixMeta.component(),
+        KeyComponent::new(vec![head.len() as u8]).expect("depth byte"),
+    ];
+    components.extend(head.iter().cloned());
+    encode_components(&components)
+}
+
+/// Byte prefix of a space's whole PrefixMeta keyspace.
+pub fn prefix_meta_scan_all(space: SpaceId) -> Vec<u8> {
+    encode_components(&[space_component(space), RecordKind::PrefixMeta.component()])
 }
 
 /// `(space, Changelog, seq_be, k1, k2, …)`
@@ -194,6 +224,7 @@ const LEASE_RECORD_VERSION: u8 = 1;
 const COUNTERS_RECORD_VERSION: u8 = 1;
 const DATA_RECORD_VERSION: u8 = 1;
 const DEVICE_RECORD_VERSION: u8 = 1;
+const PREFIX_META_RECORD_VERSION: u8 = 1;
 
 /// The full server-side state of one lease grant. Stored identically under
 /// both lease keys so the conflict check never needs a second lookup.
@@ -209,6 +240,8 @@ pub struct LeaseRecord {
     pub deadline: Timestamp,
     /// The granted TTL, reused on renewal.
     pub ttl: Duration,
+    /// Opted in to pre-deadline preemption by `acquire(steal = true)`.
+    pub stealable: bool,
 }
 
 impl LeaseRecord {
@@ -224,6 +257,7 @@ impl LeaseRecord {
             LeaseMode::Read => 0,
             LeaseMode::Write => 1,
         });
+        out.push(self.stealable as u8);
         out.extend_from_slice(&self.device.0);
         out.extend_from_slice(&self.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.0.to_be_bytes());
@@ -244,12 +278,17 @@ impl LeaseRecord {
             1 => LeaseMode::Write,
             _ => return None,
         };
+        let stealable = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         let device = DeviceId(r.bytes16()?);
         let epoch = Epoch(r.u64()?);
         let deadline = Timestamp(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
         let prefix = Key::decode(r.rest()).ok()?;
-        Some(Self { id, prefix, mode, device, epoch, deadline, ttl })
+        Some(Self { id, prefix, mode, device, epoch, deadline, ttl, stealable })
     }
 }
 
@@ -341,6 +380,40 @@ impl DataRecord {
     }
 }
 
+/// Write-time aggregates for one `(depth, prefix)`: the durable form of the
+/// augmented range-max tree. Once a prefix has been written it keeps its
+/// record forever (`live_count` may drop back to 0; `max_admission_seq`
+/// never regresses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixMetaRecord {
+    /// Admission seq of the latest batch that wrote any key under this
+    /// prefix (tombstones included).
+    pub max_admission_seq: u64,
+    /// Number of live (non-tombstoned) keys under this prefix.
+    pub live_count: u64,
+}
+
+impl PrefixMetaRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 8 * 2);
+        out.push(PREFIX_META_RECORD_VERSION);
+        out.extend_from_slice(&self.max_admission_seq.to_be_bytes());
+        out.extend_from_slice(&self.live_count.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != PREFIX_META_RECORD_VERSION {
+            return None;
+        }
+        Some(Self {
+            max_admission_seq: r.u64()?,
+            live_count: r.u64()?,
+        })
+    }
+}
+
 /// Per-device admission state: the high-water `device_seq`, for replay and
 /// out-of-order rejection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +484,7 @@ mod tests {
             epoch: Epoch(9),
             deadline: Timestamp(12345),
             ttl: Duration::from_secs(300),
+            stealable: false,
         }
     }
 
@@ -418,6 +492,28 @@ mod tests {
     fn lease_record_roundtrips() {
         let rec = sample_lease();
         assert_eq!(LeaseRecord::decode(&rec.encode()), Some(rec));
+        let stealable = LeaseRecord { stealable: true, ..sample_lease() };
+        assert_eq!(LeaseRecord::decode(&stealable.encode()), Some(stealable));
+    }
+
+    #[test]
+    fn prefix_meta_record_roundtrips() {
+        let rec = PrefixMetaRecord { max_admission_seq: 17, live_count: 4 };
+        assert_eq!(PrefixMetaRecord::decode(&rec.encode()), Some(rec));
+    }
+
+    #[test]
+    fn prefix_meta_keys_group_by_depth() {
+        let space = SpaceId([1; 16]);
+        let key = Key::from_bytes([&b"db"[..], &b"pay"[..]]).unwrap();
+        let deep = prefix_meta_key(space, key.components());
+        let shallow = prefix_meta_key(space, &key.components()[..1]);
+        assert_ne!(deep, shallow);
+        // Depth pins the interpretation: a depth-1 key is never a byte
+        // prefix of a depth-2 key.
+        assert!(!deep.starts_with(&shallow));
+        assert!(deep.starts_with(&prefix_meta_scan_all(space)));
+        assert!(shallow.starts_with(&prefix_meta_scan_all(space)));
     }
 
     #[test]

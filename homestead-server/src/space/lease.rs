@@ -9,6 +9,10 @@
 //! Expiry is strict and local: a record whose deadline has passed is dead
 //! the moment `now` reaches it, regardless of whether it is still on disk.
 //! Dead records are purged lazily by whichever operation touches them.
+//!
+//! Stealable leases (see [`homestead_core::lease`]) are preempted inside
+//! `acquire`: the victims' records are deleted in the same atomic batch
+//! that writes the new grant, whose fresh epoch fences them.
 
 use crate::error::Error;
 use crate::schema::{
@@ -48,6 +52,11 @@ impl LeaseManager {
     /// All-or-nothing batch acquire. On conflict, nothing is granted, demand
     /// is registered on every blocking lease, and the first conflicting
     /// prefix is reported with the blockers' worst-case remaining TTL.
+    ///
+    /// With `steal = true`, a spec whose incompatible live blockers are
+    /// *all* stealable preempts them: the victims are purged in the grant's
+    /// atomic batch and fenced by the fresh epochs. One non-stealable
+    /// blocker contends the whole request, as usual.
     pub async fn acquire<S: OrderedStore>(
         &mut self,
         store: &mut S,
@@ -55,6 +64,7 @@ impl LeaseManager {
         req: &AcquireRequest,
     ) -> Result<(Vec<Lease>, AdmissionSeq), Error> {
         let mut purge = WriteBatch::new();
+        let mut stolen: Vec<LeaseRecord> = Vec::new();
 
         // Conflicts against live leases in the store.
         for spec in &req.specs {
@@ -65,18 +75,23 @@ impl LeaseManager {
                 .iter()
                 .filter(|rec| !spec.mode.compatible_with(rec.mode))
                 .collect();
-            if !blockers.is_empty() {
-                let worst = blockers.iter().map(|rec| rec.deadline.0).max().unwrap();
-                self.demand.extend(blockers.iter().map(|rec| rec.id));
-                store.apply(purge).await?;
-                return Err(KernelError::Contended {
-                    prefix: spec.prefix.clone(),
-                    retry_after: Some(std::time::Duration::from_millis(
-                        worst.saturating_sub(now.0),
-                    )),
-                }
-                .into());
+            if blockers.is_empty() {
+                continue;
             }
+            if req.steal && blockers.iter().all(|rec| rec.stealable) {
+                stolen.extend(blockers.into_iter().cloned());
+                continue;
+            }
+            let worst = blockers.iter().map(|rec| rec.deadline.0).max().unwrap();
+            self.demand.extend(blockers.iter().map(|rec| rec.id));
+            store.apply(purge).await?;
+            return Err(KernelError::Contended {
+                prefix: spec.prefix.clone(),
+                retry_after: Some(std::time::Duration::from_millis(
+                    worst.saturating_sub(now.0),
+                )),
+            }
+            .into());
         }
 
         // Conflicts within the batch itself (a request may not self-overlap
@@ -96,10 +111,16 @@ impl LeaseManager {
             }
         }
 
-        // Grant: records + counters in one atomic batch (with the purge).
+        // Grant: victim purge + records + counters in one atomic batch (with
+        // the expiry purge). A stolen lease vanishes at the same instant the
+        // new grant appears — there is no in-between state to crash into.
         let mut counters = self.counters(store).await?;
         let barrier = AdmissionSeq(counters.admission_high_water);
         let mut batch = purge;
+        self.purge_records(&mut batch, &stolen);
+        for rec in &stolen {
+            self.demand.remove(&rec.id);
+        }
         let mut leases = Vec::with_capacity(req.specs.len());
         for spec in &req.specs {
             let record = LeaseRecord {
@@ -110,6 +131,7 @@ impl LeaseManager {
                 epoch: Epoch(counters.next_epoch),
                 deadline: now.saturating_add(spec.ttl),
                 ttl: spec.ttl,
+                stealable: spec.stealable,
             };
             counters.next_lease_id += 1;
             counters.next_epoch += 1;
@@ -120,6 +142,7 @@ impl LeaseManager {
                 mode: record.mode,
                 epoch: record.epoch,
                 ttl: record.ttl,
+                stealable: record.stealable,
             });
         }
         batch.put(counters_key(self.space), counters.encode());
@@ -321,6 +344,7 @@ mod tests {
             prefix: prefix.clone(),
             mode,
             ttl: Duration::from_millis(ttl_ms),
+            stealable: false,
         }
     }
 
@@ -336,6 +360,33 @@ mod tests {
         let req = AcquireRequest {
             device: dev(device),
             specs: vec![spec(prefix, mode, ttl_ms)],
+            steal: false,
+        };
+        block_on(mgr.acquire(store, Timestamp(now), &req))
+            .map(|(mut leases, _)| leases.remove(0))
+    }
+
+    /// Single-spec acquire with explicit stealable/steal flags.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_flags(
+        mgr: &mut LeaseManager,
+        store: &mut MemoryStore,
+        now: u64,
+        device: u8,
+        prefix: &Key,
+        mode: LeaseMode,
+        stealable: bool,
+        steal: bool,
+    ) -> Result<Lease, Error> {
+        let req = AcquireRequest {
+            device: dev(device),
+            specs: vec![LeaseSpec {
+                prefix: prefix.clone(),
+                mode,
+                ttl: Duration::from_millis(100),
+                stealable,
+            }],
+            steal,
         };
         block_on(mgr.acquire(store, Timestamp(now), &req))
             .map(|(mut leases, _)| leases.remove(0))
@@ -409,6 +460,92 @@ mod tests {
     }
 
     #[test]
+    fn steal_preempts_stealable_and_fences_the_victim() {
+        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let p = key(&[b"account"]);
+        let first =
+            acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
+
+        // Pre-deadline steal succeeds with a fresh id and epoch.
+        let second =
+            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, true, true).unwrap();
+        assert!(second.epoch > first.epoch);
+        assert!(second.id > first.id);
+        assert_eq!(live_record_count(&store, 10), 1, "victim purged");
+
+        // The victim is fenced: renew reports invalid, puts fail.
+        let resp = block_on(mgr.renew(
+            &mut store,
+            Timestamp(10),
+            &RenewRequest { device: dev(1), leases: vec![first.id] },
+        ))
+        .unwrap();
+        assert_eq!(resp.invalid, vec![first.id]);
+        let wref = LeaseRef { id: first.id, epoch: first.epoch };
+        assert!(matches!(
+            block_on(mgr.validate_put(&store, Timestamp(10), dev(1), &[wref], std::slice::from_ref(&p))),
+            Err(Error::Kernel(KernelError::LeaseInvalid { .. }))
+        ));
+    }
+
+    #[test]
+    fn steal_denied_by_any_non_stealable_blocker() {
+        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let p = key(&[b"account"]);
+
+        // Non-stealable holder: steal is just a normal contended acquire.
+        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, false, false).unwrap();
+        assert!(matches!(
+            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, true, true),
+            Err(Error::Kernel(KernelError::Contended { .. }))
+        ));
+
+        // Mixed blockers: one stealable read + one non-stealable read block
+        // a stealing write.
+        let q = key(&[b"docs"]);
+        acquire_flags(&mut mgr, &mut store, 0, 3, &q, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(&mut mgr, &mut store, 0, 4, &q, LeaseMode::Read, false, false).unwrap();
+        assert!(matches!(
+            acquire_flags(&mut mgr, &mut store, 10, 2, &q, LeaseMode::Write, true, true),
+            Err(Error::Kernel(KernelError::Contended { .. }))
+        ));
+        assert_eq!(live_record_count(&store, 10), 3, "nothing stolen on denial");
+    }
+
+    #[test]
+    fn stealable_without_steal_flag_still_contends() {
+        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let p = key(&[b"account"]);
+        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, true, false).unwrap();
+        assert!(matches!(
+            acquire_flags(&mut mgr, &mut store, 10, 2, &p, LeaseMode::Write, false, false),
+            Err(Error::Kernel(KernelError::Contended { .. }))
+        ));
+    }
+
+    #[test]
+    fn steal_flag_without_blockers_is_a_plain_grant() {
+        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let p = key(&[b"free"]);
+        acquire_flags(&mut mgr, &mut store, 0, 1, &p, LeaseMode::Write, false, true).unwrap();
+        assert_eq!(live_record_count(&store, 0), 1);
+    }
+
+    #[test]
+    fn steal_preempts_multiple_stealable_readers() {
+        let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let parent = key(&[b"docs"]);
+        let child = key(&[b"docs", b"a"]);
+        acquire_flags(&mut mgr, &mut store, 0, 1, &parent, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(&mut mgr, &mut store, 0, 2, &child, LeaseMode::Read, true, false).unwrap();
+
+        // A stealing write on the parent takes out both readers at once.
+        acquire_flags(&mut mgr, &mut store, 10, 3, &parent, LeaseMode::Write, false, true)
+            .unwrap();
+        assert_eq!(live_record_count(&store, 10), 1);
+    }
+
+    #[test]
     fn intra_batch_self_conflict_denied() {
         let (mut mgr, mut store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let req = AcquireRequest {
@@ -417,6 +554,7 @@ mod tests {
                 spec(&key(&[b"db"]), LeaseMode::Write, 100),
                 spec(&key(&[b"db", b"t1"]), LeaseMode::Write, 100),
             ],
+            steal: false,
         };
         assert!(matches!(
             block_on(mgr.acquire(&mut store, Timestamp(0), &req)),
@@ -558,6 +696,7 @@ mod tests {
         let req = AcquireRequest {
             device: dev(1),
             specs: vec![spec(&key(&[b"db"]), LeaseMode::Write, 100)],
+            steal: false,
         };
         let (_, barrier) = block_on(mgr.acquire(&mut store, Timestamp(0), &req)).unwrap();
         assert_eq!(barrier, AdmissionSeq(0), "nothing admitted yet");

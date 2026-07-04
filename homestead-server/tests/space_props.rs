@@ -13,7 +13,10 @@
 //!    the model's live state, tombstones hidden;
 //! 4. **replica reconstruction** — a snapshot plus any sequence of later
 //!    deltas equals current live state, with deltas ordered by
-//!    `(admission_seq, key)` and each key appearing at most once.
+//!    `(admission_seq, key)` and each key appearing at most once;
+//! 5. **aggregate coherence** — after every admitted batch, the stored
+//!    per-prefix aggregates (max admission seq, live count) equal a
+//!    brute-force recomputation from the data records.
 
 use homestead_core::clock::Timestamp;
 use homestead_core::key::Key;
@@ -25,8 +28,12 @@ use homestead_core::messages::{
 use homestead_core::space::SpaceId;
 use homestead_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
 use homestead_server::error::Error;
+use homestead_server::schema::{
+    DataRecord, PrefixMetaRecord, data_scan_all, prefix_meta_key, prefix_meta_scan_all,
+    user_key_from_data,
+};
 use homestead_server::space::Space;
-use homestead_server::storage::MemoryStore;
+use homestead_server::storage::{MemoryStore, OrderedStore, collect_scan};
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -144,9 +151,11 @@ impl Harness {
                 Timestamp(0),
                 &AcquireRequest {
                     device: dev(d),
+                    steal: false,
                     specs: vec![LeaseSpec {
                         prefix: dev_prefix(d),
                         mode: LeaseMode::Write,
+                        stealable: false,
                         ttl: Duration::from_secs(1 << 30),
                     }],
                 },
@@ -238,6 +247,39 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
         }
     }
     prop_assert_eq!(&paged, &expected);
+    Ok(())
+}
+
+/// Invariant 5: stored per-prefix aggregates equal a brute-force
+/// recomputation over every data record (tombstones count toward the max
+/// seq, only present values toward the live count). This also pins the
+/// "written prefixes keep their record forever" shape: the two maps must
+/// have identical key sets.
+fn check_aggregates(store: &MemoryStore) -> Result<(), TestCaseError> {
+    let mut expected: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+    for (k, v) in block_on(collect_scan(store.scan_prefix(&data_scan_all(SPACE)))).unwrap() {
+        let key = user_key_from_data(&k).unwrap();
+        let rec = DataRecord::decode(&v).unwrap();
+        let components = key.components();
+        for depth in 1..=components.len() {
+            let slot = expected
+                .entry(prefix_meta_key(SPACE, &components[..depth]))
+                .or_insert((0, 0));
+            slot.0 = slot.0.max(rec.tag.admission_seq.0);
+            slot.1 += rec.value.is_present() as u64;
+        }
+    }
+
+    let stored: BTreeMap<Vec<u8>, (u64, u64)> =
+        block_on(collect_scan(store.scan_prefix(&prefix_meta_scan_all(SPACE))))
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| {
+                let rec = PrefixMetaRecord::decode(&v).unwrap();
+                (k, (rec.max_admission_seq, rec.live_count))
+            })
+            .collect();
+    prop_assert_eq!(&stored, &expected, "aggregates diverged from data records");
     Ok(())
 }
 
@@ -349,6 +391,7 @@ proptest! {
                     for (suffix, value, ver) in staged {
                         model.data.insert((device, suffix), MEntry { value, ver });
                     }
+                    check_aggregates(&h.store)?;
                 }
                 Cmd::PutVerRegression { device, suffix } => {
                     // Only meaningful once the key exists.
@@ -396,7 +439,9 @@ proptest! {
             }
         }
 
-        // Final full audit: reads and every replica (after one last sync).
+        // Final full audit: aggregates, reads, every replica (after one
+        // last sync).
+        check_aggregates(&h.store)?;
         for device in 0..DEVICES {
             check_reads(&h, &model, device)?;
             sync_replica(&h, &model, device, &mut replicas[device])?;

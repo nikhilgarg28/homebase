@@ -19,7 +19,9 @@
 //!
 //! On admission the batch takes the next admission seq and writes, atomically:
 //! data records, changelog moves (delete the key's old changelog entry,
-//! insert the new one), the device high water, and the counters.
+//! insert the new one), per-prefix aggregates along every written key's
+//! prefix path (max admission seq + live-key delta; see
+//! [`PrefixMetaRecord`]), the device high water, and the counters.
 //!
 //! # Reads
 //!
@@ -29,16 +31,19 @@
 //! snapshot (cursor `None`) or the changes since the cursor, tombstones
 //! included. The one-record-per-key changelog (see [`crate::schema`]) makes
 //! a delta a single seq-ordered scan; each changed key appears exactly once,
-//! already at its final state. Delta scans currently walk the whole
-//! changelog past the cursor and filter by prefix — the augmented range-max
-//! tree that skips untouched prefixes is a later optimization.
+//! already at its final state. The per-prefix aggregates short-circuit both
+//! read shapes: a delta whose prefix has `max_admission_seq ≤ cursor` and a
+//! snapshot whose prefix has `live_count == 0` return empty without
+//! scanning. (A delta that does have news still walks the whole changelog
+//! past the cursor and filters by prefix; descending the aggregate tree to
+//! skip within the scan is a later refinement.)
 
 use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
-    CountersRecord, DataRecord, DeviceRecord, changelog_key, changelog_scan_after,
-    changelog_scan_all, counters_key, data_key, device_key, user_key_from_changelog,
-    user_key_from_data,
+    CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord, changelog_key,
+    changelog_scan_after, changelog_scan_all, counters_key, data_key, device_key,
+    prefix_meta_key, user_key_from_changelog, user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homestead_core::clock::Timestamp;
@@ -84,6 +89,7 @@ pub async fn put_batch<S: OrderedStore>(
 
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
+    let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
     for (entry, epoch) in req.entries.iter().zip(&epochs) {
         let current_ver = match staged.get(&entry.key) {
             Some(rec) => Some(rec.tag.ver),
@@ -92,6 +98,10 @@ pub async fn put_batch<S: OrderedStore>(
                 if let Some(rec) = &stored {
                     old_seqs.insert(entry.key.clone(), rec.tag.admission_seq);
                 }
+                was_live.insert(
+                    entry.key.clone(),
+                    stored.as_ref().is_some_and(|rec| rec.value.is_present()),
+                );
                 stored.map(|rec| rec.tag.ver)
             }
         };
@@ -120,8 +130,10 @@ pub async fn put_batch<S: OrderedStore>(
         );
     }
 
-    // Admitted: one atomic batch for data, changelog, device, counters.
+    // Admitted: one atomic batch for data, changelog, aggregates, device,
+    // counters.
     let mut batch = WriteBatch::new();
+    let mut live_deltas: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     for (key, record) in &staged {
         let bytes = record.encode();
         batch.put(data_key(space, key), bytes.clone());
@@ -129,6 +141,33 @@ pub async fn put_batch<S: OrderedStore>(
             batch.delete(changelog_key(space, *old, key));
         }
         batch.put(changelog_key(space, seq, key), bytes);
+
+        // Aggregate updates along the key's prefix path: every ancestor sees
+        // the new max seq; live counts move by the key's net transition
+        // across the whole batch (absent→present +1, present→absent −1).
+        let delta =
+            (record.value.is_present() as i64) - (was_live[key] as i64);
+        let components = key.components();
+        for depth in 1..=components.len() {
+            *live_deltas
+                .entry(prefix_meta_key(space, &components[..depth]))
+                .or_insert(0) += delta;
+        }
+    }
+    for (meta_key, delta) in live_deltas {
+        let current = match store.get(&meta_key).await? {
+            Some(bytes) => {
+                PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record")
+            }
+            None => PrefixMetaRecord { max_admission_seq: 0, live_count: 0 },
+        };
+        let updated = PrefixMetaRecord {
+            max_admission_seq: seq.0,
+            live_count: current.live_count.checked_add_signed(delta).expect(
+                "live count underflow: aggregates diverged from data records",
+            ),
+        };
+        batch.put(meta_key, updated.encode());
     }
     batch.put(
         device_key(space, req.device),
@@ -217,6 +256,12 @@ async fn snapshot<S: OrderedStore>(
     store: &S,
     prefix: &Key,
 ) -> Result<Vec<Entry>, StorageError> {
+    // Aggregate short-circuit: never-written prefix or all-tombstones.
+    match prefix_meta(space, store, prefix).await? {
+        None => return Ok(Vec::new()),
+        Some(meta) if meta.live_count == 0 => return Ok(Vec::new()),
+        Some(_) => {}
+    }
     let base = data_key(space, prefix);
     let mut entries = Vec::new();
     let mut iter = store.scan_prefix(&base);
@@ -240,6 +285,12 @@ async fn delta<S: OrderedStore>(
     prefix: &Key,
     since: AdmissionSeq,
 ) -> Result<Vec<Entry>, StorageError> {
+    // Aggregate short-circuit: nothing under this prefix since the cursor.
+    match prefix_meta(space, store, prefix).await? {
+        None => return Ok(Vec::new()),
+        Some(meta) if meta.max_admission_seq <= since.0 => return Ok(Vec::new()),
+        Some(_) => {}
+    }
     let start = changelog_scan_after(space, since);
     let end = prefix_successor(&changelog_scan_all(space));
     let mut entries = Vec::new();
@@ -256,6 +307,17 @@ async fn delta<S: OrderedStore>(
 }
 
 // -- record accessors ---------------------------------------------------------
+
+async fn prefix_meta<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    prefix: &Key,
+) -> Result<Option<PrefixMetaRecord>, StorageError> {
+    Ok(store
+        .get(&prefix_meta_key(space, prefix.components()))
+        .await?
+        .map(|bytes| PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record")))
+}
 
 async fn data<S: OrderedStore>(
     space: SpaceId,

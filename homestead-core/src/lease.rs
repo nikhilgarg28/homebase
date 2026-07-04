@@ -8,6 +8,17 @@
 //! re-acquire instead. The server clock exists in exactly one code path —
 //! lease deadlines — timed via [`crate::clock`].
 //!
+//! # Stealable leases
+//!
+//! A lease may opt in to preemption at acquire time (`stealable`). An
+//! acquire with `steal = true` takes a prefix *pre-deadline* if every
+//! incompatible live blocker is stealable: the blockers are purged and the
+//! new grant's fresh epoch fences their holders — a victim's next put or
+//! renew fails, so correctness never depends on it noticing. Leases not
+//! marked stealable keep strict pre-deadline denial. This is the
+//! single-active-device primitive: one stealable write lease on the account
+//! prefix, and activating a new device steals it.
+//!
 //! # Asymmetric expiry
 //!
 //! Grants carry a TTL *duration*, never an absolute deadline. The client
@@ -60,6 +71,9 @@ pub struct Lease {
     /// Granted TTL. May be shorter than requested (kernel cap → class
     /// default → app pin).
     pub ttl: Duration,
+    /// Whether this lease may be preempted pre-deadline by an
+    /// `acquire(steal = true)` (see the module docs).
+    pub stealable: bool,
 }
 
 impl Lease {
@@ -93,6 +107,7 @@ mod tests {
             mode: LeaseMode::Write,
             epoch: Epoch(7),
             ttl: Duration::from_secs(300),
+            stealable: false,
         };
         let covered = Key::from_bytes([&b"db"[..], &b"pay"[..], &b"row1"[..]]).unwrap();
         let sibling = Key::from_bytes([&b"db"[..], &b"payroll"[..]]).unwrap();

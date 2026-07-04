@@ -149,9 +149,11 @@ mod tests {
             Timestamp(0),
             &AcquireRequest {
                 device: dev(1),
+                steal: false,
                 specs: vec![LeaseSpec {
                     prefix: key(&[b"db"]),
                     mode: LeaseMode::Write,
+                    stealable: false,
                     ttl: Duration::from_secs(3600),
                 }],
             },
@@ -198,6 +200,71 @@ mod tests {
         let missing = key(&[b"db", b"t", b"nope"]);
         let got = block_on(space.get(&store, &GetRequest { keys: vec![missing] })).unwrap();
         assert!(got.entries[0].is_none());
+    }
+
+    #[test]
+    fn aggregates_track_max_seq_and_live_count() {
+        use crate::schema::{PrefixMetaRecord, prefix_meta_key};
+        let meta = |store: &MemoryStore, prefix: &Key| -> Option<PrefixMetaRecord> {
+            block_on(store.get(&prefix_meta_key(SPACE, prefix.components())))
+                .unwrap()
+                .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
+        };
+
+        let (mut space, mut store, lease) = setup();
+        let k1 = key(&[b"db", b"t", b"r1"]);
+        let k2 = key(&[b"db", b"t", b"r2"]);
+        let root = key(&[b"db"]);
+        let table = key(&[b"db", b"t"]);
+
+        // Never-written prefix: no record at all.
+        assert_eq!(meta(&store, &root), None);
+
+        // Two live keys: every ancestor counts both, at seq 2.
+        put_batch(&mut space, &mut store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
+        put_batch(&mut space, &mut store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
+        let expect = PrefixMetaRecord { max_admission_seq: 2, live_count: 2 };
+        assert_eq!(meta(&store, &root), Some(expect));
+        assert_eq!(meta(&store, &table), Some(expect));
+        assert_eq!(
+            meta(&store, &k1),
+            Some(PrefixMetaRecord { max_admission_seq: 1, live_count: 1 }),
+            "leaf prefix untouched by the sibling's write"
+        );
+
+        // Overwrite: max seq advances, live count doesn't.
+        put_batch(&mut space, &mut store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
+        assert_eq!(
+            meta(&store, &root),
+            Some(PrefixMetaRecord { max_admission_seq: 3, live_count: 2 })
+        );
+
+        // Tombstone: count drops; the record persists at live_count 0.
+        put_batch(&mut space, &mut store, lease, 4, vec![del(&k1, 3)]).unwrap();
+        put_batch(&mut space, &mut store, lease, 5, vec![del(&k2, 2)]).unwrap();
+        assert_eq!(
+            meta(&store, &root),
+            Some(PrefixMetaRecord { max_admission_seq: 5, live_count: 0 })
+        );
+        assert_eq!(
+            meta(&store, &k1),
+            Some(PrefixMetaRecord { max_admission_seq: 4, live_count: 0 })
+        );
+
+        // Intra-batch create+tombstone of a fresh key nets zero.
+        let k3 = key(&[b"db", b"t", b"r3"]);
+        put_batch(
+            &mut space,
+            &mut store,
+            lease,
+            6,
+            vec![put(&k3, b"blip", 1), del(&k3, 2)],
+        )
+        .unwrap();
+        assert_eq!(
+            meta(&store, &root),
+            Some(PrefixMetaRecord { max_admission_seq: 6, live_count: 0 })
+        );
     }
 
     #[test]
@@ -426,9 +493,11 @@ mod tests {
             Timestamp(2),
             &AcquireRequest {
                 device: dev(2),
+                steal: false,
                 specs: vec![LeaseSpec {
                     prefix: key(&[b"other"]),
                     mode: LeaseMode::Write,
+                    stealable: false,
                     ttl: Duration::from_secs(60),
                 }],
             },

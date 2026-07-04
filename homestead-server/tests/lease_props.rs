@@ -9,6 +9,10 @@
 //! 2. the by-id and by-prefix indexes hold identical record sets;
 //! 3. live records in the store are exactly the model's live leases;
 //! 4. lease ids and epochs strictly increase and never recur.
+//!
+//! Steal semantics ride the same oracle: an acquire with `steal = true`
+//! succeeds against blockers that are all stealable (which the model then
+//! marks gone) and contends if any blocker is not.
 
 use homestead_core::clock::Timestamp;
 use homestead_core::key::Key;
@@ -31,9 +35,12 @@ const SPACE: SpaceId = SpaceId([7; 16]);
 
 type Prefix = Vec<Vec<u8>>;
 
+/// `(prefix, mode, ttl_ms, stealable)`
+type Spec = (Prefix, LeaseMode, u64, bool);
+
 #[derive(Clone, Debug)]
 enum Cmd {
-    Acquire { device: u8, specs: Vec<(Prefix, LeaseMode, u64)> },
+    Acquire { device: u8, specs: Vec<Spec>, steal: bool },
     RenewAll { device: u8 },
     ReleaseLive { device: u8 },
     Advance { ms: u64 },
@@ -48,10 +55,10 @@ fn arb_prefix() -> impl Strategy<Value = Prefix> {
 
 fn arb_cmd() -> impl Strategy<Value = Cmd> {
     let mode = prop::sample::select(vec![LeaseMode::Read, LeaseMode::Write]);
-    let spec = (arb_prefix(), mode, 1u64..=40);
+    let spec = (arb_prefix(), mode, 1u64..=40, prop::bool::weighted(0.5));
     prop_oneof![
-        3 => (0u8..3, prop::collection::vec(spec, 1..=2))
-            .prop_map(|(device, specs)| Cmd::Acquire { device, specs }),
+        3 => (0u8..3, prop::collection::vec(spec, 1..=2), prop::bool::weighted(0.3))
+            .prop_map(|(device, specs, steal)| Cmd::Acquire { device, specs, steal }),
         1 => (0u8..3).prop_map(|device| Cmd::RenewAll { device }),
         1 => (0u8..3).prop_map(|device| Cmd::ReleaseLive { device }),
         2 => (1u64..=25).prop_map(|ms| Cmd::Advance { ms }),
@@ -70,6 +77,7 @@ struct MLease {
     device: u8,
     deadline: u64,
     ttl: u64,
+    stealable: bool,
     gone: bool,
 }
 
@@ -93,18 +101,36 @@ impl Model {
             .filter(|l| !l.gone && l.deadline > self.now)
     }
 
-    /// Brute-force oracle for the acquire decision.
-    fn acquire_would_conflict(&self, specs: &[(Prefix, LeaseMode, u64)]) -> bool {
-        let store_conflict = specs.iter().any(|(prefix, mode, _)| {
-            self.live()
-                .any(|l| overlaps(prefix, &l.prefix) && !mode.compatible_with(l.mode))
+    /// Brute-force oracle for the acquire decision. A blocker only blocks
+    /// when it is not stealable or the request is not stealing.
+    fn acquire_would_conflict(&self, steal: bool, specs: &[Spec]) -> bool {
+        let store_conflict = specs.iter().any(|(prefix, mode, _, _)| {
+            self.live().any(|l| {
+                overlaps(prefix, &l.prefix)
+                    && !mode.compatible_with(l.mode)
+                    && !(steal && l.stealable)
+            })
         });
-        let intra_conflict = specs.iter().enumerate().any(|(i, (pa, ma, _))| {
+        let intra_conflict = specs.iter().enumerate().any(|(i, (pa, ma, _, _))| {
             specs[i + 1..]
                 .iter()
-                .any(|(pb, mb, _)| overlaps(pa, pb) && !ma.compatible_with(*mb))
+                .any(|(pb, mb, _, _)| overlaps(pa, pb) && !ma.compatible_with(*mb))
         });
         store_conflict || intra_conflict
+    }
+
+    /// Ids of live leases an admitted acquire displaces (empty unless the
+    /// request stole; on a granted request every incompatible overlap must
+    /// have been stealable).
+    fn stolen_by(&self, specs: &[Spec]) -> Vec<u64> {
+        self.live()
+            .filter(|l| {
+                specs.iter().any(|(prefix, mode, _, _)| {
+                    overlaps(prefix, &l.prefix) && !mode.compatible_with(l.mode)
+                })
+            })
+            .map(|l| l.id)
+            .collect()
     }
 }
 
@@ -162,6 +188,7 @@ fn check_invariants(store: &MemoryStore, model: &Model) -> Result<(), TestCaseEr
         let m = model_live[id];
         prop_assert_eq!(rec.epoch.0, m.epoch);
         prop_assert_eq!(rec.mode, m.mode);
+        prop_assert_eq!(rec.stealable, m.stealable);
         prop_assert_eq!(rec.device, DeviceId([m.device; 16]));
         prop_assert_eq!(rec.deadline.0, m.deadline);
         let rec_prefix: Prefix = rec
@@ -196,32 +223,45 @@ proptest! {
 
         for cmd in cmds {
             match &cmd {
-                Cmd::Acquire { device, specs } => {
+                Cmd::Acquire { device, specs, steal } => {
                     let req = AcquireRequest {
                         device: dev(*device),
+                        steal: *steal,
                         specs: specs
                             .iter()
-                            .map(|(prefix, mode, ttl)| LeaseSpec {
+                            .map(|(prefix, mode, ttl, stealable)| LeaseSpec {
                                 prefix: to_key(prefix),
                                 mode: *mode,
                                 ttl: Duration::from_millis(*ttl),
+                                stealable: *stealable,
                             })
                             .collect(),
                     };
                     let result = block_on(mgr.acquire(&mut store, Timestamp(model.now), &req));
-                    let expected_conflict = model.acquire_would_conflict(specs);
+                    let expected_conflict = model.acquire_would_conflict(*steal, specs);
                     prop_assert_eq!(
                         result.is_err(),
                         expected_conflict,
                         "decision diverged from oracle on {:?}", cmd
                     );
                     if let Ok((leases, _barrier)) = result {
+                        // Victims first: a granted steal displaces every
+                        // incompatible live overlap (all stealable, or the
+                        // oracle would have contended).
+                        let stolen = model.stolen_by(specs);
+                        for l in &mut model.leases {
+                            if stolen.contains(&l.id) {
+                                l.gone = true;
+                            }
+                        }
+
                         prop_assert_eq!(leases.len(), specs.len());
-                        for (lease, (prefix, mode, ttl)) in leases.iter().zip(specs) {
+                        for (lease, (prefix, mode, ttl, stealable)) in leases.iter().zip(specs) {
                             // 4: ids and epochs strictly increase, never recur.
                             prop_assert_eq!(lease.id, LeaseId(model.next_id));
                             prop_assert_eq!(lease.epoch.0, model.next_epoch);
                             prop_assert_eq!(lease.mode, *mode);
+                            prop_assert_eq!(lease.stealable, *stealable);
                             model.leases.push(MLease {
                                 id: model.next_id,
                                 epoch: model.next_epoch,
@@ -230,6 +270,7 @@ proptest! {
                                 device: *device,
                                 deadline: model.now + ttl,
                                 ttl: *ttl,
+                                stealable: *stealable,
                                 gone: false,
                             });
                             model.next_id += 1;
