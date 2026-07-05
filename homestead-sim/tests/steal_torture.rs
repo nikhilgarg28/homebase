@@ -29,6 +29,7 @@ use homestead_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homestead_server::actor::{SpaceActor, SpaceHandle};
 use homestead_sim::check;
 use homestead_sim::exec::SimExecutor;
+use homestead_sim::seeds;
 use homestead_sim::store::{FaultConfig, SimStore};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -308,7 +309,7 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
 #[test]
 fn steal_torture_seeds_hold_mutual_exclusion() {
     let mut total = Coverage::default();
-    for seed in 0..100 {
+    for seed in seeds::torture_seeds() {
         let (_, coverage) = run_seed(seed);
         total.steals += coverage.steals;
         total.contended += coverage.contended;

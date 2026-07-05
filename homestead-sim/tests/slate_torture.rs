@@ -15,7 +15,7 @@ use homestead_core::messages::{
 use homestead_core::space::{Space as _, SpaceId};
 use homestead_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homestead_server::actor::{SpaceActor, SpaceHandle};
-use homestead_server::storage::SlateStore;
+use homestead_server::storage::{SlateOpenOptions, SlateStore, local_object_store};
 use homestead_sim::check;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -72,13 +72,22 @@ async fn write_marker(
         .unwrap();
 }
 
+async fn open_shard(root: &std::path::Path) -> Arc<SlateStore> {
+    let object_store = local_object_store(root).unwrap();
+    Arc::new(
+        SlateStore::open("shard", object_store, SlateOpenOptions::default())
+            .await
+            .unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn slate_survives_flush_and_reopen() {
     let dir = tempdir().unwrap();
-    let root = dir.path().to_path_buf();
+    let root = dir.path();
     let clock = Arc::new(ManualClock::new(Timestamp(0)));
 
-    let store = Arc::new(SlateStore::open(&root, "shard").await.unwrap());
+    let store = open_shard(root).await;
     let (actor, handle) = SpaceActor::new(SPACE, Arc::clone(&store), Arc::clone(&clock));
     let task = tokio::spawn(actor.run());
     write_marker(&handle, 1, true, false, b"before-crash").await;
@@ -88,7 +97,7 @@ async fn slate_survives_flush_and_reopen() {
     let _ = task.await;
 
     // "Crash": reopen; stale lease record survived — steal it back.
-    let store2 = Arc::new(SlateStore::open(&root, "shard").await.unwrap());
+    let store2 = open_shard(root).await;
     let (actor2, handle2) = SpaceActor::new(SPACE, Arc::clone(&store2), clock);
     let task2 = tokio::spawn(actor2.run());
     write_marker(&handle2, 2, true, true, b"after-reopen").await;
@@ -112,7 +121,7 @@ async fn slate_survives_flush_and_reopen() {
 async fn slate_seeded_writes_audit_clean() {
     let mut rng = StdRng::seed_from_u64(99);
     let dir = tempdir().unwrap();
-    let store = Arc::new(SlateStore::open(dir.path(), "shard").await.unwrap());
+    let store = open_shard(dir.path()).await;
     let clock = Arc::new(ManualClock::new(Timestamp(0)));
     let (actor, handle) = SpaceActor::new(SPACE, Arc::clone(&store), clock);
     let task = tokio::spawn(actor.run());

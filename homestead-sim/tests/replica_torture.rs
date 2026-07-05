@@ -30,6 +30,7 @@ use homestead_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
 use homestead_server::actor::{SpaceActor, SpaceHandle};
 use homestead_sim::check;
 use homestead_sim::exec::SimExecutor;
+use homestead_sim::seeds;
 use homestead_sim::store::{FaultConfig, SimStore};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -336,7 +337,7 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
 #[test]
 fn replica_torture_seeds_reconverge() {
     let mut total = Coverage::default();
-    for seed in 0..100 {
+    for seed in seeds::torture_seeds() {
         let (_, coverage) = run_seed(seed);
         total.tombstones += coverage.tombstones;
         total.overwrites += coverage.overwrites;

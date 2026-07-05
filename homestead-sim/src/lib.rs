@@ -11,27 +11,28 @@
 //!   that are ready to run, a seeded RNG picks which one is polled next:
 //!   every legal interleaving of actors and clients is reachable, and each
 //!   is replayable.
-//! - [`store::SimStore`] — an [`OrderedStore`] with seeded fault injection:
-//!   operations yield a random number of times (interleaving points),
-//!   reads and writes can fail with injected [`StorageError`]s (always
-//!   *before* mutating — batch atomicity is never faked), and durability is
-//!   modeled explicitly: applied batches sit in volatile state until a
-//!   randomized flush, and [`crash`](store::SimStore::crash) rolls back to
-//!   the last flush — always a *prefix* of applied batches, like a WAL.
-//! - [`check`] — brute-force invariant oracles run over a (recovered)
-//!   store: changelog ⇔ data agreement, dense admission seqs, per-prefix
-//!   aggregates, lease index agreement, counter monotonicity.
+//! - [`store::SimStore`] — Layer 1 [`OrderedStore`]: seeded fault injection,
+//!   explicit durability boundary, [`SimStore::crash`].
+//! - [`slate_shard::SlateShard`] — Layer 3: real slatedb over a fault-injecting
+//!   local object store with checkpointed power loss.
+//! - [`crash`] — parameterized crash-restart torture shared by Layer 1 and 3.
+//! - [`check`] — brute-force invariant oracles run over a (recovered) store.
 //!
-//! The actors and state machines under test are the production types from
-//! `homestead-server`, unmodified — that is the point. The kernel takes
-//! `now` explicitly, the actor loop is runtime-agnostic, and all IO sits
-//! behind `OrderedStore`, so this crate supplies environments, never
-//! forks.
+//! Seed counts: [`seeds::torture_seed_count`] (default 1000, env
+//! `HOMESTEAD_TORTURE_SEEDS`).
 //!
 //! [`OrderedStore`]: homestead_server::storage::OrderedStore
-//! [`StorageError`]: homestead_server::storage::StorageError
 
 pub mod check;
+pub mod crash;
 pub mod exec;
+pub mod seeds;
 pub mod store;
 pub mod torture;
+
+#[cfg(feature = "slatedb")]
+pub mod fault_object_store;
+#[cfg(feature = "slatedb")]
+pub mod fault_slate;
+#[cfg(feature = "slatedb")]
+pub mod slate_shard;

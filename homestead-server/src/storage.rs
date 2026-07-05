@@ -139,7 +139,7 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(feature = "slatedb")]
-pub use slate::SlateStore;
+pub use slate::{SlateOpenOptions, SlateStore, local_object_store};
 
 /// In-memory store: the reference implementation for tests and the sim.
 ///

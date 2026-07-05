@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace tests
+        run: cargo test --workspace
+      - name: Layer 1 sim without slatedb
+        run: cargo test -p homestead-sim --no-default-features
+      - name: Torture (PR seed budget)
+        env:
+          HOMESTEAD_TORTURE_SEEDS: "100"
+          HOMESTEAD_PERSIST_TORTURE_SEEDS: "20"
+          HOMESTEAD_SCENARIO_SEEDS: "20"
+        run: cargo test -p homestead-sim crash steal replica persist scenarios
+
+  torture-deep:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Torture (1000 seeds, main only)
+        env:
+          HOMESTEAD_TORTURE_SEEDS: "1000"
+          HOMESTEAD_PERSIST_TORTURE_SEEDS: "100"
+          HOMESTEAD_SCENARIO_SEEDS: "100"
+        run: cargo test -p homestead-sim crash steal replica persist scenarios

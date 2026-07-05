@@ -101,6 +101,34 @@ impl SimExecutor {
     pub fn run_until_stalled(&mut self) {
         while self.step() {}
     }
+
+    /// Whether any spawned task has not finished or been cancelled.
+    pub fn has_live_tasks(&self) -> bool {
+        self.tasks.iter().any(|slot| slot.is_some())
+    }
+
+    /// Like [`run_until_stalled`], but yields to tokio between steps so
+    /// real async IO (slatedb) can complete while preserving seeded
+    /// interleaving among sim tasks.
+    #[cfg(feature = "slatedb")]
+    pub async fn run_until_stalled_async(&mut self) {
+        let mut idle = 0u32;
+        loop {
+            if self.step() {
+                idle = 0;
+                continue;
+            }
+            if !self.has_live_tasks() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            idle += 1;
+            assert!(
+                idle < 10_000,
+                "sim executor stuck waiting on IO (>10k yields)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

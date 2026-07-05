@@ -1,7 +1,6 @@
-//! Shared torture harness: actors, clients, and oracles over [`SimStore`].
+//! Shared torture harness: actors, clients, and oracles.
 //!
-//! Scenario tests import this module; the crash torture integration test
-//! lives separately in `tests/crash_torture.rs`.
+//! Scenario tests import this module; crash torture lives in [`crate::crash`].
 
 use crate::check;
 use crate::exec::SimExecutor;
@@ -16,6 +15,7 @@ use homestead_core::messages::{
 use homestead_core::space::{Space as _, SpaceError, SpaceId};
 use homestead_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
 use homestead_server::actor::{SpaceActor, SpaceHandle};
+use homestead_server::storage::OrderedStore;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::cell::RefCell;
@@ -68,14 +68,27 @@ pub fn put_one(
 }
 
 /// Run one actor until stalled; returns the handle (keep clones alive).
-pub fn run_actor(
+pub fn run_actor<S>(
     exec: &mut SimExecutor,
-    store: Arc<SimStore>,
+    store: Arc<S>,
     clock: Arc<ManualClock>,
-) -> SpaceHandle {
+) -> SpaceHandle
+where
+    S: OrderedStore + Send + Sync + 'static,
+{
     let (actor, handle) = SpaceActor::new(SPACE, store, clock);
     exec.spawn(actor.run());
     handle
+}
+
+/// Audit with faults disabled (SimStore only; no-op for other stores).
+pub fn audit_sim_store(store: &SimStore) -> check::StoreAudit {
+    store.set_config(FaultConfig::NONE);
+    check::audit(SPACE, store)
+}
+
+pub fn audit_space<S: OrderedStore>(store: &S) -> check::StoreAudit {
+    check::audit(SPACE, store)
 }
 
 /// A read replica driven purely by `read_at`.
@@ -130,11 +143,6 @@ impl Replica {
     }
 }
 
-pub fn audit_space(store: &SimStore) -> check::StoreAudit {
-    store.set_config(FaultConfig::NONE);
-    check::audit(SPACE, store)
-}
-
 /// Steal race: two devices on one shared stealable prefix; exactly one
 /// writer is live at a time.
 pub fn run_steal_race(seed: u64) {
@@ -169,7 +177,7 @@ pub fn run_steal_race(seed: u64) {
 
     let ok = results.borrow().iter().filter(|r| r.is_ok()).count();
     assert_eq!(ok, 2, "both steals must succeed sequentially");
-    let audit = audit_space(&store);
+    let audit = audit_sim_store(&store);
     assert_eq!(audit.leases.len(), 1, "only one live lease on the prefix");
 }
 
@@ -228,7 +236,7 @@ pub fn run_contended_handoff(seed: u64) {
     });
     exec.run_until_stalled();
 
-    let audit = audit_space(&store);
+    let audit = audit_sim_store(&store);
     assert_eq!(audit.leases.len(), 1);
     assert_eq!(audit.leases.values().next().unwrap().device, dev(2));
 }
@@ -274,7 +282,7 @@ pub fn run_zombie_writer(seed: u64) {
         err.borrow().as_ref(),
         Some(SpaceError::Kernel(KernelError::LeaseInvalid { .. }))
     ));
-    audit_space(&store);
+    audit_sim_store(&store);
 }
 
 /// Replica tracks live keys via `read_at` through interleaved writes.
@@ -311,7 +319,7 @@ pub fn run_replica_sync(seed: u64) {
         });
         exec.run_until_stalled();
 
-        let hw = audit_space(&store).max_admission_seq;
+        let hw = audit_sim_store(&store).max_admission_seq;
         let r = Rc::clone(&replica);
         let h = handle.clone();
         let p = prefix.clone();
@@ -323,6 +331,6 @@ pub fn run_replica_sync(seed: u64) {
 
     let replica = replica.borrow().clone();
 
-    let audit = audit_space(&store);
+    let audit = audit_sim_store(&store);
     assert_eq!(replica.live.len(), audit.data.values().filter(|r| r.value.is_present()).count());
 }
