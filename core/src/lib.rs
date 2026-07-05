@@ -12,16 +12,21 @@
 //!   seven verbs, and [`KernelError`]
 //! - [`space`] — [`SpaceId`] and the [`Space`] trait, the async verb
 //!   contract every request executes against
+//! - [`storage`] — [`OrderedStore`](storage::OrderedStore), the ordered
+//!   byte-keyed map with atomic batches that the server's shards and the
+//!   client's durable state both sit on (plus the reference
+//!   [`MemoryStore`](storage::MemoryStore))
 //!
-//! No implementation lives here: the server crate hosts many spaces (each a
-//! deterministic state machine behind the async trait); the client crate
-//! speaks the same trait over the wire.
+//! No kernel or client logic lives here: the server crate hosts many spaces
+//! (each a deterministic state machine behind the async trait); the client
+//! crate speaks the same trait over the wire.
 
 pub mod clock;
 pub mod key;
 pub mod lease;
 pub mod messages;
 pub mod space;
+pub mod storage;
 pub mod tag;
 
 pub use clock::{Clock, ManualClock, MonotonicClock, Timestamp};

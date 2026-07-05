@@ -10,3 +10,4 @@ description = "Shared types and protocol vocabulary for the homebase leased KV k
 
 [dev-dependencies]
 proptest.workspace = true
+pollster.workspace = true
