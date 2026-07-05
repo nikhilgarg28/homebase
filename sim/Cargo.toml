@@ -2,9 +2,9 @@
 name = "homebase-sim"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Deterministic simulation and torture testing for the homebase kernel"
-license = "Apache-2.0"
-repository = "https://github.com/nikhil/homebase"
 
 [dependencies]
 homebase-core.workspace = true
