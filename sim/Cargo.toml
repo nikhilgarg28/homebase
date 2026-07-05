@@ -40,5 +40,6 @@ default-features = false
 features = ["std"]
 
 [dev-dependencies]
+homebase.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile.workspace = true
