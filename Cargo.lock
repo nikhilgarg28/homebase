@@ -889,12 +889,15 @@ name = "homebase"
 version = "0.1.1"
 dependencies = [
  "homebase-core",
+ "homebase-server",
+ "pollster",
 ]
 
 [[package]]
 name = "homebase-core"
 version = "0.1.1"
 dependencies = [
+ "pollster",
  "proptest",
 ]
 
