@@ -1,0 +1,1 @@
+- Make DST work seamlessly with SlateDB (including local disk cache)
