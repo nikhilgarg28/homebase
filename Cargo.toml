@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-homebase-core = { path = "core" }
-homebase-server = { path = "server" }
+homebase-core = { path = "core", version = "0.1.0" }
+homebase-server = { path = "server", version = "0.1.0" }
 rand = "0.9"
 proptest = "1"
 pollster = "0.4"
