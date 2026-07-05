@@ -1,8 +1,8 @@
 [package]
-name = "homebase-client"
+name = "homebase"
 version.workspace = true
 edition.workspace = true
-description = "homebase kernel client library"
+description = "homebase kernel client SDK"
 license = "Apache-2.0"
 repository = "https://github.com/nikhil/homebase"
 

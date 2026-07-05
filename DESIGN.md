@@ -1,8 +1,8 @@
 # homebase + multilite — a Leased KV Kernel and Multi-Writer SQLite on Top
 
-*One-pager · July 2026 · **homebase** = the OSS kernel (leased KV; crates `homebase-core`, `homebase-server`, `homebase-client`, `homebase-sim`; this repo) · **multilite** = SQLite built on homebase — the planned public shipping name for the SQL layer (trademark-respecting distance from SQLite; separate GitHub repo at launch; see [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md)) · GitHub org TBD (`homebase` or personal account until then). Note: "Homebase" is also an HR/labor SaaS mark (Pioneer Works) — get clearance before marketing the kernel under that name broadly.*
+*One-pager · July 2026 · **homebase** = the OSS kernel (leased KV; crates `homebase`, `homebase-core`, `homebase-server`, `homebase-sim`; this repo) · **multilite** = SQLite built on homebase — the planned public shipping name for the SQL layer (trademark-respecting distance from SQLite; separate GitHub repo at launch; see [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md)) · GitHub org TBD (`homebase` or personal account until then). Note: "Homebase" is also an HR/labor SaaS mark (Pioneer Works) — get clearance before marketing the kernel under that name broadly.*
 
-**Repo layout (this monorepo):** `core/` → `homebase-core` · `server/` → `homebase-server` · `client/` → `homebase-client` · `sim/` → `homebase-sim`. Products built on the kernel (multilite first) get their own repos and crate names.
+**Repo layout (this monorepo):** `core/` → `homebase-core` · `server/` → `homebase-server` · `client/` → `homebase` · `sim/` → `homebase-sim`. Products built on the kernel (multilite first) get their own repos and crate names.
 
 ## What it is
 
