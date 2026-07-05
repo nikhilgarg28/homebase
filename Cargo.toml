@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["homestead-core", "homestead-server", "homestead-client", "homestead-sim"]
+members = ["core", "server", "client", "sim"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-homestead-core = { path = "homestead-core" }
-homestead-server = { path = "homestead-server" }
+homebase-core = { path = "core" }
+homebase-server = { path = "server" }
 rand = "0.9"
 proptest = "1"
 pollster = "0.4"

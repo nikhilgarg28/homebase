@@ -1,0 +1,44 @@
+[package]
+name = "homebase-sim"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic simulation and torture testing for the homebase kernel"
+license = "Apache-2.0"
+repository = "https://github.com/nikhil/homebase"
+
+[dependencies]
+homebase-core.workspace = true
+homebase-server = { workspace = true, default-features = true }
+rand.workspace = true
+pollster.workspace = true
+
+[features]
+default = ["slatedb"]
+slatedb = ["homebase-server/slatedb", "dep:slatedb", "dep:async-trait", "dep:tokio", "dep:tempfile", "dep:futures-util"]
+
+[dependencies.slatedb]
+version = "0.14.1"
+optional = true
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
+[dependencies.tokio]
+workspace = true
+optional = true
+features = ["rt", "macros"]
+
+[dependencies.tempfile]
+workspace = true
+optional = true
+
+[dependencies.futures-util]
+version = "0.3"
+optional = true
+default-features = false
+features = ["std"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true

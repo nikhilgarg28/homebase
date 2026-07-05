@@ -1,9 +1,0 @@
-[package]
-name = "homestead-core"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-
-[dev-dependencies]
-proptest.workspace = true

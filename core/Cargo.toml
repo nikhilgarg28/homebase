@@ -1,0 +1,12 @@
+[package]
+name = "homebase-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared types and protocol vocabulary for the homebase leased KV kernel"
+license = "Apache-2.0"
+repository = "https://github.com/nikhil/homebase"
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

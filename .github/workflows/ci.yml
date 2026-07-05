@@ -18,13 +18,13 @@ jobs:
       - name: Workspace tests
         run: cargo test --workspace
       - name: Layer 1 sim without slatedb
-        run: cargo test -p homestead-sim --no-default-features
+        run: cargo test -p homebase-sim --no-default-features
       - name: Torture (PR seed budget)
         env:
-          HOMESTEAD_TORTURE_SEEDS: "100"
-          HOMESTEAD_PERSIST_TORTURE_SEEDS: "20"
-          HOMESTEAD_SCENARIO_SEEDS: "20"
-        run: cargo test -p homestead-sim crash steal replica persist scenarios
+          HOMEBASE_TORTURE_SEEDS: "100"
+          HOMEBASE_PERSIST_TORTURE_SEEDS: "20"
+          HOMEBASE_SCENARIO_SEEDS: "20"
+        run: cargo test -p homebase-sim crash steal replica persist scenarios
 
   torture-deep:
     runs-on: ubuntu-latest
@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Torture (1000 seeds, main only)
         env:
-          HOMESTEAD_TORTURE_SEEDS: "1000"
-          HOMESTEAD_PERSIST_TORTURE_SEEDS: "100"
-          HOMESTEAD_SCENARIO_SEEDS: "100"
-        run: cargo test -p homestead-sim crash steal replica persist scenarios
+          HOMEBASE_TORTURE_SEEDS: "1000"
+          HOMEBASE_PERSIST_TORTURE_SEEDS: "100"
+          HOMEBASE_SCENARIO_SEEDS: "100"
+        run: cargo test -p homebase-sim crash steal replica persist scenarios

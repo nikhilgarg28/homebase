@@ -5,8 +5,8 @@ multi-writer explicitly roadmap). Governing rule: **every sentence in the announ
 have a reproducible artifact behind it.** Work top to bottom; nothing ships while a claimed
 item is unchecked.
 
-Product ships as **multilite** (SQLite built on [homestead](./DESIGN.md)); this repo holds
-the kernel during development — multilite gets its own repo under the homestead org at launch.
+Product ships as **multilite** (SQLite built on [homebase](./DESIGN.md)). This repo holds
+the homebase kernel; multilite gets its own repo at launch.
 
 ## 1. Functionality floor (rung 4 + polish)
 
@@ -28,7 +28,7 @@ the kernel during development — multilite gets its own repo under the homestea
 - [ ] Durability watermark API (`last_acked_seq`)
 - [ ] Linux + macOS support
 - [ ] Rust client (rusqlite-compatible wrapper)
-- [ ] C-ABI shim (`libhomebase` returning real `sqlite3*`) — proves "unmodified apps" claim
+- [ ] C-ABI shim (`libmultilite` returning real `sqlite3*`) — proves "unmodified apps" claim
   - [ ] Python via the shim as the demo consumer
 - [ ] **Acid test: an existing rusqlite app runs unmodified except `open`**
       (someone on the thread will try this within an hour)

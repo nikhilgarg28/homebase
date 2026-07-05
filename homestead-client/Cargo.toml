@@ -1,7 +1,0 @@
-[package]
-name = "homestead-client"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-homestead-core.workspace = true

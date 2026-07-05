@@ -1,0 +1,29 @@
+[package]
+name = "homebase-server"
+version.workspace = true
+edition.workspace = true
+description = "homebase kernel server: space actors, lease enforcement, storage"
+license = "Apache-2.0"
+repository = "https://github.com/nikhil/homebase"
+
+[dependencies]
+homebase-core.workspace = true
+# Runtime-agnostic channel primitives only — the actor loop must be drivable
+# by tokio in production and by the deterministic sim's stepper identically,
+# so no executor is ever a dependency of this crate.
+futures-channel.workspace = true
+futures-core.workspace = true
+# SlateDB + local object_store backend (optional; on by default for prod + IDE).
+slatedb = { version = "0.14.1", optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[features]
+default = ["slatedb"]
+slatedb = ["dep:slatedb", "dep:async-trait"]
+
+[dev-dependencies]
+proptest.workspace = true
+pollster.workspace = true
+futures.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
