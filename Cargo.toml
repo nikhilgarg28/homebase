@@ -10,10 +10,7 @@ repository = "https://github.com/nikhilgarg28/homebase"
 
 [workspace.dependencies]
 homebase-core = { path = "core", version = "0.1.1" }
-# default-features off at the workspace level so light consumers (the client
-# crate's tests) skip slatedb; sim/server turn it back on where needed.
-homebase-server = { path = "server", version = "0.1.1", default-features = false }
-homebase = { path = "client", version = "0.1.1" }
+homebase-server = { path = "server", version = "0.1.1" }
 rand = "0.9"
 proptest = "1"
 pollster = "0.4"

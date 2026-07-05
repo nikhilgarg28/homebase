@@ -888,9 +888,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 name = "homebase"
 version = "0.1.1"
 dependencies = [
- "futures",
  "homebase-core",
- "homebase-server",
 ]
 
 [[package]]
@@ -922,7 +920,6 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
- "homebase",
  "homebase-core",
  "homebase-server",
  "pollster",
