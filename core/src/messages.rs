@@ -247,10 +247,17 @@ pub enum KernelError {
     /// lease (read leases guard read sets; they never authorize writes).
     NotCovered { key: Key },
     /// Per-key version monotonicity violated.
-    VerRegression { key: Key, current: Ver, attempted: Ver },
+    VerRegression {
+        key: Key,
+        current: Ver,
+        attempted: Ver,
+    },
     /// Per-device batch sequence monotonicity violated: replay or
     /// out-of-order submission (client-assigned, strictly increasing).
-    DeviceSeqRegression { current: DeviceSeq, attempted: DeviceSeq },
+    DeviceSeqRegression {
+        current: DeviceSeq,
+        attempted: DeviceSeq,
+    },
     /// Outside the token's prefix scope (enforced on reads AND writes).
     /// Reserved for the wire layer; the in-process kernel never emits it.
     Unauthorized { prefix: Key },
@@ -259,14 +266,21 @@ pub enum KernelError {
 impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Contended { prefix, retry_after } => match retry_after {
+            Self::Contended {
+                prefix,
+                retry_after,
+            } => match retry_after {
                 Some(d) => write!(f, "prefix {prefix:?} is contended (retry in ~{d:?})"),
                 None => write!(f, "prefix {prefix:?} is contended"),
             },
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::Fenced { lease } => write!(f, "stale epoch presented for lease {lease:?}"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
-            Self::VerRegression { key, current, attempted } => write!(
+            Self::VerRegression {
+                key,
+                current,
+                attempted,
+            } => write!(
                 f,
                 "ver regression on {key:?}: attempted {attempted:?} ≤ current {current:?}"
             ),

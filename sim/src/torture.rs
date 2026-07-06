@@ -9,8 +9,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, PutEntry,
-    ReadAtRequest, ReleaseRequest,
+    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, PutEntry, ReadAtRequest,
+    ReleaseRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -68,11 +68,7 @@ pub fn put_one(
 }
 
 /// Run one actor until stalled; returns the handle (keep clones alive).
-pub fn run_actor<S>(
-    exec: &mut SimExecutor,
-    store: Arc<S>,
-    clock: Arc<ManualClock>,
-) -> SpaceHandle
+pub fn run_actor<S>(exec: &mut SimExecutor, store: Arc<S>, clock: Arc<ManualClock>) -> SpaceHandle
 where
     S: OrderedStore + Send + Sync + 'static,
 {
@@ -119,7 +115,9 @@ impl Replica {
                 self.live = entries
                     .iter()
                     .filter_map(|e| {
-                        let Value::Present(v) = &e.value else { return None };
+                        let Value::Present(v) = &e.value else {
+                            return None;
+                        };
                         Some((e.key.clone(), v.clone()))
                     })
                     .collect();
@@ -195,7 +193,10 @@ pub fn run_contended_handoff(seed: u64) {
     let p1 = p.clone();
     let lid = Rc::clone(&lease_id);
     exec.spawn(async move {
-        let resp = h1.acquire(write_lease_req(1, &p1, 500, false)).await.unwrap();
+        let resp = h1
+            .acquire(write_lease_req(1, &p1, 500, false))
+            .await
+            .unwrap();
         *lid.borrow_mut() = Some(resp.leases[0].id);
     });
     exec.run_until_stalled();
@@ -232,7 +233,9 @@ pub fn run_contended_handoff(seed: u64) {
     let h2 = handle.clone();
     let p2 = p.clone();
     exec.spawn(async move {
-        h2.acquire(write_lease_req(2, &p2, 500, false)).await.unwrap();
+        h2.acquire(write_lease_req(2, &p2, 500, false))
+            .await
+            .unwrap();
     });
     exec.run_until_stalled();
 
@@ -299,7 +302,10 @@ pub fn run_replica_sync(seed: u64) {
     let h = handle.clone();
     let p0 = prefix.clone();
     exec.spawn(async move {
-        let resp = h.acquire(write_lease_req(0, &p0, 60_000, false)).await.unwrap();
+        let resp = h
+            .acquire(write_lease_req(0, &p0, 60_000, false))
+            .await
+            .unwrap();
         *g.borrow_mut() = Some(LeaseRef {
             id: resp.leases[0].id,
             epoch: resp.leases[0].epoch,
@@ -332,5 +338,8 @@ pub fn run_replica_sync(seed: u64) {
     let replica = replica.borrow().clone();
 
     let audit = audit_sim_store(&store);
-    assert_eq!(replica.live.len(), audit.data.values().filter(|r| r.value.is_present()).count());
+    assert_eq!(
+        replica.live.len(),
+        audit.data.values().filter(|r| r.value.is_present()).count()
+    );
 }

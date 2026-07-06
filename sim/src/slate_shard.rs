@@ -26,13 +26,8 @@ mod imp {
             let fault_store = Arc::new(
                 FaultObjectStore::new(dir.path(), seed, faults).expect("fault object store"),
             );
-            let store = Some(
-                Self::open_store(
-                    Arc::clone(&fault_store),
-                    seed.wrapping_add(1),
-                )
-                .await,
-            );
+            let store =
+                Some(Self::open_store(Arc::clone(&fault_store), seed.wrapping_add(1)).await);
             Self {
                 _dir: dir,
                 fault_store,
@@ -67,15 +62,11 @@ mod imp {
             self.fault_store
                 .simulate_power_loss()
                 .expect("power loss restore");
-            self.store = Some(
-                Self::open_store(Arc::clone(&self.fault_store), self.store_seed).await,
-            );
+            self.store =
+                Some(Self::open_store(Arc::clone(&self.fault_store), self.store_seed).await);
         }
 
-        async fn open_store(
-            fault_store: Arc<FaultObjectStore>,
-            seed: u64,
-        ) -> Arc<FaultSlateStore> {
+        async fn open_store(fault_store: Arc<FaultObjectStore>, seed: u64) -> Arc<FaultSlateStore> {
             use crate::crash::{SLATE_OS_FAULTS, SLATE_STORE_FAULTS};
             fault_store.set_config(SLATE_OS_FAULTS);
             let object_store = fault_store.as_arc();

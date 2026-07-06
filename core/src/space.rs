@@ -7,8 +7,8 @@
 
 use crate::messages::{
     AcquireRequest, AcquireResponse, GetRequest, GetResponse, KernelError, ListRequest,
-    ListResponse, PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse,
-    ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    ListResponse, PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest,
+    ReleaseResponse, RenewRequest, RenewResponse,
 };
 use std::fmt;
 use std::future::Future;

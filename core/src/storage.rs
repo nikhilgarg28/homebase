@@ -99,10 +99,8 @@ pub async fn collect_scan<I: ScanIter>(
 
 /// An ordered byte-keyed map with range scans and atomic batches.
 pub trait OrderedStore {
-    fn get(
-        &self,
-        key: &[u8],
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send;
+    fn get(&self, key: &[u8])
+    -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send;
 
     /// Streams entries with keys in `[start, end)` — `end: None` means
     /// unbounded — in ascending key order. The scan observes the store as of
@@ -119,10 +117,7 @@ pub trait OrderedStore {
     }
 
     /// Applies a batch atomically.
-    fn apply(
-        &self,
-        batch: WriteBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+    fn apply(&self, batch: WriteBatch) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
 /// A shared reference to a store is a store — every method already takes
@@ -140,10 +135,7 @@ impl<S: OrderedStore> OrderedStore for &S {
         (**self).scan(start, end)
     }
 
-    fn apply(
-        &self,
-        batch: WriteBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    fn apply(&self, batch: WriteBatch) -> impl Future<Output = Result<(), StorageError>> + Send {
         (**self).apply(batch)
     }
 }
@@ -225,10 +217,7 @@ impl OrderedStore for MemoryStore {
         }
     }
 
-    fn apply(
-        &self,
-        batch: WriteBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    fn apply(&self, batch: WriteBatch) -> impl Future<Output = Result<(), StorageError>> + Send {
         let mut map = self.map.write().unwrap();
         for op in batch.ops {
             match op {
@@ -293,10 +282,7 @@ pub mod conformance {
         scan_observes_all_prior_batches(fresh().await).await;
     }
 
-    async fn scan_all<S: OrderedStore>(
-        store: &S,
-        prefix: &[u8],
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    async fn scan_all<S: OrderedStore>(store: &S, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         collect_scan(store.scan_prefix(prefix)).await.unwrap()
     }
 
@@ -325,7 +311,11 @@ pub mod conformance {
         put_all(&store, &[(b"k", b"old")]).await;
         put_all(&store, &[(b"k", b"new")]).await;
         assert_eq!(store.get(b"k").await.unwrap(), Some(b"new".to_vec()));
-        assert_eq!(scan_all(&store, b"k").await.len(), 1, "overwrite must not duplicate");
+        assert_eq!(
+            scan_all(&store, b"k").await.len(),
+            1,
+            "overwrite must not duplicate"
+        );
     }
 
     pub async fn delete_removes_and_tolerates_missing<S: OrderedStore>(store: S) {
@@ -380,11 +370,18 @@ pub mod conformance {
 
         let all = scan_all(&store, &[]).await;
         assert_eq!(all.len(), 6);
-        assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "empty prefix scans everything in order");
+        assert!(
+            all.windows(2).all(|w| w[0].0 < w[1].0),
+            "empty prefix scans everything in order"
+        );
     }
 
     pub async fn scan_range_bounds_are_half_open<S: OrderedStore>(store: S) {
-        put_all(&store, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")]).await;
+        put_all(
+            &store,
+            &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")],
+        )
+        .await;
 
         let collect = |iter| async { collect_scan(iter).await.unwrap() };
         let keys = |entries: Vec<(Vec<u8>, Vec<u8>)>| {
@@ -420,7 +417,11 @@ pub mod conformance {
         )
         .await;
 
-        let hits: Vec<Vec<u8>> = scan_all(&store, &[0x01]).await.into_iter().map(|(k, _)| k).collect();
+        let hits: Vec<Vec<u8>> = scan_all(&store, &[0x01])
+            .await
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(
             hits,
             vec![
@@ -459,7 +460,11 @@ pub mod conformance {
         batch.put(b"k3".to_vec(), b"v3".to_vec());
         store.apply(batch).await.unwrap();
 
-        let keys: Vec<Vec<u8>> = scan_all(&store, b"k").await.into_iter().map(|(k, _)| k).collect();
+        let keys: Vec<Vec<u8>> = scan_all(&store, b"k")
+            .await
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(keys, vec![b"k2".to_vec(), b"k3".to_vec()]);
     }
 }

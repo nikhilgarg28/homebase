@@ -133,11 +133,19 @@ mod tests {
     }
 
     fn put(k: &Key, value: &[u8], ver: u64) -> PutEntry {
-        PutEntry { key: k.clone(), value: Value::Present(value.to_vec()), ver: Ver(ver) }
+        PutEntry {
+            key: k.clone(),
+            value: Value::Present(value.to_vec()),
+            ver: Ver(ver),
+        }
     }
 
     fn del(k: &Key, ver: u64) -> PutEntry {
-        PutEntry { key: k.clone(), value: Value::Absent, ver: Ver(ver) }
+        PutEntry {
+            key: k.clone(),
+            value: Value::Absent,
+            ver: Ver(ver),
+        }
     }
 
     /// Space + store + a write lease over `("db",)` held by device 1.
@@ -160,7 +168,14 @@ mod tests {
         ))
         .unwrap();
         let lease = &resp.leases[0];
-        (space, store, LeaseRef { id: lease.id, epoch: lease.epoch })
+        (
+            space,
+            store,
+            LeaseRef {
+                id: lease.id,
+                epoch: lease.epoch,
+            },
+        )
     }
 
     fn put_batch(
@@ -189,7 +204,13 @@ mod tests {
         let resp = put_batch(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
         assert_eq!(resp.admission_seq, AdmissionSeq(1));
 
-        let got = block_on(space.get(&store, &GetRequest { keys: vec![k.clone()] })).unwrap();
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![k.clone()],
+            },
+        ))
+        .unwrap();
         let entry = got.entries[0].as_ref().unwrap();
         assert_eq!(entry.value, Value::Present(b"v".to_vec()));
         assert_eq!(entry.tag.admission_seq, AdmissionSeq(1));
@@ -198,7 +219,13 @@ mod tests {
 
         // Unwritten key reads as None.
         let missing = key(&[b"db", b"t", b"nope"]);
-        let got = block_on(space.get(&store, &GetRequest { keys: vec![missing] })).unwrap();
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![missing],
+            },
+        ))
+        .unwrap();
         assert!(got.entries[0].is_none());
     }
 
@@ -223,12 +250,18 @@ mod tests {
         // Two live keys: every ancestor counts both, at seq 2.
         put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
         put_batch(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
-        let expect = PrefixMetaRecord { max_admission_seq: 2, live_count: 2 };
+        let expect = PrefixMetaRecord {
+            max_admission_seq: 2,
+            live_count: 2,
+        };
         assert_eq!(meta(&store, &root), Some(expect));
         assert_eq!(meta(&store, &table), Some(expect));
         assert_eq!(
             meta(&store, &k1),
-            Some(PrefixMetaRecord { max_admission_seq: 1, live_count: 1 }),
+            Some(PrefixMetaRecord {
+                max_admission_seq: 1,
+                live_count: 1
+            }),
             "leaf prefix untouched by the sibling's write"
         );
 
@@ -236,7 +269,10 @@ mod tests {
         put_batch(&mut space, &store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
         assert_eq!(
             meta(&store, &root),
-            Some(PrefixMetaRecord { max_admission_seq: 3, live_count: 2 })
+            Some(PrefixMetaRecord {
+                max_admission_seq: 3,
+                live_count: 2
+            })
         );
 
         // Tombstone: count drops; the record persists at live_count 0.
@@ -244,11 +280,17 @@ mod tests {
         put_batch(&mut space, &store, lease, 5, vec![del(&k2, 2)]).unwrap();
         assert_eq!(
             meta(&store, &root),
-            Some(PrefixMetaRecord { max_admission_seq: 5, live_count: 0 })
+            Some(PrefixMetaRecord {
+                max_admission_seq: 5,
+                live_count: 0
+            })
         );
         assert_eq!(
             meta(&store, &k1),
-            Some(PrefixMetaRecord { max_admission_seq: 4, live_count: 0 })
+            Some(PrefixMetaRecord {
+                max_admission_seq: 4,
+                live_count: 0
+            })
         );
 
         // Intra-batch create+tombstone of a fresh key nets zero.
@@ -263,7 +305,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             meta(&store, &root),
-            Some(PrefixMetaRecord { max_admission_seq: 6, live_count: 0 })
+            Some(PrefixMetaRecord {
+                max_admission_seq: 6,
+                live_count: 0
+            })
         );
     }
 
@@ -283,10 +328,19 @@ mod tests {
             vec![put(&k2, b"v", 1), put(&k1, b"v", 5)],
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Kernel(KernelError::VerRegression { .. })));
+        assert!(matches!(
+            err,
+            Error::Kernel(KernelError::VerRegression { .. })
+        ));
 
         // Nothing from the rejected batch landed — k2 unwritten, device seq unmoved.
-        let got = block_on(space.get(&store, &GetRequest { keys: vec![k2.clone()] })).unwrap();
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![k2.clone()],
+            },
+        ))
+        .unwrap();
         assert!(got.entries[0].is_none());
         put_batch(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)])
             .expect("device_seq 2 still available after rejected batch");
@@ -299,17 +353,14 @@ mod tests {
         put_batch(&mut space, &store, lease, 3, vec![put(&k, b"v", 1)]).unwrap();
 
         for replayed in [3, 2] {
-            let err = put_batch(
-                &mut space,
-                &store,
-                lease,
-                replayed,
-                vec![put(&k, b"v", 2)],
-            )
-            .unwrap_err();
+            let err =
+                put_batch(&mut space, &store, lease, replayed, vec![put(&k, b"v", 2)]).unwrap_err();
             assert!(matches!(
                 err,
-                Error::Kernel(KernelError::DeviceSeqRegression { current: DeviceSeq(3), .. })
+                Error::Kernel(KernelError::DeviceSeqRegression {
+                    current: DeviceSeq(3),
+                    ..
+                })
             ));
         }
     }
@@ -327,8 +378,17 @@ mod tests {
             vec![put(&k, b"v1", 1), put(&k, b"v2", 2)],
         )
         .unwrap();
-        let got = block_on(space.get(&store, &GetRequest { keys: vec![k.clone()] })).unwrap();
-        assert_eq!(got.entries[0].as_ref().unwrap().value, Value::Present(b"v2".to_vec()));
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![k.clone()],
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            got.entries[0].as_ref().unwrap().value,
+            Value::Present(b"v2".to_vec())
+        );
 
         // …and an equal ver within the batch is a regression.
         let err = put_batch(
@@ -339,7 +399,10 @@ mod tests {
             vec![put(&k, b"v3", 3), put(&k, b"v4", 3)],
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Kernel(KernelError::VerRegression { .. })));
+        assert!(matches!(
+            err,
+            Error::Kernel(KernelError::VerRegression { .. })
+        ));
     }
 
     #[test]
@@ -362,7 +425,11 @@ mod tests {
         // Tombstoned "b" is hidden.
         let all = block_on(space.list(
             &store,
-            &ListRequest { prefix: key(&[b"db"]), start_after: None, limit: None },
+            &ListRequest {
+                prefix: key(&[b"db"]),
+                start_after: None,
+                limit: None,
+            },
         ))
         .unwrap();
         assert_eq!(
@@ -374,7 +441,11 @@ mod tests {
         // Page of 2, then resume strictly after the last returned key.
         let page1 = block_on(space.list(
             &store,
-            &ListRequest { prefix: key(&[b"db"]), start_after: None, limit: Some(2) },
+            &ListRequest {
+                prefix: key(&[b"db"]),
+                start_after: None,
+                limit: Some(2),
+            },
         ))
         .unwrap();
         assert_eq!(page1.entries.len(), 2);
@@ -397,7 +468,11 @@ mod tests {
         // Exact-limit page: no phantom truncation flag.
         let exact = block_on(space.list(
             &store,
-            &ListRequest { prefix: key(&[b"db"]), start_after: None, limit: Some(3) },
+            &ListRequest {
+                prefix: key(&[b"db"]),
+                start_after: None,
+                limit: Some(3),
+            },
         ))
         .unwrap();
         assert_eq!(exact.entries.len(), 3);
@@ -409,17 +484,30 @@ mod tests {
         let (mut space, store, lease) = setup();
         let ka = key(&[b"db", b"a"]);
         let kb = key(&[b"db", b"b"]);
-        put_batch(&mut space, &store, lease, 1, vec![put(&ka, b"a1", 1), put(&kb, b"b1", 1)])
-            .unwrap();
+        put_batch(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![put(&ka, b"a1", 1), put(&kb, b"b1", 1)],
+        )
+        .unwrap();
 
         // Snapshot at seq 1.
         let snap = block_on(space.read_at(
             &store,
-            &ReadAtRequest { ranges: vec![PrefixCursor { prefix: key(&[b"db"]), since: None }] },
+            &ReadAtRequest {
+                ranges: vec![PrefixCursor {
+                    prefix: key(&[b"db"]),
+                    since: None,
+                }],
+            },
         ))
         .unwrap();
         assert_eq!(snap.at, AdmissionSeq(1));
-        let RangeCut::Snapshot(state) = &snap.ranges[0] else { panic!("expected snapshot") };
+        let RangeCut::Snapshot(state) = &snap.ranges[0] else {
+            panic!("expected snapshot")
+        };
         assert_eq!(state.len(), 2);
 
         // Two more batches: overwrite a, tombstone b.
@@ -431,12 +519,17 @@ mod tests {
         let delta = block_on(space.read_at(
             &store,
             &ReadAtRequest {
-                ranges: vec![PrefixCursor { prefix: key(&[b"db"]), since: Some(snap.at) }],
+                ranges: vec![PrefixCursor {
+                    prefix: key(&[b"db"]),
+                    since: Some(snap.at),
+                }],
             },
         ))
         .unwrap();
         assert_eq!(delta.at, AdmissionSeq(3));
-        let RangeCut::Delta(changes) = &delta.ranges[0] else { panic!("expected delta") };
+        let RangeCut::Delta(changes) = &delta.ranges[0] else {
+            panic!("expected delta")
+        };
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].key, ka);
         assert_eq!(changes[0].value, Value::Present(b"a2".to_vec()));
@@ -450,11 +543,16 @@ mod tests {
         let empty = block_on(space.read_at(
             &store,
             &ReadAtRequest {
-                ranges: vec![PrefixCursor { prefix: key(&[b"db"]), since: Some(delta.at) }],
+                ranges: vec![PrefixCursor {
+                    prefix: key(&[b"db"]),
+                    since: Some(delta.at),
+                }],
             },
         ))
         .unwrap();
-        let RangeCut::Delta(changes) = &empty.ranges[0] else { panic!("expected delta") };
+        let RangeCut::Delta(changes) = &empty.ranges[0] else {
+            panic!("expected delta")
+        };
         assert!(changes.is_empty());
     }
 
@@ -463,21 +561,37 @@ mod tests {
         let (mut space, store, lease) = setup();
         let ka = key(&[b"db", b"t1", b"r"]);
         let kb = key(&[b"db", b"t2", b"r"]);
-        put_batch(&mut space, &store, lease, 1, vec![put(&ka, b"a", 1), put(&kb, b"b", 1)])
-            .unwrap();
+        put_batch(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![put(&ka, b"a", 1), put(&kb, b"b", 1)],
+        )
+        .unwrap();
 
         let resp = block_on(space.read_at(
             &store,
             &ReadAtRequest {
                 ranges: vec![
-                    PrefixCursor { prefix: key(&[b"db", b"t1"]), since: Some(AdmissionSeq(0)) },
-                    PrefixCursor { prefix: key(&[b"db", b"t2"]), since: Some(AdmissionSeq(0)) },
+                    PrefixCursor {
+                        prefix: key(&[b"db", b"t1"]),
+                        since: Some(AdmissionSeq(0)),
+                    },
+                    PrefixCursor {
+                        prefix: key(&[b"db", b"t2"]),
+                        since: Some(AdmissionSeq(0)),
+                    },
                 ],
             },
         ))
         .unwrap();
-        let RangeCut::Delta(d1) = &resp.ranges[0] else { panic!() };
-        let RangeCut::Delta(d2) = &resp.ranges[1] else { panic!() };
+        let RangeCut::Delta(d1) = &resp.ranges[0] else {
+            panic!()
+        };
+        let RangeCut::Delta(d2) = &resp.ranges[1] else {
+            panic!()
+        };
         assert_eq!(d1.iter().map(|e| &e.key).collect::<Vec<_>>(), vec![&ka]);
         assert_eq!(d2.iter().map(|e| &e.key).collect::<Vec<_>>(), vec![&kb]);
     }
@@ -485,8 +599,14 @@ mod tests {
     #[test]
     fn acquire_barrier_tracks_admissions() {
         let (mut space, store, lease) = setup();
-        put_batch(&mut space, &store, lease, 1, vec![put(&key(&[b"db", b"k"]), b"v", 1)])
-            .unwrap();
+        put_batch(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![put(&key(&[b"db", b"k"]), b"v", 1)],
+        )
+        .unwrap();
 
         let resp = block_on(space.acquire(
             &store,
@@ -503,7 +623,11 @@ mod tests {
             },
         ))
         .unwrap();
-        assert_eq!(resp.barrier, AdmissionSeq(1), "barrier = admission high water");
+        assert_eq!(
+            resp.barrier,
+            AdmissionSeq(1),
+            "barrier = admission high water"
+        );
     }
 
     #[test]
@@ -511,8 +635,8 @@ mod tests {
         let (mut space, store, lease) = setup();
         // Key outside the leased prefix.
         let outside = key(&[b"elsewhere"]);
-        let err = put_batch(&mut space, &store, lease, 1, vec![put(&outside, b"v", 1)])
-            .unwrap_err();
+        let err =
+            put_batch(&mut space, &store, lease, 1, vec![put(&outside, b"v", 1)]).unwrap_err();
         assert!(matches!(err, Error::Kernel(KernelError::NotCovered { .. })));
     }
 }

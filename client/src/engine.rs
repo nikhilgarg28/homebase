@@ -1,40 +1,59 @@
 //! The engine — the driver over both contracts: one [`MetaStore`] (durable
 //! truth), one [`ServerHandle`] (the seven verbs), one injected
-//! [`Clock`] (the DST discipline: the engine never reads a wall clock).
+//! [`HybridClock`] (the DST discipline: the engine never reads an
+//! ambient clock).
 //!
 //! # No mirror, single driver
 //!
 //! [`Engine::open`] loads durable state once — to certify it (the audit
 //! posture) and to adopt the constant-shape facts: the device identity
-//! and the seq counter. Everything else — leases, watermarks, the queue —
+//! and the seq counter. Everything else — leases, whole-space watermarks, the queue —
 //! stays in the store and is **read on demand** through the [`MetaStore`]
 //! point reads: local-disk cheap, and the store is free to buffer. The
-//! engine holds no copy of any collection, so there is nothing to drift.
-//! What it does hold is the state that is deliberately *not* durable:
-//! which leases were confirmed this incarnation, push progress, the
-//! standing fault.
+//! engine holds no copy of any collection, so there is nothing to drift —
+//! just a handful of scalars: the identity, the seq-counter shadow, the
+//! queue-scan bound.
 //!
 //! Methods take `&mut self`: one engine drives one store, transitions are
 //! serialized by the borrow checker itself. If a storage transition
 //! faults, drop the engine and reopen — the store is the truth.
 //!
-//! # Leases: two clocks, one rule
+//! # Leases: hybrid stamps, a margin, and a poison tripwire
 //!
-//! Every lease-bearing request stamps `send = clock.now()` *before* the
-//! wire; a grant's local deadline is `send + granted TTL`. The server
-//! counts from receipt, so the local window starts strictly earlier and
-//! expires strictly earlier — the engine never presents a lease past its
-//! local deadline, which is what makes TTL expiry safe without clock
-//! synchronization (epochs remain the correctness backstop).
+//! Every lease-bearing request stamps `send = clock.stamp()` *before*
+//! the wire; a grant's deadline is `send + granted TTL` — a
+//! [`HybridTimestamp`]: wall time, monotonic time, and the lineage of
+//! the monotonic ruler. Expiry uses each ruler where it is trustworthy
+//! ([`HybridTimestamp::expired`]): the incarnation that stamped a lease
+//! judges it by its own monotonic clock — precise, step-immune, **no
+//! margin**, the full window — with the wall alongside for the one case
+//! monotonic cannot see (suspend); a *successor* incarnation falls back
+//! to the wall reading shaved by a margin of **0.1% of the lease's
+//! TTL** ([`lease_margin`]). The margin scales with the TTL because the
+//! grant itself bounds the error: a granted lease proves a server round
+//! trip at send time, so whatever wall drift a successor inherits
+//! accrued over at most one TTL — and 0.1% (1000ppm) is still ~20×
+//! real oscillator drift. The server counts TTL from receipt on its own
+//! clock, so the local window expires strictly earlier either way;
+//! epochs remain the correctness backstop for writes.
 //!
-//! Loaded leases are **unconfirmed**: the stored deadline was stamped on
-//! a dead incarnation's monotonic clock and is never trusted. An
-//! unconfirmed lease authorizes nothing until an explicit
-//! [`renew`](Engine::renew) succeeds — there is deliberately no
-//! background heartbeat; renewal is a decision the caller makes.
+//! The wall fallback is what keeps a *restarted* client's offline
+//! authority: a process that dies and returns five minutes into a
+//! day-long lease still holds it, no round trip required. The wall
+//! clock's one lie is the backward step. In-process,
+//! [`WallClock`](homebase_core::clock::WallClock) refuses to follow one
+//! (it self-checks against a monotonic ruler) — and in-lineage expiry
+//! doesn't consult it anyway. Across death, the store's clock
+//! high-water is the tripwire: an [`open`](Engine::open) that reads a
+//! wall clock *behind* the recorded high-water zero-stamps every stored
+//! lease — structurally dead until renewed — and re-anchors the
+//! high-water on the new timeline. Renewal always cures: stamps written
+//! after a backward step end *earlier* than the server's window, the
+//! conservative direction.
 //!
-//! [`acquire`](Engine::acquire) is idempotent: a spec already covered by
-//! a confirmed, locally-live held lease is satisfied without the wire —
+//! There is deliberately no background heartbeat — renewal is a decision
+//! the caller makes. [`acquire`](Engine::acquire) is idempotent: a spec
+//! already covered by a live held lease is satisfied without the wire —
 //! only the genuinely missing specs go to the server. "Ensure I hold
 //! this" is the question call sites actually ask, so that is what the
 //! verb answers.
@@ -66,8 +85,9 @@
 //!   the culprit, so degrade to shipping the solo head and walk forward —
 //!   healthy commits admit one by one until the faulty one stands alone.
 //! - **A kernel rejection of a solo commit** convicts it:
-//!   [`PushOutcome::Stalled`] names the seq and the error, the engine
-//!   records it as [`Fault`], and the queue holds. A `VerRegression`
+//!   [`PushOutcome::Stalled`] names the seq and the error — the outcome
+//!   *is* the record; re-pushing re-derives the same verdict — and the
+//!   queue holds. A `VerRegression`
 //!   means the commit itself is bad (written blind past a foreign write —
 //!   the missing-pull mistake); the resolution is
 //!   [`discard_from`](Engine::discard_from), the rollback. Lease-plane
@@ -78,24 +98,35 @@
 //! Transport failures ([`EngineError::Unavailable`]) abort the pass with
 //! the queue intact: retry when the server is back.
 
-use crate::meta::{certify, Committed, HeldLease, MetaStore};
+use crate::meta::{Committed, HeldLease, MetaStore, certify};
 use crate::server::ServerHandle;
-use homebase_core::clock::{Clock, Timestamp};
+use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, RangeCut,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, RangeCut, ReadAtRequest,
+    ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
-use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 /// Default cap on entries per wire batch — the grouping limit, not a
 /// correctness bound (a single oversized commit still ships alone).
 pub const DEFAULT_PUSH_CAP: usize = 256;
+
+/// The safety margin for the cross-incarnation wall fallback: 0.1% of
+/// the lease's TTL. Proportional on purpose — the grant proves a
+/// server round trip at send time, so the wall error a successor
+/// inherits accrued over at most one TTL, and 0.1% (1000ppm) is still
+/// ~20× real oscillator drift (~50ppm). Never applied in-lineage: the
+/// stamping process judges its own leases by the precise monotonic
+/// ruler.
+pub fn lease_margin(ttl: Duration) -> Duration {
+    ttl / 1_000
+}
 
 /// What the engine can fail with. Kernel rejections *inside a push* are
 /// not errors — they are the protocol talking, and surface as
@@ -116,6 +147,10 @@ pub enum EngineError {
     /// come alive. Fatal until fork recovery (re-mint, resync, requeue)
     /// lands in a later batch.
     Fork { admitted: DeviceSeq },
+    /// The client refused to enqueue a local write because no usable
+    /// local write lease covered the key. Usable means live, not
+    /// retiring, and past its acquire barrier in the whole-space cursor.
+    LocalAuthority { key: Key },
 }
 
 impl From<StorageError> for EngineError {
@@ -143,6 +178,7 @@ impl fmt::Display for EngineError {
                 f,
                 "device fork: the server admitted {admitted:?}, which this store never sent"
             ),
+            Self::LocalAuthority { key } => write!(f, "no local write authority for {key:?}"),
         }
     }
 }
@@ -182,36 +218,13 @@ pub enum PushOutcome {
     },
 }
 
-/// The recorded conviction of a queue head — what
-/// [`PushOutcome::Stalled`] leaves behind for introspection, cleared by
-/// the resolution (a covering [`Engine::discard_from`], or any later
-/// admission).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fault {
-    pub at: DeviceSeq,
-    pub error: KernelError,
-    /// The highest seq ever acknowledged by this incarnation before the
-    /// conviction — "the last healthy push".
-    pub healthy_through: Option<DeviceSeq>,
-}
-
-/// A held lease as the engine sees it: the durable record joined with
-/// the one bit that is deliberately *not* durable.
+/// A held lease as the engine reads it: the durable record joined with
+/// its liveness verdict at read time ([`HybridTimestamp::expired`]). A
+/// zero-stamped record (a poisoned open's leftovers) is never live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseState {
     pub held: HeldLease,
-    /// Heard from the server *this incarnation* (grant or renewal).
-    /// Loaded leases start unconfirmed and authorize nothing until a
-    /// renewal succeeds — the stored deadline is a dead clock's stamp.
-    pub confirmed: bool,
-}
-
-impl LeaseState {
-    /// Whether this lease may be presented right now: confirmed, and the
-    /// local deadline has not passed.
-    pub fn live_at(&self, now: Timestamp) -> bool {
-        self.confirmed && now < self.held.deadline
-    }
+    pub live: bool,
 }
 
 /// The driver. See the module docs for the doctrine; the type parameters
@@ -228,16 +241,10 @@ pub struct Engine<M, H, C> {
     /// pusher walks the queue in `[scan_from, next_seq)` windows;
     /// incarnation-local, tightened by every ack.
     scan_from: DeviceSeq,
-    /// Leases heard from the server this incarnation. Ids are unique per
-    /// space, not globally, hence the pairing.
-    confirmed: BTreeSet<(SpaceId, LeaseId)>,
-    /// Highest seq acknowledged this incarnation.
-    acked_through: Option<DeviceSeq>,
-    fault: Option<Fault>,
     push_cap: usize,
 }
 
-impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
+impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
     /// Load, certify, and adopt (or mint) identity. `fresh` is used only
     /// when the store has no device record yet — the caller supplies the
     /// randomness (real callers mint a UUID, the sim derives one from its
@@ -255,6 +262,59 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
                 fresh
             }
         };
+
+        // The poison tripwire: a wall clock behind the recorded
+        // high-water regressed while we were dead, so every stored
+        // stamp is suspect — kill them structurally (renewals
+        // re-stamp), then re-anchor the high-water on whatever timeline
+        // we woke up on. Crash-safe in this order: an interrupted
+        // cleanse re-detects.
+        let now = clock.stamp();
+        if state.clock_high.is_some_and(|high| now.wall < high) {
+            for (space, space_state) in &state.spaces {
+                let dead: Vec<HeldLease> = space_state
+                    .leases
+                    .values()
+                    .map(|held| HeldLease {
+                        lease: held.lease.clone(),
+                        deadline: HybridTimestamp::ZERO,
+                        barrier: held.barrier,
+                        retiring: held.retiring,
+                    })
+                    .collect();
+                if !dead.is_empty() {
+                    store.record_leases(*space, &dead).await?;
+                }
+            }
+        }
+        store.record_clock(now.wall).await?;
+
+        for (space, space_state) in &state.spaces {
+            let retiring: Vec<LeaseId> = space_state
+                .leases
+                .values()
+                .filter(|held| held.retiring)
+                .map(|held| held.lease.id)
+                .collect();
+            if retiring.is_empty() {
+                continue;
+            }
+            match server
+                .release(
+                    space,
+                    ReleaseRequest {
+                        device,
+                        leases: retiring.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => store.drop_leases(*space, &retiring).await?,
+                Err(SpaceError::Unavailable { .. }) => {}
+                Err(SpaceError::Kernel(err)) => return Err(EngineError::Rejected(err)),
+            }
+        }
+
         let next_seq = state.next_seq.unwrap_or(DeviceSeq(1));
         let scan_from = state.oplog.keys().next().copied().unwrap_or(next_seq);
         Ok(Self {
@@ -264,9 +324,6 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
             device,
             next_seq,
             scan_from,
-            confirmed: BTreeSet::new(),
-            acked_through: None,
-            fault: None,
             push_cap: DEFAULT_PUSH_CAP,
         })
     }
@@ -282,28 +339,31 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         self.device
     }
 
-    /// The standing conviction, if a push stalled and nothing has
-    /// resolved it yet.
-    pub fn fault(&self) -> Option<&Fault> {
-        self.fault.as_ref()
+    /// Whether a held lease may be presented right now — the hybrid
+    /// expiry rule, with the TTL-proportional margin on the wall
+    /// fallback. Zero stamps (a poisoned open's leftovers) are never
+    /// live.
+    fn lease_live(&self, held: &HeldLease, now: &HybridTimestamp) -> bool {
+        !held.deadline.expired(now, lease_margin(held.lease.ttl))
     }
 
-    /// The held leases covering `prefixes`, joined with this
-    /// incarnation's confirmation bits — what a caller inspects to
-    /// decide what to renew.
+    /// The held leases covering `prefixes`, judged against the clock —
+    /// what a caller inspects to decide what to renew.
     pub async fn leases(
         &self,
         space: SpaceId,
         prefixes: &[Key],
     ) -> Result<Vec<LeaseState>, EngineError> {
+        let now = self.clock.stamp();
+        let watermark = self.store.watermark(space).await?;
         Ok(self
             .store
             .leases_covering(space, prefixes)
             .await?
             .into_iter()
             .map(|held| {
-                let confirmed = self.confirmed.contains(&(space, held.lease.id));
-                LeaseState { held, confirmed }
+                let live = self.lease_usable(&held, &now, watermark);
+                LeaseState { held, live }
             })
             .collect())
     }
@@ -315,6 +375,7 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         space: SpaceId,
         entries: Vec<(Key, Value)>,
     ) -> Result<Committed, EngineError> {
+        self.check_local_write_authority(space, &entries).await?;
         let committed = self.store.commit(space, entries).await?;
         self.next_seq = DeviceSeq(committed.seq.0 + 1);
         Ok(committed)
@@ -323,14 +384,14 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
     /// Ensure the leases — the idempotent verb call sites actually want.
     /// Three tiers, cheapest first:
     ///
-    /// 1. a spec covered by a confirmed, locally-live held lease (prefix
-    ///    covers, mode adequate — a held write satisfies a read spec) is
-    ///    answered from the store, no wire;
-    /// 2. a spec covered by a held lease that is *not* currently live
-    ///    here (unconfirmed after a resume, or past its local deadline)
-    ///    is revived by renewal — same lease, same fence; the kernel
-    ///    treats a same-device re-acquire as contention, so renewal is
-    ///    the only correct revival;
+    /// 1. a spec covered by a live held lease (prefix covers, mode
+    ///    adequate — a held write satisfies a read spec) is answered
+    ///    from the store, no wire;
+    /// 2. a spec covered by a held lease that is *not* live (expired,
+    ///    inside the margin, or zero-stamped by a poisoned open) is
+    ///    revived by renewal — same lease, same fence; the kernel treats
+    ///    a same-device re-acquire as contention, so renewal is the only
+    ///    correct revival;
     /// 3. only genuinely uncovered specs go to wire acquire (leases the
     ///    renewal reported invalid land here too).
     ///
@@ -342,17 +403,25 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         steal: bool,
     ) -> Result<Acquired, EngineError> {
         if specs.is_empty() {
-            return Ok(Acquired { leases: vec![], barrier: None });
+            return Ok(Acquired {
+                leases: vec![],
+                barrier: None,
+            });
         }
 
         // Tier 2 first: revive coverage that renewal can restore.
         let queried: Vec<Key> = specs.iter().map(|spec| spec.prefix.clone()).collect();
-        let now = self.clock.now();
+        let now = self.clock.stamp();
         let held = self.store.leases_covering(space, &queried).await?;
+        let watermark = self.store.watermark(space).await?;
         let mut revive: Vec<LeaseId> = specs
             .iter()
-            .filter(|spec| self.live_covering(&held, space, spec, now).is_none())
-            .filter_map(|spec| held.iter().find(|h| covers(h, spec)).map(|h| h.lease.id))
+            .filter(|spec| self.usable_covering(&held, spec, &now, watermark).is_none())
+            .filter_map(|spec| {
+                held.iter()
+                    .find(|h| !h.retiring && covers(h, spec) && h.barrier.is_none())
+                    .map(|h| h.lease.id)
+            })
             .collect();
         revive.sort_unstable();
         revive.dedup();
@@ -361,11 +430,16 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         }
 
         // Tiers 1 and 3 against refreshed truth.
-        let send = self.clock.now();
+        let send = self.clock.stamp();
         let held = self.store.leases_covering(space, &queried).await?;
+        let watermark = self.store.watermark(space).await?;
         let mut satisfied: Vec<Option<Lease>> = specs
             .iter()
-            .map(|spec| self.live_covering(&held, space, spec, send).cloned())
+            .map(|spec| {
+                self.usable_covering(&held, spec, &send, watermark)
+                    .or_else(|| pending_barrier_covering(&held, spec, &send))
+                    .cloned()
+            })
             .collect();
         let missing: Vec<LeaseSpec> = specs
             .iter()
@@ -375,25 +449,36 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
             .collect();
         if missing.is_empty() {
             let leases = satisfied.into_iter().flatten().collect();
-            return Ok(Acquired { leases, barrier: None });
+            return Ok(Acquired {
+                leases,
+                barrier: max_pending_barrier(&held, &specs, &send, watermark),
+            });
         }
 
         let response = self
             .server
-            .acquire(&space, AcquireRequest { device: self.device, specs: missing, steal })
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: self.device,
+                    specs: missing,
+                    steal,
+                },
+            )
             .await?;
+        let watermark = self.store.watermark(space).await?;
         let fresh: Vec<HeldLease> = response
             .leases
             .iter()
             .map(|lease| HeldLease {
                 lease: lease.clone(),
                 deadline: send.saturating_add(lease.ttl),
+                barrier: pending_barrier(response.barrier, watermark),
+                retiring: false,
             })
             .collect();
+        self.store.record_clock(send.wall).await?;
         self.store.record_leases(space, &fresh).await?;
-        for held in &fresh {
-            self.confirmed.insert((space, held.lease.id));
-        }
 
         let mut granted = response.leases.into_iter();
         for slot in &mut satisfied {
@@ -401,9 +486,11 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
                 *slot = Some(granted.next().expect("grants parallel to missing specs"));
             }
         }
+        let existing_barrier = max_pending_barrier(&held, &specs, &send, watermark);
+        let fresh_barrier = pending_barrier(response.barrier, watermark);
         Ok(Acquired {
             leases: satisfied.into_iter().flatten().collect(),
-            barrier: Some(response.barrier),
+            barrier: existing_barrier.max(fresh_barrier),
         })
     }
 
@@ -424,7 +511,11 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         } else {
             self.store.leases_covering(space, prefixes).await?
         };
-        let ids: Vec<LeaseId> = held.iter().map(|h| h.lease.id).collect();
+        let ids: Vec<LeaseId> = held
+            .iter()
+            .filter(|held| !held.retiring)
+            .map(|h| h.lease.id)
+            .collect();
         self.renew_ids(space, &ids, &held).await
     }
 
@@ -437,12 +528,21 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         held: &[HeldLease],
     ) -> Result<RenewResponse, EngineError> {
         if ids.is_empty() {
-            return Ok(RenewResponse { granted: vec![], invalid: vec![] });
+            return Ok(RenewResponse {
+                granted: vec![],
+                invalid: vec![],
+            });
         }
-        let send = self.clock.now();
+        let send = self.clock.stamp();
         let response = self
             .server
-            .renew(&space, RenewRequest { device: self.device, leases: ids.to_vec() })
+            .renew(
+                &space,
+                RenewRequest {
+                    device: self.device,
+                    leases: ids.to_vec(),
+                },
+            )
             .await?;
         if !response.granted.is_empty() {
             let refreshed: Vec<HeldLease> = response
@@ -459,16 +559,11 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
                     held
                 })
                 .collect();
+            self.store.record_clock(send.wall).await?;
             self.store.record_leases(space, &refreshed).await?;
-            for held in &refreshed {
-                self.confirmed.insert((space, held.lease.id));
-            }
         }
         if !response.invalid.is_empty() {
             self.store.drop_leases(space, &response.invalid).await?;
-            for id in &response.invalid {
-                self.confirmed.remove(&(space, *id));
-            }
         }
         Ok(response)
     }
@@ -481,22 +576,26 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         if ids.is_empty() {
             return Ok(());
         }
+        self.store.retire_leases(space, ids).await?;
         self.server
-            .release(&space, ReleaseRequest { device: self.device, leases: ids.to_vec() })
+            .release(
+                &space,
+                ReleaseRequest {
+                    device: self.device,
+                    leases: ids.to_vec(),
+                },
+            )
             .await?;
         self.store.drop_leases(space, ids).await?;
-        for id in ids {
-            self.confirmed.remove(&(space, *id));
-        }
         Ok(())
     }
 
-    /// Pull a consistent cut of `prefixes` since the space's watermark
-    /// (`None` watermark → snapshot), then advance the watermark to the
+    /// Pull a consistent cut of `prefixes` since the space's whole-space watermark
+    /// (`None` whole-space watermark → snapshot), then advance the whole-space watermark to the
     /// cut and the ver high-water past every ver the cut carried — the
     /// acquire-barrier half of what makes blind Lamport stamping safe.
     ///
-    /// The watermark is one cursor per space: callers pull a stable
+    /// The whole-space watermark is one cursor per space: callers pull a stable
     /// prefix set (their shape), not ad-hoc subsets.
     pub async fn pull(
         &mut self,
@@ -506,9 +605,15 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
         let since = self.store.watermark(space).await?;
         let ranges = prefixes
             .iter()
-            .map(|prefix| PrefixCursor { prefix: prefix.clone(), since })
+            .map(|prefix| PrefixCursor {
+                prefix: prefix.clone(),
+                since,
+            })
             .collect();
-        let response = self.server.read_at(&space, ReadAtRequest { ranges }).await?;
+        let response = self
+            .server
+            .read_at(&space, ReadAtRequest { ranges })
+            .await?;
         let ver_seen = response
             .ranges
             .iter()
@@ -518,7 +623,9 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
             })
             .max()
             .unwrap_or(Ver(0));
-        self.store.advance_watermark(space, response.at, ver_seen).await?;
+        self.store
+            .advance_watermark(space, response.at, ver_seen)
+            .await?;
         Ok(response)
     }
 
@@ -538,7 +645,9 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
             // cap-sized seq window at a time. An empty window is a legal
             // gap (a discard's shadow), not the end.
             if self.scan_from >= self.next_seq {
-                return Ok(PushOutcome::Drained { acked_through: acked });
+                return Ok(PushOutcome::Drained {
+                    acked_through: acked,
+                });
             }
             let until = DeviceSeq(
                 self.scan_from
@@ -601,12 +710,9 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
                         probe = true;
                         continue;
                     }
-                    let fault =
-                        Fault { at: head, error, healthy_through: self.acked_through };
-                    self.fault = Some(fault.clone());
                     return Ok(PushOutcome::Stalled {
-                        at: fault.at,
-                        error: fault.error,
+                        at: head,
+                        error,
                         acked_through: acked,
                     });
                 }
@@ -619,69 +725,140 @@ impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
 
     /// Rollback: drop every queued commit with seq ≥ `from` — the
     /// resolution for a convicted head the caller chooses not to repair.
-    /// Later commits fall with it (they may have read what it wrote);
-    /// clears a covered [`Fault`]. The seq counter never rewinds, so the
-    /// queue may carry a gap afterwards — legal everywhere.
+    /// Later commits fall with it (they may have read what it wrote).
+    /// The seq counter never rewinds, so the queue may carry a gap
+    /// afterwards — legal everywhere.
     pub async fn discard_from(&mut self, from: DeviceSeq) -> Result<(), EngineError> {
         self.store.discard_from(from).await?;
-        if self.fault.as_ref().is_some_and(|fault| fault.at >= from) {
-            self.fault = None;
-        }
         Ok(())
     }
 
     /// Acknowledged through `through`: trim durably, advance the scan
-    /// bound, record the progress. Progress also clears any standing
-    /// fault — the queue has moved past whatever was convicted.
+    /// bound.
     async fn ack(&mut self, through: DeviceSeq) -> Result<(), EngineError> {
         self.store.trim_oplog(through).await?;
         self.scan_from = DeviceSeq(self.scan_from.0.max(through.0 + 1));
-        self.acked_through = Some(self.acked_through.map_or(through, |a| a.max(through)));
-        self.fault = None;
         Ok(())
     }
 
+    async fn check_local_write_authority(
+        &self,
+        space: SpaceId,
+        entries: &[(Key, Value)],
+    ) -> Result<(), EngineError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<Key> = entries.iter().map(|(key, _)| key.clone()).collect();
+        let held = self.store.leases_covering(space, &keys).await?;
+        let watermark = self.store.watermark(space).await?;
+        let now = self.clock.stamp();
+        for key in keys {
+            let covered = held.iter().any(|held| {
+                held.lease.mode == LeaseMode::Write
+                    && key.starts_with(&held.lease.prefix)
+                    && self.lease_usable(held, &now, watermark)
+            });
+            if !covered {
+                return Err(EngineError::LocalAuthority { key });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a held lease is usable as local authority right now:
+    /// unretired, live under the hybrid expiry rule, and past its
+    /// whole-space acquire barrier.
+    fn lease_usable(
+        &self,
+        held: &HeldLease,
+        now: &HybridTimestamp,
+        watermark: Option<AdmissionSeq>,
+    ) -> bool {
+        !held.retiring && self.lease_live(held, now) && barrier_satisfied(held.barrier, watermark)
+    }
+
     /// The held lease (if any) that satisfies `spec` right now:
-    /// covering, confirmed this incarnation, local deadline unexpired.
-    fn live_covering<'a>(
+    /// covering, live, unretired, and barrier-satisfied.
+    fn usable_covering<'a>(
         &self,
         held: &'a [HeldLease],
-        space: SpaceId,
         spec: &LeaseSpec,
-        now: Timestamp,
+        now: &HybridTimestamp,
+        watermark: Option<AdmissionSeq>,
     ) -> Option<&'a Lease> {
         held.iter()
-            .filter(|h| self.confirmed.contains(&(space, h.lease.id)))
-            .filter(|h| now < h.deadline)
+            .filter(|h| self.lease_usable(h, now, watermark))
             .find(|h| covers(h, spec))
             .map(|h| &h.lease)
     }
 
     /// The lease refs a put over `keys` may present *right now*:
-    /// covering, write mode, confirmed this incarnation, local deadline
-    /// unexpired. Presenting nothing when coverage lapsed is deliberate —
-    /// the kernel's `NotCovered` is the signal to re-acquire, and a
-    /// locally-expired lease must never back a write (the two-clock
-    /// rule).
+    /// covering, write mode, deadline clear of the margin. Presenting
+    /// nothing when coverage lapsed is deliberate — the kernel's
+    /// `NotCovered` is the signal to re-acquire, and an expired or
+    /// margin-dead lease must never back a write (the two-clock rule).
     async fn live_write_leases(
         &self,
         space: SpaceId,
         keys: &[Key],
     ) -> Result<Vec<LeaseRef>, EngineError> {
-        let now = self.clock.now();
+        let now = self.clock.stamp();
+        let watermark = self.store.watermark(space).await?;
         Ok(self
             .store
             .leases_covering(space, keys)
             .await?
             .into_iter()
             .filter(|held| {
-                held.lease.mode == LeaseMode::Write
-                    && self.confirmed.contains(&(space, held.lease.id))
-                    && now < held.deadline
+                held.lease.mode == LeaseMode::Write && self.lease_usable(held, &now, watermark)
             })
-            .map(|held| LeaseRef { id: held.lease.id, epoch: held.lease.epoch })
+            .map(|held| LeaseRef {
+                id: held.lease.id,
+                epoch: held.lease.epoch,
+            })
             .collect())
     }
+}
+
+fn barrier_satisfied(barrier: Option<AdmissionSeq>, watermark: Option<AdmissionSeq>) -> bool {
+    barrier.is_none_or(|barrier| watermark.unwrap_or(AdmissionSeq(0)) >= barrier)
+}
+
+fn pending_barrier(barrier: AdmissionSeq, watermark: Option<AdmissionSeq>) -> Option<AdmissionSeq> {
+    (!barrier_satisfied(Some(barrier), watermark)).then_some(barrier)
+}
+
+fn pending_barrier_covering<'a>(
+    held: &'a [HeldLease],
+    spec: &LeaseSpec,
+    now: &HybridTimestamp,
+) -> Option<&'a Lease> {
+    held.iter()
+        .filter(|held| !held.retiring && held.barrier.is_some())
+        .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
+        .find(|held| covers(held, spec))
+        .map(|held| &held.lease)
+}
+
+fn max_pending_barrier(
+    held: &[HeldLease],
+    specs: &[LeaseSpec],
+    now: &HybridTimestamp,
+    watermark: Option<AdmissionSeq>,
+) -> Option<AdmissionSeq> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            held.iter()
+                .filter(|held| !held.retiring && held.barrier.is_some())
+                .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
+                .filter(|held| covers(held, spec))
+                .filter_map(|held| held.barrier)
+                .filter(|barrier| !barrier_satisfied(Some(*barrier), watermark))
+                .max()
+        })
+        .max()
 }
 
 /// Whether a held lease answers a spec: its prefix covers the requested
@@ -693,5 +870,8 @@ fn covers(held: &HeldLease, spec: &LeaseSpec) -> bool {
 /// Whether a held lease's mode satisfies a requested one: write covers
 /// everything it excludes others from; read covers only read.
 fn mode_covers(held: LeaseMode, want: LeaseMode) -> bool {
-    matches!((held, want), (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read))
+    matches!(
+        (held, want),
+        (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read)
+    )
 }

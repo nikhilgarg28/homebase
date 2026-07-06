@@ -273,7 +273,10 @@ mod tests {
 
     #[test]
     fn encode_golden() {
-        assert_eq!(key(&[b"a\x00b"]).encode(), [0x61, 0x00, 0x01, 0x62, 0x00, 0x00]);
+        assert_eq!(
+            key(&[b"a\x00b"]).encode(),
+            [0x61, 0x00, 0x01, 0x62, 0x00, 0x00]
+        );
         assert_eq!(key(&[b"a", b""]).encode(), [0x61, 0x00, 0x00, 0x00, 0x00]);
     }
 
@@ -304,7 +307,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_malformed_input() {
-        assert_eq!(Key::decode(&[]).unwrap_err(), DecodeError::InvalidKey(KeyError::Empty));
+        assert_eq!(
+            Key::decode(&[]).unwrap_err(),
+            DecodeError::InvalidKey(KeyError::Empty)
+        );
         assert_eq!(Key::decode(&[0x61]).unwrap_err(), DecodeError::Truncated);
         assert_eq!(Key::decode(&[0x00]).unwrap_err(), DecodeError::Truncated);
         assert_eq!(
@@ -313,7 +319,10 @@ mod tests {
         );
         assert_eq!(
             Key::decode(&[0x00, 0x02, 0x00, 0x00]).unwrap_err(),
-            DecodeError::InvalidEscape { offset: 0, byte: 0x02 }
+            DecodeError::InvalidEscape {
+                offset: 0,
+                byte: 0x02
+            }
         );
     }
 }

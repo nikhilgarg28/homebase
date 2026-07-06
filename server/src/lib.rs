@@ -137,7 +137,10 @@ mod tests {
 
     fn server(
         pool: &LocalPool,
-    ) -> (Server<MemoryStore, ManualClock, CountingSpawner>, Rc<Cell<usize>>) {
+    ) -> (
+        Server<MemoryStore, ManualClock, CountingSpawner>,
+        Rc<Cell<usize>>,
+    ) {
         let count = Rc::new(Cell::new(0));
         let spawner = CountingSpawner {
             inner: pool.spawner(),
@@ -196,7 +199,9 @@ mod tests {
 
     async fn read_marker(handle: &SpaceHandle) -> Option<Vec<u8>> {
         let got = handle
-            .get(GetRequest { keys: vec![key(&[b"db", b"marker"])] })
+            .get(GetRequest {
+                keys: vec![key(&[b"db", b"marker"])],
+            })
             .await
             .unwrap();
         got.entries[0].as_ref().map(|e| match &e.value {
@@ -216,7 +221,10 @@ mod tests {
         assert!(!server.create_space(a), "duplicate id must be rejected");
 
         assert!(server.space(&a).is_some());
-        assert!(server.space(&b).is_none(), "unregistered space must not route");
+        assert!(
+            server.space(&b).is_none(),
+            "unregistered space must not route"
+        );
     }
 
     #[test]
@@ -253,7 +261,11 @@ mod tests {
             let seq_a = write_marker(&ha, b"from-a").await;
             let seq_b = write_marker(&hb, b"from-b").await;
             assert_eq!(seq_a, AdmissionSeq(1));
-            assert_eq!(seq_b, AdmissionSeq(1), "admission sequences must not couple");
+            assert_eq!(
+                seq_b,
+                AdmissionSeq(1),
+                "admission sequences must not couple"
+            );
 
             assert_eq!(read_marker(&ha).await, Some(b"from-a".to_vec()));
             assert_eq!(read_marker(&hb).await, Some(b"from-b".to_vec()));

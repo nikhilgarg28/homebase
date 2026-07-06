@@ -75,7 +75,10 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         let data_record = data
             .get(&key)
             .unwrap_or_else(|| panic!("changelog entry without data record: {key:?}"));
-        assert_eq!(&record, data_record, "changelog bytes diverge from data at {key:?}");
+        assert_eq!(
+            &record, data_record,
+            "changelog bytes diverge from data at {key:?}"
+        );
         assert_eq!(
             seq, record.tag.admission_seq.0,
             "changelog position diverges from record tag at {key:?}"
@@ -121,7 +124,11 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
 
     let mut epochs = BTreeSet::new();
     for rec in by_id.values() {
-        assert!(epochs.insert(rec.epoch.0), "duplicate epoch {:?}", rec.epoch);
+        assert!(
+            epochs.insert(rec.epoch.0),
+            "duplicate epoch {:?}",
+            rec.epoch
+        );
         assert!(
             rec.id.0 < counters.next_lease_id,
             "lease id {:?} not below counter {}",

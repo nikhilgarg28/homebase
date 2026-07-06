@@ -2,14 +2,14 @@
 //!
 //! Layer 3 (slatedb + fault object store) lives in `persist_crash_torture.rs`.
 
+use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::messages::GetRequest;
 use homebase_core::space::Space as _;
-use homebase_sim::crash::{self, sim, user_key, SPACE};
+use homebase_server::actor::SpaceActor;
+use homebase_sim::crash::{self, SPACE, sim, user_key};
 use homebase_sim::exec::SimExecutor;
 use homebase_sim::seeds;
 use homebase_sim::store::{FaultConfig, SimStore};
-use homebase_core::clock::{ManualClock, Timestamp};
-use homebase_server::actor::SpaceActor;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,14 +24,26 @@ fn crash_torture_seeds_hold_invariants() {
         total.acked_writes_lost += coverage.acked_writes_lost;
         total.unavailable += coverage.unavailable;
     }
-    println!("coverage across {} seeds: {total:?}", seeds::torture_seed_count());
+    println!(
+        "coverage across {} seeds: {total:?}",
+        seeds::torture_seed_count()
+    );
     if !seeds::torture_coverage_enforced() {
         return;
     }
-    assert!(total.lease_invalid > 0, "no lost-lease recoveries: {total:?}");
+    assert!(
+        total.lease_invalid > 0,
+        "no lost-lease recoveries: {total:?}"
+    );
     assert!(total.seq_regression > 0, "no replay-fence hits: {total:?}");
-    assert!(total.acked_writes_lost > 0, "no acked-write loss: {total:?}");
-    assert!(total.unavailable > 0, "no unavailability observed: {total:?}");
+    assert!(
+        total.acked_writes_lost > 0,
+        "no acked-write loss: {total:?}"
+    );
+    assert!(
+        total.unavailable > 0,
+        "no unavailability observed: {total:?}"
+    );
 }
 
 #[test]

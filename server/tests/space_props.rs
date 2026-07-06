@@ -22,8 +22,8 @@ use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PrefixCursor,
-    PutBatchRequest, PutEntry, ReadAtRequest, RangeCut,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PrefixCursor, PutBatchRequest,
+    PutEntry, RangeCut, ReadAtRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -62,7 +62,10 @@ fn user_key(d: usize, suffix: usize) -> Key {
 enum Cmd {
     /// Valid batch: fresh device_seq, strictly increasing vers.
     /// `(suffix, tombstone)` — duplicate suffixes exercise intra-batch order.
-    Put { device: usize, writes: Vec<(usize, bool)> },
+    Put {
+        device: usize,
+        writes: Vec<(usize, bool)>,
+    },
     /// Reuses the stored ver for a written key → whole batch rejected.
     PutVerRegression { device: usize, suffix: usize },
     /// Replays the device's last device_seq → whole batch rejected.
@@ -161,9 +164,16 @@ impl Harness {
                 },
             ))
             .unwrap();
-            leases.push(LeaseRef { id: resp.leases[0].id, epoch: resp.leases[0].epoch });
+            leases.push(LeaseRef {
+                id: resp.leases[0].id,
+                epoch: resp.leases[0].epoch,
+            });
         }
-        Self { space, store, leases }
+        Self {
+            space,
+            store,
+            leases,
+        }
     }
 
     fn put(
@@ -206,7 +216,11 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
     // list: full scan agrees with the model, in key order.
     let full = block_on(h.space.list(
         &h.store,
-        &ListRequest { prefix: dev_prefix(device), start_after: None, limit: None },
+        &ListRequest {
+            prefix: dev_prefix(device),
+            start_after: None,
+            limit: None,
+        },
     ))
     .unwrap();
     prop_assert!(!full.truncated);
@@ -214,7 +228,9 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
         .entries
         .iter()
         .map(|e| {
-            let Value::Present(v) = &e.value else { panic!("tombstone in list") };
+            let Value::Present(v) = &e.value else {
+                panic!("tombstone in list")
+            };
             (e.key.clone(), v.clone())
         })
         .collect();
@@ -230,14 +246,20 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
     loop {
         let page = block_on(h.space.list(
             &h.store,
-            &ListRequest { prefix: dev_prefix(device), start_after: cursor.clone(), limit: Some(1) },
+            &ListRequest {
+                prefix: dev_prefix(device),
+                start_after: cursor.clone(),
+                limit: Some(1),
+            },
         ))
         .unwrap();
         prop_assert!(page.entries.len() <= 1);
         match page.entries.into_iter().next() {
             Some(e) => {
                 cursor = Some(e.key.clone());
-                let Value::Present(v) = e.value else { panic!("tombstone in list") };
+                let Value::Present(v) = e.value else {
+                    panic!("tombstone in list")
+                };
                 paged.push((e.key, v));
             }
             None => {
@@ -270,15 +292,16 @@ fn check_aggregates(store: &MemoryStore) -> Result<(), TestCaseError> {
         }
     }
 
-    let stored: BTreeMap<Vec<u8>, (u64, u64)> =
-        block_on(collect_scan(store.scan_prefix(&prefix_meta_scan_all(SPACE))))
-            .unwrap()
-            .into_iter()
-            .map(|(k, v)| {
-                let rec = PrefixMetaRecord::decode(&v).unwrap();
-                (k, (rec.max_admission_seq, rec.live_count))
-            })
-            .collect();
+    let stored: BTreeMap<Vec<u8>, (u64, u64)> = block_on(collect_scan(
+        store.scan_prefix(&prefix_meta_scan_all(SPACE)),
+    ))
+    .unwrap()
+    .into_iter()
+    .map(|(k, v)| {
+        let rec = PrefixMetaRecord::decode(&v).unwrap();
+        (k, (rec.max_admission_seq, rec.live_count))
+    })
+    .collect();
     prop_assert_eq!(&stored, &expected, "aggregates diverged from data records");
     Ok(())
 }
@@ -292,18 +315,27 @@ fn sync_replica(
     let resp = block_on(h.space.read_at(
         &h.store,
         &ReadAtRequest {
-            ranges: vec![PrefixCursor { prefix: dev_prefix(device), since: replica.cursor }],
+            ranges: vec![PrefixCursor {
+                prefix: dev_prefix(device),
+                since: replica.cursor,
+            }],
         },
     ))
     .unwrap();
-    prop_assert_eq!(resp.at, AdmissionSeq(model.high_water), "cut is the high water");
+    prop_assert_eq!(
+        resp.at,
+        AdmissionSeq(model.high_water),
+        "cut is the high water"
+    );
 
     match (&replica.cursor, &resp.ranges[0]) {
         (None, RangeCut::Snapshot(entries)) => {
             replica.state = entries
                 .iter()
                 .map(|e| {
-                    let Value::Present(v) = &e.value else { panic!("tombstone in snapshot") };
+                    let Value::Present(v) = &e.value else {
+                        panic!("tombstone in snapshot")
+                    };
                     (e.key.clone(), v.clone())
                 })
                 .collect();
@@ -311,8 +343,10 @@ fn sync_replica(
         (Some(since), RangeCut::Delta(entries)) => {
             // Ordered by (admission_seq, key), each key at most once, all
             // strictly after the cursor.
-            let positions: Vec<(u64, &Key)> =
-                entries.iter().map(|e| (e.tag.admission_seq.0, &e.key)).collect();
+            let positions: Vec<(u64, &Key)> = entries
+                .iter()
+                .map(|e| (e.tag.admission_seq.0, &e.key))
+                .collect();
             prop_assert!(positions.windows(2).all(|w| w[0] < w[1]), "delta order");
             prop_assert!(entries.iter().all(|e| e.tag.admission_seq > *since));
             let mut keys: Vec<&Key> = entries.iter().map(|e| &e.key).collect();

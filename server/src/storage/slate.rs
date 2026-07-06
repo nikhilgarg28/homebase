@@ -77,7 +77,10 @@ impl SlateStore {
     /// Persists memtable + WAL to the object store (phase boundary / clean
     /// shutdown in torture tests).
     pub async fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().await.map_err(|e| StorageError(e.to_string()))
+        self.db
+            .flush()
+            .await
+            .map_err(|e| StorageError(e.to_string()))
     }
 
     /// Closes the database cleanly. Fails if other clones still exist.
@@ -122,11 +125,7 @@ async fn collect_range(
             .map_err(|e| StorageError(e.to_string()))?,
     };
     let mut out = Vec::new();
-    while let Some(kv) = iter
-        .next()
-        .await
-        .map_err(|e| StorageError(e.to_string()))?
-    {
+    while let Some(kv) = iter.next().await.map_err(|e| StorageError(e.to_string()))? {
         out.push((kv.key.to_vec(), kv.value.to_vec()));
     }
     Ok(out)
@@ -134,7 +133,8 @@ async fn collect_range(
 
 struct SlateScanInner {
     entries: Option<Vec<(Vec<u8>, Vec<u8>)>>,
-    init: Option<Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>> + Send>>>,
+    init:
+        Option<Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>> + Send>>>,
     position: usize,
 }
 
@@ -209,7 +209,11 @@ impl OrderedStore for SlateStore {
         let db = Arc::clone(&self.db);
         let key = key.to_vec();
         async move {
-            match db.get(&key).await.map_err(|e| StorageError(e.to_string()))? {
+            match db
+                .get(&key)
+                .await
+                .map_err(|e| StorageError(e.to_string()))?
+            {
                 Some(bytes) => Ok(Some(bytes.to_vec())),
                 None => Ok(None),
             }
@@ -220,10 +224,7 @@ impl OrderedStore for SlateStore {
         SlateScan::new(Arc::clone(&self.db), start, end)
     }
 
-    fn apply(
-        &self,
-        batch: WriteBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    fn apply(&self, batch: WriteBatch) -> impl Future<Output = Result<(), StorageError>> + Send {
         let db = Arc::clone(&self.db);
         async move {
             if batch.is_empty() {

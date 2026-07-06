@@ -186,11 +186,7 @@ pub fn lease_by_prefix_key(space: SpaceId, prefix: &Key, id: LeaseId) -> Vec<u8>
 /// with the first `head_len` components of `head`. With `head_len ==
 /// depth` this is the exact-at-prefix query; with `head_len < depth` it is
 /// the descendants-at-depth query.
-pub fn lease_by_prefix_scan(
-    space: SpaceId,
-    depth: usize,
-    head: &[KeyComponent],
-) -> Vec<u8> {
+pub fn lease_by_prefix_scan(space: SpaceId, depth: usize, head: &[KeyComponent]) -> Vec<u8> {
     let mut components = vec![
         space_component(space),
         RecordKind::LeaseByPrefix.component(),
@@ -288,7 +284,16 @@ impl LeaseRecord {
         let deadline = Timestamp(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
         let prefix = Key::decode(r.rest()).ok()?;
-        Some(Self { id, prefix, mode, device, epoch, deadline, ttl, stealable })
+        Some(Self {
+            id,
+            prefix,
+            mode,
+            device,
+            epoch,
+            deadline,
+            ttl,
+            stealable,
+        })
     }
 }
 
@@ -434,7 +439,9 @@ impl DeviceRecord {
         if r.u8()? != DEVICE_RECORD_VERSION {
             return None;
         }
-        Some(Self { last_seq: DeviceSeq(r.u64()?) })
+        Some(Self {
+            last_seq: DeviceSeq(r.u64()?),
+        })
     }
 }
 
@@ -492,13 +499,19 @@ mod tests {
     fn lease_record_roundtrips() {
         let rec = sample_lease();
         assert_eq!(LeaseRecord::decode(&rec.encode()), Some(rec));
-        let stealable = LeaseRecord { stealable: true, ..sample_lease() };
+        let stealable = LeaseRecord {
+            stealable: true,
+            ..sample_lease()
+        };
         assert_eq!(LeaseRecord::decode(&stealable.encode()), Some(stealable));
     }
 
     #[test]
     fn prefix_meta_record_roundtrips() {
-        let rec = PrefixMetaRecord { max_admission_seq: 17, live_count: 4 };
+        let rec = PrefixMetaRecord {
+            max_admission_seq: 17,
+            live_count: 4,
+        };
         assert_eq!(PrefixMetaRecord::decode(&rec.encode()), Some(rec));
     }
 
@@ -535,15 +548,23 @@ mod tests {
             ver: Ver(11),
             admission_seq: AdmissionSeq(99),
         };
-        let present = DataRecord { tag: tag.clone(), value: Value::Present(b"ct".to_vec()) };
+        let present = DataRecord {
+            tag: tag.clone(),
+            value: Value::Present(b"ct".to_vec()),
+        };
         assert_eq!(DataRecord::decode(&present.encode()), Some(present));
-        let tombstone = DataRecord { tag, value: Value::Absent };
+        let tombstone = DataRecord {
+            tag,
+            value: Value::Absent,
+        };
         assert_eq!(DataRecord::decode(&tombstone.encode()), Some(tombstone));
     }
 
     #[test]
     fn device_record_roundtrips() {
-        let rec = DeviceRecord { last_seq: DeviceSeq(41) };
+        let rec = DeviceRecord {
+            last_seq: DeviceSeq(41),
+        };
         assert_eq!(DeviceRecord::decode(&rec.encode()), Some(rec));
     }
 

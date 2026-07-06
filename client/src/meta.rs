@@ -44,13 +44,16 @@
 //! direct puts with queued commits on one device id would interleave the
 //! stream); storeless engine-tier consumers are separate devices.
 //!
-//! **Two cursors, two directions — they never meet.** The watermark is
-//! the *pull* cursor: per space, in the server's `AdmissionSeq` domain —
-//! "synced down through here." Trim is *push* acknowledgment:
+//! **Two cursors, two directions — they never meet.** The whole-space
+//! whole-space watermark is the *pull* cursor: per space, in the server's
+//! `AdmissionSeq` domain — "the stable space shape has synced down
+//! through here." Trim is *push* acknowledgment:
 //! client-level, in the device's own `DeviceSeq` domain — "the server
 //! admitted my queue through here, drop the prefix." Different sequence
 //! spaces, never compared: a write-only client trims forever without a
-//! watermark; a read-only one advances watermarks without ever trimming.
+//! whole-space watermark; a read-only one advances whole-space watermarks without ever trimming.
+//! Prefix/shape-specific cursors come later; until then callers must pull
+//! the stable full shape for a space before using a fresh acquire barrier.
 //!
 //! **Vers are assigned by the store: one Lamport high-water, no per-key
 //! table.** The protocol's per-key ver chains stay (the untrusted-server
@@ -74,10 +77,19 @@
 //! unexpected `DeviceSeqRegression` is proof of a fork, and the engine
 //! re-mints, resyncs, and requeues. Device ids are disposable by design.
 //!
-//! **Lease records carry no deadline.** Local deadlines die with the
-//! process's monotonic clock (asymmetric expiry), so a resumed lease is
-//! *unconfirmed* until a renewal succeeds; the record keeps exactly what
-//! that renewal needs.
+//! **Lease deadlines are hybrid stamps, and the clock high-water is
+//! their tripwire.** A deadline carries both rulers (wall + monotonic)
+//! and the lineage of the monotonic one: the stamping incarnation
+//! judges it precisely, any successor falls back to the wall reading
+//! with a margin — that is what lets a restarted client keep its
+//! offline authority without a round trip. The wall's one lie is the
+//! backward step, so the store keeps a [`ClockRecord`]: the highest
+//! wall send stamp ever recorded. An open that reads a wall clock
+//! *behind* the high-water knows the timeline regressed while it was
+//! dead — every stored deadline is suspect, and the engine zero-stamps
+//! them (a renewal re-stamps on the new timeline, which is
+//! automatically conservative). [`certify`] holds wall stamps to the
+//! high-water.
 //!
 //! # The oracle
 //!
@@ -88,7 +100,7 @@
 //! `load` obligation; [`conformance`] drives any implementation through
 //! the full transition lifecycle and certifies at every step.
 
-use homebase_core::clock::Timestamp;
+use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::PutEntry;
@@ -128,12 +140,23 @@ pub struct VerHighRecord {
     pub high: Ver,
 }
 
-/// The space watermark: the admission seq this replica has synced through.
+/// The whole-space watermark: the admission seq this replica's stable
+/// space shape has synced through.
 /// Absence is meaningful — no pull has completed, so the next one is a
 /// snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatermarkRecord {
     pub at: AdmissionSeq,
+}
+
+/// The wall-clock high-water: the highest send stamp this store has
+/// recorded. The backward-step tripwire — a fresh reading below it means
+/// the wall clock regressed while the client was down, and every lease
+/// stamp written before the step is suspect. Recorded (not maxed) so the
+/// engine can re-anchor after handling a poisoned open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockRecord {
+    pub high_water: Timestamp,
 }
 
 /// Cache of a space's sealed key bundle: ciphertext plus the space-key
@@ -145,20 +168,28 @@ pub struct CodecRecord {
     pub sealed: Vec<u8>,
 }
 
-/// A held grant with its local deadline, stamped at request-send on the
-/// injected clock. The deadline is stored but **never trusted across
-/// incarnations** — a fresh process's monotonic clock has a new origin,
-/// so loaded leases are *unconfirmed until a renewal succeeds* regardless
-/// of the stamp (it survives for introspection, and for durable-clock
-/// deployments to use conservatively later). Correctness never hangs on
-/// it: epochs fence writes, and owned-read authority is gated by
-/// confirmation.
+/// A held grant with its deadline: request-send + granted TTL, a
+/// [`HybridTimestamp`] — wall time, monotonic time, and the lineage of
+/// the monotonic ruler. The incarnation that stamped it judges it by
+/// the precise monotonic ruler (wall alongside, for suspend); any later
+/// incarnation falls back to the wall reading with a safety margin —
+/// which is what keeps offline authority across restarts. The clock
+/// high-water is the tripwire for wall regression: a poisoned open
+/// zeroes the stamp (structurally dead) until a renewal re-stamps it.
+/// Epochs remain the correctness backstop for writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldLease {
     pub lease: Lease,
-    /// Send time + granted TTL, on the clock of the incarnation that
-    /// heard the grant.
-    pub deadline: Timestamp,
+    /// Send time + granted TTL, stamped by the incarnation that heard
+    /// the grant.
+    pub deadline: HybridTimestamp,
+    /// Fresh acquires are not local authority until the whole-space
+    /// whole-space watermark has reached the grant's barrier. Renewals preserve this.
+    pub barrier: Option<AdmissionSeq>,
+    /// A release intent has been durably recorded. Retiring leases are
+    /// never local authority, but keep the id so the server release can
+    /// be retried after a crash.
+    pub retiring: bool,
 }
 
 /// One committed, unshipped batch in the single queue, keyed by the
@@ -192,6 +223,8 @@ pub struct ClientState {
     pub next_seq: Option<DeviceSeq>,
     /// The ver the next commit's entries will exceed.
     pub ver_high: Option<Ver>,
+    /// The wall-clock high-water (see [`ClockRecord`]).
+    pub clock_high: Option<Timestamp>,
     /// The one queue, keyed by wire seq; each record names its space.
     pub oplog: BTreeMap<DeviceSeq, CommitRecord>,
     pub spaces: BTreeMap<SpaceId, SpaceState>,
@@ -208,6 +241,10 @@ pub struct ClientState {
 ///    means a torn commit (the assignment and the entry are one atomic
 ///    transition).
 ///
+/// 3. when a clock high-water is recorded, every lease's send stamp
+///    (`deadline − ttl`) lies at or under it — a stamp past the
+///    high-water is a torn transition or a tampered timeline.
+///
 /// Queue seqs carry no density invariant: trims take a prefix and
 /// discards take a suffix, but the seq counter never rewinds, so a
 /// discard followed by new commits legally leaves a gap.
@@ -215,6 +252,22 @@ pub struct ClientState {
 /// Implementation-level integrity (key shapes, record decoding, index
 /// agreement) is each implementation's `load` obligation.
 pub fn certify(state: &ClientState) {
+    if let Some(high) = state.clock_high {
+        for (space, space_state) in &state.spaces {
+            for held in space_state.leases.values() {
+                let ttl = held.lease.ttl.as_millis().min(u64::MAX as u128) as u64;
+                let send = held.deadline.wall.0.saturating_sub(ttl);
+                assert!(
+                    send <= high.0,
+                    "lease {:?} in {space:?} stamped past the clock high-water: \
+                     send {send}, high {}",
+                    held.lease.id,
+                    high.0
+                );
+            }
+        }
+    }
+
     let mut last_ver: BTreeMap<(SpaceId, &Key), Ver> = BTreeMap::new();
     for record in state.oplog.values() {
         for entry in &record.entries {
@@ -232,16 +285,12 @@ pub fn certify(state: &ClientState) {
     }
 
     if let Some((max_seq, _)) = state.oplog.last_key_value() {
-        let next = state
-            .next_seq
-            .expect("queued commits require a seq record");
+        let next = state.next_seq.expect("queued commits require a seq record");
         assert!(
             next > *max_seq,
             "next_seq lags the oplog: next {next:?}, queued through {max_seq:?}"
         );
-        let high = state
-            .ver_high
-            .expect("queued commits require a ver record");
+        let high = state.ver_high.expect("queued commits require a ver record");
         let queued_high = state
             .oplog
             .values()
@@ -298,7 +347,7 @@ pub trait MetaStore {
         prefixes: &[Key],
     ) -> impl Future<Output = Result<Vec<HeldLease>, StorageError>> + Send;
 
-    /// One space's pull cursor.
+    /// One space's stable-shape pull cursor.
     fn watermark(
         &self,
         space: SpaceId,
@@ -307,10 +356,7 @@ pub trait MetaStore {
     // -- transitions: every method one atomic, durable step.
 
     /// Identity minted at first open (or re-minted after a suspected fork).
-    fn record_device(
-        &self,
-        id: DeviceId,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+    fn record_device(&self, id: DeviceId) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// A local commit: stamps the batch with the next `DeviceSeq` and its
     /// entries with consecutive vers above the high-water (in entry order
@@ -355,13 +401,22 @@ pub trait MetaStore {
         from: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// A pulled cut moves the sync point — and raises the ver high-water
-    /// to the maximum ver the cut carried, atomically with it.
+    /// A pulled stable-shape cut moves the sync point — and raises the ver
+    /// high-water to the maximum ver the cut carried, atomically with it.
     fn advance_watermark(
         &self,
         space: SpaceId,
         at: AdmissionSeq,
         ver_seen: Ver,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// The wall-clock high-water updates — written at open (re-anchor)
+    /// and at every lease stamp (advance). A plain overwrite on purpose:
+    /// recovering from a poisoned open must be able to *lower* it onto
+    /// the new timeline.
+    fn record_clock(
+        &self,
+        high: Timestamp,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Grants (or renewals) become durable — one atomic transition for
@@ -376,6 +431,14 @@ pub trait MetaStore {
         &self,
         space: SpaceId,
         leases: &[HeldLease],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Release intent: mark held leases unusable locally while retaining
+    /// enough information to retry the server release after a crash.
+    fn retire_leases(
+        &self,
+        space: SpaceId,
+        ids: &[LeaseId],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Released or refused leases are forgotten, atomically as a batch.
@@ -433,8 +496,9 @@ pub enum StoreNamespace {
 /// (Meta, Client, Device)               → DeviceRecord
 /// (Meta, Client, Seq)                  → SeqRecord
 /// (Meta, Client, Ver)                  → VerHighRecord
+/// (Meta, Client, Clock)                → ClockRecord
 /// (Meta, Client, Oplog, seq_be)        → CommitRecord
-/// (Meta, Space, id, Watermark)         → WatermarkRecord
+/// (Meta, Space, id, Watermark)         → WatermarkRecord (whole-space cursor)
 /// (Meta, Space, id, Codec)             → CodecRecord
 /// (Meta, Space, id, Lease, prefix)      → LeaseRecord
 /// ```
@@ -464,6 +528,7 @@ enum ClientKind {
     Seq = 1,
     Ver = 2,
     Oplog = 3,
+    Clock = 4,
 }
 
 /// Record kind under `(Meta, Space, id, …)`.
@@ -521,6 +586,10 @@ fn ver_key() -> Vec<u8> {
     encode_components(&client_kind(ClientKind::Ver))
 }
 
+fn clock_key() -> Vec<u8> {
+    encode_components(&client_kind(ClientKind::Clock))
+}
+
 fn oplog_scan() -> Vec<u8> {
     encode_components(&client_kind(ClientKind::Oplog))
 }
@@ -555,8 +624,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
 
         let mut out = ClientState::default();
         for (storage_key, bytes) in all {
-            let components =
-                decode_components(&storage_key).expect("undecodable storage key");
+            let components = decode_components(&storage_key).expect("undecodable storage key");
             let namespace = single_byte(&components, 0, "store namespace");
             assert_eq!(
                 namespace,
@@ -570,26 +638,31 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                     match kind {
                         k if k == ClientKind::Device as u8 => {
                             assert_eq!(components.len(), 3, "device key has no suffix");
-                            let record = DeviceRecord::decode(&bytes)
-                                .expect("undecodable device record");
+                            let record =
+                                DeviceRecord::decode(&bytes).expect("undecodable device record");
                             out.device = Some(record.id);
                         }
                         k if k == ClientKind::Seq as u8 => {
                             assert_eq!(components.len(), 3, "seq key has no suffix");
-                            let record =
-                                SeqRecord::decode(&bytes).expect("undecodable seq record");
+                            let record = SeqRecord::decode(&bytes).expect("undecodable seq record");
                             out.next_seq = Some(record.next);
                         }
                         k if k == ClientKind::Ver as u8 => {
                             assert_eq!(components.len(), 3, "ver key has no suffix");
-                            let record = VerHighRecord::decode(&bytes)
-                                .expect("undecodable ver record");
+                            let record =
+                                VerHighRecord::decode(&bytes).expect("undecodable ver record");
                             out.ver_high = Some(record.high);
+                        }
+                        k if k == ClientKind::Clock as u8 => {
+                            assert_eq!(components.len(), 3, "clock key has no suffix");
+                            let record =
+                                ClockRecord::decode(&bytes).expect("undecodable clock record");
+                            out.clock_high = Some(record.high_water);
                         }
                         k if k == ClientKind::Oplog as u8 => {
                             let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
-                            let record = CommitRecord::decode(&bytes)
-                                .expect("undecodable commit record");
+                            let record =
+                                CommitRecord::decode(&bytes).expect("undecodable commit record");
                             out.oplog.insert(seq, record);
                         }
                         other => panic!("unknown client record kind {other}"),
@@ -607,17 +680,15 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                     match kind {
                         k if k == SpaceKind::Watermark as u8 => {
                             let record = WatermarkRecord::decode(&bytes)
-                                .expect("undecodable watermark");
+                                .expect("undecodable whole-space watermark");
                             space.watermark = Some(record.at);
                         }
                         k if k == SpaceKind::Codec as u8 => {
-                            let record =
-                                CodecRecord::decode(&bytes).expect("undecodable codec");
+                            let record = CodecRecord::decode(&bytes).expect("undecodable codec");
                             space.codec = Some(record);
                         }
                         k if k == SpaceKind::Lease as u8 => {
-                            let record =
-                                HeldLease::decode(&bytes).expect("undecodable lease");
+                            let record = HeldLease::decode(&bytes).expect("undecodable lease");
                             assert_eq!(
                                 components
                                     .get(4)
@@ -649,8 +720,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         let end = homebase_core::storage::prefix_successor(&oplog_scan());
         let mut scan = self.store.scan(oplog_key(from), end);
         while let Some((storage_key, bytes)) = scan.next().await? {
-            let components =
-                decode_components(&storage_key).expect("undecodable storage key");
+            let components = decode_components(&storage_key).expect("undecodable storage key");
             let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
             if seq > through {
                 break;
@@ -687,11 +757,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     }
 
     async fn watermark(&self, space: SpaceId) -> Result<Option<AdmissionSeq>, StorageError> {
-        Ok(self
-            .store
-            .get(&watermark_key(space))
-            .await?
-            .map(|bytes| WatermarkRecord::decode(&bytes).expect("undecodable watermark").at))
+        Ok(self.store.get(&watermark_key(space)).await?.map(|bytes| {
+            WatermarkRecord::decode(&bytes)
+                .expect("undecodable whole-space watermark")
+                .at
+        }))
     }
 
     async fn record_device(&self, id: DeviceId) -> Result<(), StorageError> {
@@ -706,11 +776,19 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         entries: Vec<(Key, Value)>,
     ) -> Result<Committed, StorageError> {
         let seq = match self.store.get(&seq_key()).await? {
-            Some(bytes) => SeqRecord::decode(&bytes).expect("undecodable seq record").next,
+            Some(bytes) => {
+                SeqRecord::decode(&bytes)
+                    .expect("undecodable seq record")
+                    .next
+            }
             None => DeviceSeq(1),
         };
         let high = match self.store.get(&ver_key()).await? {
-            Some(bytes) => VerHighRecord::decode(&bytes).expect("undecodable ver record").high,
+            Some(bytes) => {
+                VerHighRecord::decode(&bytes)
+                    .expect("undecodable ver record")
+                    .high
+            }
             None => Ver(0),
         };
         let record = CommitRecord {
@@ -729,7 +807,13 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
 
         let mut batch = WriteBatch::new();
         batch.put(oplog_key(seq), record.encode());
-        batch.put(seq_key(), SeqRecord { next: DeviceSeq(seq.0 + 1) }.encode());
+        batch.put(
+            seq_key(),
+            SeqRecord {
+                next: DeviceSeq(seq.0 + 1),
+            }
+            .encode(),
+        );
         batch.put(ver_key(), VerHighRecord { high: ver_high }.encode());
         self.store.apply(batch).await?;
         Ok(Committed { seq, ver_high })
@@ -739,8 +823,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         let queued = collect_scan(self.store.scan_prefix(&oplog_scan())).await?;
         let mut batch = WriteBatch::new();
         for (storage_key, _) in queued {
-            let components =
-                decode_components(&storage_key).expect("undecodable storage key");
+            let components = decode_components(&storage_key).expect("undecodable storage key");
             let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
             if seq > through {
                 break; // ordered scan: everything after is newer
@@ -757,8 +840,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         let queued = collect_scan(self.store.scan_prefix(&oplog_scan())).await?;
         let mut batch = WriteBatch::new();
         for (storage_key, _) in queued {
-            let components =
-                decode_components(&storage_key).expect("undecodable storage key");
+            let components = decode_components(&storage_key).expect("undecodable storage key");
             let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
             if seq >= from {
                 batch.delete(storage_key);
@@ -777,21 +859,59 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         ver_seen: Ver,
     ) -> Result<(), StorageError> {
         let high = match self.store.get(&ver_key()).await? {
-            Some(bytes) => VerHighRecord::decode(&bytes).expect("undecodable ver record").high,
+            Some(bytes) => {
+                VerHighRecord::decode(&bytes)
+                    .expect("undecodable ver record")
+                    .high
+            }
             None => Ver(0),
         };
         let mut batch = WriteBatch::new();
         batch.put(watermark_key(space), WatermarkRecord { at }.encode());
-        batch.put(ver_key(), VerHighRecord { high: high.max(ver_seen) }.encode());
+        batch.put(
+            ver_key(),
+            VerHighRecord {
+                high: high.max(ver_seen),
+            }
+            .encode(),
+        );
         self.store.apply(batch).await
     }
 
-    async fn record_leases(&self, space: SpaceId, leases: &[HeldLease]) -> Result<(), StorageError> {
+    async fn record_clock(&self, high: Timestamp) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::new();
+        batch.put(clock_key(), ClockRecord { high_water: high }.encode());
+        self.store.apply(batch).await
+    }
+
+    async fn record_leases(
+        &self,
+        space: SpaceId,
+        leases: &[HeldLease],
+    ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
         for held in leases {
             batch.put(lease_key(space, &held.lease.prefix), held.encode());
         }
         self.store.apply(batch).await
+    }
+
+    async fn retire_leases(&self, space: SpaceId, ids: &[LeaseId]) -> Result<(), StorageError> {
+        // Records key by prefix, server speaks ids. Same short scan as
+        // drop_leases, but rewrite matching records with `retiring = true`.
+        let scan = encode_components(&space_kind(space, SpaceKind::Lease));
+        let mut batch = WriteBatch::new();
+        for (storage_key, bytes) in collect_scan(self.store.scan_prefix(&scan)).await? {
+            let mut record = HeldLease::decode(&bytes).expect("undecodable lease");
+            if ids.contains(&record.lease.id) && !record.retiring {
+                record.retiring = true;
+                batch.put(storage_key, record.encode());
+            }
+        }
+        if !batch.is_empty() {
+            self.store.apply(batch).await?;
+        }
+        Ok(())
     }
 
     async fn drop_leases(&self, space: SpaceId, ids: &[LeaseId]) -> Result<(), StorageError> {
@@ -826,8 +946,9 @@ const DEVICE_RECORD_VERSION: u8 = 1;
 const SEQ_RECORD_VERSION: u8 = 1;
 const VER_HIGH_RECORD_VERSION: u8 = 1;
 const WATERMARK_RECORD_VERSION: u8 = 1;
+const CLOCK_RECORD_VERSION: u8 = 1;
 const CODEC_RECORD_VERSION: u8 = 1;
-const LEASE_RECORD_VERSION: u8 = 1;
+const LEASE_RECORD_VERSION: u8 = 2;
 const COMMIT_RECORD_VERSION: u8 = 1;
 
 impl DeviceRecord {
@@ -887,6 +1008,25 @@ impl VerHighRecord {
     }
 }
 
+impl ClockRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 8);
+        out.push(CLOCK_RECORD_VERSION);
+        out.extend_from_slice(&self.high_water.0.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != CLOCK_RECORD_VERSION {
+            return None;
+        }
+        let high_water = Timestamp(r.u64()?);
+        r.end()?;
+        Some(Self { high_water })
+    }
+}
+
 impl WatermarkRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + 8);
@@ -930,7 +1070,7 @@ impl CodecRecord {
 impl HeldLease {
     pub fn encode(&self) -> Vec<u8> {
         let l = &self.lease;
-        let mut out = Vec::with_capacity(1 + 8 + 1 + 1 + 8 + 8 + 8 + 32);
+        let mut out = Vec::with_capacity(1 + 8 + 1 + 1 + 8 + 8 + 32 + 32 + 10);
         out.push(LEASE_RECORD_VERSION);
         out.extend_from_slice(&l.id.0.to_be_bytes());
         out.push(match l.mode {
@@ -941,14 +1081,25 @@ impl HeldLease {
         out.extend_from_slice(&l.epoch.0.to_be_bytes());
         let ttl_ms = l.ttl.as_millis().min(u64::MAX as u128) as u64;
         out.extend_from_slice(&ttl_ms.to_be_bytes());
-        out.extend_from_slice(&self.deadline.0.to_be_bytes());
+        out.extend_from_slice(&self.deadline.wall.0.to_be_bytes());
+        out.extend_from_slice(&self.deadline.mono.0.to_be_bytes());
+        out.extend_from_slice(&self.deadline.lineage.0);
+        out.push(self.retiring as u8);
+        match self.barrier {
+            Some(barrier) => {
+                out.push(1);
+                out.extend_from_slice(&barrier.0.to_be_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&l.prefix.encode());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != LEASE_RECORD_VERSION {
+        let version = r.u8()?;
+        if !matches!(version, 1 | LEASE_RECORD_VERSION) {
             return None;
         }
         let id = LeaseId(r.u64()?);
@@ -964,11 +1115,39 @@ impl HeldLease {
         };
         let epoch = homebase_core::tag::Epoch(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
-        let deadline = Timestamp(r.u64()?);
+        let deadline = HybridTimestamp {
+            wall: Timestamp(r.u64()?),
+            mono: Timestamp(r.u64()?),
+            lineage: Lineage(r.bytes16()?),
+        };
+        let (retiring, barrier) = if version == 1 {
+            (false, None)
+        } else {
+            let retiring = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let barrier = match r.u8()? {
+                0 => None,
+                1 => Some(AdmissionSeq(r.u64()?)),
+                _ => return None,
+            };
+            (retiring, barrier)
+        };
         let prefix = Key::decode(r.rest()).ok()?;
         Some(Self {
-            lease: Lease { id, prefix, mode, epoch, ttl, stealable },
+            lease: Lease {
+                id,
+                prefix,
+                mode,
+                epoch,
+                ttl,
+                stealable,
+            },
             deadline,
+            barrier,
+            retiring,
         })
     }
 }
@@ -1036,7 +1215,11 @@ fn u64_at(components: &[KeyComponent], index: usize, what: &str) -> u64 {
         .get(index)
         .unwrap_or_else(|| panic!("storage key missing {what}"))
         .as_bytes();
-    u64::from_be_bytes(bytes.try_into().unwrap_or_else(|_| panic!("{what} must be 8 bytes")))
+    u64::from_be_bytes(
+        bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("{what} must be 8 bytes")),
+    )
 }
 
 struct Reader<'a> {
@@ -1105,6 +1288,15 @@ pub mod conformance {
         Key::from_bytes(components.iter().copied()).unwrap()
     }
 
+    /// A hybrid stamp with both rulers at `ms`, on a test lineage.
+    fn stamp(ms: u64) -> HybridTimestamp {
+        HybridTimestamp {
+            wall: Timestamp(ms),
+            mono: Timestamp(ms),
+            lineage: Lineage([9; 16]),
+        }
+    }
+
     fn sample_lease() -> HeldLease {
         HeldLease {
             lease: Lease {
@@ -1115,7 +1307,9 @@ pub mod conformance {
                 ttl: Duration::from_secs(300),
                 stealable: true,
             },
-            deadline: Timestamp(1_300),
+            deadline: stamp(1_300),
+            barrier: None,
+            retiring: false,
         }
     }
 
@@ -1127,7 +1321,11 @@ pub mod conformance {
 
         // Fresh: empty, certifiable.
         let state = audit(store).await;
-        assert_eq!(state, ClientState::default(), "a fresh store remembers nothing");
+        assert_eq!(
+            state,
+            ClientState::default(),
+            "a fresh store remembers nothing"
+        );
 
         // Genesis.
         let device = DeviceId([1; 16]);
@@ -1138,23 +1336,50 @@ pub mod conformance {
         // The store assigns both counters: seqs dense from 1, vers
         // climbing from the high-water.
         let first = store
-            .commit(space, vec![
-                (key(&[b"db", b"a"]), Value::Present(b"ciphertext".to_vec())),
-                (key(&[b"db", b"gone"]), Value::Absent),
-            ])
+            .commit(
+                space,
+                vec![
+                    (key(&[b"db", b"a"]), Value::Present(b"ciphertext".to_vec())),
+                    (key(&[b"db", b"gone"]), Value::Absent),
+                ],
+            )
             .await
             .unwrap();
-        assert_eq!(first, Committed { seq: DeviceSeq(1), ver_high: Ver(2) });
+        assert_eq!(
+            first,
+            Committed {
+                seq: DeviceSeq(1),
+                ver_high: Ver(2)
+            }
+        );
         let second = store
-            .commit(link, vec![(key(&[b"dir", b"entry"]), Value::Present(b"sealed".to_vec()))])
+            .commit(
+                link,
+                vec![(key(&[b"dir", b"entry"]), Value::Present(b"sealed".to_vec()))],
+            )
             .await
             .unwrap();
-        assert_eq!(second, Committed { seq: DeviceSeq(2), ver_high: Ver(3) });
+        assert_eq!(
+            second,
+            Committed {
+                seq: DeviceSeq(2),
+                ver_high: Ver(3)
+            }
+        );
         let third = store
-            .commit(space, vec![(key(&[b"db", b"a"]), Value::Present(b"newer".to_vec()))])
+            .commit(
+                space,
+                vec![(key(&[b"db", b"a"]), Value::Present(b"newer".to_vec()))],
+            )
             .await
             .unwrap();
-        assert_eq!(third, Committed { seq: DeviceSeq(3), ver_high: Ver(4) });
+        assert_eq!(
+            third,
+            Committed {
+                seq: DeviceSeq(3),
+                ver_high: Ver(4)
+            }
+        );
 
         let state = audit(store).await;
         assert_eq!(state.next_seq, Some(DeviceSeq(4)));
@@ -1162,9 +1387,17 @@ pub mod conformance {
         assert_eq!(state.oplog.len(), 3);
         assert_eq!(state.oplog[&DeviceSeq(1)].space, space);
         assert_eq!(state.oplog[&DeviceSeq(1)].entries[0].ver, Ver(1));
-        assert_eq!(state.oplog[&DeviceSeq(1)].entries[1].ver, Ver(2), "consecutive in order");
+        assert_eq!(
+            state.oplog[&DeviceSeq(1)].entries[1].ver,
+            Ver(2),
+            "consecutive in order"
+        );
         assert_eq!(state.oplog[&DeviceSeq(2)].space, link);
-        assert_eq!(state.oplog[&DeviceSeq(3)].entries[0].ver, Ver(4), "chain continued");
+        assert_eq!(
+            state.oplog[&DeviceSeq(3)].entries[0].ver,
+            Ver(4),
+            "chain continued"
+        );
 
         // The queue read sees exactly what load sees: a seq range,
         // ascending; a point lookup is the one-seq range.
@@ -1176,7 +1409,11 @@ pub mod conformance {
         );
         assert_eq!(window[0].1, state.oplog[&DeviceSeq(1)]);
         assert_eq!(
-            store.oplog(DeviceSeq(1), DeviceSeq(u64::MAX)).await.unwrap().len(),
+            store
+                .oplog(DeviceSeq(1), DeviceSeq(u64::MAX))
+                .await
+                .unwrap()
+                .len(),
             3,
             "an open-ended range reads the whole queue"
         );
@@ -1185,7 +1422,11 @@ pub mod conformance {
             vec![(DeviceSeq(2), state.oplog[&DeviceSeq(2)].clone())]
         );
         assert!(
-            store.oplog(DeviceSeq(9), DeviceSeq(9)).await.unwrap().is_empty(),
+            store
+                .oplog(DeviceSeq(9), DeviceSeq(9))
+                .await
+                .unwrap()
+                .is_empty(),
             "never minted"
         );
 
@@ -1202,39 +1443,73 @@ pub mod conformance {
         store.trim_oplog(DeviceSeq(1)).await.unwrap();
         assert_eq!(audit(store).await.oplog.len(), 2, "re-ack is a no-op");
         assert!(
-            store.oplog(DeviceSeq(1), DeviceSeq(1)).await.unwrap().is_empty(),
+            store
+                .oplog(DeviceSeq(1), DeviceSeq(1))
+                .await
+                .unwrap()
+                .is_empty(),
             "a trimmed seq is gone from range reads too"
         );
 
         // A pull moves the sync point and raises the ver high-water to
         // what the cut carried; the next commit climbs past it.
-        store.advance_watermark(space, AdmissionSeq(40), Ver(10)).await.unwrap();
+        store
+            .advance_watermark(space, AdmissionSeq(40), Ver(10))
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert_eq!(state.spaces[&space].watermark, Some(AdmissionSeq(40)));
         assert_eq!(state.ver_high, Some(Ver(10)));
-        assert_eq!(store.watermark(space).await.unwrap(), Some(AdmissionSeq(40)));
+        assert_eq!(
+            store.watermark(space).await.unwrap(),
+            Some(AdmissionSeq(40))
+        );
         assert_eq!(store.watermark(link).await.unwrap(), None, "no pull yet");
         let fourth = store
-            .commit(space, vec![(key(&[b"db", b"b"]), Value::Present(b"post-pull".to_vec()))])
+            .commit(
+                space,
+                vec![(key(&[b"db", b"b"]), Value::Present(b"post-pull".to_vec()))],
+            )
             .await
             .unwrap();
-        assert_eq!(fourth, Committed { seq: DeviceSeq(4), ver_high: Ver(11) });
+        assert_eq!(
+            fourth,
+            Committed {
+                seq: DeviceSeq(4),
+                ver_high: Ver(11)
+            }
+        );
 
         // A pull carrying older vers never regresses the high-water.
-        store.advance_watermark(space, AdmissionSeq(41), Ver(5)).await.unwrap();
+        store
+            .advance_watermark(space, AdmissionSeq(41), Ver(5))
+            .await
+            .unwrap();
         assert_eq!(audit(store).await.ver_high, Some(Ver(11)));
 
         // Duplicate keys in one commit behave like a sequence — the
         // kernel's own within-batch rule: later occurrences carry
         // strictly greater vers, and the state still certifies.
         let dup = store
-            .commit(space, vec![
-                (key(&[b"db", b"c"]), Value::Present(b"twice".to_vec())),
-                (key(&[b"db", b"c"]), Value::Present(b"the second wins".to_vec())),
-            ])
+            .commit(
+                space,
+                vec![
+                    (key(&[b"db", b"c"]), Value::Present(b"twice".to_vec())),
+                    (
+                        key(&[b"db", b"c"]),
+                        Value::Present(b"the second wins".to_vec()),
+                    ),
+                ],
+            )
             .await
             .unwrap();
-        assert_eq!(dup, Committed { seq: DeviceSeq(5), ver_high: Ver(13) });
+        assert_eq!(
+            dup,
+            Committed {
+                seq: DeviceSeq(5),
+                ver_high: Ver(13)
+            }
+        );
         let state = audit(store).await;
         let entries = &state.oplog[&DeviceSeq(5)].entries;
         assert_eq!(entries[0].ver, Ver(12));
@@ -1254,7 +1529,10 @@ pub mod conformance {
         // Rollback: discard drops the suffix — the resolution for a
         // rejected push the caller chooses not to repair.
         let doomed = store
-            .commit(space, vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))])
+            .commit(
+                space,
+                vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))],
+            )
             .await
             .unwrap();
         store.discard_from(doomed.seq).await.unwrap();
@@ -1270,7 +1548,10 @@ pub mod conformance {
         // counter never rewinds. The state still certifies and the head
         // window shows the hole.
         let after_gap = store
-            .commit(space, vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))])
+            .commit(
+                space,
+                vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))],
+            )
             .await
             .unwrap();
         assert_eq!(after_gap.seq, DeviceSeq(7));
@@ -1281,7 +1562,11 @@ pub mod conformance {
             "a discarded seq is never re-minted"
         );
         assert!(
-            store.oplog(DeviceSeq(6), DeviceSeq(6)).await.unwrap().is_empty(),
+            store
+                .oplog(DeviceSeq(6), DeviceSeq(6))
+                .await
+                .unwrap()
+                .is_empty(),
             "the hole is real"
         );
         assert_eq!(
@@ -1296,6 +1581,15 @@ pub mod conformance {
             "the range read walks straight over the gap"
         );
 
+        // The clock high-water is a plain overwrite — advanced at every
+        // stamp, and lowerable on purpose (re-anchoring after a
+        // poisoned open lands on an earlier timeline).
+        store.record_clock(Timestamp(1_000)).await.unwrap();
+        assert_eq!(audit(store).await.clock_high, Some(Timestamp(1_000)));
+        store.record_clock(Timestamp(500)).await.unwrap();
+        assert_eq!(audit(store).await.clock_high, Some(Timestamp(500)));
+        store.record_clock(Timestamp(2_000)).await.unwrap();
+
         // Lease churn + codec cache, across both spaces.
         // A batch grant is recorded atomically as a batch.
         let second_lease = HeldLease {
@@ -1307,7 +1601,9 @@ pub mod conformance {
                 ttl: Duration::from_secs(300),
                 stealable: false,
             },
-            deadline: Timestamp(2_000),
+            deadline: stamp(2_000),
+            barrier: Some(AdmissionSeq(40)),
+            retiring: false,
         };
         store
             .record_leases(space, &[sample_lease(), second_lease.clone()])
@@ -1322,11 +1618,22 @@ pub mod conformance {
                 ttl: Duration::from_secs(60),
                 stealable: false,
             },
-            deadline: Timestamp(900),
+            deadline: stamp(900),
+            barrier: None,
+            retiring: false,
         };
-        store.record_leases(link, std::slice::from_ref(&link_lease)).await.unwrap();
         store
-            .record_codec(space, &CodecRecord { space_key_epoch: 0, sealed: b"sealed".to_vec() })
+            .record_leases(link, std::slice::from_ref(&link_lease))
+            .await
+            .unwrap();
+        store
+            .record_codec(
+                space,
+                &CodecRecord {
+                    space_key_epoch: 0,
+                    sealed: b"sealed".to_vec(),
+                },
+            )
             .await
             .unwrap();
 
@@ -1351,33 +1658,62 @@ pub mod conformance {
             "multiple queries dedup into one answer, in prefix order"
         );
         assert!(
-            store.leases_covering(space, &[key(&[b"db"])]).await.unwrap().is_empty(),
+            store
+                .leases_covering(space, &[key(&[b"db"])])
+                .await
+                .unwrap()
+                .is_empty(),
             "a descendant lease does not cover its ancestor"
         );
         assert_eq!(
-            store.leases_covering(link, &[key(&[b"dir", b"entry"])]).await.unwrap(),
+            store
+                .leases_covering(link, &[key(&[b"dir", b"entry"])])
+                .await
+                .unwrap(),
             vec![link_lease.clone()]
         );
         assert_eq!(
             state.spaces[&space].codec,
-            Some(CodecRecord { space_key_epoch: 0, sealed: b"sealed".to_vec() })
+            Some(CodecRecord {
+                space_key_epoch: 0,
+                sealed: b"sealed".to_vec()
+            })
         );
 
         // Renewal overwrites in place; release forgets.
         // A renewal overwrites in place with a fresh deadline stamp.
         let renewed = HeldLease {
-            lease: Lease { ttl: Duration::from_secs(600), ..sample_lease().lease },
-            deadline: Timestamp(5_000),
+            lease: Lease {
+                ttl: Duration::from_secs(600),
+                ..sample_lease().lease
+            },
+            deadline: stamp(5_000),
+            barrier: None,
+            retiring: false,
         };
-        store.record_leases(space, std::slice::from_ref(&renewed)).await.unwrap();
-        assert_eq!(audit(store).await.spaces[&space].leases[&LeaseId(42)], renewed);
+        store
+            .record_leases(space, std::slice::from_ref(&renewed))
+            .await
+            .unwrap();
+        assert_eq!(
+            audit(store).await.spaces[&space].leases[&LeaseId(42)],
+            renewed
+        );
         // A re-grant of the same prefix replaces the old record: one
         // live lease per (space, prefix).
         let regrant = HeldLease {
-            lease: Lease { id: LeaseId(99), ..sample_lease().lease },
-            deadline: Timestamp(9_000),
+            lease: Lease {
+                id: LeaseId(99),
+                ..sample_lease().lease
+            },
+            deadline: stamp(9_000),
+            barrier: None,
+            retiring: false,
         };
-        store.record_leases(space, std::slice::from_ref(&regrant)).await.unwrap();
+        store
+            .record_leases(space, std::slice::from_ref(&regrant))
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert!(
             !state.spaces[&space].leases.contains_key(&LeaseId(42)),
@@ -1385,7 +1721,10 @@ pub mod conformance {
         );
         assert_eq!(state.spaces[&space].leases[&LeaseId(99)], regrant);
 
-        store.drop_leases(space, &[LeaseId(99), LeaseId(43)]).await.unwrap();
+        store
+            .drop_leases(space, &[LeaseId(99), LeaseId(43)])
+            .await
+            .unwrap();
         assert!(audit(store).await.spaces[&space].leases.is_empty());
     }
 }
@@ -1404,6 +1743,14 @@ mod tests {
         Key::from_bytes(components.iter().copied()).unwrap()
     }
 
+    fn stamp(ms: u64) -> HybridTimestamp {
+        HybridTimestamp {
+            wall: Timestamp(ms),
+            mono: Timestamp(ms),
+            lineage: Lineage([9; 16]),
+        }
+    }
+
     fn sample_commit() -> CommitRecord {
         CommitRecord {
             space: SPACE,
@@ -1413,7 +1760,11 @@ mod tests {
                     value: Value::Present(b"ciphertext".to_vec()),
                     ver: Ver(3),
                 },
-                PutEntry { key: key(&[b"db", b"gone"]), value: Value::Absent, ver: Ver(3) },
+                PutEntry {
+                    key: key(&[b"db", b"gone"]),
+                    value: Value::Absent,
+                    ver: Ver(3),
+                },
                 PutEntry {
                     key: key(&[b"db", b"empty"]),
                     value: Value::Present(vec![]),
@@ -1434,19 +1785,36 @@ mod tests {
 
     #[test]
     fn records_roundtrip() {
-        let device = DeviceRecord { id: DeviceId([3; 16]) };
+        let device = DeviceRecord {
+            id: DeviceId([3; 16]),
+        };
         assert_eq!(DeviceRecord::decode(&device.encode()), Some(device));
 
-        let seq = SeqRecord { next: DeviceSeq(17) };
+        let seq = SeqRecord {
+            next: DeviceSeq(17),
+        };
         assert_eq!(SeqRecord::decode(&seq.encode()), Some(seq));
 
         let ver = VerHighRecord { high: Ver(9) };
         assert_eq!(VerHighRecord::decode(&ver.encode()), Some(ver));
 
-        let watermark = WatermarkRecord { at: AdmissionSeq(99) };
-        assert_eq!(WatermarkRecord::decode(&watermark.encode()), Some(watermark));
+        let watermark = WatermarkRecord {
+            at: AdmissionSeq(99),
+        };
+        assert_eq!(
+            WatermarkRecord::decode(&watermark.encode()),
+            Some(watermark)
+        );
 
-        let codec = CodecRecord { space_key_epoch: 0, sealed: b"sealed-bundle".to_vec() };
+        let clock = ClockRecord {
+            high_water: Timestamp(123_456),
+        };
+        assert_eq!(ClockRecord::decode(&clock.encode()), Some(clock));
+
+        let codec = CodecRecord {
+            space_key_epoch: 0,
+            sealed: b"sealed-bundle".to_vec(),
+        };
         assert_eq!(CodecRecord::decode(&codec.encode()), Some(codec));
 
         let lease = HeldLease {
@@ -1458,13 +1826,18 @@ mod tests {
                 ttl: Duration::from_secs(300),
                 stealable: true,
             },
-            deadline: Timestamp(1_234),
+            deadline: stamp(1_234),
+            barrier: Some(AdmissionSeq(17)),
+            retiring: true,
         };
         assert_eq!(HeldLease::decode(&lease.encode()), Some(lease));
 
         let commit = sample_commit();
         assert_eq!(CommitRecord::decode(&commit.encode()), Some(commit));
-        let empty = CommitRecord { space: LINK, entries: vec![] };
+        let empty = CommitRecord {
+            space: LINK,
+            entries: vec![],
+        };
         assert_eq!(CommitRecord::decode(&empty.encode()), Some(empty));
     }
 
@@ -1486,14 +1859,21 @@ mod tests {
             device_key(),
             seq_key(),
             ver_key(),
+            clock_key(),
             oplog_key(DeviceSeq(1)),
             watermark_key(SPACE),
             codec_key(SPACE),
             lease_key(SPACE, &key(&[b"db", b"pay"])),
         ] {
-            assert!(storage_key.starts_with(&brand), "every reference key wears the brand");
+            assert!(
+                storage_key.starts_with(&brand),
+                "every reference key wears the brand"
+            );
         }
-        assert!(oplog_key(DeviceSeq(1)) < oplog_key(DeviceSeq(2)), "queue drains in order");
+        assert!(
+            oplog_key(DeviceSeq(1)) < oplog_key(DeviceSeq(2)),
+            "queue drains in order"
+        );
 
         // A cohabitant under the Data brand is invisible to meta scans.
         let foreign = encode_components(&[
@@ -1527,7 +1907,11 @@ mod tests {
 
             let store = OrderedMetaStore::new(inner);
             let state = store.load().await.unwrap();
-            assert_eq!(state, ClientState::default(), "the Data brand is none of our business");
+            assert_eq!(
+                state,
+                ClientState::default(),
+                "the Data brand is none of our business"
+            );
         });
     }
 
@@ -1550,6 +1934,35 @@ mod tests {
         );
         state.next_seq = Some(DeviceSeq(4));
         state.ver_high = Some(Ver(4));
+        certify(&state);
+    }
+
+    #[test]
+    #[should_panic(expected = "stamped past the clock high-water")]
+    fn certify_catches_stamps_from_the_future() {
+        let mut state = ClientState {
+            clock_high: Some(Timestamp(1_000)),
+            ..ClientState::default()
+        };
+        let space = state.spaces.entry(SPACE).or_default();
+        space.leases.insert(
+            LeaseId(1),
+            HeldLease {
+                lease: Lease {
+                    id: LeaseId(1),
+                    prefix: key(&[b"db"]),
+                    mode: LeaseMode::Write,
+                    epoch: Epoch(1),
+                    ttl: Duration::from_secs(1),
+                    stealable: false,
+                },
+                // wall send = 100_000 − 1_000 = 99_000, far past the
+                // high-water: a stamp the recorded timeline never saw.
+                deadline: stamp(100_000),
+                barrier: None,
+                retiring: false,
+            },
+        );
         certify(&state);
     }
 
@@ -1590,5 +2003,4 @@ mod tests {
         state.ver_high = Some(Ver(1));
         certify(&state);
     }
-
 }

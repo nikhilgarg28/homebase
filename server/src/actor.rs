@@ -182,10 +182,7 @@ impl SpaceApi for SpaceHandle {
         self.call(move |reply| Command::PutBatch(req, reply))
     }
 
-    fn get(
-        &self,
-        req: GetRequest,
-    ) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
+    fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
         self.call(move |reply| Command::Get(req, reply))
     }
 
@@ -240,7 +237,14 @@ mod tests {
         }
     }
 
-    fn put_req(device: u8, seq: u64, lease: LeaseRef, k: &Key, v: &[u8], ver: u64) -> PutBatchRequest {
+    fn put_req(
+        device: u8,
+        seq: u64,
+        lease: LeaseRef,
+        k: &Key,
+        v: &[u8],
+        ver: u64,
+    ) -> PutBatchRequest {
         PutBatchRequest {
             device: dev(device),
             device_seq: DeviceSeq(seq),
@@ -275,15 +279,27 @@ mod tests {
             };
 
             let k = key(&[b"db", b"row"]);
-            let put = handle.put_batch(put_req(1, 1, lease, &k, b"v", 1)).await.unwrap();
+            let put = handle
+                .put_batch(put_req(1, 1, lease, &k, b"v", 1))
+                .await
+                .unwrap();
             assert_eq!(put.admission_seq, AdmissionSeq(1));
 
-            let got = handle.get(GetRequest { keys: vec![k.clone()] }).await.unwrap();
+            let got = handle
+                .get(GetRequest {
+                    keys: vec![k.clone()],
+                })
+                .await
+                .unwrap();
             let entry = got.entries[0].as_ref().unwrap();
             assert_eq!(entry.value, Value::Present(b"v".to_vec()));
 
             let listed = handle
-                .list(ListRequest { prefix, start_after: None, limit: None })
+                .list(ListRequest {
+                    prefix,
+                    start_after: None,
+                    limit: None,
+                })
                 .await
                 .unwrap();
             assert_eq!(listed.entries.len(), 1);
@@ -323,7 +339,10 @@ mod tests {
         // dense — the mailbox is the serialization point.
         let client = |handle: SpaceHandle, device: u8| async move {
             let prefix = key(&[format!("d{device}").as_bytes()]);
-            let granted = handle.acquire(acquire_req(device, &prefix, 1000)).await.unwrap();
+            let granted = handle
+                .acquire(acquire_req(device, &prefix, 1000))
+                .await
+                .unwrap();
             let lease = LeaseRef {
                 id: granted.leases[0].id,
                 epoch: granted.leases[0].epoch,
@@ -343,7 +362,11 @@ mod tests {
         let (a, b) = pool.run_until(futures::future::join(client(handle, 1), client(other, 2)));
         let mut all: Vec<u64> = a.into_iter().chain(b).collect();
         all.sort_unstable();
-        assert_eq!(all, (1..=10).collect::<Vec<u64>>(), "dense, no gaps, no duplicates");
+        assert_eq!(
+            all,
+            (1..=10).collect::<Vec<u64>>(),
+            "dense, no gaps, no duplicates"
+        );
     }
 
     #[test]

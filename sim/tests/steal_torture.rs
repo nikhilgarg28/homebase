@@ -128,7 +128,10 @@ async fn client(
                     }
                 }
                 Err(SpaceError::Kernel(KernelError::Contended { .. })) => {
-                    assert!(!steal, "steal over all-stealable blockers can never contend");
+                    assert!(
+                        !steal,
+                        "steal over all-stealable blockers can never contend"
+                    );
                     coverage.borrow_mut().contended += 1;
                 }
                 Err(SpaceError::Unavailable { .. }) => return,
@@ -138,7 +141,12 @@ async fn client(
         };
 
         // Holder move: read-modify-write the counter under the lease.
-        let current = match handle.get(GetRequest { keys: vec![counter_key()] }).await {
+        let current = match handle
+            .get(GetRequest {
+                keys: vec![counter_key()],
+            })
+            .await
+        {
             Ok(resp) => resp.entries[0]
                 .as_ref()
                 .map(|e| match &e.value {
@@ -173,7 +181,10 @@ async fn client(
                 // Sometimes hand the lease off cleanly.
                 if rng.random_bool(0.25) {
                     match handle
-                        .release(ReleaseRequest { device: dev(d), leases: vec![lease.id] })
+                        .release(ReleaseRequest {
+                            device: dev(d),
+                            leases: vec![lease.id],
+                        })
                         .await
                     {
                         Ok(_) => {

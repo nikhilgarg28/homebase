@@ -20,8 +20,8 @@ use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{AcquireRequest, LeaseSpec, ReleaseRequest, RenewRequest};
 use homebase_core::space::SpaceId;
 use homebase_core::tag::DeviceId;
-use homebase_server::space::lease::LeaseManager;
 use homebase_server::schema::{LeaseRecord, lease_by_id_scan, lease_by_prefix_scan_all};
+use homebase_server::space::lease::LeaseManager;
 use homebase_server::storage::{MemoryStore, OrderedStore, collect_scan};
 use pollster::block_on;
 use proptest::prelude::*;
@@ -40,10 +40,20 @@ type Spec = (Prefix, LeaseMode, u64, bool);
 
 #[derive(Clone, Debug)]
 enum Cmd {
-    Acquire { device: u8, specs: Vec<Spec>, steal: bool },
-    RenewAll { device: u8 },
-    ReleaseLive { device: u8 },
-    Advance { ms: u64 },
+    Acquire {
+        device: u8,
+        specs: Vec<Spec>,
+        steal: bool,
+    },
+    RenewAll {
+        device: u8,
+    },
+    ReleaseLive {
+        device: u8,
+    },
+    Advance {
+        ms: u64,
+    },
 }
 
 fn arb_prefix() -> impl Strategy<Value = Prefix> {
@@ -138,17 +148,19 @@ impl Model {
 // invariant checks against the real store
 
 fn store_records(store: &MemoryStore) -> (Vec<LeaseRecord>, Vec<LeaseRecord>) {
-    let by_id: Vec<LeaseRecord> = block_on(collect_scan(store.scan_prefix(&lease_by_id_scan(SPACE))))
-        .unwrap()
-        .into_iter()
-        .map(|(_, v)| LeaseRecord::decode(&v).unwrap())
-        .collect();
-    let by_prefix: Vec<LeaseRecord> =
-        block_on(collect_scan(store.scan_prefix(&lease_by_prefix_scan_all(SPACE))))
+    let by_id: Vec<LeaseRecord> =
+        block_on(collect_scan(store.scan_prefix(&lease_by_id_scan(SPACE))))
             .unwrap()
             .into_iter()
             .map(|(_, v)| LeaseRecord::decode(&v).unwrap())
             .collect();
+    let by_prefix: Vec<LeaseRecord> = block_on(collect_scan(
+        store.scan_prefix(&lease_by_prefix_scan_all(SPACE)),
+    ))
+    .unwrap()
+    .into_iter()
+    .map(|(_, v)| LeaseRecord::decode(&v).unwrap())
+    .collect();
     (by_id, by_prefix)
 }
 
@@ -175,10 +187,8 @@ fn check_invariants(store: &MemoryStore, model: &Model) -> Result<(), TestCaseEr
     }
 
     // 3: live store records == model live leases, field by field.
-    let store_live: BTreeMap<u64, &LeaseRecord> =
-        live.iter().map(|r| (r.id.0, *r)).collect();
-    let model_live: BTreeMap<u64, &MLease> =
-        model.live().map(|l| (l.id, l)).collect();
+    let store_live: BTreeMap<u64, &LeaseRecord> = live.iter().map(|r| (r.id.0, *r)).collect();
+    let model_live: BTreeMap<u64, &MLease> = model.live().map(|l| (l.id, l)).collect();
     prop_assert_eq!(
         store_live.keys().collect::<Vec<_>>(),
         model_live.keys().collect::<Vec<_>>(),

@@ -9,9 +9,7 @@
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
-use homebase_core::messages::{
-    AcquireRequest, GetRequest, LeaseSpec, PutBatchRequest, PutEntry,
-};
+use homebase_core::messages::{AcquireRequest, GetRequest, LeaseSpec, PutBatchRequest, PutEntry};
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homebase_server::actor::{SpaceActor, SpaceHandle};

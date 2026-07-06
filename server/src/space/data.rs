@@ -42,8 +42,8 @@ use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
     CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord, changelog_key,
-    changelog_scan_after, changelog_scan_all, counters_key, data_key, device_key,
-    prefix_meta_key, user_key_from_changelog, user_key_from_data,
+    changelog_scan_after, changelog_scan_all, counters_key, data_key, device_key, prefix_meta_key,
+    user_key_from_changelog, user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homebase_core::clock::Timestamp;
@@ -145,8 +145,7 @@ pub async fn put_batch<S: OrderedStore>(
         // Aggregate updates along the key's prefix path: every ancestor sees
         // the new max seq; live counts move by the key's net transition
         // across the whole batch (absent→present +1, present→absent −1).
-        let delta =
-            (record.value.is_present() as i64) - (was_live[key] as i64);
+        let delta = (record.value.is_present() as i64) - (was_live[key] as i64);
         let components = key.components();
         for depth in 1..=components.len() {
             *live_deltas
@@ -156,22 +155,27 @@ pub async fn put_batch<S: OrderedStore>(
     }
     for (meta_key, delta) in live_deltas {
         let current = match store.get(&meta_key).await? {
-            Some(bytes) => {
-                PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record")
-            }
-            None => PrefixMetaRecord { max_admission_seq: 0, live_count: 0 },
+            Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record"),
+            None => PrefixMetaRecord {
+                max_admission_seq: 0,
+                live_count: 0,
+            },
         };
         let updated = PrefixMetaRecord {
             max_admission_seq: seq.0,
-            live_count: current.live_count.checked_add_signed(delta).expect(
-                "live count underflow: aggregates diverged from data records",
-            ),
+            live_count: current
+                .live_count
+                .checked_add_signed(delta)
+                .expect("live count underflow: aggregates diverged from data records"),
         };
         batch.put(meta_key, updated.encode());
     }
     batch.put(
         device_key(space, req.device),
-        DeviceRecord { last_seq: req.device_seq }.encode(),
+        DeviceRecord {
+            last_seq: req.device_seq,
+        }
+        .encode(),
     );
     batch.put(counters_key(space), counters.encode());
     store.apply(batch).await?;
@@ -228,7 +232,11 @@ pub async fn list<S: OrderedStore>(
             break;
         }
         let key = user_key_from_data(&storage_key).expect("corrupt data key");
-        entries.push(Entry { key, value: rec.value, tag: rec.tag });
+        entries.push(Entry {
+            key,
+            value: rec.value,
+            tag: rec.tag,
+        });
     }
     Ok(ListResponse { entries, truncated })
 }
@@ -271,7 +279,11 @@ async fn snapshot<S: OrderedStore>(
             continue;
         }
         let key = user_key_from_data(&storage_key).expect("corrupt data key");
-        entries.push(Entry { key, value: rec.value, tag: rec.tag });
+        entries.push(Entry {
+            key,
+            value: rec.value,
+            tag: rec.tag,
+        });
     }
     Ok(entries)
 }
@@ -301,7 +313,11 @@ async fn delta<S: OrderedStore>(
             continue;
         }
         let rec = DataRecord::decode(&bytes).expect("corrupt data record");
-        entries.push(Entry { key, value: rec.value, tag: rec.tag });
+        entries.push(Entry {
+            key,
+            value: rec.value,
+            tag: rec.tag,
+        });
     }
     Ok(entries)
 }

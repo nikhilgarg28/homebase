@@ -84,11 +84,7 @@ struct WriterState {
     rng_seed: u64,
 }
 
-async fn writer(
-    handle: SpaceHandle,
-    state: WriterState,
-    coverage: Rc<RefCell<Coverage>>,
-) {
+async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Coverage>>) {
     let mut rng = StdRng::seed_from_u64(state.rng_seed);
     for _ in 0..WRITER_ATTEMPTS {
         if state.lease.borrow().is_none() {
@@ -181,7 +177,10 @@ async fn sync_once(
     let since = replica.cursor.get().map(AdmissionSeq);
     let resp = match handle
         .read_at(ReadAtRequest {
-            ranges: vec![PrefixCursor { prefix: prefix(), since }],
+            ranges: vec![PrefixCursor {
+                prefix: prefix(),
+                since,
+            }],
         })
         .await
     {
@@ -214,9 +213,14 @@ async fn sync_once(
         }
         (Some(since), RangeCut::Delta(entries)) => {
             coverage.borrow_mut().deltas += 1;
-            let positions: Vec<(u64, &Key)> =
-                entries.iter().map(|e| (e.tag.admission_seq.0, &e.key)).collect();
-            assert!(positions.windows(2).all(|w| w[0] < w[1]), "delta order broken");
+            let positions: Vec<(u64, &Key)> = entries
+                .iter()
+                .map(|e| (e.tag.admission_seq.0, &e.key))
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "delta order broken"
+            );
             assert!(
                 entries.iter().all(|e| e.tag.admission_seq > *since),
                 "delta leaked entries at or before the cursor"
@@ -301,8 +305,7 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
         // With the world quiet, at most two rounds settle the replica: one
         // to detect a cursor regression, one to resnapshot.
         let mut settle = SimExecutor::new(master.random());
-        let (actor, handle) =
-            SpaceActor::new(SPACE, Arc::new(store.clone()), Arc::clone(&clock));
+        let (actor, handle) = SpaceActor::new(SPACE, Arc::new(store.clone()), Arc::clone(&clock));
         settle.spawn(actor.run());
         {
             let replica = replica.clone();
@@ -329,8 +332,7 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
         );
     }
 
-    let final_state: Vec<(Key, Vec<u8>)> =
-        replica.state.borrow().clone().into_iter().collect();
+    let final_state: Vec<(Key, Vec<u8>)> = replica.state.borrow().clone().into_iter().collect();
     (final_state, *coverage.borrow())
 }
 
@@ -351,7 +353,10 @@ fn replica_torture_seeds_reconverge() {
     assert!(total.overwrites > 0, "no overwrites: {total:?}");
     assert!(total.snapshots > 0, "no snapshots served: {total:?}");
     assert!(total.deltas > 0, "no deltas served: {total:?}");
-    assert!(total.replica_resets > 0, "no crash outran a replica: {total:?}");
+    assert!(
+        total.replica_resets > 0,
+        "no crash outran a replica: {total:?}"
+    );
 }
 
 #[test]

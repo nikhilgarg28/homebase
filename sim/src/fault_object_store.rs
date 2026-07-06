@@ -8,8 +8,8 @@
 
 #[cfg(feature = "slatedb")]
 mod imp {
-    use async_trait::async_trait;
     use crate::store::FaultConfig;
+    use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -17,8 +17,7 @@ mod imp {
     use slatedb::object_store::{
         CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
-        local::LocalFileSystem,
-        path::Path,
+        local::LocalFileSystem, path::Path,
     };
     use std::fmt;
     use std::ops::Range;

@@ -98,8 +98,7 @@ impl LeaseManager {
         // incompatibly; the compiler derives disjoint spec sets).
         for (i, a) in req.specs.iter().enumerate() {
             for b in &req.specs[i + 1..] {
-                let overlap =
-                    a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix);
+                let overlap = a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix);
                 if overlap && !a.mode.compatible_with(b.mode) {
                     store.apply(purge).await?;
                     return Err(KernelError::Contended {
@@ -241,8 +240,7 @@ impl LeaseManager {
         let mut epochs = Vec::with_capacity(keys.len());
         for key in keys {
             let covering = resolved.iter().find(|rec| {
-                rec.mode == homebase_core::lease::LeaseMode::Write
-                    && key.starts_with(&rec.prefix)
+                rec.mode == homebase_core::lease::LeaseMode::Write && key.starts_with(&rec.prefix)
             });
             match covering {
                 Some(rec) => epochs.push(rec.epoch),
@@ -294,10 +292,7 @@ impl LeaseManager {
             .map(|value| LeaseRecord::decode(&value).expect("corrupt lease record")))
     }
 
-    async fn counters<S: OrderedStore>(
-        &self,
-        store: &S,
-    ) -> Result<CountersRecord, StorageError> {
+    async fn counters<S: OrderedStore>(&self, store: &S) -> Result<CountersRecord, StorageError> {
         Ok(store
             .get(&counters_key(self.space))
             .await?
@@ -362,8 +357,7 @@ mod tests {
             specs: vec![spec(prefix, mode, ttl_ms)],
             steal: false,
         };
-        block_on(mgr.acquire(store, Timestamp(now), &req))
-            .map(|(mut leases, _)| leases.remove(0))
+        block_on(mgr.acquire(store, Timestamp(now), &req)).map(|(mut leases, _)| leases.remove(0))
     }
 
     /// Single-spec acquire with explicit stealable/steal flags.
@@ -388,8 +382,7 @@ mod tests {
             }],
             steal,
         };
-        block_on(mgr.acquire(store, Timestamp(now), &req))
-            .map(|(mut leases, _)| leases.remove(0))
+        block_on(mgr.acquire(store, Timestamp(now), &req)).map(|(mut leases, _)| leases.remove(0))
     }
 
     fn live_record_count(store: &MemoryStore, now: u64) -> usize {
@@ -477,13 +470,25 @@ mod tests {
         let resp = block_on(mgr.renew(
             &store,
             Timestamp(10),
-            &RenewRequest { device: dev(1), leases: vec![first.id] },
+            &RenewRequest {
+                device: dev(1),
+                leases: vec![first.id],
+            },
         ))
         .unwrap();
         assert_eq!(resp.invalid, vec![first.id]);
-        let wref = LeaseRef { id: first.id, epoch: first.epoch };
+        let wref = LeaseRef {
+            id: first.id,
+            epoch: first.epoch,
+        };
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(10), dev(1), &[wref], std::slice::from_ref(&p))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(10),
+                dev(1),
+                &[wref],
+                std::slice::from_ref(&p)
+            )),
             Err(Error::Kernel(KernelError::LeaseInvalid { .. }))
         ));
     }
@@ -536,12 +541,31 @@ mod tests {
         let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let parent = key(&[b"docs"]);
         let child = key(&[b"docs", b"a"]);
-        acquire_flags(&mut mgr, &store, 0, 1, &parent, LeaseMode::Read, true, false).unwrap();
+        acquire_flags(
+            &mut mgr,
+            &store,
+            0,
+            1,
+            &parent,
+            LeaseMode::Read,
+            true,
+            false,
+        )
+        .unwrap();
         acquire_flags(&mut mgr, &store, 0, 2, &child, LeaseMode::Read, true, false).unwrap();
 
         // A stealing write on the parent takes out both readers at once.
-        acquire_flags(&mut mgr, &store, 10, 3, &parent, LeaseMode::Write, false, true)
-            .unwrap();
+        acquire_flags(
+            &mut mgr,
+            &store,
+            10,
+            3,
+            &parent,
+            LeaseMode::Write,
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(live_record_count(&store, 10), 1);
     }
 
@@ -573,7 +597,10 @@ mod tests {
         let resp = block_on(mgr.renew(
             &store,
             Timestamp(40),
-            &RenewRequest { device: dev(1), leases: vec![lease.id] },
+            &RenewRequest {
+                device: dev(1),
+                leases: vec![lease.id],
+            },
         ))
         .unwrap();
         assert_eq!(resp.granted.len(), 1);
@@ -584,7 +611,10 @@ mod tests {
         let resp = block_on(mgr.renew(
             &store,
             Timestamp(80), // would be past the original deadline (50) without renewal
-            &RenewRequest { device: dev(1), leases: vec![lease.id] },
+            &RenewRequest {
+                device: dev(1),
+                leases: vec![lease.id],
+            },
         ))
         .unwrap();
         assert_eq!(resp.granted.len(), 1, "renewal at t=40 extended to t=90");
@@ -601,7 +631,10 @@ mod tests {
         let resp = block_on(mgr.renew(
             &store,
             Timestamp(10),
-            &RenewRequest { device: dev(2), leases: vec![lease.id] },
+            &RenewRequest {
+                device: dev(2),
+                leases: vec![lease.id],
+            },
         ))
         .unwrap();
         assert_eq!(resp.invalid, vec![lease.id]);
@@ -610,7 +643,10 @@ mod tests {
         let resp = block_on(mgr.renew(
             &store,
             Timestamp(50),
-            &RenewRequest { device: dev(1), leases: vec![lease.id, LeaseId(999)] },
+            &RenewRequest {
+                device: dev(1),
+                leases: vec![lease.id, LeaseId(999)],
+            },
         ))
         .unwrap();
         assert_eq!(resp.invalid, vec![lease.id, LeaseId(999)]);
@@ -627,13 +663,19 @@ mod tests {
         block_on(mgr.release(
             &store,
             Timestamp(10),
-            &ReleaseRequest { device: dev(2), leases: vec![lease.id] },
+            &ReleaseRequest {
+                device: dev(2),
+                leases: vec![lease.id],
+            },
         ))
         .unwrap();
         assert_eq!(live_record_count(&store, 10), 1);
 
         // Owner release frees the prefix; releasing again is fine.
-        let req = ReleaseRequest { device: dev(1), leases: vec![lease.id] };
+        let req = ReleaseRequest {
+            device: dev(1),
+            leases: vec![lease.id],
+        };
         block_on(mgr.release(&store, Timestamp(10), &req)).unwrap();
         block_on(mgr.release(&store, Timestamp(10), &req)).unwrap();
         acquire_one(&mut mgr, &store, 10, 2, &p, LeaseMode::Write, 100).unwrap();
@@ -648,44 +690,87 @@ mod tests {
 
         let write = acquire_one(&mut mgr, &store, 0, 1, &table, LeaseMode::Write, 50).unwrap();
         let read = acquire_one(&mut mgr, &store, 0, 1, &other_row, LeaseMode::Read, 50).unwrap();
-        let wref = LeaseRef { id: write.id, epoch: write.epoch };
-        let rref = LeaseRef { id: read.id, epoch: read.epoch };
+        let wref = LeaseRef {
+            id: write.id,
+            epoch: write.epoch,
+        };
+        let rref = LeaseRef {
+            id: read.id,
+            epoch: read.epoch,
+        };
 
         // Happy path returns the covering epoch.
         let epochs = block_on(mgr.validate_put(
-            &store, Timestamp(10), dev(1), &[wref], std::slice::from_ref(&row),
+            &store,
+            Timestamp(10),
+            dev(1),
+            &[wref],
+            std::slice::from_ref(&row),
         ))
         .unwrap();
         assert_eq!(epochs, vec![write.epoch]);
 
         // Read leases never authorize writes.
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(10), dev(1), &[rref], std::slice::from_ref(&other_row))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(10),
+                dev(1),
+                &[rref],
+                std::slice::from_ref(&other_row)
+            )),
             Err(Error::Kernel(KernelError::NotCovered { .. }))
         ));
 
         // Uncovered key.
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(10), dev(1), &[wref], std::slice::from_ref(&other_row))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(10),
+                dev(1),
+                &[wref],
+                std::slice::from_ref(&other_row)
+            )),
             Err(Error::Kernel(KernelError::NotCovered { .. }))
         ));
 
         // Stale epoch fences.
-        let stale = LeaseRef { id: write.id, epoch: Epoch(write.epoch.0 + 1) };
+        let stale = LeaseRef {
+            id: write.id,
+            epoch: Epoch(write.epoch.0 + 1),
+        };
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(10), dev(1), &[stale], std::slice::from_ref(&row))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(10),
+                dev(1),
+                &[stale],
+                std::slice::from_ref(&row)
+            )),
             Err(Error::Kernel(KernelError::Fenced { .. }))
         ));
 
         // Foreign device.
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(10), dev(2), &[wref], std::slice::from_ref(&row))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(10),
+                dev(2),
+                &[wref],
+                std::slice::from_ref(&row)
+            )),
             Err(Error::Kernel(KernelError::LeaseInvalid { .. }))
         ));
 
         // Expired.
         assert!(matches!(
-            block_on(mgr.validate_put(&store, Timestamp(50), dev(1), &[wref], std::slice::from_ref(&row))),
+            block_on(mgr.validate_put(
+                &store,
+                Timestamp(50),
+                dev(1),
+                &[wref],
+                std::slice::from_ref(&row)
+            )),
             Err(Error::Kernel(KernelError::LeaseInvalid { .. }))
         ));
     }

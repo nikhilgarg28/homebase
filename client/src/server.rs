@@ -92,7 +92,11 @@ where
     S: Space + Send,
     F: Fn(&SpaceId) -> Option<S> + Sync,
 {
-    async fn acquire(&self, space: &SpaceId, req: AcquireRequest) -> Result<AcquireResponse, SpaceError> {
+    async fn acquire(
+        &self,
+        space: &SpaceId,
+        req: AcquireRequest,
+    ) -> Result<AcquireResponse, SpaceError> {
         match self(space) {
             Some(s) => s.acquire(req).await,
             None => Err(SpaceError::unavailable("space not served by this endpoint")),
@@ -106,14 +110,22 @@ where
         }
     }
 
-    async fn release(&self, space: &SpaceId, req: ReleaseRequest) -> Result<ReleaseResponse, SpaceError> {
+    async fn release(
+        &self,
+        space: &SpaceId,
+        req: ReleaseRequest,
+    ) -> Result<ReleaseResponse, SpaceError> {
         match self(space) {
             Some(s) => s.release(req).await,
             None => Err(SpaceError::unavailable("space not served by this endpoint")),
         }
     }
 
-    async fn put_batch(&self, space: &SpaceId, req: PutBatchRequest) -> Result<PutBatchResponse, SpaceError> {
+    async fn put_batch(
+        &self,
+        space: &SpaceId,
+        req: PutBatchRequest,
+    ) -> Result<PutBatchResponse, SpaceError> {
         match self(space) {
             Some(s) => s.put_batch(req).await,
             None => Err(SpaceError::unavailable("space not served by this endpoint")),
@@ -134,7 +146,11 @@ where
         }
     }
 
-    async fn read_at(&self, space: &SpaceId, req: ReadAtRequest) -> Result<ReadAtResponse, SpaceError> {
+    async fn read_at(
+        &self,
+        space: &SpaceId,
+        req: ReadAtRequest,
+    ) -> Result<ReadAtResponse, SpaceError> {
         match self(space) {
             Some(s) => s.read_at(req).await,
             None => Err(SpaceError::unavailable("space not served by this endpoint")),
@@ -148,19 +164,35 @@ where
 pub enum Offline {}
 
 impl ServerHandle for Offline {
-    async fn acquire(&self, _space: &SpaceId, _req: AcquireRequest) -> Result<AcquireResponse, SpaceError> {
+    async fn acquire(
+        &self,
+        _space: &SpaceId,
+        _req: AcquireRequest,
+    ) -> Result<AcquireResponse, SpaceError> {
         match *self {}
     }
 
-    async fn renew(&self, _space: &SpaceId, _req: RenewRequest) -> Result<RenewResponse, SpaceError> {
+    async fn renew(
+        &self,
+        _space: &SpaceId,
+        _req: RenewRequest,
+    ) -> Result<RenewResponse, SpaceError> {
         match *self {}
     }
 
-    async fn release(&self, _space: &SpaceId, _req: ReleaseRequest) -> Result<ReleaseResponse, SpaceError> {
+    async fn release(
+        &self,
+        _space: &SpaceId,
+        _req: ReleaseRequest,
+    ) -> Result<ReleaseResponse, SpaceError> {
         match *self {}
     }
 
-    async fn put_batch(&self, _space: &SpaceId, _req: PutBatchRequest) -> Result<PutBatchResponse, SpaceError> {
+    async fn put_batch(
+        &self,
+        _space: &SpaceId,
+        _req: PutBatchRequest,
+    ) -> Result<PutBatchResponse, SpaceError> {
         match *self {}
     }
 
@@ -172,7 +204,11 @@ impl ServerHandle for Offline {
         match *self {}
     }
 
-    async fn read_at(&self, _space: &SpaceId, _req: ReadAtRequest) -> Result<ReadAtResponse, SpaceError> {
+    async fn read_at(
+        &self,
+        _space: &SpaceId,
+        _req: ReadAtRequest,
+    ) -> Result<ReadAtResponse, SpaceError> {
         match *self {}
     }
 }
@@ -233,46 +269,100 @@ pub mod conformance {
         let k = key(&[b"db", b"k"]);
 
         let granted = handle
-            .acquire(&space, AcquireRequest { device: dev(1), specs: vec![wspec(&db)], steal: false })
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: dev(1),
+                    specs: vec![wspec(&db)],
+                    steal: false,
+                },
+            )
             .await
             .expect("acquire on a served space");
         assert_eq!(granted.leases.len(), 1);
-        assert_eq!(granted.barrier, AdmissionSeq(0), "fresh space: nothing admitted yet");
-        let lease = LeaseRef { id: granted.leases[0].id, epoch: granted.leases[0].epoch };
+        assert_eq!(
+            granted.barrier,
+            AdmissionSeq(0),
+            "fresh space: nothing admitted yet"
+        );
+        let lease = LeaseRef {
+            id: granted.leases[0].id,
+            epoch: granted.leases[0].epoch,
+        };
 
         let put = handle
-            .put_batch(&space, PutBatchRequest {
-                device: dev(1),
-                device_seq: DeviceSeq(1),
-                leases: vec![lease],
-                entries: vec![PutEntry { key: k.clone(), value: Value::Present(marker.to_vec()), ver: Ver(1) }],
-            })
+            .put_batch(
+                &space,
+                PutBatchRequest {
+                    device: dev(1),
+                    device_seq: DeviceSeq(1),
+                    leases: vec![lease],
+                    entries: vec![PutEntry {
+                        key: k.clone(),
+                        value: Value::Present(marker.to_vec()),
+                        ver: Ver(1),
+                    }],
+                },
+            )
             .await
             .expect("covered put");
-        assert_eq!(put.admission_seq, AdmissionSeq(1), "fresh space: first admission");
+        assert_eq!(
+            put.admission_seq,
+            AdmissionSeq(1),
+            "fresh space: first admission"
+        );
 
-        let got = handle.get(&space, GetRequest { keys: vec![k.clone()] }).await.unwrap();
+        let got = handle
+            .get(
+                &space,
+                GetRequest {
+                    keys: vec![k.clone()],
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(
             got.entries[0].as_ref().map(|e| &e.value),
             Some(&Value::Present(marker.to_vec()))
         );
 
         let listed = handle
-            .list(&space, ListRequest { prefix: db.clone(), start_after: None, limit: None })
+            .list(
+                &space,
+                ListRequest {
+                    prefix: db.clone(),
+                    start_after: None,
+                    limit: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(listed.entries.len(), 1);
         assert!(!listed.truncated);
 
         let cut = handle
-            .read_at(&space, ReadAtRequest { ranges: vec![PrefixCursor { prefix: db.clone(), since: None }] })
+            .read_at(
+                &space,
+                ReadAtRequest {
+                    ranges: vec![PrefixCursor {
+                        prefix: db.clone(),
+                        since: None,
+                    }],
+                },
+            )
             .await
             .unwrap();
         assert_eq!(cut.at, AdmissionSeq(1));
         assert!(matches!(&cut.ranges[0], RangeCut::Snapshot(entries) if entries.len() == 1));
 
         let renewed = handle
-            .renew(&space, RenewRequest { device: dev(1), leases: vec![lease.id] })
+            .renew(
+                &space,
+                RenewRequest {
+                    device: dev(1),
+                    leases: vec![lease.id],
+                },
+            )
             .await
             .unwrap();
         assert_eq!(renewed.granted.len(), 1);
@@ -280,11 +370,24 @@ pub mod conformance {
         assert!(!renewed.granted[0].contended, "nobody is waiting");
 
         handle
-            .release(&space, ReleaseRequest { device: dev(1), leases: vec![lease.id] })
+            .release(
+                &space,
+                ReleaseRequest {
+                    device: dev(1),
+                    leases: vec![lease.id],
+                },
+            )
             .await
             .unwrap();
         handle
-            .acquire(&space, AcquireRequest { device: dev(2), specs: vec![wspec(&db)], steal: false })
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: dev(2),
+                    specs: vec![wspec(&db)],
+                    steal: false,
+                },
+            )
             .await
             .expect("released prefix must be acquirable by another device");
     }
@@ -294,7 +397,15 @@ pub mod conformance {
     pub async fn cross_space_isolation<T: ServerHandle>(handle: &T, a: SpaceId, b: SpaceId) {
         let k = key(&[b"db", b"k"]);
         for (space, marker) in [(a, &b"from-a"[..]), (b, &b"from-b"[..])] {
-            let got = handle.get(&space, GetRequest { keys: vec![k.clone()] }).await.unwrap();
+            let got = handle
+                .get(
+                    &space,
+                    GetRequest {
+                        keys: vec![k.clone()],
+                    },
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 got.entries[0].as_ref().map(|e| &e.value),
                 Some(&Value::Present(marker.to_vec())),
@@ -312,12 +423,26 @@ pub mod conformance {
     ) {
         let x = key(&[b"x"]);
         handle
-            .acquire(&space, AcquireRequest { device: dev(1), specs: vec![wspec(&x)], steal: false })
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: dev(1),
+                    specs: vec![wspec(&x)],
+                    steal: false,
+                },
+            )
             .await
             .unwrap();
 
         let contended = handle
-            .acquire(&space, AcquireRequest { device: dev(2), specs: vec![wspec(&x)], steal: false })
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: dev(2),
+                    specs: vec![wspec(&x)],
+                    steal: false,
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -326,20 +451,26 @@ pub mod conformance {
         );
 
         let uncovered = handle
-            .put_batch(&space, PutBatchRequest {
-                device: dev(2),
-                device_seq: DeviceSeq(1),
-                leases: vec![],
-                entries: vec![PutEntry {
-                    key: key(&[b"x", b"k"]),
-                    value: Value::Present(b"v".to_vec()),
-                    ver: Ver(1),
-                }],
-            })
+            .put_batch(
+                &space,
+                PutBatchRequest {
+                    device: dev(2),
+                    device_seq: DeviceSeq(1),
+                    leases: vec![],
+                    entries: vec![PutEntry {
+                        key: key(&[b"x", b"k"]),
+                        value: Value::Present(b"v".to_vec()),
+                        ver: Ver(1),
+                    }],
+                },
+            )
             .await
             .unwrap_err();
         assert!(
-            matches!(uncovered, SpaceError::Kernel(KernelError::NotCovered { .. })),
+            matches!(
+                uncovered,
+                SpaceError::Kernel(KernelError::NotCovered { .. })
+            ),
             "coverage refusal is a kernel decision, got {uncovered:?}"
         );
     }
@@ -361,34 +492,66 @@ pub mod conformance {
         let db = key(&[b"db"]);
 
         let err = handle
-            .acquire(&unknown, AcquireRequest { device: dev(1), specs: vec![wspec(&db)], steal: false })
+            .acquire(
+                &unknown,
+                AcquireRequest {
+                    device: dev(1),
+                    specs: vec![wspec(&db)],
+                    steal: false,
+                },
+            )
             .await
             .unwrap_err();
         assert!(is_transport(&err), "acquire: {err:?}");
         let err = handle
-            .renew(&unknown, RenewRequest { device: dev(1), leases: vec![] })
+            .renew(
+                &unknown,
+                RenewRequest {
+                    device: dev(1),
+                    leases: vec![],
+                },
+            )
             .await
             .unwrap_err();
         assert!(is_transport(&err), "renew: {err:?}");
         let err = handle
-            .release(&unknown, ReleaseRequest { device: dev(1), leases: vec![] })
+            .release(
+                &unknown,
+                ReleaseRequest {
+                    device: dev(1),
+                    leases: vec![],
+                },
+            )
             .await
             .unwrap_err();
         assert!(is_transport(&err), "release: {err:?}");
         let err = handle
-            .put_batch(&unknown, PutBatchRequest {
-                device: dev(1),
-                device_seq: DeviceSeq(1),
-                leases: vec![],
-                entries: vec![],
-            })
+            .put_batch(
+                &unknown,
+                PutBatchRequest {
+                    device: dev(1),
+                    device_seq: DeviceSeq(1),
+                    leases: vec![],
+                    entries: vec![],
+                },
+            )
             .await
             .unwrap_err();
         assert!(is_transport(&err), "put_batch: {err:?}");
-        let err = handle.get(&unknown, GetRequest { keys: vec![] }).await.unwrap_err();
+        let err = handle
+            .get(&unknown, GetRequest { keys: vec![] })
+            .await
+            .unwrap_err();
         assert!(is_transport(&err), "get: {err:?}");
         let err = handle
-            .list(&unknown, ListRequest { prefix: db.clone(), start_after: None, limit: None })
+            .list(
+                &unknown,
+                ListRequest {
+                    prefix: db.clone(),
+                    start_after: None,
+                    limit: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(is_transport(&err), "list: {err:?}");

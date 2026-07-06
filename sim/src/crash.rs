@@ -9,9 +9,7 @@ use crate::store::{FaultConfig, SimStore};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
-use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry,
-};
+use homebase_core::messages::{AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry};
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
@@ -53,7 +51,11 @@ pub fn prefix(d: u8) -> Key {
 }
 
 pub fn user_key(d: u8, seq: u64) -> Key {
-    Key::from_bytes([format!("d{d}").into_bytes(), format!("k{seq:06}").into_bytes()]).unwrap()
+    Key::from_bytes([
+        format!("d{d}").into_bytes(),
+        format!("k{seq:06}").into_bytes(),
+    ])
+    .unwrap()
 }
 
 pub fn value(d: u8, seq: u64) -> Vec<u8> {
@@ -172,8 +174,9 @@ pub fn phase_oracle<S: OrderedStore>(
     acks.lock().unwrap().retain(|ack| {
         let record = audit.data.get(&user_key(ack.device, ack.device_seq));
         if ack.admission_seq <= high {
-            let record = record
-                .unwrap_or_else(|| panic!("acked batch below high water lost: {ack:?} (seed {seed})"));
+            let record = record.unwrap_or_else(|| {
+                panic!("acked batch below high water lost: {ack:?} (seed {seed})")
+            });
             assert_eq!(
                 record.value,
                 Value::Present(value(ack.device, ack.device_seq)),

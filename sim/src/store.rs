@@ -99,7 +99,11 @@ impl SimStore {
     fn draw_yields(&self) -> u32 {
         let mut inner = self.inner.lock().unwrap();
         let max = inner.config.max_latency_yields;
-        if max == 0 { 0 } else { inner.rng.random_range(0..=max) }
+        if max == 0 {
+            0
+        } else {
+            inner.rng.random_range(0..=max)
+        }
     }
 
     fn draw_error(&self) -> bool {
@@ -192,10 +196,7 @@ impl OrderedStore for SimStore {
         }
     }
 
-    fn apply(
-        &self,
-        batch: WriteBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    fn apply(&self, batch: WriteBatch) -> impl Future<Output = Result<(), StorageError>> + Send {
         let this = self.clone();
         let fail = self.draw_error();
         let mut batch = Some(batch);
@@ -244,11 +245,14 @@ mod tests {
 
     #[test]
     fn crash_rolls_back_to_the_last_flush_prefix() {
-        let store = SimStore::new(7, FaultConfig {
-            error_rate: 0.0,
-            flush_rate: 0.0, // manual flushes only
-            max_latency_yields: 0,
-        });
+        let store = SimStore::new(
+            7,
+            FaultConfig {
+                error_rate: 0.0,
+                flush_rate: 0.0, // manual flushes only
+                max_latency_yields: 0,
+            },
+        );
         let put = |k: &[u8], v: &[u8]| {
             let mut batch = WriteBatch::new();
             batch.put(k.to_vec(), v.to_vec());
@@ -264,17 +268,24 @@ mod tests {
         store.crash();
         assert_eq!(block_on(store.get(b"a")).unwrap(), Some(b"1".to_vec()));
         assert_eq!(block_on(store.get(b"b")).unwrap(), Some(b"2".to_vec()));
-        assert_eq!(block_on(store.get(b"c")).unwrap(), None, "unflushed suffix lost");
+        assert_eq!(
+            block_on(store.get(b"c")).unwrap(),
+            None,
+            "unflushed suffix lost"
+        );
         assert_eq!(block_on(store.get(b"d")).unwrap(), None);
     }
 
     #[test]
     fn injected_apply_fault_leaves_no_trace() {
-        let store = SimStore::new(1, FaultConfig {
-            error_rate: 1.0,
-            flush_rate: 1.0,
-            max_latency_yields: 0,
-        });
+        let store = SimStore::new(
+            1,
+            FaultConfig {
+                error_rate: 1.0,
+                flush_rate: 1.0,
+                max_latency_yields: 0,
+            },
+        );
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         assert!(block_on(store.apply(batch)).is_err());

@@ -7,8 +7,8 @@
 mod slate;
 
 pub use homebase_core::storage::{
-    MemoryStore, Op, OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan,
-    conformance, prefix_successor,
+    MemoryStore, Op, OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan, conformance,
+    prefix_successor,
 };
 
 #[cfg(feature = "slatedb")]
