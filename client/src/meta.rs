@@ -44,16 +44,15 @@
 //! direct puts with queued commits on one device id would interleave the
 //! stream); storeless engine-tier consumers are separate devices.
 //!
-//! **Two cursors, two directions — they never meet.** The whole-space
-//! whole-space watermark is the *pull* cursor: per space, in the server's
-//! `AdmissionSeq` domain — "the stable space shape has synced down
-//! through here." Trim is *push* acknowledgment:
+//! **Two cursors, two directions — they never meet.** Range watermarks are
+//! the *pull* cursors: per space and exact range, in the server's
+//! `AdmissionSeq` domain — "this range has synced down through here."
+//! Effective watermark lookup walks ancestor ranges and takes the max.
+//! Trim is *push* acknowledgment:
 //! client-level, in the device's own `DeviceSeq` domain — "the server
 //! admitted my queue through here, drop the prefix." Different sequence
 //! spaces, never compared: a write-only client trims forever without a
-//! whole-space watermark; a read-only one advances whole-space watermarks without ever trimming.
-//! Prefix/shape-specific cursors come later; until then callers must pull
-//! the stable full shape for a space before using a fresh acquire barrier.
+//! range watermark; a read-only one advances range watermarks without ever trimming.
 //!
 //! **Vers are assigned by the store: one Lamport high-water, no per-key
 //! table.** The protocol's per-key ver chains stay (the untrusted-server
@@ -103,7 +102,7 @@
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
-use homebase_core::messages::PutEntry;
+use homebase_core::messages::{PutEntry, Range};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -140,8 +139,8 @@ pub struct VerHighRecord {
     pub high: Ver,
 }
 
-/// The whole-space watermark: the admission seq this replica's stable
-/// space shape has synced through.
+/// One exact range watermark: the admission seq this replica has synced
+/// through for that range.
 /// Absence is meaningful — no pull has completed, so the next one is a
 /// snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,8 +182,8 @@ pub struct HeldLease {
     /// Send time + granted TTL, stamped by the incarnation that heard
     /// the grant.
     pub deadline: HybridTimestamp,
-    /// Fresh acquires are not local authority until the whole-space
-    /// whole-space watermark has reached the grant's barrier. Renewals preserve this.
+    /// Fresh acquires are not local authority until the effective watermark
+    /// for this lease prefix has reached the grant's barrier. Renewals preserve this.
     pub barrier: Option<AdmissionSeq>,
     /// A release intent has been durably recorded. Retiring leases are
     /// never local authority, but keep the id so the server release can
@@ -209,7 +208,7 @@ pub struct CommitRecord {
 /// One space's slice of the loaded state.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SpaceState {
-    pub watermark: Option<AdmissionSeq>,
+    pub watermarks: BTreeMap<Range, AdmissionSeq>,
     pub codec: Option<CodecRecord>,
     pub leases: BTreeMap<LeaseId, HeldLease>,
 }
@@ -347,10 +346,13 @@ pub trait MetaStore {
         prefixes: &[Key],
     ) -> impl Future<Output = Result<Vec<HeldLease>, StorageError>> + Send;
 
-    /// One space's stable-shape pull cursor.
+    /// Effective pull cursor for `range`: exact cursor or the max cursor
+    /// from any stored ancestor range (Full covers everything, prefix
+    /// ancestors cover descendants).
     fn watermark(
         &self,
         space: SpaceId,
+        range: &Range,
     ) -> impl Future<Output = Result<Option<AdmissionSeq>, StorageError>> + Send;
 
     // -- transitions: every method one atomic, durable step.
@@ -401,11 +403,14 @@ pub trait MetaStore {
         from: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// A pulled stable-shape cut moves the sync point — and raises the ver
-    /// high-water to the maximum ver the cut carried, atomically with it.
+    /// A pulled range cut records that exact range's sync point — and
+    /// raises the ver high-water to the maximum ver the cut carried,
+    /// atomically with it. Ancestor max is computed at read time, not
+    /// fanned out here.
     fn advance_watermark(
         &self,
         space: SpaceId,
+        range: &Range,
         at: AdmissionSeq,
         ver_seen: Ver,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
@@ -498,7 +503,7 @@ pub enum StoreNamespace {
 /// (Meta, Client, Ver)                  → VerHighRecord
 /// (Meta, Client, Clock)                → ClockRecord
 /// (Meta, Client, Oplog, seq_be)        → CommitRecord
-/// (Meta, Space, id, Watermark)         → WatermarkRecord (whole-space cursor)
+/// (Meta, Space, id, Watermark, range)  → WatermarkRecord (exact range cursor)
 /// (Meta, Space, id, Codec)             → CodecRecord
 /// (Meta, Space, id, Lease, prefix)      → LeaseRecord
 /// ```
@@ -600,8 +605,61 @@ fn oplog_key(seq: DeviceSeq) -> Vec<u8> {
     encode_components(&components)
 }
 
-fn watermark_key(space: SpaceId) -> Vec<u8> {
-    encode_components(&space_kind(space, SpaceKind::Watermark))
+fn watermark_key(space: SpaceId, range: &Range) -> Vec<u8> {
+    let mut components = space_kind(space, SpaceKind::Watermark);
+    match range {
+        Range::Full => components.push(byte_component(0)),
+        Range::Prefix(prefix) => {
+            components.push(byte_component(1));
+            components.push(KeyComponent::new(prefix.encode()).expect("nonempty encoded prefix"));
+        }
+    }
+    encode_components(&components)
+}
+
+fn range_from_watermark_key(components: &[KeyComponent]) -> Range {
+    // Compatibility with the earlier scalar watermark: no range suffix
+    // meant the full-range cursor.
+    if components.len() == 4 {
+        return Range::Full;
+    }
+    match single_byte(components, 4, "watermark range kind") {
+        0 => {
+            assert_eq!(components.len(), 5, "full watermark has no suffix");
+            Range::Full
+        }
+        1 => {
+            assert_eq!(
+                components.len(),
+                6,
+                "prefix watermark stores one encoded prefix"
+            );
+            Range::Prefix(
+                Key::decode(
+                    components
+                        .get(5)
+                        .expect("prefix watermark missing encoded prefix")
+                        .as_bytes(),
+                )
+                .expect("undecodable watermark prefix"),
+            )
+        }
+        other => panic!("unknown watermark range kind {other}"),
+    }
+}
+
+fn watermark_ancestors(range: &Range) -> Vec<Range> {
+    let mut out = vec![Range::Full];
+    if let Range::Prefix(prefix) = range {
+        let components = prefix.components();
+        for depth in 1..=components.len() {
+            out.push(Range::Prefix(
+                Key::new(components[..depth].to_vec())
+                    .expect("a prefix of a valid key is a valid key"),
+            ));
+        }
+    }
+    out
 }
 
 fn codec_key(space: SpaceId) -> Vec<u8> {
@@ -679,9 +737,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                     let kind = single_byte(&components, 3, "space kind");
                     match kind {
                         k if k == SpaceKind::Watermark as u8 => {
-                            let record = WatermarkRecord::decode(&bytes)
-                                .expect("undecodable whole-space watermark");
-                            space.watermark = Some(record.at);
+                            let record =
+                                WatermarkRecord::decode(&bytes).expect("undecodable watermark");
+                            space
+                                .watermarks
+                                .insert(range_from_watermark_key(&components), record.at);
                         }
                         k if k == SpaceKind::Codec as u8 => {
                             let record = CodecRecord::decode(&bytes).expect("undecodable codec");
@@ -756,12 +816,21 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         Ok(out)
     }
 
-    async fn watermark(&self, space: SpaceId) -> Result<Option<AdmissionSeq>, StorageError> {
-        Ok(self.store.get(&watermark_key(space)).await?.map(|bytes| {
-            WatermarkRecord::decode(&bytes)
-                .expect("undecodable whole-space watermark")
-                .at
-        }))
+    async fn watermark(
+        &self,
+        space: SpaceId,
+        range: &Range,
+    ) -> Result<Option<AdmissionSeq>, StorageError> {
+        let mut out = None;
+        for ancestor in watermark_ancestors(range) {
+            if let Some(bytes) = self.store.get(&watermark_key(space, &ancestor)).await? {
+                let at = WatermarkRecord::decode(&bytes)
+                    .expect("undecodable watermark")
+                    .at;
+                out = Some(out.map_or(at, |current: AdmissionSeq| current.max(at)));
+            }
+        }
+        Ok(out)
     }
 
     async fn record_device(&self, id: DeviceId) -> Result<(), StorageError> {
@@ -855,6 +924,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     async fn advance_watermark(
         &self,
         space: SpaceId,
+        range: &Range,
         at: AdmissionSeq,
         ver_seen: Ver,
     ) -> Result<(), StorageError> {
@@ -867,7 +937,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             None => Ver(0),
         };
         let mut batch = WriteBatch::new();
-        batch.put(watermark_key(space), WatermarkRecord { at }.encode());
+        batch.put(watermark_key(space, range), WatermarkRecord { at }.encode());
         batch.put(
             ver_key(),
             VerHighRecord {
@@ -1453,18 +1523,23 @@ pub mod conformance {
 
         // A pull moves the sync point and raises the ver high-water to
         // what the cut carried; the next commit climbs past it.
+        let db_range = Range::Prefix(key(&[b"db"]));
         store
-            .advance_watermark(space, AdmissionSeq(40), Ver(10))
+            .advance_watermark(space, &db_range, AdmissionSeq(40), Ver(10))
             .await
             .unwrap();
         let state = audit(store).await;
-        assert_eq!(state.spaces[&space].watermark, Some(AdmissionSeq(40)));
+        assert_eq!(state.spaces[&space].watermarks[&db_range], AdmissionSeq(40));
         assert_eq!(state.ver_high, Some(Ver(10)));
         assert_eq!(
-            store.watermark(space).await.unwrap(),
+            store.watermark(space, &db_range).await.unwrap(),
             Some(AdmissionSeq(40))
         );
-        assert_eq!(store.watermark(link).await.unwrap(), None, "no pull yet");
+        assert_eq!(
+            store.watermark(link, &db_range).await.unwrap(),
+            None,
+            "no pull yet"
+        );
         let fourth = store
             .commit(
                 space,
@@ -1482,10 +1557,25 @@ pub mod conformance {
 
         // A pull carrying older vers never regresses the high-water.
         store
-            .advance_watermark(space, AdmissionSeq(41), Ver(5))
+            .advance_watermark(space, &db_range, AdmissionSeq(41), Ver(5))
             .await
             .unwrap();
         assert_eq!(audit(store).await.ver_high, Some(Ver(11)));
+        store
+            .advance_watermark(space, &Range::Full, AdmissionSeq(50), Ver(5))
+            .await
+            .unwrap();
+        let state = audit(store).await;
+        assert_eq!(
+            state.spaces[&space].watermarks[&db_range],
+            AdmissionSeq(41),
+            "exact prefix cursor is not rewritten by ancestor progress"
+        );
+        assert_eq!(
+            store.watermark(space, &db_range).await.unwrap(),
+            Some(AdmissionSeq(50)),
+            "effective prefix cursor is ancestor max"
+        );
 
         // Duplicate keys in one commit behave like a sequence — the
         // kernel's own within-batch rule: later occurrences carry
@@ -1861,7 +1951,8 @@ mod tests {
             ver_key(),
             clock_key(),
             oplog_key(DeviceSeq(1)),
-            watermark_key(SPACE),
+            watermark_key(SPACE, &Range::Full),
+            watermark_key(SPACE, &Range::Prefix(key(&[b"db"]))),
             codec_key(SPACE),
             lease_key(SPACE, &key(&[b"db", b"pay"])),
         ] {

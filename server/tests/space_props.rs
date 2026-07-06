@@ -22,8 +22,8 @@ use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PrefixCursor, PutBatchRequest,
-    PutEntry, RangeCut, ReadAtRequest,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatchRequest, PutEntry,
+    Range, RangeCursor, RangeCut, ReadAtRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -315,8 +315,8 @@ fn sync_replica(
     let resp = block_on(h.space.read_at(
         &h.store,
         &ReadAtRequest {
-            ranges: vec![PrefixCursor {
-                prefix: dev_prefix(device),
+            ranges: vec![RangeCursor {
+                range: Range::Prefix(dev_prefix(device)),
                 since: replica.cursor,
             }],
         },

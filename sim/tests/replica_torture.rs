@@ -22,8 +22,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, PutEntry, RangeCut,
-    ReadAtRequest,
+    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCursor,
+    RangeCut, ReadAtRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -177,8 +177,8 @@ async fn sync_once(
     let since = replica.cursor.get().map(AdmissionSeq);
     let resp = match handle
         .read_at(ReadAtRequest {
-            ranges: vec![PrefixCursor {
-                prefix: prefix(),
+            ranges: vec![RangeCursor {
+                range: Range::Prefix(prefix()),
                 since,
             }],
         })

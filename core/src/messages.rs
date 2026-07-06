@@ -181,11 +181,38 @@ pub struct ListResponse {
 // ---------------------------------------------------------------------------
 // read_at
 
+/// A read range within one space.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Range {
+    /// The whole space: every live data key for snapshots, every changed
+    /// key for deltas.
+    Full,
+    /// All keys under this component-wise prefix.
+    Prefix(Key),
+}
+
+impl Range {
+    pub fn covers_key(&self, key: &Key) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Prefix(prefix) => key.starts_with(prefix),
+        }
+    }
+
+    pub fn covers_range(&self, other: &Range) -> bool {
+        match (self, other) {
+            (Self::Full, _) => true,
+            (Self::Prefix(_), Self::Full) => false,
+            (Self::Prefix(a), Self::Prefix(b)) => b.starts_with(a),
+        }
+    }
+}
+
 /// A range with the caller's cursor position. `since: None` requests a full
 /// snapshot; `Some` requests the changes since that admission point.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrefixCursor {
-    pub prefix: Key,
+pub struct RangeCursor {
+    pub range: Range,
     pub since: Option<AdmissionSeq>,
 }
 
@@ -197,7 +224,7 @@ pub struct PrefixCursor {
 /// scan. Cursors are client-owned state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadAtRequest {
-    pub ranges: Vec<PrefixCursor>,
+    pub ranges: Vec<RangeCursor>,
 }
 
 /// Per-range result of a consistent cut: `(S, Δ)` in the design's terms.

@@ -7,7 +7,7 @@
 //!
 //! [`Engine::open`] loads durable state once — to certify it (the audit
 //! posture) and to adopt the constant-shape facts: the device identity
-//! and the seq counter. Everything else — leases, whole-space watermarks, the queue —
+//! and the seq counter. Everything else — leases, range watermarks, the queue —
 //! stays in the store and is **read on demand** through the [`MetaStore`]
 //! point reads: local-disk cheap, and the store is free to buffer. The
 //! engine holds no copy of any collection, so there is nothing to drift —
@@ -104,8 +104,8 @@ use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, RangeCut, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, Range, RangeCursor, RangeCut,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -149,8 +149,11 @@ pub enum EngineError {
     Fork { admitted: DeviceSeq },
     /// The client refused to enqueue a local write because no usable
     /// local write lease covered the key. Usable means live, not
-    /// retiring, and past its acquire barrier in the whole-space cursor.
+    /// retiring, and past its acquire barrier in the lease-prefix range.
     LocalAuthority { key: Key },
+    /// Releasing this lease would strand queued local writes that still
+    /// need to be pushed under it.
+    ReleaseBlocked { lease: LeaseId, at: DeviceSeq },
 }
 
 impl From<StorageError> for EngineError {
@@ -179,6 +182,9 @@ impl fmt::Display for EngineError {
                 "device fork: the server admitted {admitted:?}, which this store never sent"
             ),
             Self::LocalAuthority { key } => write!(f, "no local write authority for {key:?}"),
+            Self::ReleaseBlocked { lease, at } => {
+                write!(f, "lease {lease:?} still covers queued write {at:?}")
+            }
         }
     }
 }
@@ -289,32 +295,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         }
         store.record_clock(now.wall).await?;
 
-        for (space, space_state) in &state.spaces {
-            let retiring: Vec<LeaseId> = space_state
-                .leases
-                .values()
-                .filter(|held| held.retiring)
-                .map(|held| held.lease.id)
-                .collect();
-            if retiring.is_empty() {
-                continue;
-            }
-            match server
-                .release(
-                    space,
-                    ReleaseRequest {
-                        device,
-                        leases: retiring.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(_) => store.drop_leases(*space, &retiring).await?,
-                Err(SpaceError::Unavailable { .. }) => {}
-                Err(SpaceError::Kernel(err)) => return Err(EngineError::Rejected(err)),
-            }
-        }
-
         let next_seq = state.next_seq.unwrap_or(DeviceSeq(1));
         let scan_from = state.oplog.keys().next().copied().unwrap_or(next_seq);
         Ok(Self {
@@ -355,17 +335,12 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         prefixes: &[Key],
     ) -> Result<Vec<LeaseState>, EngineError> {
         let now = self.clock.stamp();
-        let watermark = self.store.watermark(space).await?;
-        Ok(self
-            .store
-            .leases_covering(space, prefixes)
-            .await?
-            .into_iter()
-            .map(|held| {
-                let live = self.lease_usable(&held, &now, watermark);
-                LeaseState { held, live }
-            })
-            .collect())
+        let mut out = Vec::new();
+        for held in self.store.leases_covering(space, prefixes).await? {
+            let live = self.lease_usable_for_held(space, &held, &now).await?;
+            out.push(LeaseState { held, live });
+        }
+        Ok(out)
     }
 
     /// A local commit: durable in the store (seq and vers assigned
@@ -413,16 +388,23 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         let queried: Vec<Key> = specs.iter().map(|spec| spec.prefix.clone()).collect();
         let now = self.clock.stamp();
         let held = self.store.leases_covering(space, &queried).await?;
-        let watermark = self.store.watermark(space).await?;
-        let mut revive: Vec<LeaseId> = specs
-            .iter()
-            .filter(|spec| self.usable_covering(&held, spec, &now, watermark).is_none())
-            .filter_map(|spec| {
-                held.iter()
-                    .find(|h| !h.retiring && covers(h, spec) && h.barrier.is_none())
-                    .map(|h| h.lease.id)
-            })
-            .collect();
+        let mut revive: Vec<LeaseId> = Vec::new();
+        for spec in &specs {
+            if self
+                .usable_covering(space, &held, spec, &now)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if let Some(id) = held
+                .iter()
+                .find(|h| !h.retiring && covers(h, spec) && h.barrier.is_none())
+                .map(|h| h.lease.id)
+            {
+                revive.push(id);
+            }
+        }
         revive.sort_unstable();
         revive.dedup();
         if !revive.is_empty() {
@@ -432,15 +414,15 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         // Tiers 1 and 3 against refreshed truth.
         let send = self.clock.stamp();
         let held = self.store.leases_covering(space, &queried).await?;
-        let watermark = self.store.watermark(space).await?;
-        let mut satisfied: Vec<Option<Lease>> = specs
-            .iter()
-            .map(|spec| {
-                self.usable_covering(&held, spec, &send, watermark)
+        let mut satisfied: Vec<Option<Lease>> = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            satisfied.push(
+                self.usable_covering(space, &held, spec, &send)
+                    .await?
                     .or_else(|| pending_barrier_covering(&held, spec, &send))
-                    .cloned()
-            })
-            .collect();
+                    .cloned(),
+            );
+        }
         let missing: Vec<LeaseSpec> = specs
             .iter()
             .zip(&satisfied)
@@ -451,7 +433,9 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
             let leases = satisfied.into_iter().flatten().collect();
             return Ok(Acquired {
                 leases,
-                barrier: max_pending_barrier(&held, &specs, &send, watermark),
+                barrier: self
+                    .max_pending_barrier(space, &held, &specs, &send)
+                    .await?,
             });
         }
 
@@ -466,17 +450,19 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
                 },
             )
             .await?;
-        let watermark = self.store.watermark(space).await?;
-        let fresh: Vec<HeldLease> = response
-            .leases
-            .iter()
-            .map(|lease| HeldLease {
+        let mut fresh = Vec::with_capacity(response.leases.len());
+        for lease in &response.leases {
+            let watermark = self
+                .store
+                .watermark(space, &Range::Prefix(lease.prefix.clone()))
+                .await?;
+            fresh.push(HeldLease {
                 lease: lease.clone(),
                 deadline: send.saturating_add(lease.ttl),
                 barrier: pending_barrier(response.barrier, watermark),
                 retiring: false,
-            })
-            .collect();
+            });
+        }
         self.store.record_clock(send.wall).await?;
         self.store.record_leases(space, &fresh).await?;
 
@@ -486,8 +472,10 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
                 *slot = Some(granted.next().expect("grants parallel to missing specs"));
             }
         }
-        let existing_barrier = max_pending_barrier(&held, &specs, &send, watermark);
-        let fresh_barrier = pending_barrier(response.barrier, watermark);
+        let existing_barrier = self
+            .max_pending_barrier(space, &held, &specs, &send)
+            .await?;
+        let fresh_barrier = fresh.iter().filter_map(|held| held.barrier).max();
         Ok(Acquired {
             leases: satisfied.into_iter().flatten().collect(),
             barrier: existing_barrier.max(fresh_barrier),
@@ -568,14 +556,15 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         Ok(response)
     }
 
-    /// Release leases: tell the server (idempotent there), then forget.
-    /// A crash between the two leaves a stale record that the next
-    /// renewal reports invalid and drops — the saga resolves itself. An
-    /// empty `ids` never touches the wire.
+    /// Release leases: first mark them retiring locally, then tell the
+    /// server (idempotent there), then forget. Queued writes covered by a
+    /// lease block release; callers should push or discard before releasing.
+    /// An empty `ids` never touches the wire.
     pub async fn release(&mut self, space: SpaceId, ids: &[LeaseId]) -> Result<(), EngineError> {
         if ids.is_empty() {
             return Ok(());
         }
+        self.reject_release_if_queued_writes(space, ids).await?;
         self.store.retire_leases(space, ids).await?;
         self.server
             .release(
@@ -590,29 +579,63 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         Ok(())
     }
 
-    /// Pull a consistent cut of `prefixes` since the space's whole-space watermark
-    /// (`None` whole-space watermark → snapshot), then advance the whole-space watermark to the
-    /// cut and the ver high-water past every ver the cut carried — the
-    /// acquire-barrier half of what makes blind Lamport stamping safe.
-    ///
-    /// The whole-space watermark is one cursor per space: callers pull a stable
-    /// prefix set (their shape), not ad-hoc subsets.
+    async fn reject_release_if_queued_writes(
+        &self,
+        space: SpaceId,
+        ids: &[LeaseId],
+    ) -> Result<(), EngineError> {
+        let state = self.store.load().await?;
+        let Some(space_state) = state.spaces.get(&space) else {
+            return Ok(());
+        };
+        let releasing: Vec<&HeldLease> = ids
+            .iter()
+            .filter_map(|id| space_state.leases.get(id))
+            .collect();
+        if releasing.is_empty() {
+            return Ok(());
+        }
+        for (seq, record) in &state.oplog {
+            if record.space != space {
+                continue;
+            }
+            for held in &releasing {
+                if record
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key.starts_with(&held.lease.prefix))
+                {
+                    return Err(EngineError::ReleaseBlocked {
+                        lease: held.lease.id,
+                        at: *seq,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pull one range since its effective watermark (`None` → snapshot), then
+    /// record the returned cut for that exact range. Pulling
+    /// [`Range::Prefix`] never advances [`Range::Full`]; descendants only see
+    /// ancestor progress through the read-time max in [`MetaStore::watermark`].
     pub async fn pull(
         &mut self,
         space: SpaceId,
-        prefixes: &[Key],
+        range: Range,
     ) -> Result<ReadAtResponse, EngineError> {
-        let since = self.store.watermark(space).await?;
-        let ranges = prefixes
-            .iter()
-            .map(|prefix| PrefixCursor {
-                prefix: prefix.clone(),
-                since,
-            })
-            .collect();
+        let since = self.store.watermark(space, &range).await?;
         let response = self
             .server
-            .read_at(&space, ReadAtRequest { ranges })
+            .read_at(
+                &space,
+                ReadAtRequest {
+                    ranges: vec![RangeCursor {
+                        range: range.clone(),
+                        since,
+                    }],
+                },
+            )
             .await?;
         let ver_seen = response
             .ranges
@@ -624,7 +647,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
             .max()
             .unwrap_or(Ver(0));
         self.store
-            .advance_watermark(space, response.at, ver_seen)
+            .advance_watermark(space, &range, response.at, ver_seen)
             .await?;
         Ok(response)
     }
@@ -751,14 +774,18 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         }
         let keys: Vec<Key> = entries.iter().map(|(key, _)| key.clone()).collect();
         let held = self.store.leases_covering(space, &keys).await?;
-        let watermark = self.store.watermark(space).await?;
         let now = self.clock.stamp();
         for key in keys {
-            let covered = held.iter().any(|held| {
-                held.lease.mode == LeaseMode::Write
+            let mut covered = false;
+            for held in &held {
+                if held.lease.mode == LeaseMode::Write
                     && key.starts_with(&held.lease.prefix)
-                    && self.lease_usable(held, &now, watermark)
-            });
+                    && self.lease_usable_for_held(space, held, &now).await?
+                {
+                    covered = true;
+                    break;
+                }
+            }
             if !covered {
                 return Err(EngineError::LocalAuthority { key });
             }
@@ -778,19 +805,66 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         !held.retiring && self.lease_live(held, now) && barrier_satisfied(held.barrier, watermark)
     }
 
+    async fn lease_usable_for_held(
+        &self,
+        space: SpaceId,
+        held: &HeldLease,
+        now: &HybridTimestamp,
+    ) -> Result<bool, EngineError> {
+        let watermark = self
+            .store
+            .watermark(space, &Range::Prefix(held.lease.prefix.clone()))
+            .await?;
+        Ok(self.lease_usable(held, now, watermark))
+    }
+
     /// The held lease (if any) that satisfies `spec` right now:
     /// covering, live, unretired, and barrier-satisfied.
-    fn usable_covering<'a>(
+    async fn usable_covering<'a>(
         &self,
+        space: SpaceId,
         held: &'a [HeldLease],
         spec: &LeaseSpec,
         now: &HybridTimestamp,
-        watermark: Option<AdmissionSeq>,
-    ) -> Option<&'a Lease> {
-        held.iter()
-            .filter(|h| self.lease_usable(h, now, watermark))
-            .find(|h| covers(h, spec))
-            .map(|h| &h.lease)
+    ) -> Result<Option<&'a Lease>, EngineError> {
+        for h in held {
+            if covers(h, spec) && self.lease_usable_for_held(space, h, now).await? {
+                return Ok(Some(&h.lease));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn max_pending_barrier(
+        &self,
+        space: SpaceId,
+        held: &[HeldLease],
+        specs: &[LeaseSpec],
+        now: &HybridTimestamp,
+    ) -> Result<Option<AdmissionSeq>, EngineError> {
+        let mut out = None;
+        for spec in specs {
+            for held in held {
+                if held.retiring
+                    || held.barrier.is_none()
+                    || held.deadline.expired(now, lease_margin(held.lease.ttl))
+                    || !covers(held, spec)
+                {
+                    continue;
+                }
+                let watermark = self
+                    .store
+                    .watermark(space, &Range::Prefix(held.lease.prefix.clone()))
+                    .await?;
+                if let Some(barrier) = held.barrier {
+                    if !barrier_satisfied(Some(barrier), watermark) {
+                        out =
+                            Some(out.map_or(barrier, |current: AdmissionSeq| current.max(barrier)));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The lease refs a put over `keys` may present *right now*:
@@ -804,20 +878,18 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         keys: &[Key],
     ) -> Result<Vec<LeaseRef>, EngineError> {
         let now = self.clock.stamp();
-        let watermark = self.store.watermark(space).await?;
-        Ok(self
-            .store
-            .leases_covering(space, keys)
-            .await?
-            .into_iter()
-            .filter(|held| {
-                held.lease.mode == LeaseMode::Write && self.lease_usable(held, &now, watermark)
-            })
-            .map(|held| LeaseRef {
-                id: held.lease.id,
-                epoch: held.lease.epoch,
-            })
-            .collect())
+        let mut out = Vec::new();
+        for held in self.store.leases_covering(space, keys).await? {
+            if held.lease.mode == LeaseMode::Write
+                && self.lease_usable_for_held(space, &held, &now).await?
+            {
+                out.push(LeaseRef {
+                    id: held.lease.id,
+                    epoch: held.lease.epoch,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -839,26 +911,6 @@ fn pending_barrier_covering<'a>(
         .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
         .find(|held| covers(held, spec))
         .map(|held| &held.lease)
-}
-
-fn max_pending_barrier(
-    held: &[HeldLease],
-    specs: &[LeaseSpec],
-    now: &HybridTimestamp,
-    watermark: Option<AdmissionSeq>,
-) -> Option<AdmissionSeq> {
-    specs
-        .iter()
-        .filter_map(|spec| {
-            held.iter()
-                .filter(|held| !held.retiring && held.barrier.is_some())
-                .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
-                .filter(|held| covers(held, spec))
-                .filter_map(|held| held.barrier)
-                .filter(|barrier| !barrier_satisfied(Some(*barrier), watermark))
-                .max()
-        })
-        .max()
 }
 
 /// Whether a held lease answers a spec: its prefix covers the requested

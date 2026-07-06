@@ -117,7 +117,7 @@ mod tests {
     use crate::storage::MemoryStore;
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
-    use homebase_core::messages::{KernelError, LeaseSpec, PrefixCursor, PutEntry, RangeCut};
+    use homebase_core::messages::{KernelError, LeaseSpec, PutEntry, Range, RangeCursor, RangeCut};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use pollster::block_on;
     use std::time::Duration;
@@ -497,8 +497,8 @@ mod tests {
         let snap = block_on(space.read_at(
             &store,
             &ReadAtRequest {
-                ranges: vec![PrefixCursor {
-                    prefix: key(&[b"db"]),
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db"])),
                     since: None,
                 }],
             },
@@ -519,8 +519,8 @@ mod tests {
         let delta = block_on(space.read_at(
             &store,
             &ReadAtRequest {
-                ranges: vec![PrefixCursor {
-                    prefix: key(&[b"db"]),
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db"])),
                     since: Some(snap.at),
                 }],
             },
@@ -543,8 +543,8 @@ mod tests {
         let empty = block_on(space.read_at(
             &store,
             &ReadAtRequest {
-                ranges: vec![PrefixCursor {
-                    prefix: key(&[b"db"]),
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db"])),
                     since: Some(delta.at),
                 }],
             },
@@ -574,12 +574,12 @@ mod tests {
             &store,
             &ReadAtRequest {
                 ranges: vec![
-                    PrefixCursor {
-                        prefix: key(&[b"db", b"t1"]),
+                    RangeCursor {
+                        range: Range::Prefix(key(&[b"db", b"t1"])),
                         since: Some(AdmissionSeq(0)),
                     },
-                    PrefixCursor {
-                        prefix: key(&[b"db", b"t2"]),
+                    RangeCursor {
+                        range: Range::Prefix(key(&[b"db", b"t2"])),
                         since: Some(AdmissionSeq(0)),
                     },
                 ],

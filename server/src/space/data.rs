@@ -42,15 +42,15 @@ use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
     CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord, changelog_key,
-    changelog_scan_after, changelog_scan_all, counters_key, data_key, device_key, prefix_meta_key,
-    user_key_from_changelog, user_key_from_data,
+    changelog_scan_after, changelog_scan_all, counters_key, data_key, data_scan_all, device_key,
+    prefix_meta_key, user_key_from_changelog, user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
     GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
-    PutBatchResponse, RangeCut, ReadAtRequest, ReadAtResponse,
+    PutBatchResponse, Range, RangeCut, ReadAtRequest, ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Tag};
@@ -250,8 +250,8 @@ pub async fn read_at<S: OrderedStore>(
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
         let cut = match range.since {
-            None => RangeCut::Snapshot(snapshot(space, store, &range.prefix).await?),
-            Some(since) => RangeCut::Delta(delta(space, store, &range.prefix, since).await?),
+            None => RangeCut::Snapshot(snapshot(space, store, &range.range).await?),
+            Some(since) => RangeCut::Delta(delta(space, store, &range.range, since).await?),
         };
         ranges.push(cut);
     }
@@ -262,8 +262,26 @@ pub async fn read_at<S: OrderedStore>(
 async fn snapshot<S: OrderedStore>(
     space: SpaceId,
     store: &S,
-    prefix: &Key,
+    range: &Range,
 ) -> Result<Vec<Entry>, StorageError> {
+    let Range::Prefix(prefix) = range else {
+        let base = data_scan_all(space);
+        let mut entries = Vec::new();
+        let mut iter = store.scan_prefix(&base);
+        while let Some((storage_key, bytes)) = iter.next().await? {
+            let rec = DataRecord::decode(&bytes).expect("corrupt data record");
+            if rec.value.is_absent() {
+                continue;
+            }
+            let key = user_key_from_data(&storage_key).expect("corrupt data key");
+            entries.push(Entry {
+                key,
+                value: rec.value,
+                tag: rec.tag,
+            });
+        }
+        return Ok(entries);
+    };
     // Aggregate short-circuit: never-written prefix or all-tombstones.
     match prefix_meta(space, store, prefix).await? {
         None => return Ok(Vec::new()),
@@ -294,14 +312,16 @@ async fn snapshot<S: OrderedStore>(
 async fn delta<S: OrderedStore>(
     space: SpaceId,
     store: &S,
-    prefix: &Key,
+    range: &Range,
     since: AdmissionSeq,
 ) -> Result<Vec<Entry>, StorageError> {
-    // Aggregate short-circuit: nothing under this prefix since the cursor.
-    match prefix_meta(space, store, prefix).await? {
-        None => return Ok(Vec::new()),
-        Some(meta) if meta.max_admission_seq <= since.0 => return Ok(Vec::new()),
-        Some(_) => {}
+    if let Range::Prefix(prefix) = range {
+        // Aggregate short-circuit: nothing under this prefix since the cursor.
+        match prefix_meta(space, store, prefix).await? {
+            None => return Ok(Vec::new()),
+            Some(meta) if meta.max_admission_seq <= since.0 => return Ok(Vec::new()),
+            Some(_) => {}
+        }
     }
     let start = changelog_scan_after(space, since);
     let end = prefix_successor(&changelog_scan_all(space));
@@ -309,7 +329,7 @@ async fn delta<S: OrderedStore>(
     let mut iter = store.scan(start, end);
     while let Some((storage_key, bytes)) = iter.next().await? {
         let key = user_key_from_changelog(&storage_key).expect("corrupt changelog key");
-        if !key.starts_with(prefix) {
+        if !range.covers_key(&key) {
             continue;
         }
         let rec = DataRecord::decode(&bytes).expect("corrupt data record");

@@ -11,7 +11,7 @@
 //!
 //! - [`meta`] — **contract 2 of 3**: [`MetaStore`](meta::MetaStore), a
 //!   device's durable truth (identity, one shared seq stream, one oplog,
-//!   per-space whole-space watermark/leases/codec cache) expressed as the transition
+//!   per-space range watermarks/leases/codec cache) expressed as the transition
 //!   vocabulary itself — every method one atomic, durable, async step.
 //!   [`OrderedMetaStore`](meta::OrderedMetaStore) is the reference
 //!   implementation over any

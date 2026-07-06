@@ -9,8 +9,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, PutEntry, ReadAtRequest,
-    ReleaseRequest,
+    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCursor,
+    ReadAtRequest, ReleaseRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -103,8 +103,8 @@ impl Replica {
     ) -> Result<(), SpaceError> {
         let resp = handle
             .read_at(ReadAtRequest {
-                ranges: vec![PrefixCursor {
-                    prefix: prefix.clone(),
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(prefix.clone()),
                     since: self.cursor,
                 }],
             })

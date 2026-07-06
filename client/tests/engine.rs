@@ -12,7 +12,7 @@ use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, RangeCut,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCut,
     ReleaseRequest,
 };
 use homebase_core::space::SpaceId;
@@ -901,7 +901,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
         // without importing the foreign value's ver. The pusher still
         // degrades a group rejection into the faulty solo commit.
         OrderedMetaStore::new(&mem)
-            .advance_watermark(SPACE, AdmissionSeq(1), Ver(0))
+            .advance_watermark(SPACE, &Range::Prefix(db.clone()), AdmissionSeq(1), Ver(0))
             .await
             .unwrap();
         engine
@@ -1052,12 +1052,13 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         // The acquire-barrier discipline: pull to the barrier before
         // trusting local state. The pull is a snapshot (no cursor yet)
         // and raises the ver high-water past everything it saw.
-        let pulled = engine.pull(SPACE, std::slice::from_ref(&db)).await.unwrap();
+        let pulled = engine.pull(SPACE, Range::Prefix(db.clone())).await.unwrap();
         assert!(pulled.at >= granted.barrier.unwrap());
         assert!(matches!(&pulled.ranges[0], RangeCut::Snapshot(entries) if entries.len() == 1));
         assert_eq!(
-            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].watermark,
-            Some(pulled.at)
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].watermarks
+                [&Range::Prefix(db.clone())],
+            pulled.at
         );
 
         // Now the same key can be overwritten: the commit stamps above
@@ -1078,18 +1079,21 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
 
         // The next pull is a delta from the stored cursor and carries
         // exactly our own admitted write.
-        let pulled = engine.pull(SPACE, std::slice::from_ref(&db)).await.unwrap();
+        let pulled = engine.pull(SPACE, Range::Prefix(db.clone())).await.unwrap();
         assert!(matches!(&pulled.ranges[0], RangeCut::Delta(entries) if entries.len() == 1));
 
         // The cursor is durable: a resumed incarnation pulls deltas, not
         // snapshots.
         let state = audit(&OrderedMetaStore::new(&mem)).await;
-        assert_eq!(state.spaces[&SPACE].watermark, Some(pulled.at));
+        assert_eq!(
+            state.spaces[&SPACE].watermarks[&Range::Prefix(db.clone())],
+            pulled.at
+        );
     });
 }
 
 #[test]
-fn pending_release_blocks_writes_and_finishes_on_reopen() {
+fn pending_release_blocks_writes_and_retries_explicitly() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -1125,18 +1129,21 @@ fn pending_release_blocks_writes_and_finishes_on_reopen() {
             EngineError::LocalAuthority { .. }
         ));
 
-        // Reopening with a server resumes the release saga and drops the
-        // local record; a new device can acquire immediately.
-        let engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+        // Reopening does not do hidden server work. The retiring lease is
+        // still remembered but not usable.
+        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
             .await
             .unwrap();
-        assert!(
-            engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let leases = engine
+            .leases(SPACE, std::slice::from_ref(&db))
+            .await
+            .unwrap();
+        assert_eq!(leases.len(), 1);
+        assert!(!leases[0].live);
+
+        // An explicit release retry finishes the saga and drops the local
+        // record; a new device can acquire immediately.
+        engine.release(SPACE, &[lease_id]).await.unwrap();
         let other = handle
             .acquire(
                 &SPACE,
@@ -1149,6 +1156,41 @@ fn pending_release_blocks_writes_and_finishes_on_reopen() {
             .await
             .unwrap();
         assert_eq!(other.leases[0].prefix, db);
+    });
+}
+
+#[test]
+fn release_rejects_when_queued_writes_are_covered() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let k = key(&[b"db", b"k"]);
+
+        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        let granted = engine
+            .acquire(SPACE, vec![wspec(&db, 60)], false)
+            .await
+            .unwrap();
+        engine
+            .commit(SPACE, vec![(k, val(b"queued"))])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.release(SPACE, &[granted.leases[0].id]).await.unwrap_err(),
+            EngineError::ReleaseBlocked {
+                lease,
+                at: DeviceSeq(1)
+            } if lease == granted.leases[0].id
+        ));
+        assert!(
+            !audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].leases[&granted.leases[0].id]
+                .retiring
+        );
     });
 }
 

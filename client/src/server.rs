@@ -224,8 +224,8 @@ pub mod conformance {
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
     use homebase_core::messages::{
-        AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PrefixCursor,
-        PutBatchRequest, PutEntry, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
+        AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatchRequest, PutEntry,
+        Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
     };
     use homebase_core::space::{SpaceError, SpaceId};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -344,8 +344,8 @@ pub mod conformance {
             .read_at(
                 &space,
                 ReadAtRequest {
-                    ranges: vec![PrefixCursor {
-                        prefix: db.clone(),
+                    ranges: vec![RangeCursor {
+                        range: Range::Prefix(db.clone()),
                         since: None,
                     }],
                 },
