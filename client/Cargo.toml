@@ -18,3 +18,4 @@ sha2 = "0.11.0"
 homebase-server = { workspace = true, default-features = false }
 homebase-sim = { workspace = true, default-features = false }
 pollster.workspace = true
+rand.workspace = true

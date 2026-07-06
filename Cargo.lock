@@ -971,6 +971,7 @@ dependencies = [
  "homebase-server",
  "homebase-sim",
  "pollster",
+ "rand 0.9.4",
  "sha2",
 ]
 
