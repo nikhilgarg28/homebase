@@ -30,8 +30,12 @@
 //!   rejection → solo probes, solo rejection → conviction, fork →
 //!   fatal).
 //!
-//! Next: the job-queue dogfood over the engine.
+//! - [`cipher`] — the privacy boundary: `SpaceEnvelope`, space-id
+//!   commitment, deterministic name pseudonyms, and value envelopes.
+//!
+//! Next: replica encrypt-at-ingest over the engine and cipher.
 
+pub mod cipher;
 pub mod engine;
 pub mod meta;
 pub mod server;
