@@ -5,6 +5,7 @@
 //! would have sent. Every recovery path in the pusher's algebra gets a
 //! deterministic run.
 
+use homebase::cipher::SpaceEnvelope;
 use homebase::engine::{Engine, EngineError, PushOutcome};
 use homebase::meta::{MetaStore, OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
@@ -27,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SPACE: SpaceId = SpaceId([1; 16]);
-const LINK: SpaceId = SpaceId([2; 16]);
 
 /// A `Sync` spawner: each space actor gets a thread (same as the
 /// ServerHandle conformance driver).
@@ -181,97 +181,88 @@ fn open_mints_identity_once() {
         let clock = ManualClock::new(Timestamp(0));
         let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
 
-        let engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         assert_eq!(engine.device(), dev(1));
         let _ = engine;
 
         // A later incarnation offers different randomness; the store wins.
-        let engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(2))
-            .await
-            .unwrap();
+        let engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(2),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         assert_eq!(engine.device(), dev(1));
     });
 }
 
 #[test]
-fn push_drains_and_groups_by_space() {
+fn push_drains_and_groups_same_space_neighbors() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE, LINK]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
-        let dir = key(&[b"dir"]);
-        engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
-        engine
-            .acquire(LINK, vec![wspec(&dir, 60)], false)
-            .await
-            .unwrap();
+        engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
 
         let (a1, a2, a3) = (
             key(&[b"db", b"a1"]),
             key(&[b"db", b"a2"]),
             key(&[b"db", b"a3"]),
         );
-        let d = key(&[b"dir", b"d"]);
-        engine
-            .commit(SPACE, vec![(a1.clone(), val(b"1"))])
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(a2.clone(), val(b"2"))])
-            .await
-            .unwrap();
-        engine
-            .commit(LINK, vec![(d.clone(), val(b"3"))])
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(a3.clone(), val(b"4"))])
-            .await
-            .unwrap();
-        assert_eq!(queued(&mem).await, 4);
+        engine.commit(vec![(a1.clone(), val(b"1"))]).await.unwrap();
+        engine.commit(vec![(a2.clone(), val(b"2"))]).await.unwrap();
+        engine.commit(vec![(a3.clone(), val(b"4"))]).await.unwrap();
+        assert_eq!(queued(&mem).await, 3);
 
         let outcome = engine.push().await.unwrap();
         assert_eq!(
             outcome,
             PushOutcome::Drained {
-                acked_through: Some(DeviceSeq(4))
+                acked_through: Some(DeviceSeq(3))
             }
         );
         assert_eq!(queued(&mem).await, 0);
 
-        // Same-space neighbors merged and shipped under the group's LAST
-        // seq; the space boundary split the stream.
+        // Same-space neighbors merge and ship under the group's LAST seq.
         assert_eq!(
             fetch(&handle, SPACE, &a1).await.unwrap().tag.device_seq,
-            DeviceSeq(2)
+            DeviceSeq(3)
         );
         assert_eq!(
             fetch(&handle, SPACE, &a2).await.unwrap().tag.device_seq,
-            DeviceSeq(2)
-        );
-        assert_eq!(
-            fetch(&handle, LINK, &d).await.unwrap().tag.device_seq,
             DeviceSeq(3)
         );
         assert_eq!(
             fetch(&handle, SPACE, &a3).await.unwrap().tag.device_seq,
-            DeviceSeq(4)
+            DeviceSeq(3)
         );
 
         // The trim is durable, and a drained queue pushes as a no-op.
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert!(state.oplog.is_empty());
-        assert_eq!(state.next_seq, Some(DeviceSeq(5)));
+        assert_eq!(state.next_seq, Some(DeviceSeq(4)));
         assert_eq!(
             engine.push().await.unwrap(),
             PushOutcome::Drained {
@@ -287,25 +278,22 @@ fn push_cap_splits_groups() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap()
-            .with_push_cap(1);
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap()
+        .with_push_cap(1);
 
         let db = key(&[b"db"]);
-        engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        engine
-            .commit(SPACE, vec![(k1.clone(), val(b"1"))])
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(k2.clone(), val(b"2"))])
-            .await
-            .unwrap();
+        engine.commit(vec![(k1.clone(), val(b"1"))]).await.unwrap();
+        engine.commit(vec![(k2.clone(), val(b"2"))]).await.unwrap();
 
         engine.push().await.unwrap();
         // At cap 1 nothing merges: each commit ships under its own seq.
@@ -326,15 +314,18 @@ fn acquire_satisfies_covered_specs_locally() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
-        let first = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let first = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         assert_eq!(
             first.barrier, None,
             "no admitted writes means no catch-up barrier"
@@ -343,10 +334,7 @@ fn acquire_satisfies_covered_specs_locally() {
 
         // Asking again changes nothing: same lease, same epoch, no wire
         // grant — and so no new catch-up obligation.
-        let again = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let again = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         assert_eq!(again.leases, vec![lease.clone()]);
         assert_eq!(again.barrier, None);
 
@@ -358,7 +346,7 @@ fn acquire_satisfies_covered_specs_locally() {
             ttl: Duration::from_secs(60),
             stealable: false,
         };
-        let covered = engine.acquire(SPACE, vec![read_spec], false).await.unwrap();
+        let covered = engine.acquire(vec![read_spec], false).await.unwrap();
         assert_eq!(covered.leases, vec![lease.clone()]);
         assert_eq!(covered.barrier, None);
 
@@ -366,7 +354,7 @@ fn acquire_satisfies_covered_specs_locally() {
         // one is acquired, and the answer stays parallel to the specs.
         let other = key(&[b"other"]);
         let mixed = engine
-            .acquire(SPACE, vec![wspec(&db, 60), wspec(&other, 60)], false)
+            .acquire(vec![wspec(&db, 60), wspec(&other, 60)], false)
             .await
             .unwrap();
         assert_eq!(mixed.leases[0], lease);
@@ -382,17 +370,14 @@ fn acquire_satisfies_covered_specs_locally() {
         // local window — because the kernel treats a same-device
         // re-acquire of a live lease as contention.
         clock.advance(Duration::from_secs(60));
-        let revived = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let revived = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         assert_eq!(revived.barrier, None);
         assert_eq!(revived.leases[0].id, lease.id, "renewed, not re-granted");
         assert_eq!(revived.leases[0].epoch, lease.epoch, "the fence stands");
 
         // And the revived lease actually backs writes again.
         engine
-            .commit(SPACE, vec![(key(&[b"db", b"w"]), val(b"v"))])
+            .commit(vec![(key(&[b"db", b"w"]), val(b"v"))])
             .await
             .unwrap();
         assert!(matches!(
@@ -412,17 +397,20 @@ fn resume_keeps_wall_clock_authority() {
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
         let lease_id = {
-            let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-                .await
-                .unwrap();
+            let mut engine = Engine::open(
+                OrderedMetaStore::new(&mem),
+                &handle,
+                &clock,
+                dev(1),
+                &SpaceEnvelope::plaintext(SPACE),
+            )
+            .await
+            .unwrap();
             let granted = engine
-                .acquire(SPACE, vec![wspec(&db, 3_600)], false)
+                .acquire(vec![wspec(&db, 3_600)], false)
                 .await
                 .unwrap();
-            engine
-                .commit(SPACE, vec![(k.clone(), val(b"v"))])
-                .await
-                .unwrap();
+            engine.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
             granted.leases[0].id
             // crash: the engine drops here, the store survives
         };
@@ -443,14 +431,17 @@ fn resume_keeps_wall_clock_authority() {
         // renewal round trip. Offline authority survives restarts.
         clock.advance(Duration::from_secs(300));
         clock.set_lineage(Lineage([2; 16]));
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(9))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(9),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         assert_eq!(engine.device(), dev(1));
-        let leases = engine
-            .leases(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        let leases = engine.leases(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(leases.len(), 1);
         assert!(leases[0].live, "the wall fallback outlives the process");
         assert_eq!(
@@ -466,18 +457,15 @@ fn resume_keeps_wall_clock_authority() {
         clock.advance(Duration::from_secs(3600));
         assert!(matches!(
             engine
-                .commit(SPACE, vec![(k.clone(), val(b"later"))])
+                .commit(vec![(k.clone(), val(b"later"))])
                 .await
                 .unwrap_err(),
             EngineError::LocalAuthority { .. }
         ));
-        let renewed = engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        let renewed = engine.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(renewed.granted.len(), 1);
         engine
-            .commit(SPACE, vec![(k.clone(), val(b"later"))])
+            .commit(vec![(k.clone(), val(b"later"))])
             .await
             .unwrap();
         assert_eq!(
@@ -498,15 +486,18 @@ fn margin_applies_only_across_incarnations() {
 
         let db = key(&[b"db"]);
         {
-            let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-                .await
-                .unwrap();
+            let mut engine = Engine::open(
+                OrderedMetaStore::new(&mem),
+                &handle,
+                &clock,
+                dev(1),
+                &SpaceEnvelope::plaintext(SPACE),
+            )
+            .await
+            .unwrap();
+            engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
             engine
-                .acquire(SPACE, vec![wspec(&db, 60)], false)
-                .await
-                .unwrap();
-            engine
-                .commit(SPACE, vec![(key(&[b"db", b"k"]), val(b"v"))])
+                .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
                 .await
                 .unwrap();
 
@@ -527,48 +518,33 @@ fn margin_applies_only_across_incarnations() {
         // 0.1% of the 60s TTL, 60ms — and two milliseconds shy is
         // already retired.
         clock.set_lineage(Lineage([2; 16]));
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(9))
-            .await
-            .unwrap();
-        assert!(
-            !engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(9),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        assert!(!engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
         // The exact boundary: live until deadline − 60ms, not after.
         clock.set(Timestamp(59_939));
-        assert!(
-            engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        assert!(engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
         clock.set(Timestamp(59_940));
-        assert!(
-            !engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        assert!(!engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
         clock.set(Timestamp(60_000 - 2));
         assert!(matches!(
             engine
-                .commit(SPACE, vec![(key(&[b"db", b"k2"]), val(b"v2"))])
+                .commit(vec![(key(&[b"db", b"k2"]), val(b"v2"))])
                 .await
                 .unwrap_err(),
             EngineError::LocalAuthority { .. }
         ));
 
+        engine.renew(std::slice::from_ref(&db)).await.unwrap();
         engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(key(&[b"db", b"k2"]), val(b"v2"))])
+            .commit(vec![(key(&[b"db", b"k2"]), val(b"v2"))])
             .await
             .unwrap();
         assert_eq!(
@@ -586,17 +562,20 @@ fn suspend_expires_leases_within_a_lineage() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
+        engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(key(&[b"db", b"k"]), val(b"v"))])
+            .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
             .await
             .unwrap();
 
@@ -605,13 +584,7 @@ fn suspend_expires_leases_within_a_lineage() {
         // takes the earlier verdict of the two rulers, and the wall one
         // knows the lease is long gone.
         clock.skew_wall(Duration::from_secs(3_600));
-        assert!(
-            !engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        assert!(!engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
         let outcome = engine.push().await.unwrap();
         assert!(
             matches!(
@@ -624,10 +597,7 @@ fn suspend_expires_leases_within_a_lineage() {
             "a slept-through lease must not back a write, got {outcome:?}"
         );
 
-        engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        engine.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(
             engine.push().await.unwrap(),
             PushOutcome::Drained {
@@ -647,17 +617,17 @@ fn backward_clock_step_poisons_stored_stamps() {
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
         {
-            let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-                .await
-                .unwrap();
-            engine
-                .acquire(SPACE, vec![wspec(&db, 60)], false)
-                .await
-                .unwrap();
-            engine
-                .commit(SPACE, vec![(k.clone(), val(b"v"))])
-                .await
-                .unwrap();
+            let mut engine = Engine::open(
+                OrderedMetaStore::new(&mem),
+                &handle,
+                &clock,
+                dev(1),
+                &SpaceEnvelope::plaintext(SPACE),
+            )
+            .await
+            .unwrap();
+            engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+            engine.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
         }
 
         // The wall clock is set BACK while the process is dead. The
@@ -667,9 +637,15 @@ fn backward_clock_step_poisons_stored_stamps() {
         // high-water re-anchors.
         clock.set(Timestamp(2_000));
         clock.set_lineage(Lineage([2; 16]));
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(9))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(9),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert_eq!(
             state.spaces[&SPACE]
@@ -681,13 +657,7 @@ fn backward_clock_step_poisons_stored_stamps() {
             HybridTimestamp::ZERO
         );
         assert_eq!(state.clock_high, Some(Timestamp(2_000)));
-        assert!(
-            !engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        assert!(!engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
 
         // Zero-stamped means no authority: the push stalls. Renewal
         // re-stamps on the new timeline — conservative by construction —
@@ -703,10 +673,7 @@ fn backward_clock_step_poisons_stored_stamps() {
             ),
             "poisoned stamps must not back writes, got {outcome:?}"
         );
-        engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        engine.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(
             audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
                 .leases
@@ -727,16 +694,16 @@ fn backward_clock_step_poisons_stored_stamps() {
         // Poison does not linger: a later open on the healed timeline
         // keeps the renewed stamp alive.
         clock.advance(Duration::from_secs(10));
-        let engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(9))
-            .await
-            .unwrap();
-        assert!(
-            engine
-                .leases(SPACE, std::slice::from_ref(&db))
-                .await
-                .unwrap()[0]
-                .live
-        );
+        let engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(9),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        assert!(engine.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
     });
 }
 
@@ -747,21 +714,21 @@ fn local_expiry_gates_writes_before_the_server_does() {
         let clock = ManualClock::new(Timestamp(0));
         let server_clock = Arc::new(ManualClock::new(Timestamp(0)));
         let handle = spawn_server(Arc::clone(&server_clock), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         let _lease_id = granted.leases[0].id;
-        engine
-            .commit(SPACE, vec![(k.clone(), val(b"v"))])
-            .await
-            .unwrap();
+        engine.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
 
         // Only the CLIENT clock reaches the deadline; the server still
         // holds the lease live. The engine must refuse first — that
@@ -780,14 +747,8 @@ fn local_expiry_gates_writes_before_the_server_does() {
         );
 
         // Renewal restarts the local window from this send.
-        engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
-        let leases = engine
-            .leases(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        engine.renew(std::slice::from_ref(&db)).await.unwrap();
+        let leases = engine.leases(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(leases[0].held.deadline, hstamp(60_000 + 60_000, 1));
         assert_eq!(
             engine.push().await.unwrap(),
@@ -804,26 +765,29 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         let lease = LeaseRef {
             id: granted.leases[0].id,
             epoch: granted.leases[0].epoch,
         };
         engine
-            .commit(SPACE, vec![(k1.clone(), val(b"one"))])
+            .commit(vec![(k1.clone(), val(b"one"))])
             .await
             .unwrap();
         engine
-            .commit(SPACE, vec![(k2.clone(), val(b"two"))])
+            .commit(vec![(k2.clone(), val(b"two"))])
             .await
             .unwrap();
 
@@ -899,13 +863,16 @@ fn group_rejection_probes_to_the_faulty_commit() {
 
         // … and this engine commits against k blindly (it never pulled):
         // the middle commit of three is genuinely faulty.
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         // Simulate a buggy caller that marks the acquire barrier satisfied
         // without importing the foreign value's ver. The pusher still
         // degrades a group rejection into the faulty solo commit.
@@ -913,16 +880,13 @@ fn group_rejection_probes_to_the_faulty_commit() {
             .advance_watermark(SPACE, &Range::Prefix(db.clone()), AdmissionSeq(1), Ver(0))
             .await
             .unwrap();
+        engine.commit(vec![(x.clone(), val(b"ok"))]).await.unwrap();
         engine
-            .commit(SPACE, vec![(x.clone(), val(b"ok"))])
+            .commit(vec![(k.clone(), val(b"stale"))])
             .await
             .unwrap();
         engine
-            .commit(SPACE, vec![(k.clone(), val(b"stale"))])
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(y.clone(), val(b"after"))])
+            .commit(vec![(y.clone(), val(b"after"))])
             .await
             .unwrap();
 
@@ -976,30 +940,34 @@ fn a_forked_store_is_fatal() {
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         let _lease_id = granted.leases[0].id;
-        engine
-            .commit(SPACE, vec![(k1.clone(), val(b"a"))])
-            .await
-            .unwrap();
+        engine.commit(vec![(k1.clone(), val(b"a"))]).await.unwrap();
 
         // The file copy comes alive: a twin loads the same identity —
         // and, on the shared wall timeline, the same live authority.
         // Nothing distinguishes it until the seqs collide.
         let twin_mem = clone_store(&mem).await;
-        let mut twin = Engine::open(OrderedMetaStore::new(&twin_mem), &handle, &clock, dev(7))
-            .await
-            .unwrap();
+        let mut twin = Engine::open(
+            OrderedMetaStore::new(&twin_mem),
+            &handle,
+            &clock,
+            dev(7),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         assert_eq!(twin.device(), dev(1), "the copy carries the identity");
-        twin.commit(SPACE, vec![(k2.clone(), val(b"twin"))])
-            .await
-            .unwrap();
+        twin.commit(vec![(k2.clone(), val(b"twin"))]).await.unwrap();
         assert_eq!(
             twin.push().await.unwrap(),
             PushOutcome::Drained {
@@ -1043,16 +1011,19 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         )
         .await;
 
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         assert!(matches!(
             engine
-                .commit(SPACE, vec![(k.clone(), val(b"too-soon"))])
+                .commit(vec![(k.clone(), val(b"too-soon"))])
                 .await
                 .unwrap_err(),
             EngineError::LocalAuthority { .. }
@@ -1061,7 +1032,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         // The acquire-barrier discipline: pull to the barrier before
         // trusting local state. The pull is a snapshot (no cursor yet)
         // and raises the ver high-water past everything it saw.
-        let pulled = engine.pull(SPACE, Range::Prefix(db.clone())).await.unwrap();
+        let pulled = engine.pull(Range::Prefix(db.clone())).await.unwrap();
         assert!(pulled.at >= granted.barrier.unwrap());
         assert!(matches!(&pulled.ranges[0], RangeCut::Snapshot(entries) if entries.len() == 1));
         assert_eq!(
@@ -1073,7 +1044,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         // Now the same key can be overwritten: the commit stamps above
         // the pulled ver, so the server's chain accepts it.
         engine
-            .commit(SPACE, vec![(k.clone(), val(b"mine"))])
+            .commit(vec![(k.clone(), val(b"mine"))])
             .await
             .unwrap();
         assert_eq!(
@@ -1088,7 +1059,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
 
         // The next pull is a delta from the stored cursor and carries
         // exactly our own admitted write.
-        let pulled = engine.pull(SPACE, Range::Prefix(db.clone())).await.unwrap();
+        let pulled = engine.pull(Range::Prefix(db.clone())).await.unwrap();
         assert!(matches!(&pulled.ranges[0], RangeCut::Delta(entries) if entries.len() == 1));
 
         // The cursor is durable: a resumed incarnation pulls deltas, not
@@ -1124,13 +1095,16 @@ fn ensure_acquires_pulls_and_makes_writes_locally_authorized() {
         )
         .await;
 
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let acquired = engine
-            .ensure(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let acquired = engine.ensure(vec![wspec(&db, 60)], false).await.unwrap();
         assert_eq!(acquired.barrier, None);
         assert_eq!(acquired.leases.len(), 1);
         assert_eq!(
@@ -1140,7 +1114,7 @@ fn ensure_acquires_pulls_and_makes_writes_locally_authorized() {
         );
 
         engine
-            .commit(SPACE, vec![(k.clone(), val(b"mine"))])
+            .commit(vec![(k.clone(), val(b"mine"))])
             .await
             .unwrap();
         assert_eq!(
@@ -1178,13 +1152,16 @@ fn ensure_satisfies_read_lease_barriers_too() {
         )
         .await;
 
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let acquired = engine
-            .ensure(SPACE, vec![rspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let acquired = engine.ensure(vec![rspec(&db, 60)], false).await.unwrap();
         assert_eq!(acquired.barrier, None);
         assert_eq!(acquired.leases[0].mode, LeaseMode::Read);
         assert_eq!(
@@ -1204,29 +1181,38 @@ fn pending_release_blocks_writes_and_retries_explicitly() {
 
         let db = key(&[b"db"]);
         let lease_id = {
-            let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-                .await
-                .unwrap();
-            let granted = engine
-                .acquire(SPACE, vec![wspec(&db, 60)], false)
-                .await
-                .unwrap();
+            let mut engine = Engine::open(
+                OrderedMetaStore::new(&mem),
+                &handle,
+                &clock,
+                dev(1),
+                &SpaceEnvelope::plaintext(SPACE),
+            )
+            .await
+            .unwrap();
+            let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
             granted.leases[0].id
         };
 
         let offline = |_: &SpaceId| Option::<SpaceHandle>::None;
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &offline, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &offline,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            engine.release(SPACE, &[lease_id]).await.unwrap_err(),
+            engine.release(&[lease_id]).await.unwrap_err(),
             EngineError::Unavailable { .. }
         ));
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert!(state.spaces[&SPACE].leases[&lease_id].retiring);
         assert!(matches!(
             engine
-                .commit(SPACE, vec![(key(&[b"db", b"k"]), val(b"v"))])
+                .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
                 .await
                 .unwrap_err(),
             EngineError::LocalAuthority { .. }
@@ -1234,19 +1220,22 @@ fn pending_release_blocks_writes_and_retries_explicitly() {
 
         // Reopening does not do hidden server work. The retiring lease is
         // still remembered but not usable.
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let leases = engine
-            .leases(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let leases = engine.leases(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(leases.len(), 1);
         assert!(!leases[0].live);
 
         // An explicit release retry finishes the saga and drops the local
         // record; a new device can acquire immediately.
-        engine.release(SPACE, &[lease_id]).await.unwrap();
+        engine.release(&[lease_id]).await.unwrap();
         let other = handle
             .acquire(
                 &SPACE,
@@ -1271,20 +1260,20 @@ fn release_rejects_when_queued_writes_are_covered() {
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
 
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
-        engine
-            .commit(SPACE, vec![(k, val(b"queued"))])
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        engine.commit(vec![(k, val(b"queued"))]).await.unwrap();
 
         assert!(matches!(
-            engine.release(SPACE, &[granted.leases[0].id]).await.unwrap_err(),
+            engine.release(&[granted.leases[0].id]).await.unwrap_err(),
             EngineError::ReleaseBlocked {
                 lease,
                 at: DeviceSeq(1)
@@ -1303,23 +1292,32 @@ fn unavailable_leaves_the_queue_intact() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let served = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &served, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &served,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
         let db = key(&[b"db"]);
-        engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         drop(engine);
 
         let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         engine
-            .commit(SPACE, vec![(key(&[b"db", b"k"]), val(b"v"))])
+            .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
             .await
             .unwrap();
         assert!(matches!(
@@ -1337,31 +1335,31 @@ fn renew_reports_invalid_and_forgets() {
         let clock = ManualClock::new(Timestamp(0));
         let server_clock = Arc::new(ManualClock::new(Timestamp(0)));
         let handle = spawn_server(Arc::clone(&server_clock), &[SPACE]);
-        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
-            .await
-            .unwrap();
+        let mut engine = Engine::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            &SpaceEnvelope::plaintext(SPACE),
+        )
+        .await
+        .unwrap();
 
         let db = key(&[b"db"]);
-        let granted = engine
-            .acquire(SPACE, vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        let granted = engine.acquire(vec![wspec(&db, 60)], false).await.unwrap();
         let lease_id = granted.leases[0].id;
 
         // The SERVER's clock passes the deadline: strict local expiry,
         // the lease is gone there. Renewal is how this side finds out.
         server_clock.advance(Duration::from_secs(120));
-        let renewed = engine
-            .renew(SPACE, std::slice::from_ref(&db))
-            .await
-            .unwrap();
+        let renewed = engine.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(renewed.invalid, vec![lease_id]);
         assert!(renewed.granted.is_empty());
 
         // Forgotten everywhere: memory and the durable record.
         assert!(
             engine
-                .leases(SPACE, std::slice::from_ref(&db))
+                .leases(std::slice::from_ref(&db))
                 .await
                 .unwrap()
                 .is_empty()

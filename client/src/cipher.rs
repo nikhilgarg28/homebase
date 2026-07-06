@@ -11,7 +11,7 @@ use hmac::{Hmac, Mac};
 use homebase_core::key::{Key, KeyComponent, KeyError};
 use homebase_core::messages::{PutEntry, Range};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{Value, Ver};
+use homebase_core::tag::Value;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -64,6 +64,21 @@ enum CipherMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueNonce(pub [u8; VALUE_NONCE_LEN]);
+
+pub trait NonceSource {
+    fn next_nonce(&mut self) -> Result<ValueNonce, String>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemNonceSource;
+
+impl NonceSource for SystemNonceSource {
+    fn next_nonce(&mut self) -> Result<ValueNonce, String> {
+        let mut bytes = [0u8; VALUE_NONCE_LEN];
+        getrandom::fill(&mut bytes).map_err(|err| err.to_string())?;
+        Ok(ValueNonce(bytes))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CipherError {
@@ -165,6 +180,10 @@ impl SpaceCipher {
         self.space_id
     }
 
+    pub fn is_plaintext(&self) -> bool {
+        matches!(self.mode, CipherMode::Plaintext)
+    }
+
     pub fn encode_key(&self, key: &Key) -> Result<Key, CipherError> {
         match &self.mode {
             CipherMode::Plaintext => Ok(key.clone()),
@@ -185,7 +204,7 @@ impl SpaceCipher {
         nonce: ValueNonce,
     ) -> Result<PutEntry, CipherError> {
         let key = self.encode_key(&entry.key)?;
-        let value = self.encode_value(&key, entry.ver, &entry.value, nonce)?;
+        let value = self.encode_value(&key, &entry.value, nonce)?;
         Ok(PutEntry {
             key,
             value,
@@ -196,7 +215,6 @@ impl SpaceCipher {
     pub fn encode_value(
         &self,
         encoded_key: &Key,
-        ver: Ver,
         value: &Value,
         nonce: ValueNonce,
     ) -> Result<Value, CipherError> {
@@ -211,7 +229,7 @@ impl SpaceCipher {
                     .ok_or(CipherError::MissingSpaceKey {
                         epoch: V1_KEY_EPOCH,
                     })?;
-                let aad = value_aad(encoded_key, ver, V1_KEY_EPOCH);
+                let aad = value_aad(encoded_key, V1_KEY_EPOCH);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -233,12 +251,7 @@ impl SpaceCipher {
         }
     }
 
-    pub fn decode_value(
-        &self,
-        encoded_key: &Key,
-        ver: Ver,
-        value: &Value,
-    ) -> Result<Value, CipherError> {
+    pub fn decode_value(&self, encoded_key: &Key, value: &Value) -> Result<Value, CipherError> {
         let Value::Present(bytes) = value else {
             return Ok(Value::Absent);
         };
@@ -249,7 +262,7 @@ impl SpaceCipher {
                 let key = space_keys
                     .get(&epoch)
                     .ok_or(CipherError::MissingSpaceKey { epoch })?;
-                let aad = value_aad(encoded_key, ver, epoch);
+                let aad = value_aad(encoded_key, epoch);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -304,12 +317,11 @@ fn child_name_key(path_key: &[u8; KEY_LEN], component: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn value_aad(encoded_key: &Key, ver: Ver, epoch: u64) -> Vec<u8> {
+fn value_aad(encoded_key: &Key, epoch: u64) -> Vec<u8> {
     let key = encoded_key.encode();
-    let mut out = Vec::with_capacity(VALUE_AAD_PREFIX.len() + 8 + 8 + key.len());
+    let mut out = Vec::with_capacity(VALUE_AAD_PREFIX.len() + 8 + key.len());
     out.extend_from_slice(VALUE_AAD_PREFIX);
     out.extend_from_slice(&epoch.to_be_bytes());
-    out.extend_from_slice(&ver.0.to_be_bytes());
     out.extend_from_slice(&key);
     out
 }
@@ -343,6 +355,7 @@ fn decode_value_envelope(bytes: &[u8]) -> Result<(u64, ValueNonce, &[u8]), Ciphe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use homebase_core::tag::Ver;
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
@@ -384,7 +397,7 @@ mod tests {
         assert_eq!(codec.encode_key(&raw).unwrap(), raw);
         assert_eq!(
             codec
-                .encode_value(&raw, Ver(1), &Value::Present(b"v".to_vec()), nonce(3))
+                .encode_value(&raw, &Value::Present(b"v".to_vec()), nonce(3))
                 .unwrap(),
             Value::Present(b"v".to_vec())
         );
@@ -430,18 +443,12 @@ mod tests {
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
         let value = Value::Present(b"secret".to_vec());
-        let sealed = codec
-            .encode_value(&encoded_key, Ver(7), &value, nonce(3))
-            .unwrap();
+        let sealed = codec.encode_value(&encoded_key, &value, nonce(3)).unwrap();
         assert_ne!(sealed, value);
+        assert_eq!(codec.decode_value(&encoded_key, &sealed).unwrap(), value);
+        let other_key = codec.encode_key(&key(&[b"db", b"other"])).unwrap();
         assert_eq!(
-            codec.decode_value(&encoded_key, Ver(7), &sealed).unwrap(),
-            value
-        );
-        assert_eq!(
-            codec
-                .decode_value(&encoded_key, Ver(8), &sealed)
-                .unwrap_err(),
+            codec.decode_value(&other_key, &sealed).unwrap_err(),
             CipherError::DecryptFailed
         );
 
@@ -452,7 +459,7 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 0x01;
         assert_eq!(
             codec
-                .decode_value(&encoded_key, Ver(7), &Value::Present(tampered))
+                .decode_value(&encoded_key, &Value::Present(tampered))
                 .unwrap_err(),
             CipherError::DecryptFailed
         );
@@ -472,9 +479,7 @@ mod tests {
         assert_ne!(encoded.key, entry.key);
         assert_ne!(encoded.value, entry.value);
         assert_eq!(
-            codec
-                .decode_value(&encoded.key, encoded.ver, &encoded.value)
-                .unwrap(),
+            codec.decode_value(&encoded.key, &encoded.value).unwrap(),
             entry.value
         );
 

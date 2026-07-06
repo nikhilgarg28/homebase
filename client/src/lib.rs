@@ -21,24 +21,27 @@
 //!   [`audit`](meta::audit)) and [`meta::conformance`] gate every
 //!   implementation.
 //!
-//! - [`engine`] — the driver over both contracts (plus an injected
+//! - [`replica`] — the one-space driver over both contracts (plus an injected
 //!   [`Clock`](homebase_core::clock::Clock)): no mirror — durable
 //!   collections are read from the store on demand — two-clock lease
 //!   discipline with explicit renewal and idempotent acquire, and the
 //!   adaptive pusher — FIFO groups on the wire, recovery reconstructed
 //!   entirely from kernel rejections (seq collision → trim, group
 //!   rejection → solo probes, solo rejection → conviction, fork →
-//!   fatal).
+//!   fatal). It owns the space envelope/cipher and encrypts at ingest.
 //!
 //! - [`cipher`] — the privacy boundary: `SpaceEnvelope`, space-id
 //!   commitment, deterministic name pseudonyms, and value envelopes.
 //!
-//! Next: replica encrypt-at-ingest over the engine and cipher.
+//! - [`engine`] — compatibility aliases for the old state-machine name.
+//!
+//! Next: client identity and envelope discovery.
 
 pub mod cipher;
 pub mod engine;
 pub mod meta;
+pub mod replica;
 pub mod server;
 
-pub use engine::{Acquired, Engine, EngineError, PushOutcome};
+pub use replica::{Acquired, PushOutcome, Replica, ReplicaError};
 pub use server::{Offline, ServerHandle};
