@@ -9,8 +9,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCursor,
-    ReadAtRequest, ReleaseRequest,
+    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
+    RangeCursor, ReadAtRequest, ReleaseRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -57,12 +57,14 @@ pub fn put_one(
 ) -> PutBatchRequest {
     PutBatchRequest {
         device: dev(device),
-        device_seq: DeviceSeq(seq),
         leases: vec![lease],
-        entries: vec![PutEntry {
-            key: k.clone(),
-            value: Value::Present(v.to_vec()),
-            ver: Ver(ver),
+        batches: vec![PutBatch {
+            device_seq: DeviceSeq(seq),
+            entries: vec![PutEntry {
+                key: k.clone(),
+                value: Value::Present(v.to_vec()),
+                ver: Ver(ver),
+            }],
         }],
     }
 }

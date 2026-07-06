@@ -9,7 +9,9 @@ use crate::store::{FaultConfig, SimStore};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
-use homebase_core::messages::{AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry};
+use homebase_core::messages::{
+    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+};
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
@@ -128,12 +130,14 @@ pub async fn client(
         let lease = state.lease.lock().unwrap().unwrap();
         let req = PutBatchRequest {
             device: dev(d),
-            device_seq: DeviceSeq(seq),
             leases: vec![lease],
-            entries: vec![PutEntry {
-                key: user_key(d, seq),
-                value: Value::Present(value(d, seq)),
-                ver: Ver(1),
+            batches: vec![PutBatch {
+                device_seq: DeviceSeq(seq),
+                entries: vec![PutEntry {
+                    key: user_key(d, seq),
+                    value: Value::Present(value(d, seq)),
+                    ver: Ver(1),
+                }],
             }],
         };
         match handle.put_batch(req).await {
@@ -141,7 +145,7 @@ pub async fn client(
                 acks.lock().unwrap().push(Ack {
                     device: d,
                     device_seq: seq,
-                    admission_seq: resp.admission_seq.0,
+                    admission_seq: resp.admission_seqs[0].0,
                 });
                 state.next_seq.store(seq + 1, Ordering::SeqCst);
                 completed += 1;

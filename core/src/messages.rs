@@ -123,7 +123,17 @@ pub struct PutEntry {
     pub ver: Ver,
 }
 
-/// Atomic write batch (batch = transaction; torn batches impossible).
+/// One client commit within an atomic put request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PutBatch {
+    /// Client-assigned, strictly increasing per device; one per client
+    /// commit. A request may coalesce successive client commits without
+    /// erasing their individual seq identity.
+    pub device_seq: DeviceSeq,
+    pub entries: Vec<PutEntry>,
+}
+
+/// Atomic write request (request = transaction; torn requests impossible).
 ///
 /// Admission requires: every entry's key covered by some presented **write**
 /// lease whose id and epoch are both live (epoch-fenced), and per-key `Ver`
@@ -132,16 +142,15 @@ pub struct PutEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutBatchRequest {
     pub device: DeviceId,
-    /// Client-assigned, strictly increasing per device; one per batch.
-    pub device_seq: DeviceSeq,
     pub leases: Vec<LeaseRef>,
-    pub entries: Vec<PutEntry>,
+    /// Successive client commits to admit atomically in one server turn.
+    pub batches: Vec<PutBatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutBatchResponse {
-    /// The single admission point assigned to the whole batch.
-    pub admission_seq: AdmissionSeq,
+    /// Admission points assigned to each input batch, in order.
+    pub admission_seqs: Vec<AdmissionSeq>,
 }
 
 // ---------------------------------------------------------------------------

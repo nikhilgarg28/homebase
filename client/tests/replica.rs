@@ -1,4 +1,4 @@
-use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueNonce};
+use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueContext, ValueNonce};
 use homebase::meta::OrderedMetaStore;
 use homebase::replica::Replica;
 use homebase::server::ServerHandle;
@@ -135,9 +135,71 @@ fn encrypted_replica_writes_ciphertext_under_encoded_keys() {
         let stored = fetch(&handle, space, &encoded_row).await.unwrap();
         assert_ne!(stored.value, val(b"secret"));
         assert_eq!(
-            cipher.decode_value(&encoded_row, &stored.value).unwrap(),
+            cipher
+                .decode_value(
+                    &encoded_row,
+                    &stored.value,
+                    ValueContext::from_tag(&stored.tag)
+                )
+                .unwrap(),
             val(b"secret")
         );
+    });
+}
+
+#[test]
+fn encrypted_push_preserves_per_commit_device_seq_aad() {
+    block_on(async {
+        let envelope = encrypted_envelope();
+        let space = envelope.space_id();
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let db = key(&[b"db"]);
+        let row1 = key(&[b"db", b"k1"]);
+        let row2 = key(&[b"db", b"k2"]);
+
+        let writer_clock = ManualClock::new(Timestamp(0));
+        let mut writer = Replica::open_with_nonce_source(
+            OrderedMetaStore::new(MemoryStore::new()),
+            &handle,
+            &writer_clock,
+            dev(1),
+            &envelope,
+            TestNonceSource::new(1),
+        )
+        .await
+        .unwrap();
+        writer.ensure(vec![wspec(&db, 60)], false).await.unwrap();
+        writer
+            .commit(vec![(row1.clone(), val(b"one"))])
+            .await
+            .unwrap();
+        writer
+            .commit(vec![(row2.clone(), val(b"two"))])
+            .await
+            .unwrap();
+        writer.push().await.unwrap();
+
+        let reader_clock = ManualClock::new(Timestamp(0));
+        let mut reader = Replica::open(
+            OrderedMetaStore::new(MemoryStore::new()),
+            &handle,
+            &reader_clock,
+            dev(2),
+            &envelope,
+        )
+        .await
+        .unwrap();
+        let pulled = reader.pull(Range::Prefix(db)).await.unwrap();
+
+        let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
+            panic!("initial pull should snapshot")
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.value == val(b"one")));
+        assert!(entries.iter().any(|entry| entry.value == val(b"two")));
+        let mut device_seqs: Vec<_> = entries.iter().map(|entry| entry.tag.device_seq.0).collect();
+        device_seqs.sort_unstable();
+        assert_eq!(device_seqs, vec![1, 2]);
     });
 }
 

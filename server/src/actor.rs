@@ -210,7 +210,7 @@ mod tests {
     use homebase_core::clock::{ManualClock, Timestamp};
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
-    use homebase_core::messages::{KernelError, LeaseSpec, PutEntry};
+    use homebase_core::messages::{KernelError, LeaseSpec, PutBatch, PutEntry};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use std::time::Duration;
 
@@ -247,12 +247,14 @@ mod tests {
     ) -> PutBatchRequest {
         PutBatchRequest {
             device: dev(device),
-            device_seq: DeviceSeq(seq),
             leases: vec![lease],
-            entries: vec![PutEntry {
-                key: k.clone(),
-                value: Value::Present(v.to_vec()),
-                ver: Ver(ver),
+            batches: vec![PutBatch {
+                device_seq: DeviceSeq(seq),
+                entries: vec![PutEntry {
+                    key: k.clone(),
+                    value: Value::Present(v.to_vec()),
+                    ver: Ver(ver),
+                }],
             }],
         }
     }
@@ -283,7 +285,7 @@ mod tests {
                 .put_batch(put_req(1, 1, lease, &k, b"v", 1))
                 .await
                 .unwrap();
-            assert_eq!(put.admission_seq, AdmissionSeq(1));
+            assert_eq!(put.admission_seqs, vec![AdmissionSeq(1)]);
 
             let got = handle
                 .get(GetRequest {
@@ -354,7 +356,7 @@ mod tests {
                     .put_batch(put_req(device, i, lease, &k, b"v", 1))
                     .await
                     .unwrap();
-                seqs.push(resp.admission_seq.0);
+                seqs.push(resp.admission_seqs[0].0);
             }
             seqs
         };

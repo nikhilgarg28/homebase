@@ -22,7 +22,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, ReleaseRequest,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+    ReleaseRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
@@ -161,12 +162,14 @@ async fn client(
         let seq = state.next_seq.get();
         let req = PutBatchRequest {
             device: dev(d),
-            device_seq: DeviceSeq(seq),
             leases: vec![lease],
-            entries: vec![PutEntry {
-                key: counter_key(),
-                value: Value::Present(encode(current.0 + 1)),
-                ver: Ver(current.1 + 1),
+            batches: vec![PutBatch {
+                device_seq: DeviceSeq(seq),
+                entries: vec![PutEntry {
+                    key: counter_key(),
+                    value: Value::Present(encode(current.0 + 1)),
+                    ver: Ver(current.1 + 1),
+                }],
             }],
         };
         match handle.put_batch(req).await {
@@ -174,7 +177,7 @@ async fn client(
                 acks.borrow_mut().push(Ack {
                     device: d,
                     value: current.0 + 1,
-                    admission_seq: resp.admission_seq.0,
+                    admission_seq: resp.admission_seqs[0].0,
                 });
                 state.next_seq.set(seq + 1);
 

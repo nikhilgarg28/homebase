@@ -22,8 +22,8 @@ use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCursor,
-    RangeCut, ReadAtRequest,
+    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
+    RangeCursor, RangeCut, ReadAtRequest,
 };
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -124,12 +124,14 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
 
         let req = PutBatchRequest {
             device: WRITER,
-            device_seq: DeviceSeq(seq),
             leases: vec![state.lease.borrow().unwrap()],
-            entries: vec![PutEntry {
-                key: pool_key(key_index),
-                value: value.clone(),
-                ver: Ver(ver),
+            batches: vec![PutBatch {
+                device_seq: DeviceSeq(seq),
+                entries: vec![PutEntry {
+                    key: pool_key(key_index),
+                    value: value.clone(),
+                    ver: Ver(ver),
+                }],
             }],
         };
         match handle.put_batch(req).await {

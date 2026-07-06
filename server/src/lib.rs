@@ -111,7 +111,7 @@ mod tests {
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
     use homebase_core::messages::{
-        AcquireRequest, GetRequest, LeaseSpec, PutBatchRequest, PutEntry,
+        AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
     };
     use homebase_core::space::Space as _;
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -184,17 +184,19 @@ mod tests {
         handle
             .put_batch(PutBatchRequest {
                 device: dev(1),
-                device_seq: DeviceSeq(1),
                 leases: vec![lease],
-                entries: vec![PutEntry {
-                    key: key(&[b"db", b"marker"]),
-                    value: Value::Present(marker.to_vec()),
-                    ver: Ver(1),
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(1),
+                    entries: vec![PutEntry {
+                        key: key(&[b"db", b"marker"]),
+                        value: Value::Present(marker.to_vec()),
+                        ver: Ver(1),
+                    }],
                 }],
             })
             .await
             .unwrap()
-            .admission_seq
+            .admission_seqs[0]
     }
 
     async fn read_marker(handle: &SpaceHandle) -> Option<Vec<u8>> {

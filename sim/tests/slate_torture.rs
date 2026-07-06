@@ -9,7 +9,9 @@
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
-use homebase_core::messages::{AcquireRequest, GetRequest, LeaseSpec, PutBatchRequest, PutEntry};
+use homebase_core::messages::{
+    AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+};
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
@@ -58,12 +60,14 @@ async fn write_marker(
     handle
         .put_batch(PutBatchRequest {
             device: dev(),
-            device_seq: DeviceSeq(device_seq),
             leases: vec![lease],
-            entries: vec![PutEntry {
-                key: key(&[b"db", b"marker"]),
-                value: Value::Present(marker.to_vec()),
-                ver: Ver(device_seq),
+            batches: vec![PutBatch {
+                device_seq: DeviceSeq(device_seq),
+                entries: vec![PutEntry {
+                    key: key(&[b"db", b"marker"]),
+                    value: Value::Present(marker.to_vec()),
+                    ver: Ver(device_seq),
+                }],
             }],
         })
         .await
@@ -147,12 +151,14 @@ async fn slate_seeded_writes_audit_clean() {
         handle
             .put_batch(PutBatchRequest {
                 device: dev(),
-                device_seq: DeviceSeq(seq),
                 leases: vec![lease],
-                entries: vec![PutEntry {
-                    key: k,
-                    value: Value::Present(format!("v{seq}").into_bytes()),
-                    ver: Ver(1),
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(seq),
+                    entries: vec![PutEntry {
+                        key: k,
+                        value: Value::Present(format!("v{seq}").into_bytes()),
+                        ver: Ver(1),
+                    }],
                 }],
             })
             .await

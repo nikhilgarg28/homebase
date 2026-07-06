@@ -11,7 +11,7 @@ use hmac::{Hmac, Mac};
 use homebase_core::key::{Key, KeyComponent, KeyError};
 use homebase_core::messages::{PutEntry, Range};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::Value;
+use homebase_core::tag::{DeviceId, DeviceSeq, Tag, Value, Ver};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -64,6 +64,23 @@ enum CipherMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueNonce(pub [u8; VALUE_NONCE_LEN]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValueContext {
+    pub device: DeviceId,
+    pub device_seq: DeviceSeq,
+    pub ver: Ver,
+}
+
+impl ValueContext {
+    pub fn from_tag(tag: &Tag) -> Self {
+        Self {
+            device: tag.device,
+            device_seq: tag.device_seq,
+            ver: tag.ver,
+        }
+    }
+}
 
 pub trait NonceSource {
     fn next_nonce(&mut self) -> Result<ValueNonce, String>;
@@ -200,11 +217,18 @@ impl SpaceCipher {
 
     pub fn encode_put_entry(
         &self,
+        device: DeviceId,
+        device_seq: DeviceSeq,
         entry: &PutEntry,
         nonce: ValueNonce,
     ) -> Result<PutEntry, CipherError> {
         let key = self.encode_key(&entry.key)?;
-        let value = self.encode_value(&key, &entry.value, nonce)?;
+        let context = ValueContext {
+            device,
+            device_seq,
+            ver: entry.ver,
+        };
+        let value = self.encode_value(&key, &entry.value, context, nonce)?;
         Ok(PutEntry {
             key,
             value,
@@ -216,6 +240,7 @@ impl SpaceCipher {
         &self,
         encoded_key: &Key,
         value: &Value,
+        context: ValueContext,
         nonce: ValueNonce,
     ) -> Result<Value, CipherError> {
         let Value::Present(plaintext) = value else {
@@ -229,7 +254,7 @@ impl SpaceCipher {
                     .ok_or(CipherError::MissingSpaceKey {
                         epoch: V1_KEY_EPOCH,
                     })?;
-                let aad = value_aad(encoded_key, V1_KEY_EPOCH);
+                let aad = value_aad(encoded_key, V1_KEY_EPOCH, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -251,7 +276,12 @@ impl SpaceCipher {
         }
     }
 
-    pub fn decode_value(&self, encoded_key: &Key, value: &Value) -> Result<Value, CipherError> {
+    pub fn decode_value(
+        &self,
+        encoded_key: &Key,
+        value: &Value,
+        context: ValueContext,
+    ) -> Result<Value, CipherError> {
         let Value::Present(bytes) = value else {
             return Ok(Value::Absent);
         };
@@ -262,7 +292,7 @@ impl SpaceCipher {
                 let key = space_keys
                     .get(&epoch)
                     .ok_or(CipherError::MissingSpaceKey { epoch })?;
-                let aad = value_aad(encoded_key, epoch);
+                let aad = value_aad(encoded_key, epoch, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -317,11 +347,14 @@ fn child_name_key(path_key: &[u8; KEY_LEN], component: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn value_aad(encoded_key: &Key, epoch: u64) -> Vec<u8> {
+fn value_aad(encoded_key: &Key, epoch: u64, context: ValueContext) -> Vec<u8> {
     let key = encoded_key.encode();
-    let mut out = Vec::with_capacity(VALUE_AAD_PREFIX.len() + 8 + key.len());
+    let mut out = Vec::with_capacity(VALUE_AAD_PREFIX.len() + 8 + 16 + 8 + 8 + key.len());
     out.extend_from_slice(VALUE_AAD_PREFIX);
     out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&context.device.0);
+    out.extend_from_slice(&context.device_seq.0.to_be_bytes());
+    out.extend_from_slice(&context.ver.0.to_be_bytes());
     out.extend_from_slice(&key);
     out
 }
@@ -355,7 +388,6 @@ fn decode_value_envelope(bytes: &[u8]) -> Result<(u64, ValueNonce, &[u8]), Ciphe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use homebase_core::tag::Ver;
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
@@ -371,6 +403,14 @@ mod tests {
 
     fn nonce(n: u8) -> ValueNonce {
         ValueNonce([n; VALUE_NONCE_LEN])
+    }
+
+    fn context(ver: u64) -> ValueContext {
+        ValueContext {
+            device: DeviceId([7; 16]),
+            device_seq: DeviceSeq(8),
+            ver: Ver(ver),
+        }
     }
 
     #[test]
@@ -397,7 +437,7 @@ mod tests {
         assert_eq!(codec.encode_key(&raw).unwrap(), raw);
         assert_eq!(
             codec
-                .encode_value(&raw, &Value::Present(b"v".to_vec()), nonce(3))
+                .encode_value(&raw, &Value::Present(b"v".to_vec()), context(1), nonce(3))
                 .unwrap(),
             Value::Present(b"v".to_vec())
         );
@@ -443,12 +483,27 @@ mod tests {
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
         let value = Value::Present(b"secret".to_vec());
-        let sealed = codec.encode_value(&encoded_key, &value, nonce(3)).unwrap();
+        let sealed = codec
+            .encode_value(&encoded_key, &value, context(9), nonce(3))
+            .unwrap();
         assert_ne!(sealed, value);
-        assert_eq!(codec.decode_value(&encoded_key, &sealed).unwrap(), value);
+        assert_eq!(
+            codec
+                .decode_value(&encoded_key, &sealed, context(9))
+                .unwrap(),
+            value
+        );
         let other_key = codec.encode_key(&key(&[b"db", b"other"])).unwrap();
         assert_eq!(
-            codec.decode_value(&other_key, &sealed).unwrap_err(),
+            codec
+                .decode_value(&other_key, &sealed, context(9))
+                .unwrap_err(),
+            CipherError::DecryptFailed
+        );
+        assert_eq!(
+            codec
+                .decode_value(&encoded_key, &sealed, context(10))
+                .unwrap_err(),
             CipherError::DecryptFailed
         );
 
@@ -459,7 +514,7 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 0x01;
         assert_eq!(
             codec
-                .decode_value(&encoded_key, &Value::Present(tampered))
+                .decode_value(&encoded_key, &Value::Present(tampered), context(9))
                 .unwrap_err(),
             CipherError::DecryptFailed
         );
@@ -475,11 +530,15 @@ mod tests {
             value: Value::Present(b"secret".to_vec()),
             ver: Ver(9),
         };
-        let encoded = codec.encode_put_entry(&entry, nonce(5)).unwrap();
+        let encoded = codec
+            .encode_put_entry(DeviceId([7; 16]), DeviceSeq(8), &entry, nonce(5))
+            .unwrap();
         assert_ne!(encoded.key, entry.key);
         assert_ne!(encoded.value, entry.value);
         assert_eq!(
-            codec.decode_value(&encoded.key, &encoded.value).unwrap(),
+            codec
+                .decode_value(&encoded.key, &encoded.value, context(9))
+                .unwrap(),
             entry.value
         );
 
@@ -488,7 +547,10 @@ mod tests {
             ..entry
         };
         assert_eq!(
-            codec.encode_put_entry(&tombstone, nonce(6)).unwrap().value,
+            codec
+                .encode_put_entry(DeviceId([7; 16]), DeviceSeq(8), &tombstone, nonce(6))
+                .unwrap()
+                .value,
             Value::Absent
         );
     }

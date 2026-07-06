@@ -22,8 +22,8 @@ use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatchRequest, PutEntry,
-    Range, RangeCursor, RangeCut, ReadAtRequest,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
+    PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -187,12 +187,14 @@ impl Harness {
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(device),
-                device_seq: DeviceSeq(device_seq),
                 leases: vec![self.leases[device]],
-                entries,
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(device_seq),
+                    entries,
+                }],
             },
         ))
-        .map(|resp| resp.admission_seq)
+        .map(|resp| resp.admission_seqs[0])
     }
 }
 

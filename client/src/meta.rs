@@ -34,15 +34,16 @@
 //! stream; likewise the single queue drains in order, each space
 //! receiving its commits in order.
 //!
-//! **The queue is keyed by the wire seq, assigned at commit.**
-//! [`commit`](MetaStore::commit) stamps each batch with the next
-//! `DeviceSeq` and persists the assignment atomically with the entry —
-//! write-ahead *by construction*: a successor can never reuse a seq a
-//! dead incarnation may have sent, because the send and the reservation
-//! are the same record. The contract this rests on: **a store-backed
-//! client writes the server exclusively through its queue** (mixing
-//! direct puts with queued commits on one device id would interleave the
-//! stream); storeless engine-tier consumers are separate devices.
+//! **The queue is keyed by the wire seq, assigned by reservation.**
+//! [`reserve_commit`](MetaStore::reserve_commit) stamps each batch with
+//! the next `DeviceSeq`, and [`commit`](MetaStore::commit) persists that
+//! reserved assignment atomically with the entry — write-ahead *by
+//! construction*: a successor can never reuse a seq a dead incarnation
+//! may have sent, because the send and the committed reservation are the
+//! same record. The contract this rests on: **a store-backed client
+//! writes the server exclusively through its queue** (mixing direct puts
+//! with queued commits on one device id would interleave the stream);
+//! storeless engine-tier consumers are separate devices.
 //!
 //! **Two cursors, two directions — they never meet.** Range watermarks are
 //! the *pull* cursors: per space and exact range, in the server's
@@ -58,11 +59,12 @@
 //! table.** The protocol's per-key ver chains stay (the untrusted-server
 //! rollback tripwire, the exclusion auditor, what makes fork-recovery
 //! requeues safe) — but per-key monotonicity does not require per-key
-//! state: [`commit`](MetaStore::commit) stamps entries with consecutive
-//! vers above the high-water (`+1, +2, …` in entry order — so duplicate
-//! keys in one batch behave like a sequence, mirroring the kernel's own
-//! within-batch rule), and pulls raise the high-water to the maximum ver
-//! observed ([`advance_watermark`](MetaStore::advance_watermark)). By the
+//! state: [`reserve_commit`](MetaStore::reserve_commit) stamps entries
+//! with consecutive vers above the high-water (`+1, +2, …` in entry
+//! order — so duplicate keys in one batch behave like a sequence,
+//! mirroring the kernel's own within-batch rule), and pulls raise the
+//! high-water to the maximum ver observed
+//! ([`advance_watermark`](MetaStore::advance_watermark)). By the
 //! acquire-barrier rule a writer has pulled everything under its lease
 //! before writing, so the counter dominates the stored ver of every key
 //! it may touch. (Multilite may additionally keep a per-row shadow tag
@@ -120,10 +122,10 @@ pub struct DeviceRecord {
     pub id: DeviceId,
 }
 
-/// The next `DeviceSeq` a commit will be stamped with — one stream shared
-/// by every space, advanced atomically inside [`MetaStore::commit`] (the
-/// assignment and the queue entry are one record: write-ahead by
-/// construction).
+/// The next `DeviceSeq` a commit reservation will be stamped with — one
+/// stream shared by every space, advanced atomically inside
+/// [`MetaStore::commit`] (the reserved assignment and the queue entry are
+/// one record: write-ahead by construction).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeqRecord {
     pub next: DeviceSeq,
@@ -360,17 +362,27 @@ pub trait MetaStore {
     /// Identity minted at first open (or re-minted after a suspected fork).
     fn record_device(&self, id: DeviceId) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// A local commit: stamps the batch with the next `DeviceSeq` and its
-    /// entries with consecutive vers above the high-water (in entry order
-    /// — duplicate keys are legal and behave like a sequence, the
-    /// kernel's own within-batch rule), advances both counters, and
-    /// appends to the queue — **one atomic transition** (the assignment
-    /// and the entry are inseparable; that is the write-ahead guarantee).
-    /// Returns what was assigned.
-    fn commit(
+    /// Reserve a commit with the next
+    /// `DeviceSeq` and its entries with consecutive vers above the
+    /// high-water (in entry order — duplicate keys are legal and behave
+    /// like a sequence, the kernel's own within-batch rule), but does not
+    /// advance counters or append to the queue. The replica uses this
+    /// window to transform values with stamped tags in AEAD associated
+    /// data, then persists through [`commit`](Self::commit).
+    ///
+    /// Crash recovery ignores reservations because they are never durable.
+    fn reserve_commit(
         &self,
         space: SpaceId,
         entries: Vec<(Key, Value)>,
+    ) -> impl Future<Output = Result<ReservedCommit, StorageError>> + Send;
+
+    /// Commit a reservation: advances the counters and appends the
+    /// caller-transformed entries to the queue — **one atomic transition**.
+    /// Returns what was assigned.
+    fn commit(
+        &self,
+        reserved: ReservedCommit,
     ) -> impl Future<Output = Result<Committed, StorageError>> + Send;
 
     /// Acknowledged commits leave the queue: deletes every queued entry
@@ -468,6 +480,15 @@ pub trait MetaStore {
 pub struct Committed {
     pub seq: DeviceSeq,
     pub ver_high: Ver,
+}
+
+/// A non-durable reserved commit. The entries may still carry caller-plain
+/// values; only [`MetaStore::commit`] makes the record durable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReservedCommit {
+    pub seq: DeviceSeq,
+    pub ver_high: Ver,
+    pub record: CommitRecord,
 }
 
 /// Load-then-certify: the audit entry point for any implementation.
@@ -839,11 +860,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         self.store.apply(batch).await
     }
 
-    async fn commit(
+    async fn reserve_commit(
         &self,
         space: SpaceId,
         entries: Vec<(Key, Value)>,
-    ) -> Result<Committed, StorageError> {
+    ) -> Result<ReservedCommit, StorageError> {
         let seq = match self.store.get(&seq_key()).await? {
             Some(bytes) => {
                 SeqRecord::decode(&bytes)
@@ -873,19 +894,65 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                 .collect(),
         };
         let ver_high = Ver(high.0 + record.entries.len() as u64);
+        Ok(ReservedCommit {
+            seq,
+            ver_high,
+            record,
+        })
+    }
+
+    async fn commit(&self, reserved: ReservedCommit) -> Result<Committed, StorageError> {
+        let entries_len = reserved.record.entries.len() as u64;
+        let expected_high = Ver(reserved
+            .ver_high
+            .0
+            .checked_sub(entries_len)
+            .ok_or_else(|| {
+                StorageError("malformed commit reservation: ver high below entry count".into())
+            })?);
+        let current_seq = match self.store.get(&seq_key()).await? {
+            Some(bytes) => {
+                SeqRecord::decode(&bytes)
+                    .expect("undecodable seq record")
+                    .next
+            }
+            None => DeviceSeq(1),
+        };
+        let current_high = match self.store.get(&ver_key()).await? {
+            Some(bytes) => {
+                VerHighRecord::decode(&bytes)
+                    .expect("undecodable ver record")
+                    .high
+            }
+            None => Ver(0),
+        };
+        if current_seq != reserved.seq || current_high != expected_high {
+            return Err(StorageError(
+                "stale commit reservation: counters advanced before commit".into(),
+            ));
+        }
 
         let mut batch = WriteBatch::new();
-        batch.put(oplog_key(seq), record.encode());
+        batch.put(oplog_key(reserved.seq), reserved.record.encode());
         batch.put(
             seq_key(),
             SeqRecord {
-                next: DeviceSeq(seq.0 + 1),
+                next: DeviceSeq(reserved.seq.0 + 1),
             }
             .encode(),
         );
-        batch.put(ver_key(), VerHighRecord { high: ver_high }.encode());
+        batch.put(
+            ver_key(),
+            VerHighRecord {
+                high: reserved.ver_high,
+            }
+            .encode(),
+        );
         self.store.apply(batch).await?;
-        Ok(Committed { seq, ver_high })
+        Ok(Committed {
+            seq: reserved.seq,
+            ver_high: reserved.ver_high,
+        })
     }
 
     async fn trim_oplog(&self, through: DeviceSeq) -> Result<(), StorageError> {
@@ -1383,6 +1450,15 @@ pub mod conformance {
         }
     }
 
+    async fn commit_entries<M: MetaStore>(
+        store: &M,
+        space: SpaceId,
+        entries: Vec<(Key, Value)>,
+    ) -> Committed {
+        let reserved = store.reserve_commit(space, entries).await.unwrap();
+        store.commit(reserved).await.unwrap()
+    }
+
     /// Drives the whole lifecycle against a **fresh** store. Panics on any
     /// contract violation.
     pub async fn run_all<M: MetaStore>(store: &M) {
@@ -1405,16 +1481,15 @@ pub mod conformance {
         // Three commits through the one queue, two spaces interleaved.
         // The store assigns both counters: seqs dense from 1, vers
         // climbing from the high-water.
-        let first = store
-            .commit(
-                space,
-                vec![
-                    (key(&[b"db", b"a"]), Value::Present(b"ciphertext".to_vec())),
-                    (key(&[b"db", b"gone"]), Value::Absent),
-                ],
-            )
-            .await
-            .unwrap();
+        let first = commit_entries(
+            store,
+            space,
+            vec![
+                (key(&[b"db", b"a"]), Value::Present(b"ciphertext".to_vec())),
+                (key(&[b"db", b"gone"]), Value::Absent),
+            ],
+        )
+        .await;
         assert_eq!(
             first,
             Committed {
@@ -1422,13 +1497,12 @@ pub mod conformance {
                 ver_high: Ver(2)
             }
         );
-        let second = store
-            .commit(
-                link,
-                vec![(key(&[b"dir", b"entry"]), Value::Present(b"sealed".to_vec()))],
-            )
-            .await
-            .unwrap();
+        let second = commit_entries(
+            store,
+            link,
+            vec![(key(&[b"dir", b"entry"]), Value::Present(b"sealed".to_vec()))],
+        )
+        .await;
         assert_eq!(
             second,
             Committed {
@@ -1436,13 +1510,12 @@ pub mod conformance {
                 ver_high: Ver(3)
             }
         );
-        let third = store
-            .commit(
-                space,
-                vec![(key(&[b"db", b"a"]), Value::Present(b"newer".to_vec()))],
-            )
-            .await
-            .unwrap();
+        let third = commit_entries(
+            store,
+            space,
+            vec![(key(&[b"db", b"a"]), Value::Present(b"newer".to_vec()))],
+        )
+        .await;
         assert_eq!(
             third,
             Committed {
@@ -1540,13 +1613,12 @@ pub mod conformance {
             None,
             "no pull yet"
         );
-        let fourth = store
-            .commit(
-                space,
-                vec![(key(&[b"db", b"b"]), Value::Present(b"post-pull".to_vec()))],
-            )
-            .await
-            .unwrap();
+        let fourth = commit_entries(
+            store,
+            space,
+            vec![(key(&[b"db", b"b"]), Value::Present(b"post-pull".to_vec()))],
+        )
+        .await;
         assert_eq!(
             fourth,
             Committed {
@@ -1580,19 +1652,18 @@ pub mod conformance {
         // Duplicate keys in one commit behave like a sequence — the
         // kernel's own within-batch rule: later occurrences carry
         // strictly greater vers, and the state still certifies.
-        let dup = store
-            .commit(
-                space,
-                vec![
-                    (key(&[b"db", b"c"]), Value::Present(b"twice".to_vec())),
-                    (
-                        key(&[b"db", b"c"]),
-                        Value::Present(b"the second wins".to_vec()),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
+        let dup = commit_entries(
+            store,
+            space,
+            vec![
+                (key(&[b"db", b"c"]), Value::Present(b"twice".to_vec())),
+                (
+                    key(&[b"db", b"c"]),
+                    Value::Present(b"the second wins".to_vec()),
+                ),
+            ],
+        )
+        .await;
         assert_eq!(
             dup,
             Committed {
@@ -1618,13 +1689,12 @@ pub mod conformance {
 
         // Rollback: discard drops the suffix — the resolution for a
         // rejected push the caller chooses not to repair.
-        let doomed = store
-            .commit(
-                space,
-                vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))],
-            )
-            .await
-            .unwrap();
+        let doomed = commit_entries(
+            store,
+            space,
+            vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))],
+        )
+        .await;
         store.discard_from(doomed.seq).await.unwrap();
         let state = audit(store).await;
         assert_eq!(
@@ -1637,13 +1707,12 @@ pub mod conformance {
         // A commit after a discard leaves a gap — legal, because the seq
         // counter never rewinds. The state still certifies and the head
         // window shows the hole.
-        let after_gap = store
-            .commit(
-                space,
-                vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))],
-            )
-            .await
-            .unwrap();
+        let after_gap = commit_entries(
+            store,
+            space,
+            vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))],
+        )
+        .await;
         assert_eq!(after_gap.seq, DeviceSeq(7));
         let state = audit(store).await;
         assert_eq!(

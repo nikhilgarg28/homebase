@@ -98,15 +98,17 @@
 //! Transport failures ([`ReplicaError::Unavailable`]) abort the pass with
 //! the queue intact: retry when the server is back.
 
-use crate::cipher::{CipherError, NonceSource, SpaceCipher, SpaceEnvelope, SystemNonceSource};
+use crate::cipher::{
+    CipherError, NonceSource, SpaceCipher, SpaceEnvelope, SystemNonceSource, ValueContext,
+};
 use crate::meta::{Committed, HeldLease, MetaStore, certify};
 use crate::server::ServerHandle;
 use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatchRequest, Range, RangeCursor, RangeCut,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, Range, RangeCursor,
+    RangeCut, ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -394,17 +396,26 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Replica<M, H
         let mut encoded = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             let key = self.cipher.encode_key(&key)?;
+            encoded.push((key, value));
+        }
+        self.check_local_write_authority(self.space, &encoded)
+            .await?;
+        let mut reserved = self.store.reserve_commit(self.space, encoded).await?;
+        for entry in &mut reserved.record.entries {
             let nonce = self
                 .nonce_source
                 .next_nonce()
                 .map_err(|reason| ReplicaError::Nonce { reason })?;
-            let value = self.cipher.encode_value(&key, &value, nonce)?;
-            encoded.push((key, value));
+            let context = ValueContext {
+                device: self.device,
+                device_seq: reserved.seq,
+                ver: entry.ver,
+            };
+            entry.value = self
+                .cipher
+                .encode_value(&entry.key, &entry.value, context, nonce)?;
         }
-        let entries = encoded;
-        self.check_local_write_authority(self.space, &entries)
-            .await?;
-        let committed = self.store.commit(self.space, entries).await?;
+        let committed = self.store.commit(reserved).await?;
         self.next_seq = DeviceSeq(committed.seq.0 + 1);
         Ok(committed)
     }
@@ -759,7 +770,11 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Replica<M, H
                 RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
             };
             for entry in entries {
-                entry.value = self.cipher.decode_value(&entry.key, &entry.value)?;
+                entry.value = self.cipher.decode_value(
+                    &entry.key,
+                    &entry.value,
+                    ValueContext::from_tag(&entry.tag),
+                )?;
             }
         }
         Ok(response)
@@ -800,25 +815,38 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Replica<M, H
             self.scan_from = head; // nothing below was queued in the window
             let space = head_record.space;
             let mut last = head;
-            let mut entries = head_record.entries.clone();
+            let mut batches = vec![PutBatch {
+                device_seq: head,
+                entries: head_record.entries.clone(),
+            }];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
                         || record.space != space
-                        || entries.len() + record.entries.len() > self.push_cap
+                        || batches
+                            .iter()
+                            .map(|batch| batch.entries.len())
+                            .sum::<usize>()
+                            + record.entries.len()
+                            > self.push_cap
                     {
                         break;
                     }
-                    entries.extend(record.entries.iter().cloned());
+                    batches.push(PutBatch {
+                        device_seq: *seq,
+                        entries: record.entries.clone(),
+                    });
                     last = *seq;
                 }
             }
-            let keys: Vec<Key> = entries.iter().map(|entry| entry.key.clone()).collect();
+            let keys: Vec<Key> = batches
+                .iter()
+                .flat_map(|batch| batch.entries.iter().map(|entry| entry.key.clone()))
+                .collect();
             let request = PutBatchRequest {
                 device: self.device,
-                device_seq: last,
                 leases: self.live_write_leases(space, &keys).await?,
-                entries,
+                batches,
             };
             match self.server.put_batch(&space, request).await {
                 Ok(_) => {

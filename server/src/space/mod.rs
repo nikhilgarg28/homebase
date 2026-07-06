@@ -117,7 +117,9 @@ mod tests {
     use crate::storage::MemoryStore;
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
-    use homebase_core::messages::{KernelError, LeaseSpec, PutEntry, Range, RangeCursor, RangeCut};
+    use homebase_core::messages::{
+        KernelError, LeaseSpec, PutBatch, PutEntry, Range, RangeCursor, RangeCut,
+    };
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use pollster::block_on;
     use std::time::Duration;
@@ -190,9 +192,11 @@ mod tests {
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(1),
-                device_seq: DeviceSeq(device_seq),
                 leases: vec![lease],
-                entries,
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(device_seq),
+                    entries,
+                }],
             },
         ))
     }
@@ -202,7 +206,7 @@ mod tests {
         let (mut space, store, lease) = setup();
         let k = key(&[b"db", b"t", b"r1"]);
         let resp = put_batch(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
-        assert_eq!(resp.admission_seq, AdmissionSeq(1));
+        assert_eq!(resp.admission_seqs, vec![AdmissionSeq(1)]);
 
         let got = block_on(space.get(
             &store,
@@ -227,6 +231,41 @@ mod tests {
         ))
         .unwrap();
         assert!(got.entries[0].is_none());
+    }
+
+    #[test]
+    fn put_batch_coalesces_successive_client_batches_atomically() {
+        let (mut space, store, lease) = setup();
+        let k1 = key(&[b"db", b"t", b"r1"]);
+        let k2 = key(&[b"db", b"t", b"r2"]);
+        let resp = block_on(space.put_batch(
+            &store,
+            Timestamp(1),
+            &PutBatchRequest {
+                device: dev(1),
+                leases: vec![lease],
+                batches: vec![
+                    PutBatch {
+                        device_seq: DeviceSeq(1),
+                        entries: vec![put(&k1, b"v1", 1)],
+                    },
+                    PutBatch {
+                        device_seq: DeviceSeq(2),
+                        entries: vec![put(&k2, b"v2", 2)],
+                    },
+                ],
+            },
+        ))
+        .unwrap();
+        assert_eq!(resp.admission_seqs, vec![AdmissionSeq(1), AdmissionSeq(2)]);
+
+        let got = block_on(space.get(&store, &GetRequest { keys: vec![k1, k2] })).unwrap();
+        let first = got.entries[0].as_ref().unwrap();
+        let second = got.entries[1].as_ref().unwrap();
+        assert_eq!(first.tag.device_seq, DeviceSeq(1));
+        assert_eq!(first.tag.admission_seq, AdmissionSeq(1));
+        assert_eq!(second.tag.device_seq, DeviceSeq(2));
+        assert_eq!(second.tag.admission_seq, AdmissionSeq(2));
     }
 
     #[test]

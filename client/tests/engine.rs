@@ -13,8 +13,8 @@ use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseMode, LeaseRef};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutEntry, Range, RangeCut,
-    ReleaseRequest,
+    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
+    RangeCut, ReleaseRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{MemoryStore, OrderedStore, WriteBatch, collect_scan};
@@ -129,9 +129,11 @@ async fn foreign_put(
             &space,
             PutBatchRequest {
                 device,
-                device_seq: seq,
                 leases: vec![lease],
-                entries,
+                batches: vec![PutBatch {
+                    device_seq: seq,
+                    entries,
+                }],
             },
         )
         .await
@@ -245,14 +247,15 @@ fn push_drains_and_groups_same_space_neighbors() {
         );
         assert_eq!(queued(&mem).await, 0);
 
-        // Same-space neighbors merge and ship under the group's LAST seq.
+        // Same-space neighbors merge into one request while preserving each
+        // client commit's seq identity in stored tags.
         assert_eq!(
             fetch(&handle, SPACE, &a1).await.unwrap().tag.device_seq,
-            DeviceSeq(3)
+            DeviceSeq(1)
         );
         assert_eq!(
             fetch(&handle, SPACE, &a2).await.unwrap().tag.device_seq,
-            DeviceSeq(3)
+            DeviceSeq(2)
         );
         assert_eq!(
             fetch(&handle, SPACE, &a3).await.unwrap().tag.device_seq,
@@ -791,25 +794,30 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
             .await
             .unwrap();
 
-        // The dead incarnation's send: the same group, shipped under the
-        // group's last seq, admitted — and then the crash ate the trim.
+        // The dead incarnation's send: the same group, coalesced as two
+        // client batches, admitted — and then the crash ate the trim.
         handle
             .put_batch(
                 &SPACE,
                 PutBatchRequest {
                     device: engine.device(),
-                    device_seq: DeviceSeq(2),
                     leases: vec![lease],
-                    entries: vec![
-                        PutEntry {
-                            key: k1.clone(),
-                            value: val(b"one"),
-                            ver: Ver(1),
+                    batches: vec![
+                        PutBatch {
+                            device_seq: DeviceSeq(1),
+                            entries: vec![PutEntry {
+                                key: k1.clone(),
+                                value: val(b"one"),
+                                ver: Ver(1),
+                            }],
                         },
-                        PutEntry {
-                            key: k2.clone(),
-                            value: val(b"two"),
-                            ver: Ver(2),
+                        PutBatch {
+                            device_seq: DeviceSeq(2),
+                            entries: vec![PutEntry {
+                                key: k2.clone(),
+                                value: val(b"two"),
+                                ver: Ver(2),
+                            }],
                         },
                     ],
                 },

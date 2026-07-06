@@ -224,8 +224,8 @@ pub mod conformance {
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseMode, LeaseRef};
     use homebase_core::messages::{
-        AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatchRequest, PutEntry,
-        Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
+        AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
+        PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
     };
     use homebase_core::space::{SpaceError, SpaceId};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -295,20 +295,22 @@ pub mod conformance {
                 &space,
                 PutBatchRequest {
                     device: dev(1),
-                    device_seq: DeviceSeq(1),
                     leases: vec![lease],
-                    entries: vec![PutEntry {
-                        key: k.clone(),
-                        value: Value::Present(marker.to_vec()),
-                        ver: Ver(1),
+                    batches: vec![PutBatch {
+                        device_seq: DeviceSeq(1),
+                        entries: vec![PutEntry {
+                            key: k.clone(),
+                            value: Value::Present(marker.to_vec()),
+                            ver: Ver(1),
+                        }],
                     }],
                 },
             )
             .await
             .expect("covered put");
         assert_eq!(
-            put.admission_seq,
-            AdmissionSeq(1),
+            put.admission_seqs,
+            vec![AdmissionSeq(1)],
             "fresh space: first admission"
         );
 
@@ -455,12 +457,14 @@ pub mod conformance {
                 &space,
                 PutBatchRequest {
                     device: dev(2),
-                    device_seq: DeviceSeq(1),
                     leases: vec![],
-                    entries: vec![PutEntry {
-                        key: key(&[b"x", b"k"]),
-                        value: Value::Present(b"v".to_vec()),
-                        ver: Ver(1),
+                    batches: vec![PutBatch {
+                        device_seq: DeviceSeq(1),
+                        entries: vec![PutEntry {
+                            key: key(&[b"x", b"k"]),
+                            value: Value::Present(b"v".to_vec()),
+                            ver: Ver(1),
+                        }],
                     }],
                 },
             )
@@ -530,9 +534,11 @@ pub mod conformance {
                 &unknown,
                 PutBatchRequest {
                     device: dev(1),
-                    device_seq: DeviceSeq(1),
                     leases: vec![],
-                    entries: vec![],
+                    batches: vec![PutBatch {
+                        device_seq: DeviceSeq(1),
+                        entries: vec![],
+                    }],
                 },
             )
             .await
