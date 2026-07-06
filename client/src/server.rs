@@ -158,6 +158,44 @@ where
     }
 }
 
+/// Router that never serves a space — for offline-only clients.
+pub fn offline_router() -> impl Fn(&SpaceId) -> Option<UnreachableSpace> + Sync + Copy {
+    |_: &SpaceId| None
+}
+
+/// Never instantiated — only used as the `Space` type for [`offline_router`].
+pub enum UnreachableSpace {}
+
+impl Space for UnreachableSpace {
+    async fn acquire(&self, _: AcquireRequest) -> Result<AcquireResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn renew(&self, _: RenewRequest) -> Result<RenewResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn release(&self, _: ReleaseRequest) -> Result<ReleaseResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn put_batch(&self, _: PutBatchRequest) -> Result<PutBatchResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn get(&self, _: GetRequest) -> Result<GetResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn list(&self, _: ListRequest) -> Result<ListResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn read_at(&self, _: ReadAtRequest) -> Result<ReadAtResponse, SpaceError> {
+        match *self {}
+    }
+}
+
 /// The server type for clients that have no server. Uninhabited: a value
 /// can never exist, so `None::<Offline>` is the only way to use it and no
 /// verb is ever reachable — the compiler proves it.

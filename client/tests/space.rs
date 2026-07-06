@@ -1,6 +1,8 @@
-use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueContext, ValueNonce};
+use homebase::Client;
+use homebase::cipher::{
+    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext, ValueNonce,
+};
 use homebase::meta::OrderedMetaStore;
-use homebase::replica::Replica;
 use homebase::server::ServerHandle;
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
@@ -103,31 +105,36 @@ async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<En
 }
 
 #[test]
-fn encrypted_replica_writes_ciphertext_under_encoded_keys() {
+fn encrypted_space_writes_ciphertext_under_encoded_keys() {
     block_on(async {
         let envelope = encrypted_envelope();
         let space = envelope.space_id();
-        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let spaces = [space];
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &spaces);
         let clock = ManualClock::new(Timestamp(0));
-        let mut replica = Replica::open_with_nonce_source(
+        let client = Client::open(
             OrderedMetaStore::new(MemoryStore::new()),
             &handle,
             &clock,
             dev(1),
-            &envelope,
             TestNonceSource::new(7),
         )
         .await
         .unwrap();
+        client.attach(&envelope).await.unwrap();
+        let mut space_handle = client.space(space).await.unwrap();
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
-        replica.ensure(vec![wspec(&db, 60)], false).await.unwrap();
-        replica
+        space_handle
+            .ensure(vec![wspec(&db, 60)], false)
+            .await
+            .unwrap();
+        space_handle
             .commit(vec![(row.clone(), val(b"secret"))])
             .await
             .unwrap();
-        replica.push().await.unwrap();
+        client.push().await.unwrap();
 
         let cipher = envelope.open().unwrap();
         let encoded_row = cipher.encode_key(&row).unwrap();
@@ -152,44 +159,51 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
     block_on(async {
         let envelope = encrypted_envelope();
         let space = envelope.space_id();
-        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let spaces = [space];
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &spaces);
         let db = key(&[b"db"]);
         let row1 = key(&[b"db", b"k1"]);
         let row2 = key(&[b"db", b"k2"]);
 
         let writer_clock = ManualClock::new(Timestamp(0));
-        let mut writer = Replica::open_with_nonce_source(
+        let writer = Client::open(
             OrderedMetaStore::new(MemoryStore::new()),
             &handle,
             &writer_clock,
             dev(1),
-            &envelope,
             TestNonceSource::new(1),
         )
         .await
         .unwrap();
-        writer.ensure(vec![wspec(&db, 60)], false).await.unwrap();
-        writer
+        writer.attach(&envelope).await.unwrap();
+        let mut writer_space = writer.space(space).await.unwrap();
+        writer_space
+            .ensure(vec![wspec(&db, 60)], false)
+            .await
+            .unwrap();
+        writer_space
             .commit(vec![(row1.clone(), val(b"one"))])
             .await
             .unwrap();
-        writer
+        writer_space
             .commit(vec![(row2.clone(), val(b"two"))])
             .await
             .unwrap();
         writer.push().await.unwrap();
 
         let reader_clock = ManualClock::new(Timestamp(0));
-        let mut reader = Replica::open(
+        let reader = Client::open(
             OrderedMetaStore::new(MemoryStore::new()),
             &handle,
             &reader_clock,
             dev(2),
-            &envelope,
+            SystemNonceSource,
         )
         .await
         .unwrap();
-        let pulled = reader.pull(Range::Prefix(db)).await.unwrap();
+        reader.attach(&envelope).await.unwrap();
+        let mut reader_space = reader.space(space).await.unwrap();
+        let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
 
         let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
             panic!("initial pull should snapshot")
@@ -206,48 +220,50 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
 #[test]
 fn envelope_can_be_reused_after_linking_without_changing_space() {
     block_on(async {
-        // Local genesis: the device has an envelope before any link/account
-        // directory exists.
         let local_envelope = encrypted_envelope();
         let space = local_envelope.space_id();
-        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let spaces = [space];
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &spaces);
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
 
         let writer_clock = ManualClock::new(Timestamp(0));
-        let mut writer = Replica::open_with_nonce_source(
+        let writer = Client::open(
             OrderedMetaStore::new(MemoryStore::new()),
             &handle,
             &writer_clock,
             dev(1),
-            &local_envelope,
             TestNonceSource::new(1),
         )
         .await
         .unwrap();
-        writer.ensure(vec![wspec(&db, 60)], false).await.unwrap();
-        writer
+        writer.attach(&local_envelope).await.unwrap();
+        let mut writer_space = writer.space(space).await.unwrap();
+        writer_space
+            .ensure(vec![wspec(&db, 60)], false)
+            .await
+            .unwrap();
+        writer_space
             .commit(vec![(row, val(b"before-link"))])
             .await
             .unwrap();
         writer.push().await.unwrap();
 
-        // Linking later publishes the same envelope through a directory.
-        // Opening from that discovered envelope reaches the same space and
-        // decrypts existing ciphertext.
         let linked_envelope = local_envelope.clone();
         assert_eq!(linked_envelope.space_id(), space);
         let reader_clock = ManualClock::new(Timestamp(0));
-        let mut reader = Replica::open(
+        let reader = Client::open(
             OrderedMetaStore::new(MemoryStore::new()),
             &handle,
             &reader_clock,
             dev(2),
-            &linked_envelope,
+            SystemNonceSource,
         )
         .await
         .unwrap();
-        let pulled = reader.pull(Range::Prefix(db)).await.unwrap();
+        reader.attach(&linked_envelope).await.unwrap();
+        let mut reader_space = reader.space(space).await.unwrap();
+        let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
 
         assert!(matches!(
             &pulled.ranges[0],

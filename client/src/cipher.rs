@@ -103,6 +103,7 @@ pub enum CipherError {
     SpaceIdMismatch { expected: SpaceId, derived: SpaceId },
     InvalidKey(KeyError),
     MalformedValueEnvelope,
+    MalformedEnvelopeRecord,
     DecryptFailed,
 }
 
@@ -118,6 +119,7 @@ impl fmt::Display for CipherError {
             }
             Self::InvalidKey(err) => write!(f, "{err}"),
             Self::MalformedValueEnvelope => write!(f, "malformed value envelope"),
+            Self::MalformedEnvelopeRecord => write!(f, "malformed envelope record"),
             Self::DecryptFailed => write!(f, "value decryption failed"),
         }
     }
@@ -131,7 +133,16 @@ impl From<KeyError> for CipherError {
     }
 }
 
+const ENVELOPE_RECORD_VERSION: u8 = 1;
+const ENVELOPE_KIND_ENCRYPTED: u8 = 0;
+const ENVELOPE_KIND_PLAINTEXT: u8 = 1;
+
 impl SpaceEnvelope {
+    /// Mint a fresh encrypted envelope from caller-supplied random key material.
+    pub fn mint(name_key: NameKey, space_key: SpaceKey) -> Self {
+        Self::encrypted(name_key, space_key)
+    }
+
     pub fn encrypted(name_key: NameKey, space_key: SpaceKey) -> Self {
         Self::encrypted_with_epochs(name_key, [(V1_KEY_EPOCH, space_key)])
     }
@@ -188,6 +199,87 @@ impl SpaceEnvelope {
                 space_id: derived,
                 mode: CipherMode::Plaintext,
             }),
+        }
+    }
+
+    /// Persisted form for [`crate::meta::CodecRecord::sealed`].
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Encrypted {
+                name_key,
+                space_keys,
+            } => {
+                let count = space_keys.len().min(u16::MAX as usize) as u16;
+                let mut out =
+                    Vec::with_capacity(1 + 1 + KEY_LEN + 2 + space_keys.len() * (8 + KEY_LEN));
+                out.push(ENVELOPE_RECORD_VERSION);
+                out.push(ENVELOPE_KIND_ENCRYPTED);
+                out.extend_from_slice(&name_key.0);
+                out.extend_from_slice(&count.to_be_bytes());
+                for (epoch, key) in space_keys {
+                    out.extend_from_slice(&epoch.to_be_bytes());
+                    out.extend_from_slice(&key.0);
+                }
+                out
+            }
+            Self::Plaintext { space_id } => {
+                let mut out = Vec::with_capacity(1 + 1 + 16);
+                out.push(ENVELOPE_RECORD_VERSION);
+                out.push(ENVELOPE_KIND_PLAINTEXT);
+                out.extend_from_slice(&space_id.0);
+                out
+            }
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CipherError> {
+        let Some((&[version, kind], rest)) = bytes.split_first_chunk() else {
+            return Err(CipherError::MalformedEnvelopeRecord);
+        };
+        if version != ENVELOPE_RECORD_VERSION {
+            return Err(CipherError::MalformedEnvelopeRecord);
+        }
+        match kind {
+            ENVELOPE_KIND_ENCRYPTED => {
+                if rest.len() < KEY_LEN + 2 {
+                    return Err(CipherError::MalformedEnvelopeRecord);
+                }
+                let mut name_bytes = [0u8; KEY_LEN];
+                name_bytes.copy_from_slice(&rest[..KEY_LEN]);
+                let count =
+                    u16::from_be_bytes(rest[KEY_LEN..KEY_LEN + 2].try_into().unwrap()) as usize;
+                let mut offset = KEY_LEN + 2;
+                let mut space_keys = BTreeMap::new();
+                for _ in 0..count {
+                    if rest.len() < offset + 8 + KEY_LEN {
+                        return Err(CipherError::MalformedEnvelopeRecord);
+                    }
+                    let epoch = u64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    let mut key_bytes = [0u8; KEY_LEN];
+                    key_bytes.copy_from_slice(&rest[offset..offset + KEY_LEN]);
+                    offset += KEY_LEN;
+                    space_keys.insert(epoch, SpaceKey(key_bytes));
+                }
+                if offset != rest.len() {
+                    return Err(CipherError::MalformedEnvelopeRecord);
+                }
+                Ok(Self::Encrypted {
+                    name_key: NameKey(name_bytes),
+                    space_keys,
+                })
+            }
+            ENVELOPE_KIND_PLAINTEXT => {
+                if rest.len() != 16 {
+                    return Err(CipherError::MalformedEnvelopeRecord);
+                }
+                let mut id = [0u8; 16];
+                id.copy_from_slice(rest);
+                Ok(Self::Plaintext {
+                    space_id: SpaceId(id),
+                })
+            }
+            _ => Err(CipherError::MalformedEnvelopeRecord),
         }
     }
 }

@@ -1,0 +1,670 @@
+//! Per-space commit, pull, and lease operations for one [`SpaceId`],
+//! reached through [`Client::attach`](crate::client::Client::attach) and
+//! [`Client::space`](crate::client::Client::space).
+
+use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource, ValueContext};
+use crate::client::Client;
+use crate::meta::{Committed, HeldLease, MetaStore};
+use crate::server::ServerHandle;
+use homebase_core::clock::{HybridClock, HybridTimestamp};
+use homebase_core::key::Key;
+use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+use homebase_core::messages::{
+    AcquireRequest, KernelError, LeaseSpec, Range, RangeCursor, RangeCut, ReadAtRequest,
+    ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+};
+use homebase_core::space::{SpaceError, SpaceId};
+use homebase_core::storage::StorageError;
+use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use std::fmt;
+use std::time::Duration;
+
+pub const DEFAULT_PUSH_CAP: usize = 256;
+
+pub fn lease_margin(ttl: Duration) -> Duration {
+    ttl / 1_000
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpaceDriverError {
+    Storage(StorageError),
+    Cipher(CipherError),
+    Nonce { reason: String },
+    Unavailable { reason: String },
+    Rejected(KernelError),
+    Fork { admitted: DeviceSeq },
+    LocalAuthority { key: Key },
+    ReleaseBlocked { lease: LeaseId, at: DeviceSeq },
+}
+
+impl From<StorageError> for SpaceDriverError {
+    fn from(err: StorageError) -> Self {
+        Self::Storage(err)
+    }
+}
+
+impl From<CipherError> for SpaceDriverError {
+    fn from(err: CipherError) -> Self {
+        Self::Cipher(err)
+    }
+}
+
+impl From<SpaceError> for SpaceDriverError {
+    fn from(err: SpaceError) -> Self {
+        match err {
+            SpaceError::Kernel(err) => Self::Rejected(err),
+            SpaceError::Unavailable { reason } => Self::Unavailable { reason },
+        }
+    }
+}
+
+impl fmt::Display for SpaceDriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(err) => write!(f, "{err}"),
+            Self::Cipher(err) => write!(f, "{err}"),
+            Self::Nonce { reason } => write!(f, "nonce generation failed: {reason}"),
+            Self::Unavailable { reason } => write!(f, "server unavailable: {reason}"),
+            Self::Rejected(err) => write!(f, "server rejected: {err}"),
+            Self::Fork { admitted } => write!(
+                f,
+                "device fork: the server admitted {admitted:?}, which this store never sent"
+            ),
+            Self::LocalAuthority { key } => write!(f, "no local write authority for {key:?}"),
+            Self::ReleaseBlocked { lease, at } => {
+                write!(f, "lease {lease:?} still covers queued write {at:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpaceDriverError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Acquired {
+    pub leases: Vec<Lease>,
+    pub barrier: Option<AdmissionSeq>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    Drained {
+        acked_through: Option<DeviceSeq>,
+    },
+    Stalled {
+        at: DeviceSeq,
+        error: KernelError,
+        acked_through: Option<DeviceSeq>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseState {
+    pub held: HeldLease,
+    pub live: bool,
+}
+
+/// A handle to one space within a [`Client`].
+pub struct Space<'a, M, H, C, N = SystemNonceSource> {
+    client: &'a Client<M, H, C, N>,
+    id: SpaceId,
+}
+
+impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a, M, H, C, N> {
+    pub(crate) fn new(client: &'a Client<M, H, C, N>, id: SpaceId) -> Self {
+        Self { client, id }
+    }
+
+    pub fn space_id(&self) -> SpaceId {
+        self.id
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.client.device()
+    }
+
+    pub fn cipher(&self) -> SpaceCipher {
+        self.client.cipher(self.id)
+    }
+
+    pub async fn leases(&self, prefixes: &[Key]) -> Result<Vec<LeaseState>, SpaceDriverError> {
+        let now = self.client.clock().stamp();
+        let prefixes = self.encode_keys(prefixes)?;
+        let mut out = Vec::new();
+        for held in self
+            .client
+            .store()
+            .leases_covering(self.id, &prefixes)
+            .await?
+        {
+            let live = self.lease_usable_for_held(&held, &now).await?;
+            out.push(LeaseState { held, live });
+        }
+        Ok(out)
+    }
+
+    pub async fn commit(&self, entries: Vec<(Key, Value)>) -> Result<Committed, SpaceDriverError> {
+        let cipher = self.cipher();
+        let mut encoded = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let key = cipher.encode_key(&key)?;
+            encoded.push((key, value));
+        }
+        self.check_local_write_authority(&encoded).await?;
+        let device = self.device();
+        let mut reserved = self.client.store().reserve_commit(self.id, encoded).await?;
+        for entry in &mut reserved.record.entries {
+            let nonce = self
+                .client
+                .next_nonce()
+                .map_err(|reason| SpaceDriverError::Nonce { reason })?;
+            let context = ValueContext {
+                device,
+                device_seq: reserved.seq,
+                ver: entry.ver,
+            };
+            entry.value = cipher.encode_value(&entry.key, &entry.value, context, nonce)?;
+        }
+        let committed = self.client.store().commit(reserved).await?;
+        self.client.bump_next_seq(committed.seq);
+        Ok(committed)
+    }
+
+    pub async fn acquire(
+        &self,
+        specs: Vec<LeaseSpec>,
+        steal: bool,
+    ) -> Result<Acquired, SpaceDriverError> {
+        let specs = self.encode_specs(specs)?;
+        let space = self.id;
+        if specs.is_empty() {
+            return Ok(Acquired {
+                leases: vec![],
+                barrier: None,
+            });
+        }
+
+        let queried: Vec<Key> = specs.iter().map(|spec| spec.prefix.clone()).collect();
+        let now = self.client.clock().stamp();
+        let held = self.client.store().leases_covering(space, &queried).await?;
+        let mut revive: Vec<LeaseId> = Vec::new();
+        for spec in &specs {
+            if self.usable_covering(&held, spec, &now).await?.is_some() {
+                continue;
+            }
+            if let Some(id) = held
+                .iter()
+                .find(|h| !h.retiring && covers(h, spec) && h.barrier.is_none())
+                .map(|h| h.lease.id)
+            {
+                revive.push(id);
+            }
+        }
+        revive.sort_unstable();
+        revive.dedup();
+        if !revive.is_empty() {
+            self.renew_ids(space, &revive, &held).await?;
+        }
+
+        let send = self.client.clock().stamp();
+        let held = self.client.store().leases_covering(space, &queried).await?;
+        let mut satisfied: Vec<Option<Lease>> = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            satisfied.push(
+                self.usable_covering(&held, spec, &send)
+                    .await?
+                    .or_else(|| pending_barrier_covering(&held, spec, &send))
+                    .cloned(),
+            );
+        }
+        let missing: Vec<LeaseSpec> = specs
+            .iter()
+            .zip(&satisfied)
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        if missing.is_empty() {
+            let leases = satisfied.into_iter().flatten().collect();
+            return Ok(Acquired {
+                leases,
+                barrier: self.max_pending_barrier(&held, &specs, &send).await?,
+            });
+        }
+
+        let response = self
+            .client
+            .server()
+            .acquire(
+                &space,
+                AcquireRequest {
+                    device: self.device(),
+                    specs: missing,
+                    steal,
+                },
+            )
+            .await?;
+        let mut fresh = Vec::with_capacity(response.leases.len());
+        for lease in &response.leases {
+            let watermark = self
+                .client
+                .store()
+                .watermark(space, &Range::Prefix(lease.prefix.clone()))
+                .await?;
+            fresh.push(HeldLease {
+                lease: lease.clone(),
+                deadline: send.saturating_add(lease.ttl),
+                barrier: pending_barrier(response.barrier, watermark),
+                retiring: false,
+            });
+        }
+        self.client.store().record_clock(send.wall).await?;
+        self.client.store().record_leases(space, &fresh).await?;
+
+        let mut granted = response.leases.into_iter();
+        for slot in &mut satisfied {
+            if slot.is_none() {
+                *slot = Some(granted.next().expect("grants parallel to missing specs"));
+            }
+        }
+        let existing_barrier = self.max_pending_barrier(&held, &specs, &send).await?;
+        let fresh_barrier = fresh.iter().filter_map(|held| held.barrier).max();
+        Ok(Acquired {
+            leases: satisfied.into_iter().flatten().collect(),
+            barrier: existing_barrier.max(fresh_barrier),
+        })
+    }
+
+    pub async fn ensure(
+        &self,
+        specs: Vec<LeaseSpec>,
+        steal: bool,
+    ) -> Result<Acquired, SpaceDriverError> {
+        let acquired = self.acquire(specs, steal).await?;
+        if acquired.barrier.is_none() {
+            return Ok(acquired);
+        }
+
+        let mut pulled = Vec::<Key>::new();
+        for lease in &acquired.leases {
+            let held = self.held_lease_by_id(lease.id).await?;
+            if held.barrier.is_some()
+                && !self
+                    .lease_usable_for_held(&held, &self.client.clock().stamp())
+                    .await?
+                && !pulled.iter().any(|prefix| prefix == &lease.prefix)
+            {
+                self.pull_encoded(Range::Prefix(lease.prefix.clone()))
+                    .await?;
+                pulled.push(lease.prefix.clone());
+            }
+        }
+
+        Ok(Acquired {
+            leases: acquired.leases,
+            barrier: None,
+        })
+    }
+
+    pub async fn renew(&self, prefixes: &[Key]) -> Result<RenewResponse, SpaceDriverError> {
+        let prefixes = self.encode_keys(prefixes)?;
+        let held = if prefixes.is_empty() {
+            Vec::new()
+        } else {
+            self.client
+                .store()
+                .leases_covering(self.id, &prefixes)
+                .await?
+        };
+        let ids: Vec<LeaseId> = held
+            .iter()
+            .filter(|held| !held.retiring)
+            .map(|h| h.lease.id)
+            .collect();
+        self.renew_ids(self.id, &ids, &held).await
+    }
+
+    pub async fn release(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.reject_release_if_queued_writes(ids).await?;
+        self.client.store().retire_leases(self.id, ids).await?;
+        self.client
+            .server()
+            .release(
+                &self.id,
+                ReleaseRequest {
+                    device: self.device(),
+                    leases: ids.to_vec(),
+                },
+            )
+            .await?;
+        self.client.store().drop_leases(self.id, ids).await?;
+        Ok(())
+    }
+
+    pub async fn pull(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
+        let range = self.cipher().encode_range(&range)?;
+        self.pull_encoded(range).await
+    }
+
+    async fn pull_encoded(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
+        let space = self.id;
+        let cipher = self.cipher();
+        let since = self.client.store().watermark(space, &range).await?;
+        let mut response = self
+            .client
+            .server()
+            .read_at(
+                &space,
+                ReadAtRequest {
+                    ranges: vec![RangeCursor {
+                        range: range.clone(),
+                        since,
+                    }],
+                },
+            )
+            .await?;
+        let ver_seen = response
+            .ranges
+            .iter()
+            .flat_map(|range| {
+                let (RangeCut::Snapshot(entries) | RangeCut::Delta(entries)) = range;
+                entries.iter().map(|entry| entry.tag.ver)
+            })
+            .max()
+            .unwrap_or(Ver(0));
+        self.client
+            .store()
+            .advance_watermark(space, &range, response.at, ver_seen)
+            .await?;
+        for cut in &mut response.ranges {
+            let entries = match cut {
+                RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
+            };
+            for entry in entries {
+                entry.value = cipher.decode_value(
+                    &entry.key,
+                    &entry.value,
+                    ValueContext::from_tag(&entry.tag),
+                )?;
+            }
+        }
+        Ok(response)
+    }
+
+    fn lease_live(&self, held: &HeldLease, now: &HybridTimestamp) -> bool {
+        !held.deadline.expired(now, lease_margin(held.lease.ttl))
+    }
+
+    async fn renew_ids(
+        &self,
+        space: SpaceId,
+        ids: &[LeaseId],
+        held: &[HeldLease],
+    ) -> Result<RenewResponse, SpaceDriverError> {
+        if ids.is_empty() {
+            return Ok(RenewResponse {
+                granted: vec![],
+                invalid: vec![],
+            });
+        }
+        let send = self.client.clock().stamp();
+        let response = self
+            .client
+            .server()
+            .renew(
+                &space,
+                RenewRequest {
+                    device: self.device(),
+                    leases: ids.to_vec(),
+                },
+            )
+            .await?;
+        if !response.granted.is_empty() {
+            let refreshed: Vec<HeldLease> = response
+                .granted
+                .iter()
+                .map(|grant| {
+                    let mut held = held
+                        .iter()
+                        .find(|h| h.lease.id == grant.id)
+                        .expect("server renewed a lease the store does not hold")
+                        .clone();
+                    held.lease.ttl = grant.ttl;
+                    held.deadline = send.saturating_add(grant.ttl);
+                    held
+                })
+                .collect();
+            self.client.store().record_clock(send.wall).await?;
+            self.client.store().record_leases(space, &refreshed).await?;
+        }
+        if !response.invalid.is_empty() {
+            self.client
+                .store()
+                .drop_leases(space, &response.invalid)
+                .await?;
+        }
+        Ok(response)
+    }
+
+    async fn reject_release_if_queued_writes(
+        &self,
+        ids: &[LeaseId],
+    ) -> Result<(), SpaceDriverError> {
+        let state = self.client.store().load().await?;
+        let Some(space_state) = state.spaces.get(&self.id) else {
+            return Ok(());
+        };
+        let releasing: Vec<&HeldLease> = ids
+            .iter()
+            .filter_map(|id| space_state.leases.get(id))
+            .collect();
+        if releasing.is_empty() {
+            return Ok(());
+        }
+        for (seq, record) in &state.oplog {
+            if record.space != self.id {
+                continue;
+            }
+            for held in &releasing {
+                if record
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key.starts_with(&held.lease.prefix))
+                {
+                    return Err(SpaceDriverError::ReleaseBlocked {
+                        lease: held.lease.id,
+                        at: *seq,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn held_lease_by_id(&self, id: LeaseId) -> Result<HeldLease, SpaceDriverError> {
+        let state = self.client.store().load().await?;
+        Ok(state
+            .spaces
+            .get(&self.id)
+            .and_then(|space_state| space_state.leases.get(&id))
+            .cloned()
+            .expect("acquire returned a lease that is not durably held"))
+    }
+
+    async fn check_local_write_authority(
+        &self,
+        entries: &[(Key, Value)],
+    ) -> Result<(), SpaceDriverError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<Key> = entries.iter().map(|(key, _)| key.clone()).collect();
+        let held = self.client.store().leases_covering(self.id, &keys).await?;
+        let now = self.client.clock().stamp();
+        for key in keys {
+            let mut covered = false;
+            for held in &held {
+                if held.lease.mode == LeaseMode::Write
+                    && key.starts_with(&held.lease.prefix)
+                    && self.lease_usable_for_held(held, &now).await?
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered {
+                return Err(SpaceDriverError::LocalAuthority { key });
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_keys(&self, keys: &[Key]) -> Result<Vec<Key>, SpaceDriverError> {
+        keys.iter()
+            .map(|key| Ok(self.cipher().encode_key(key)?))
+            .collect()
+    }
+
+    fn encode_specs(&self, specs: Vec<LeaseSpec>) -> Result<Vec<LeaseSpec>, SpaceDriverError> {
+        specs
+            .into_iter()
+            .map(|spec| {
+                Ok(LeaseSpec {
+                    prefix: self.cipher().encode_key(&spec.prefix)?,
+                    mode: spec.mode,
+                    ttl: spec.ttl,
+                    stealable: spec.stealable,
+                })
+            })
+            .collect()
+    }
+
+    fn lease_usable(
+        &self,
+        held: &HeldLease,
+        now: &HybridTimestamp,
+        watermark: Option<AdmissionSeq>,
+    ) -> bool {
+        !held.retiring && self.lease_live(held, now) && barrier_satisfied(held.barrier, watermark)
+    }
+
+    async fn lease_usable_for_held(
+        &self,
+        held: &HeldLease,
+        now: &HybridTimestamp,
+    ) -> Result<bool, SpaceDriverError> {
+        let watermark = self
+            .client
+            .store()
+            .watermark(self.id, &Range::Prefix(held.lease.prefix.clone()))
+            .await?;
+        Ok(self.lease_usable(held, now, watermark))
+    }
+
+    async fn usable_covering<'b>(
+        &self,
+        held: &'b [HeldLease],
+        spec: &LeaseSpec,
+        now: &HybridTimestamp,
+    ) -> Result<Option<&'b Lease>, SpaceDriverError> {
+        for h in held {
+            if covers(h, spec) && self.lease_usable_for_held(h, now).await? {
+                return Ok(Some(&h.lease));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn max_pending_barrier(
+        &self,
+        held: &[HeldLease],
+        specs: &[LeaseSpec],
+        now: &HybridTimestamp,
+    ) -> Result<Option<AdmissionSeq>, SpaceDriverError> {
+        let mut out = None;
+        for spec in specs {
+            for held in held {
+                if held.retiring
+                    || held.barrier.is_none()
+                    || held.deadline.expired(now, lease_margin(held.lease.ttl))
+                    || !covers(held, spec)
+                {
+                    continue;
+                }
+                let watermark = self
+                    .client
+                    .store()
+                    .watermark(self.id, &Range::Prefix(held.lease.prefix.clone()))
+                    .await?;
+                if let Some(barrier) = held.barrier {
+                    if !barrier_satisfied(Some(barrier), watermark) {
+                        out =
+                            Some(out.map_or(barrier, |current: AdmissionSeq| current.max(barrier)));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub(crate) async fn live_write_leases<M: MetaStore, C: HybridClock>(
+    store: &M,
+    clock: &C,
+    space: SpaceId,
+    keys: &[Key],
+) -> Result<Vec<LeaseRef>, SpaceDriverError> {
+    let now = clock.stamp();
+    let mut out = Vec::new();
+    for held in store.leases_covering(space, keys).await? {
+        if held.lease.mode != LeaseMode::Write {
+            continue;
+        }
+        let watermark = store
+            .watermark(space, &Range::Prefix(held.lease.prefix.clone()))
+            .await?;
+        if !held.retiring
+            && !held.deadline.expired(&now, lease_margin(held.lease.ttl))
+            && barrier_satisfied(held.barrier, watermark)
+        {
+            out.push(LeaseRef {
+                id: held.lease.id,
+                epoch: held.lease.epoch,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn barrier_satisfied(barrier: Option<AdmissionSeq>, watermark: Option<AdmissionSeq>) -> bool {
+    barrier.is_none_or(|barrier| watermark.unwrap_or(AdmissionSeq(0)) >= barrier)
+}
+
+fn pending_barrier(barrier: AdmissionSeq, watermark: Option<AdmissionSeq>) -> Option<AdmissionSeq> {
+    (!barrier_satisfied(Some(barrier), watermark)).then_some(barrier)
+}
+
+fn pending_barrier_covering<'a>(
+    held: &'a [HeldLease],
+    spec: &LeaseSpec,
+    now: &HybridTimestamp,
+) -> Option<&'a Lease> {
+    held.iter()
+        .filter(|held| !held.retiring && held.barrier.is_some())
+        .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
+        .find(|held| covers(held, spec))
+        .map(|held| &held.lease)
+}
+
+fn covers(held: &HeldLease, spec: &LeaseSpec) -> bool {
+    spec.prefix.starts_with(&held.lease.prefix) && mode_covers(held.lease.mode, spec.mode)
+}
+
+fn mode_covers(held: LeaseMode, want: LeaseMode) -> bool {
+    matches!(
+        (held, want),
+        (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read)
+    )
+}
