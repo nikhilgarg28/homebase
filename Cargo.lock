@@ -969,6 +969,7 @@ dependencies = [
  "hmac",
  "homebase-core",
  "homebase-server",
+ "homebase-sim",
  "pollster",
  "sha2",
 ]

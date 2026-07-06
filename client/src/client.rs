@@ -122,9 +122,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
     pub async fn attach(&self, envelope: &SpaceEnvelope) -> Result<(), ClientError> {
         let cipher = envelope.open()?;
         let id = cipher.space_id();
-        if self.is_attached(id) {
-            return Ok(());
-        }
 
         let state = self.store.load().await?;
         match state.spaces.get(&id).and_then(|s| s.codec.as_ref()) {
@@ -145,6 +142,10 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                     return Err(ClientError::CodecMismatch { id });
                 }
             }
+        }
+
+        if self.is_attached(id) {
+            return Ok(());
         }
 
         self.attached.borrow_mut().insert(id, cipher);

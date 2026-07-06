@@ -17,3 +17,4 @@ to detect that multilite db was written to from sqlite later
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?
 - Clock - track lineage so that we can track incarnation key from process restart
+- Should client be renamed to be device or all device machinery (ID, seqnum etc) should be mapped to client (i.e ClientID)
