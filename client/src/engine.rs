@@ -482,6 +482,44 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
         })
     }
 
+    /// Ensure the requested leases are locally usable before returning.
+    ///
+    /// This is the ergonomic acquire path: it obtains or renews coverage,
+    /// then satisfies any pending acquire barriers by pulling each returned
+    /// lease's own prefix. The lower-level [`Engine::acquire`] remains
+    /// available for callers that want to schedule catch-up themselves.
+    pub async fn ensure(
+        &mut self,
+        space: SpaceId,
+        specs: Vec<LeaseSpec>,
+        steal: bool,
+    ) -> Result<Acquired, EngineError> {
+        let acquired = self.acquire(space, specs, steal).await?;
+        if acquired.barrier.is_none() {
+            return Ok(acquired);
+        }
+
+        let mut pulled = Vec::<Key>::new();
+        for lease in &acquired.leases {
+            let held = self.held_lease_by_id(space, lease.id).await?;
+            if held.barrier.is_some()
+                && !self
+                    .lease_usable_for_held(space, &held, &self.clock.stamp())
+                    .await?
+                && !pulled.iter().any(|prefix| prefix == &lease.prefix)
+            {
+                self.pull(space, Range::Prefix(lease.prefix.clone()))
+                    .await?;
+                pulled.push(lease.prefix.clone());
+            }
+        }
+
+        Ok(Acquired {
+            leases: acquired.leases,
+            barrier: None,
+        })
+    }
+
     /// Renew the held leases covering `prefixes` — the explicit act that
     /// confirms them (there is no background heartbeat). Grants get
     /// fresh local deadlines from this call's send time and are written
@@ -613,6 +651,20 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock> Engine<M, H, C> {
             }
         }
         Ok(())
+    }
+
+    async fn held_lease_by_id(
+        &self,
+        space: SpaceId,
+        id: LeaseId,
+    ) -> Result<HeldLease, EngineError> {
+        let state = self.store.load().await?;
+        Ok(state
+            .spaces
+            .get(&space)
+            .and_then(|space_state| space_state.leases.get(&id))
+            .cloned()
+            .expect("acquire returned a lease that is not durably held"))
     }
 
     /// Pull one range since its effective watermark (`None` → snapshot), then

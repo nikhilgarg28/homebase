@@ -60,6 +60,15 @@ fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
     }
 }
 
+fn rspec(prefix: &Key, secs: u64) -> LeaseSpec {
+    LeaseSpec {
+        prefix: prefix.clone(),
+        mode: LeaseMode::Read,
+        ttl: Duration::from_secs(secs),
+        stealable: false,
+    }
+}
+
 /// A real server behind the canonical closure handle. The closure owns
 /// the `Arc<Server>`, so the server lives exactly as long as the handle.
 fn spawn_server(
@@ -1088,6 +1097,100 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         assert_eq!(
             state.spaces[&SPACE].watermarks[&Range::Prefix(db.clone())],
             pulled.at
+        );
+    });
+}
+
+#[test]
+fn ensure_acquires_pulls_and_makes_writes_locally_authorized() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+
+        let db = key(&[b"db"]);
+        let k = key(&[b"db", b"k"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PutEntry {
+                key: k.clone(),
+                value: val(b"foreign"),
+                ver: Ver(7),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+
+        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        let acquired = engine
+            .ensure(SPACE, vec![wspec(&db, 60)], false)
+            .await
+            .unwrap();
+        assert_eq!(acquired.barrier, None);
+        assert_eq!(acquired.leases.len(), 1);
+        assert_eq!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].watermarks
+                [&Range::Prefix(db.clone())],
+            AdmissionSeq(1)
+        );
+
+        engine
+            .commit(SPACE, vec![(k.clone(), val(b"mine"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(1))
+            }
+        );
+        let entry = fetch(&handle, SPACE, &k).await.unwrap();
+        assert_eq!(entry.value, val(b"mine"));
+        assert_eq!(entry.tag.ver, Ver(8));
+    });
+}
+
+#[test]
+fn ensure_satisfies_read_lease_barriers_too() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+
+        let db = key(&[b"db"]);
+        let k = key(&[b"db", b"k"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PutEntry {
+                key: k,
+                value: val(b"foreign"),
+                ver: Ver(7),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+
+        let mut engine = Engine::open(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        let acquired = engine
+            .ensure(SPACE, vec![rspec(&db, 60)], false)
+            .await
+            .unwrap();
+        assert_eq!(acquired.barrier, None);
+        assert_eq!(acquired.leases[0].mode, LeaseMode::Read);
+        assert_eq!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].watermarks
+                [&Range::Prefix(db.clone())],
+            AdmissionSeq(1)
         );
     });
 }
