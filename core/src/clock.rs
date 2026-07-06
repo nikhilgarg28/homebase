@@ -36,6 +36,14 @@ pub trait Clock {
     fn now(&self) -> Timestamp;
 }
 
+/// A shared reference to a clock is a clock — `now` already takes `&self`.
+/// Tests hold the `ManualClock` and hand out `&clock` to crank it mid-run.
+impl<C: Clock + ?Sized> Clock for &C {
+    fn now(&self) -> Timestamp {
+        (**self).now()
+    }
+}
+
 /// Real monotonic clock: milliseconds elapsed since construction.
 pub struct MonotonicClock {
     origin: Instant,

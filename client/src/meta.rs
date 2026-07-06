@@ -93,7 +93,7 @@ use homebase_core::key::{Key, KeyComponent, decode_components, encode_components
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::PutEntry;
 use homebase_core::space::SpaceId;
-use homebase_core::storage::{OrderedStore, StorageError, WriteBatch, collect_scan};
+use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -200,30 +200,21 @@ pub struct ClientState {
 /// The recomputation oracle — the client twin of the server-side `check`.
 /// Panics with context on any violation:
 ///
-/// 1. the oplog's seqs are **dense ascending** — trims take a prefix,
-///    discards take a suffix, so a gap means a torn transition;
-/// 2. vers are **strictly increasing per (space, key)** across the queue
+/// 1. vers are **strictly increasing per (space, key)** across the queue
 ///    in commit order — a regression would bounce off the server as
 ///    `VerRegression`;
-/// 3. the counters cover the queue: `next_seq` exceeds every queued seq
+/// 2. the counters cover the queue: `next_seq` exceeds every queued seq
 ///    and `ver_high` is at least every queued ver — a lagging counter
 ///    means a torn commit (the assignment and the entry are one atomic
 ///    transition).
 ///
+/// Queue seqs carry no density invariant: trims take a prefix and
+/// discards take a suffix, but the seq counter never rewinds, so a
+/// discard followed by new commits legally leaves a gap.
+///
 /// Implementation-level integrity (key shapes, record decoding, index
 /// agreement) is each implementation's `load` obligation.
 pub fn certify(state: &ClientState) {
-    let seqs: Vec<u64> = state.oplog.keys().map(|s| s.0).collect();
-    for pair in seqs.windows(2) {
-        assert_eq!(
-            pair[0] + 1,
-            pair[1],
-            "oplog gap: {} then {}",
-            pair[0],
-            pair[1]
-        );
-    }
-
     let mut last_ver: BTreeMap<(SpaceId, &Key), Ver> = BTreeMap::new();
     for record in state.oplog.values() {
         for entry in &record.entries {
@@ -275,9 +266,45 @@ pub fn certify(state: &ClientState) {
 /// return `Send` futures (desugared, like every trait in this codebase).
 pub trait MetaStore {
     /// Everything remembered from the last incarnation. The engine calls
-    /// this once at open and writes through afterward; corruption is a
-    /// panic with context (the audit posture), IO failure an `Err`.
+    /// this once at open — to certify and to adopt the constant-shape
+    /// facts (identity, counters) — and afterward holds **no mirror** of
+    /// the collections: leases and the queue are consulted through the
+    /// point reads below, on demand. Corruption is a panic with context
+    /// (the audit posture), IO failure an `Err`.
     fn load(&self) -> impl Future<Output = Result<ClientState, StorageError>> + Send;
+
+    // -- reads: on-demand lookups against durable truth. Local-disk
+    // cheap; implementations are free to buffer for performance — the
+    // single-driver discipline means no one else invalidates them.
+
+    /// The queued commits with `from ≤ seq ≤ through`, ascending — the
+    /// one queue read. The pusher walks the queue in bounded seq windows
+    /// (an empty answer inside a window is a legal gap, not the end);
+    /// `oplog(s, s)` is the point lookup (the fork check: a seq the
+    /// server claims we sent must still be queued).
+    fn oplog(
+        &self,
+        from: DeviceSeq,
+        through: DeviceSeq,
+    ) -> impl Future<Output = Result<Vec<(DeviceSeq, CommitRecord)>, StorageError>> + Send;
+
+    /// The held leases whose prefixes **cover** any of `prefixes`
+    /// (component-wise ancestors, the query itself included) — the only
+    /// lease question the engine ever asks: "what authority do I hold
+    /// over these keys?" Never the whole space.
+    fn leases_covering(
+        &self,
+        space: SpaceId,
+        prefixes: &[Key],
+    ) -> impl Future<Output = Result<Vec<HeldLease>, StorageError>> + Send;
+
+    /// One space's pull cursor.
+    fn watermark(
+        &self,
+        space: SpaceId,
+    ) -> impl Future<Output = Result<Option<AdmissionSeq>, StorageError>> + Send;
+
+    // -- transitions: every method one atomic, durable step.
 
     /// Identity minted at first open (or re-minted after a suspected fork).
     fn record_device(
@@ -318,6 +345,11 @@ pub trait MetaStore {
     /// suffix mirror of [`trim_oplog`](Self::trim_oplog), the resolution
     /// for a rejected push the caller chooses not to repair. The
     /// single-driver discipline keeps it from racing a push.
+    ///
+    /// The seq counter never rewinds (a discarded seq may have been
+    /// *sent* and rejected; re-minting it would confuse the replay
+    /// fence), so a discard followed by new commits leaves a **gap** in
+    /// the queue — legal, and [`certify`] treats it so.
     fn discard_from(
         &self,
         from: DeviceSeq,
@@ -334,9 +366,12 @@ pub trait MetaStore {
 
     /// Grants (or renewals) become durable — one atomic transition for
     /// the whole batch, because a batch acquire is all-or-nothing at the
-    /// server and must not be half-remembered here. Resumable, but
-    /// unconfirmed until the next renewal succeeds (the stored deadline
-    /// is never trusted across incarnations).
+    /// server and must not be half-remembered here. Records are
+    /// identified by **(space, prefix)**: a re-grant of the same prefix
+    /// replaces the superseded record (the server holds at most one live
+    /// lease per prefix per device). Resumable, but unconfirmed until
+    /// the next renewal succeeds (the stored deadline is never trusted
+    /// across incarnations).
     fn record_leases(
         &self,
         space: SpaceId,
@@ -401,7 +436,7 @@ pub enum StoreNamespace {
 /// (Meta, Client, Oplog, seq_be)        → CommitRecord
 /// (Meta, Space, id, Watermark)         → WatermarkRecord
 /// (Meta, Space, id, Codec)             → CodecRecord
-/// (Meta, Space, id, Lease, id_be)      → LeaseRecord
+/// (Meta, Space, id, Lease, prefix)      → LeaseRecord
 /// ```
 pub struct OrderedMetaStore<S> {
     store: S,
@@ -504,9 +539,13 @@ fn codec_key(space: SpaceId) -> Vec<u8> {
     encode_components(&space_kind(space, SpaceKind::Codec))
 }
 
-fn lease_key(space: SpaceId, id: LeaseId) -> Vec<u8> {
+/// Leases are keyed by the prefix they cover — the question the engine
+/// asks is "who covers this key?", answered by point reads on the
+/// query's ancestors. One live lease per (space, prefix): a re-grant of
+/// the same prefix overwrites.
+fn lease_key(space: SpaceId, prefix: &Key) -> Vec<u8> {
     let mut components = space_kind(space, SpaceKind::Lease);
-    components.push(u64_component(id.0));
+    components.push(KeyComponent::new(prefix.encode()).expect("nonempty encoded prefix"));
     encode_components(&components)
 }
 
@@ -577,12 +616,15 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                             space.codec = Some(record);
                         }
                         k if k == SpaceKind::Lease as u8 => {
-                            let key_id = u64_at(&components, 4, "lease id");
                             let record =
                                 HeldLease::decode(&bytes).expect("undecodable lease");
                             assert_eq!(
-                                record.lease.id.0, key_id,
-                                "lease record id diverges from its storage key"
+                                components
+                                    .get(4)
+                                    .expect("lease key missing prefix")
+                                    .as_bytes(),
+                                record.lease.prefix.encode(),
+                                "lease record prefix diverges from its storage key"
                             );
                             space.leases.insert(record.lease.id, record);
                         }
@@ -593,6 +635,63 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
         }
         Ok(out)
+    }
+
+    async fn oplog(
+        &self,
+        from: DeviceSeq,
+        through: DeviceSeq,
+    ) -> Result<Vec<(DeviceSeq, CommitRecord)>, StorageError> {
+        let mut out = Vec::new();
+        if from > through {
+            return Ok(out);
+        }
+        let end = homebase_core::storage::prefix_successor(&oplog_scan());
+        let mut scan = self.store.scan(oplog_key(from), end);
+        while let Some((storage_key, bytes)) = scan.next().await? {
+            let components =
+                decode_components(&storage_key).expect("undecodable storage key");
+            let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
+            if seq > through {
+                break;
+            }
+            let record = CommitRecord::decode(&bytes).expect("undecodable commit record");
+            out.push((seq, record));
+        }
+        Ok(out)
+    }
+
+    async fn leases_covering(
+        &self,
+        space: SpaceId,
+        prefixes: &[Key],
+    ) -> Result<Vec<HeldLease>, StorageError> {
+        // Every component-wise ancestor of every query (the query
+        // itself included) is one point read; dedup across queries.
+        let mut candidates = std::collections::BTreeSet::new();
+        for prefix in prefixes {
+            let components = prefix.components();
+            for depth in 1..=components.len() {
+                let ancestor = Key::new(components[..depth].to_vec())
+                    .expect("a prefix of a valid key is a valid key");
+                candidates.insert(lease_key(space, &ancestor));
+            }
+        }
+        let mut out = Vec::new();
+        for candidate in candidates {
+            if let Some(bytes) = self.store.get(&candidate).await? {
+                out.push(HeldLease::decode(&bytes).expect("undecodable lease"));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn watermark(&self, space: SpaceId) -> Result<Option<AdmissionSeq>, StorageError> {
+        Ok(self
+            .store
+            .get(&watermark_key(space))
+            .await?
+            .map(|bytes| WatermarkRecord::decode(&bytes).expect("undecodable watermark").at))
     }
 
     async fn record_device(&self, id: DeviceId) -> Result<(), StorageError> {
@@ -690,17 +789,26 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     async fn record_leases(&self, space: SpaceId, leases: &[HeldLease]) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
         for held in leases {
-            batch.put(lease_key(space, held.lease.id), held.encode());
+            batch.put(lease_key(space, &held.lease.prefix), held.encode());
         }
         self.store.apply(batch).await
     }
 
     async fn drop_leases(&self, space: SpaceId, ids: &[LeaseId]) -> Result<(), StorageError> {
+        // The server speaks ids; records key by prefix. A space holds
+        // few leases, so the resolution is one short scan.
+        let scan = encode_components(&space_kind(space, SpaceKind::Lease));
         let mut batch = WriteBatch::new();
-        for id in ids {
-            batch.delete(lease_key(space, *id));
+        for (storage_key, bytes) in collect_scan(self.store.scan_prefix(&scan)).await? {
+            let record = HeldLease::decode(&bytes).expect("undecodable lease");
+            if ids.contains(&record.lease.id) {
+                batch.delete(storage_key);
+            }
         }
-        self.store.apply(batch).await
+        if !batch.is_empty() {
+            self.store.apply(batch).await?;
+        }
+        Ok(())
     }
 
     async fn record_codec(&self, space: SpaceId, record: &CodecRecord) -> Result<(), StorageError> {
@@ -1058,6 +1166,29 @@ pub mod conformance {
         assert_eq!(state.oplog[&DeviceSeq(2)].space, link);
         assert_eq!(state.oplog[&DeviceSeq(3)].entries[0].ver, Ver(4), "chain continued");
 
+        // The queue read sees exactly what load sees: a seq range,
+        // ascending; a point lookup is the one-seq range.
+        let window = store.oplog(DeviceSeq(1), DeviceSeq(2)).await.unwrap();
+        assert_eq!(
+            window.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![DeviceSeq(1), DeviceSeq(2)],
+            "a range read is inclusive on both ends"
+        );
+        assert_eq!(window[0].1, state.oplog[&DeviceSeq(1)]);
+        assert_eq!(
+            store.oplog(DeviceSeq(1), DeviceSeq(u64::MAX)).await.unwrap().len(),
+            3,
+            "an open-ended range reads the whole queue"
+        );
+        assert_eq!(
+            store.oplog(DeviceSeq(2), DeviceSeq(2)).await.unwrap(),
+            vec![(DeviceSeq(2), state.oplog[&DeviceSeq(2)].clone())]
+        );
+        assert!(
+            store.oplog(DeviceSeq(9), DeviceSeq(9)).await.unwrap().is_empty(),
+            "never minted"
+        );
+
         // A push ack trims the acknowledged prefix — nothing else to
         // clear; grouping is a wire-time choice, never durable state.
         store.trim_oplog(DeviceSeq(1)).await.unwrap();
@@ -1070,6 +1201,10 @@ pub mod conformance {
         assert_eq!(state.next_seq, Some(DeviceSeq(4)));
         store.trim_oplog(DeviceSeq(1)).await.unwrap();
         assert_eq!(audit(store).await.oplog.len(), 2, "re-ack is a no-op");
+        assert!(
+            store.oplog(DeviceSeq(1), DeviceSeq(1)).await.unwrap().is_empty(),
+            "a trimmed seq is gone from range reads too"
+        );
 
         // A pull moves the sync point and raises the ver high-water to
         // what the cut carried; the next commit climbs past it.
@@ -1077,6 +1212,8 @@ pub mod conformance {
         let state = audit(store).await;
         assert_eq!(state.spaces[&space].watermark, Some(AdmissionSeq(40)));
         assert_eq!(state.ver_high, Some(Ver(10)));
+        assert_eq!(store.watermark(space).await.unwrap(), Some(AdmissionSeq(40)));
+        assert_eq!(store.watermark(link).await.unwrap(), None, "no pull yet");
         let fourth = store
             .commit(space, vec![(key(&[b"db", b"b"]), Value::Present(b"post-pull".to_vec()))])
             .await
@@ -1129,6 +1266,36 @@ pub mod conformance {
         );
         assert_eq!(state.next_seq, Some(DeviceSeq(7)), "counters never rewind");
 
+        // A commit after a discard leaves a gap — legal, because the seq
+        // counter never rewinds. The state still certifies and the head
+        // window shows the hole.
+        let after_gap = store
+            .commit(space, vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))])
+            .await
+            .unwrap();
+        assert_eq!(after_gap.seq, DeviceSeq(7));
+        let state = audit(store).await;
+        assert_eq!(
+            state.oplog.keys().copied().collect::<Vec<_>>(),
+            vec![DeviceSeq(5), DeviceSeq(7)],
+            "a discarded seq is never re-minted"
+        );
+        assert!(
+            store.oplog(DeviceSeq(6), DeviceSeq(6)).await.unwrap().is_empty(),
+            "the hole is real"
+        );
+        assert_eq!(
+            store
+                .oplog(DeviceSeq(1), DeviceSeq(u64::MAX))
+                .await
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(5), DeviceSeq(7)],
+            "the range read walks straight over the gap"
+        );
+
         // Lease churn + codec cache, across both spaces.
         // A batch grant is recorded atomically as a batch.
         let second_lease = HeldLease {
@@ -1167,6 +1334,30 @@ pub mod conformance {
         assert_eq!(state.spaces[&space].leases[&LeaseId(42)], sample_lease());
         assert_eq!(state.spaces[&space].leases[&LeaseId(43)], second_lease);
         assert_eq!(state.spaces[&link].leases[&LeaseId(7)], link_lease);
+        // The lease read answers "who covers these keys?" — ancestors
+        // only, never the whole space.
+        let covering = store
+            .leases_covering(space, &[key(&[b"db", b"pay", b"row1"])])
+            .await
+            .unwrap();
+        assert_eq!(covering, vec![sample_lease()], "an ancestor prefix covers");
+        let covering = store
+            .leases_covering(space, &[key(&[b"db", b"pay"]), key(&[b"db", b"hr", b"x"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            covering,
+            vec![second_lease.clone(), sample_lease()],
+            "multiple queries dedup into one answer, in prefix order"
+        );
+        assert!(
+            store.leases_covering(space, &[key(&[b"db"])]).await.unwrap().is_empty(),
+            "a descendant lease does not cover its ancestor"
+        );
+        assert_eq!(
+            store.leases_covering(link, &[key(&[b"dir", b"entry"])]).await.unwrap(),
+            vec![link_lease.clone()]
+        );
         assert_eq!(
             state.spaces[&space].codec,
             Some(CodecRecord { space_key_epoch: 0, sealed: b"sealed".to_vec() })
@@ -1180,7 +1371,21 @@ pub mod conformance {
         };
         store.record_leases(space, std::slice::from_ref(&renewed)).await.unwrap();
         assert_eq!(audit(store).await.spaces[&space].leases[&LeaseId(42)], renewed);
-        store.drop_leases(space, &[LeaseId(42), LeaseId(43)]).await.unwrap();
+        // A re-grant of the same prefix replaces the old record: one
+        // live lease per (space, prefix).
+        let regrant = HeldLease {
+            lease: Lease { id: LeaseId(99), ..sample_lease().lease },
+            deadline: Timestamp(9_000),
+        };
+        store.record_leases(space, std::slice::from_ref(&regrant)).await.unwrap();
+        let state = audit(store).await;
+        assert!(
+            !state.spaces[&space].leases.contains_key(&LeaseId(42)),
+            "the superseded grant is gone"
+        );
+        assert_eq!(state.spaces[&space].leases[&LeaseId(99)], regrant);
+
+        store.drop_leases(space, &[LeaseId(99), LeaseId(43)]).await.unwrap();
         assert!(audit(store).await.spaces[&space].leases.is_empty());
     }
 }
@@ -1284,7 +1489,7 @@ mod tests {
             oplog_key(DeviceSeq(1)),
             watermark_key(SPACE),
             codec_key(SPACE),
-            lease_key(SPACE, LeaseId(1)),
+            lease_key(SPACE, &key(&[b"db", b"pay"])),
         ] {
             assert!(storage_key.starts_with(&brand), "every reference key wears the brand");
         }
@@ -1327,11 +1532,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "oplog gap")]
-    fn certify_catches_oplog_gaps() {
+    fn certify_allows_queue_gaps() {
+        // A discard followed by new commits leaves a hole (the counter
+        // never rewinds) — a legal history, not corruption. Distinct
+        // keys keep the ver chains clean.
         let mut state = covered_state();
-        state.oplog.insert(DeviceSeq(3), sample_commit());
+        state.oplog.insert(
+            DeviceSeq(3),
+            CommitRecord {
+                space: SPACE,
+                entries: vec![PutEntry {
+                    key: key(&[b"db", b"later"]),
+                    value: Value::Present(b"x".to_vec()),
+                    ver: Ver(4),
+                }],
+            },
+        );
         state.next_seq = Some(DeviceSeq(4));
+        state.ver_high = Some(Ver(4));
         certify(&state);
     }
 

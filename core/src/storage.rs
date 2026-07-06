@@ -125,6 +125,29 @@ pub trait OrderedStore {
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
+/// A shared reference to a store is a store — every method already takes
+/// `&self`. This is what lets one store back several views at once (a
+/// crash/resume test running two incarnations over one `MemoryStore`).
+impl<S: OrderedStore> OrderedStore for &S {
+    fn get(
+        &self,
+        key: &[u8],
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send {
+        (**self).get(key)
+    }
+
+    fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter {
+        (**self).scan(start, end)
+    }
+
+    fn apply(
+        &self,
+        batch: WriteBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        (**self).apply(batch)
+    }
+}
+
 /// The smallest byte string strictly greater than every string starting with
 /// `prefix`, or `None` when no such bound exists (all-0xFF prefix).
 pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {

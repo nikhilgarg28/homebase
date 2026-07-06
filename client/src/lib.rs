@@ -21,9 +21,20 @@
 //!   [`audit`](meta::audit)) and [`meta::conformance`] gate every
 //!   implementation.
 //!
-//! Next: the write-through engine over both contracts.
+//! - [`engine`] — the driver over both contracts (plus an injected
+//!   [`Clock`](homebase_core::clock::Clock)): no mirror — durable
+//!   collections are read from the store on demand — two-clock lease
+//!   discipline with explicit renewal and idempotent acquire, and the
+//!   adaptive pusher — FIFO groups on the wire, recovery reconstructed
+//!   entirely from kernel rejections (seq collision → trim, group
+//!   rejection → solo probes, solo rejection → conviction, fork →
+//!   fatal).
+//!
+//! Next: the job-queue dogfood over the engine.
 
+pub mod engine;
 pub mod meta;
 pub mod server;
 
+pub use engine::{Acquired, Engine, EngineError, PushOutcome};
 pub use server::{Offline, ServerHandle};

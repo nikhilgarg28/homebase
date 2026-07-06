@@ -1,0 +1,697 @@
+//! The engine — the driver over both contracts: one [`MetaStore`] (durable
+//! truth), one [`ServerHandle`] (the seven verbs), one injected
+//! [`Clock`] (the DST discipline: the engine never reads a wall clock).
+//!
+//! # No mirror, single driver
+//!
+//! [`Engine::open`] loads durable state once — to certify it (the audit
+//! posture) and to adopt the constant-shape facts: the device identity
+//! and the seq counter. Everything else — leases, watermarks, the queue —
+//! stays in the store and is **read on demand** through the [`MetaStore`]
+//! point reads: local-disk cheap, and the store is free to buffer. The
+//! engine holds no copy of any collection, so there is nothing to drift.
+//! What it does hold is the state that is deliberately *not* durable:
+//! which leases were confirmed this incarnation, push progress, the
+//! standing fault.
+//!
+//! Methods take `&mut self`: one engine drives one store, transitions are
+//! serialized by the borrow checker itself. If a storage transition
+//! faults, drop the engine and reopen — the store is the truth.
+//!
+//! # Leases: two clocks, one rule
+//!
+//! Every lease-bearing request stamps `send = clock.now()` *before* the
+//! wire; a grant's local deadline is `send + granted TTL`. The server
+//! counts from receipt, so the local window starts strictly earlier and
+//! expires strictly earlier — the engine never presents a lease past its
+//! local deadline, which is what makes TTL expiry safe without clock
+//! synchronization (epochs remain the correctness backstop).
+//!
+//! Loaded leases are **unconfirmed**: the stored deadline was stamped on
+//! a dead incarnation's monotonic clock and is never trusted. An
+//! unconfirmed lease authorizes nothing until an explicit
+//! [`renew`](Engine::renew) succeeds — there is deliberately no
+//! background heartbeat; renewal is a decision the caller makes.
+//!
+//! [`acquire`](Engine::acquire) is idempotent: a spec already covered by
+//! a confirmed, locally-live held lease is satisfied without the wire —
+//! only the genuinely missing specs go to the server. "Ensure I hold
+//! this" is the question call sites actually ask, so that is what the
+//! verb answers.
+//!
+//! # The pusher
+//!
+//! [`push`](Engine::push) drains the queue FIFO, reading head windows
+//! from the store as it goes. Consecutive commits to the same space merge
+//! into one wire batch (up to [`with_push_cap`](Engine::with_push_cap)
+//! entries) and ship under the group's **last** seq — the earlier seqs
+//! are skipped, which the kernel permits (strictly increasing, gaps
+//! legal). Grouping is a wire-time choice, never durable state; recovery
+//! reconstructs everything it needs from the kernel's own rejections:
+//!
+//! - **Seq collision** (`DeviceSeqRegression` naming a seq that is still
+//!   in our queue): the admitted set is always a *prefix* of the queue —
+//!   pushes are FIFO, groups are contiguous, admission is atomic — so
+//!   `current` *is* the admitted extent: trim through it and continue.
+//!   This is exactly-once for free: a dead incarnation's send is
+//!   discovered, never replayed.
+//! - **Fork** (`current` at or past the mint counter, or naming a seq
+//!   not in the queue): the server admitted something this store never
+//!   minted or never sent — proof another store is writing under our
+//!   device id (a file copy come alive). Fatal for now:
+//!   [`EngineError::Fork`]. (Re-mint-and-requeue recovery is a later
+//!   batch; the ver chains are the deeper tripwire for the forks this
+//!   check cannot see.)
+//! - **Any other kernel rejection of a merged group**: the group hides
+//!   the culprit, so degrade to shipping the solo head and walk forward —
+//!   healthy commits admit one by one until the faulty one stands alone.
+//! - **A kernel rejection of a solo commit** convicts it:
+//!   [`PushOutcome::Stalled`] names the seq and the error, the engine
+//!   records it as [`Fault`], and the queue holds. A `VerRegression`
+//!   means the commit itself is bad (written blind past a foreign write —
+//!   the missing-pull mistake); the resolution is
+//!   [`discard_from`](Engine::discard_from), the rollback. Lease-plane
+//!   rejections (`NotCovered`, `LeaseInvalid`, `Fenced`) mean coverage
+//!   lapsed; the resolution is re-acquire/renew and push again — the
+//!   commit is innocent.
+//!
+//! Transport failures ([`EngineError::Unavailable`]) abort the pass with
+//! the queue intact: retry when the server is back.
+
+use crate::meta::{certify, Committed, HeldLease, MetaStore};
+use crate::server::ServerHandle;
+use homebase_core::clock::{Clock, Timestamp};
+use homebase_core::key::Key;
+use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+use homebase_core::messages::{
+    AcquireRequest, KernelError, LeaseSpec, PrefixCursor, PutBatchRequest, RangeCut,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+};
+use homebase_core::space::{SpaceError, SpaceId};
+use homebase_core::storage::StorageError;
+use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use std::collections::BTreeSet;
+use std::fmt;
+
+/// Default cap on entries per wire batch — the grouping limit, not a
+/// correctness bound (a single oversized commit still ships alone).
+pub const DEFAULT_PUSH_CAP: usize = 256;
+
+/// What the engine can fail with. Kernel rejections *inside a push* are
+/// not errors — they are the protocol talking, and surface as
+/// [`PushOutcome`]; this enum is for the faults that end a call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineError {
+    /// The meta store faulted mid-transition. The store remains the
+    /// truth; drop the engine and reopen.
+    Storage(StorageError),
+    /// Transport-plane failure: nothing about the request was judged.
+    /// Retry when the server is reachable.
+    Unavailable { reason: String },
+    /// The server rejected a non-push verb (acquire contention, above
+    /// all). The request was judged and refused; the caller decides.
+    Rejected(KernelError),
+    /// The server has admitted a seq this store never minted or never
+    /// sent: another store is writing under our device id — a file copy
+    /// come alive. Fatal until fork recovery (re-mint, resync, requeue)
+    /// lands in a later batch.
+    Fork { admitted: DeviceSeq },
+}
+
+impl From<StorageError> for EngineError {
+    fn from(err: StorageError) -> Self {
+        Self::Storage(err)
+    }
+}
+
+impl From<SpaceError> for EngineError {
+    fn from(err: SpaceError) -> Self {
+        match err {
+            SpaceError::Kernel(err) => Self::Rejected(err),
+            SpaceError::Unavailable { reason } => Self::Unavailable { reason },
+        }
+    }
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(err) => write!(f, "{err}"),
+            Self::Unavailable { reason } => write!(f, "server unavailable: {reason}"),
+            Self::Rejected(err) => write!(f, "server rejected: {err}"),
+            Self::Fork { admitted } => write!(
+                f,
+                "device fork: the server admitted {admitted:?}, which this store never sent"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+/// What [`Engine::acquire`] hands back: the leases satisfying each spec,
+/// parallel to the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Acquired {
+    /// One lease per spec, in spec order — freshly granted or already
+    /// held.
+    pub leases: Vec<Lease>,
+    /// Present iff the server granted anything new: the catch-up
+    /// obligation — [`pull`](Engine::pull) the acquired prefixes to at
+    /// least this point before trusting local state. `None` means every
+    /// spec was satisfied by leases held continuously since their own
+    /// grants, so no new obligation exists.
+    pub barrier: Option<AdmissionSeq>,
+}
+
+/// How a push pass ended. `acked_through` is the highest seq *this call*
+/// confirmed admitted (and trimmed) — `None` when the pass made no
+/// progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The queue is empty; everything committed has been admitted.
+    Drained { acked_through: Option<DeviceSeq> },
+    /// The queue head was convicted by a solo rejection and the pass
+    /// stopped. See the module docs for the two resolutions: rollback
+    /// ([`Engine::discard_from`]) for a faulty commit, re-acquire and
+    /// push again for lapsed coverage.
+    Stalled {
+        at: DeviceSeq,
+        error: KernelError,
+        acked_through: Option<DeviceSeq>,
+    },
+}
+
+/// The recorded conviction of a queue head — what
+/// [`PushOutcome::Stalled`] leaves behind for introspection, cleared by
+/// the resolution (a covering [`Engine::discard_from`], or any later
+/// admission).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub at: DeviceSeq,
+    pub error: KernelError,
+    /// The highest seq ever acknowledged by this incarnation before the
+    /// conviction — "the last healthy push".
+    pub healthy_through: Option<DeviceSeq>,
+}
+
+/// A held lease as the engine sees it: the durable record joined with
+/// the one bit that is deliberately *not* durable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseState {
+    pub held: HeldLease,
+    /// Heard from the server *this incarnation* (grant or renewal).
+    /// Loaded leases start unconfirmed and authorize nothing until a
+    /// renewal succeeds — the stored deadline is a dead clock's stamp.
+    pub confirmed: bool,
+}
+
+impl LeaseState {
+    /// Whether this lease may be presented right now: confirmed, and the
+    /// local deadline has not passed.
+    pub fn live_at(&self, now: Timestamp) -> bool {
+        self.confirmed && now < self.held.deadline
+    }
+}
+
+/// The driver. See the module docs for the doctrine; the type parameters
+/// are the three injected worlds: durable truth, the server, time.
+pub struct Engine<M, H, C> {
+    store: M,
+    server: H,
+    clock: C,
+    device: DeviceId,
+    /// The seq the next commit gets — the fork discriminant. A scalar
+    /// shadow of the store's counter, maintained from commit returns.
+    next_seq: DeviceSeq,
+    /// A lower bound on the queue head: nothing is queued below it. The
+    /// pusher walks the queue in `[scan_from, next_seq)` windows;
+    /// incarnation-local, tightened by every ack.
+    scan_from: DeviceSeq,
+    /// Leases heard from the server this incarnation. Ids are unique per
+    /// space, not globally, hence the pairing.
+    confirmed: BTreeSet<(SpaceId, LeaseId)>,
+    /// Highest seq acknowledged this incarnation.
+    acked_through: Option<DeviceSeq>,
+    fault: Option<Fault>,
+    push_cap: usize,
+}
+
+impl<M: MetaStore, H: ServerHandle, C: Clock> Engine<M, H, C> {
+    /// Load, certify, and adopt (or mint) identity. `fresh` is used only
+    /// when the store has no device record yet — the caller supplies the
+    /// randomness (real callers mint a UUID, the sim derives one from its
+    /// seed; the engine itself never touches an entropy source).
+    ///
+    /// Panics if the loaded state fails [`certify`] — the audit posture:
+    /// corrupted truth is a stop, not an error to route around.
+    pub async fn open(store: M, server: H, clock: C, fresh: DeviceId) -> Result<Self, EngineError> {
+        let state = store.load().await?;
+        certify(&state);
+        let device = match state.device {
+            Some(id) => id,
+            None => {
+                store.record_device(fresh).await?;
+                fresh
+            }
+        };
+        let next_seq = state.next_seq.unwrap_or(DeviceSeq(1));
+        let scan_from = state.oplog.keys().next().copied().unwrap_or(next_seq);
+        Ok(Self {
+            store,
+            server,
+            clock,
+            device,
+            next_seq,
+            scan_from,
+            confirmed: BTreeSet::new(),
+            acked_through: None,
+            fault: None,
+            push_cap: DEFAULT_PUSH_CAP,
+        })
+    }
+
+    /// Replace the grouping cap (entries per wire batch).
+    pub fn with_push_cap(mut self, cap: usize) -> Self {
+        assert!(cap > 0, "a zero cap would ship nothing");
+        self.push_cap = cap;
+        self
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// The standing conviction, if a push stalled and nothing has
+    /// resolved it yet.
+    pub fn fault(&self) -> Option<&Fault> {
+        self.fault.as_ref()
+    }
+
+    /// The held leases covering `prefixes`, joined with this
+    /// incarnation's confirmation bits — what a caller inspects to
+    /// decide what to renew.
+    pub async fn leases(
+        &self,
+        space: SpaceId,
+        prefixes: &[Key],
+    ) -> Result<Vec<LeaseState>, EngineError> {
+        Ok(self
+            .store
+            .leases_covering(space, prefixes)
+            .await?
+            .into_iter()
+            .map(|held| {
+                let confirmed = self.confirmed.contains(&(space, held.lease.id));
+                LeaseState { held, confirmed }
+            })
+            .collect())
+    }
+
+    /// A local commit: durable in the store (seq and vers assigned
+    /// there), queued for push. Entirely offline.
+    pub async fn commit(
+        &mut self,
+        space: SpaceId,
+        entries: Vec<(Key, Value)>,
+    ) -> Result<Committed, EngineError> {
+        let committed = self.store.commit(space, entries).await?;
+        self.next_seq = DeviceSeq(committed.seq.0 + 1);
+        Ok(committed)
+    }
+
+    /// Ensure the leases — the idempotent verb call sites actually want.
+    /// Three tiers, cheapest first:
+    ///
+    /// 1. a spec covered by a confirmed, locally-live held lease (prefix
+    ///    covers, mode adequate — a held write satisfies a read spec) is
+    ///    answered from the store, no wire;
+    /// 2. a spec covered by a held lease that is *not* currently live
+    ///    here (unconfirmed after a resume, or past its local deadline)
+    ///    is revived by renewal — same lease, same fence; the kernel
+    ///    treats a same-device re-acquire as contention, so renewal is
+    ///    the only correct revival;
+    /// 3. only genuinely uncovered specs go to wire acquire (leases the
+    ///    renewal reported invalid land here too).
+    ///
+    /// An empty `specs` never touches the wire.
+    pub async fn acquire(
+        &mut self,
+        space: SpaceId,
+        specs: Vec<LeaseSpec>,
+        steal: bool,
+    ) -> Result<Acquired, EngineError> {
+        if specs.is_empty() {
+            return Ok(Acquired { leases: vec![], barrier: None });
+        }
+
+        // Tier 2 first: revive coverage that renewal can restore.
+        let queried: Vec<Key> = specs.iter().map(|spec| spec.prefix.clone()).collect();
+        let now = self.clock.now();
+        let held = self.store.leases_covering(space, &queried).await?;
+        let mut revive: Vec<LeaseId> = specs
+            .iter()
+            .filter(|spec| self.live_covering(&held, space, spec, now).is_none())
+            .filter_map(|spec| held.iter().find(|h| covers(h, spec)).map(|h| h.lease.id))
+            .collect();
+        revive.sort_unstable();
+        revive.dedup();
+        if !revive.is_empty() {
+            self.renew_ids(space, &revive, &held).await?;
+        }
+
+        // Tiers 1 and 3 against refreshed truth.
+        let send = self.clock.now();
+        let held = self.store.leases_covering(space, &queried).await?;
+        let mut satisfied: Vec<Option<Lease>> = specs
+            .iter()
+            .map(|spec| self.live_covering(&held, space, spec, send).cloned())
+            .collect();
+        let missing: Vec<LeaseSpec> = specs
+            .iter()
+            .zip(&satisfied)
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        if missing.is_empty() {
+            let leases = satisfied.into_iter().flatten().collect();
+            return Ok(Acquired { leases, barrier: None });
+        }
+
+        let response = self
+            .server
+            .acquire(&space, AcquireRequest { device: self.device, specs: missing, steal })
+            .await?;
+        let fresh: Vec<HeldLease> = response
+            .leases
+            .iter()
+            .map(|lease| HeldLease {
+                lease: lease.clone(),
+                deadline: send.saturating_add(lease.ttl),
+            })
+            .collect();
+        self.store.record_leases(space, &fresh).await?;
+        for held in &fresh {
+            self.confirmed.insert((space, held.lease.id));
+        }
+
+        let mut granted = response.leases.into_iter();
+        for slot in &mut satisfied {
+            if slot.is_none() {
+                *slot = Some(granted.next().expect("grants parallel to missing specs"));
+            }
+        }
+        Ok(Acquired {
+            leases: satisfied.into_iter().flatten().collect(),
+            barrier: Some(response.barrier),
+        })
+    }
+
+    /// Renew the held leases covering `prefixes` — the explicit act that
+    /// confirms them (there is no background heartbeat). Grants get
+    /// fresh local deadlines from this call's send time and are written
+    /// through; leases the server reports invalid are dropped
+    /// everywhere. `contended` flags ride the response for the caller's
+    /// release policy. Empty `prefixes` — or prefixes nothing covers —
+    /// never touch the wire.
+    pub async fn renew(
+        &mut self,
+        space: SpaceId,
+        prefixes: &[Key],
+    ) -> Result<RenewResponse, EngineError> {
+        let held = if prefixes.is_empty() {
+            Vec::new()
+        } else {
+            self.store.leases_covering(space, prefixes).await?
+        };
+        let ids: Vec<LeaseId> = held.iter().map(|h| h.lease.id).collect();
+        self.renew_ids(space, &ids, &held).await
+    }
+
+    /// The renewal engine room: `held` must contain a record for every
+    /// id (panics otherwise — the callers just read them).
+    async fn renew_ids(
+        &mut self,
+        space: SpaceId,
+        ids: &[LeaseId],
+        held: &[HeldLease],
+    ) -> Result<RenewResponse, EngineError> {
+        if ids.is_empty() {
+            return Ok(RenewResponse { granted: vec![], invalid: vec![] });
+        }
+        let send = self.clock.now();
+        let response = self
+            .server
+            .renew(&space, RenewRequest { device: self.device, leases: ids.to_vec() })
+            .await?;
+        if !response.granted.is_empty() {
+            let refreshed: Vec<HeldLease> = response
+                .granted
+                .iter()
+                .map(|grant| {
+                    let mut held = held
+                        .iter()
+                        .find(|h| h.lease.id == grant.id)
+                        .expect("server renewed a lease the store does not hold")
+                        .clone();
+                    held.lease.ttl = grant.ttl;
+                    held.deadline = send.saturating_add(grant.ttl);
+                    held
+                })
+                .collect();
+            self.store.record_leases(space, &refreshed).await?;
+            for held in &refreshed {
+                self.confirmed.insert((space, held.lease.id));
+            }
+        }
+        if !response.invalid.is_empty() {
+            self.store.drop_leases(space, &response.invalid).await?;
+            for id in &response.invalid {
+                self.confirmed.remove(&(space, *id));
+            }
+        }
+        Ok(response)
+    }
+
+    /// Release leases: tell the server (idempotent there), then forget.
+    /// A crash between the two leaves a stale record that the next
+    /// renewal reports invalid and drops — the saga resolves itself. An
+    /// empty `ids` never touches the wire.
+    pub async fn release(&mut self, space: SpaceId, ids: &[LeaseId]) -> Result<(), EngineError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.server
+            .release(&space, ReleaseRequest { device: self.device, leases: ids.to_vec() })
+            .await?;
+        self.store.drop_leases(space, ids).await?;
+        for id in ids {
+            self.confirmed.remove(&(space, *id));
+        }
+        Ok(())
+    }
+
+    /// Pull a consistent cut of `prefixes` since the space's watermark
+    /// (`None` watermark → snapshot), then advance the watermark to the
+    /// cut and the ver high-water past every ver the cut carried — the
+    /// acquire-barrier half of what makes blind Lamport stamping safe.
+    ///
+    /// The watermark is one cursor per space: callers pull a stable
+    /// prefix set (their shape), not ad-hoc subsets.
+    pub async fn pull(
+        &mut self,
+        space: SpaceId,
+        prefixes: &[Key],
+    ) -> Result<ReadAtResponse, EngineError> {
+        let since = self.store.watermark(space).await?;
+        let ranges = prefixes
+            .iter()
+            .map(|prefix| PrefixCursor { prefix: prefix.clone(), since })
+            .collect();
+        let response = self.server.read_at(&space, ReadAtRequest { ranges }).await?;
+        let ver_seen = response
+            .ranges
+            .iter()
+            .flat_map(|range| {
+                let (RangeCut::Snapshot(entries) | RangeCut::Delta(entries)) = range;
+                entries.iter().map(|entry| entry.tag.ver)
+            })
+            .max()
+            .unwrap_or(Ver(0));
+        self.store.advance_watermark(space, response.at, ver_seen).await?;
+        Ok(response)
+    }
+
+    /// Drain the queue. One pass: ships groups FIFO until the queue is
+    /// empty ([`PushOutcome::Drained`]), a solo head is convicted
+    /// ([`PushOutcome::Stalled`]), the transport drops
+    /// ([`EngineError::Unavailable`], queue intact), or a fork is proven
+    /// ([`EngineError::Fork`]). See the module docs for the recovery
+    /// algebra.
+    pub async fn push(&mut self) -> Result<PushOutcome, EngineError> {
+        let mut acked = None;
+        // After a merged group is rejected, ship solo heads until one is
+        // admitted (or convicted) — the adaptive probe.
+        let mut probe = false;
+        loop {
+            // The queue lives in [scan_from, next_seq); walk it one
+            // cap-sized seq window at a time. An empty window is a legal
+            // gap (a discard's shadow), not the end.
+            if self.scan_from >= self.next_seq {
+                return Ok(PushOutcome::Drained { acked_through: acked });
+            }
+            let until = DeviceSeq(
+                self.scan_from
+                    .0
+                    .saturating_add(self.push_cap as u64 - 1)
+                    .min(self.next_seq.0 - 1),
+            );
+            let window = self.store.oplog(self.scan_from, until).await?;
+            let Some((head, head_record)) = window.first() else {
+                self.scan_from = DeviceSeq(until.0 + 1);
+                continue;
+            };
+            let head = *head;
+            self.scan_from = head; // nothing below was queued in the window
+            let space = head_record.space;
+            let mut last = head;
+            let mut entries = head_record.entries.clone();
+            if !probe {
+                for (seq, record) in &window[1..] {
+                    if seq.0 != last.0 + 1
+                        || record.space != space
+                        || entries.len() + record.entries.len() > self.push_cap
+                    {
+                        break;
+                    }
+                    entries.extend(record.entries.iter().cloned());
+                    last = *seq;
+                }
+            }
+            let keys: Vec<Key> = entries.iter().map(|entry| entry.key.clone()).collect();
+            let request = PutBatchRequest {
+                device: self.device,
+                device_seq: last,
+                leases: self.live_write_leases(space, &keys).await?,
+                entries,
+            };
+            match self.server.put_batch(&space, request).await {
+                Ok(_) => {
+                    self.ack(last).await?;
+                    acked = Some(last);
+                    probe = false;
+                }
+                Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
+                    // A legitimate collision names our own earlier send,
+                    // and an admitted-but-untrimmed seq is necessarily
+                    // still queued. Anything else — a seq we never
+                    // minted, or one we minted but never sent — is
+                    // another store wearing our identity.
+                    let ours = current < self.next_seq
+                        && !self.store.oplog(current, current).await?.is_empty();
+                    if !ours {
+                        return Err(EngineError::Fork { admitted: current });
+                    }
+                    self.ack(current).await?;
+                    acked = Some(current);
+                    probe = false;
+                }
+                Err(SpaceError::Kernel(error)) => {
+                    if last > head {
+                        probe = true;
+                        continue;
+                    }
+                    let fault =
+                        Fault { at: head, error, healthy_through: self.acked_through };
+                    self.fault = Some(fault.clone());
+                    return Ok(PushOutcome::Stalled {
+                        at: fault.at,
+                        error: fault.error,
+                        acked_through: acked,
+                    });
+                }
+                Err(SpaceError::Unavailable { reason }) => {
+                    return Err(EngineError::Unavailable { reason });
+                }
+            }
+        }
+    }
+
+    /// Rollback: drop every queued commit with seq ≥ `from` — the
+    /// resolution for a convicted head the caller chooses not to repair.
+    /// Later commits fall with it (they may have read what it wrote);
+    /// clears a covered [`Fault`]. The seq counter never rewinds, so the
+    /// queue may carry a gap afterwards — legal everywhere.
+    pub async fn discard_from(&mut self, from: DeviceSeq) -> Result<(), EngineError> {
+        self.store.discard_from(from).await?;
+        if self.fault.as_ref().is_some_and(|fault| fault.at >= from) {
+            self.fault = None;
+        }
+        Ok(())
+    }
+
+    /// Acknowledged through `through`: trim durably, advance the scan
+    /// bound, record the progress. Progress also clears any standing
+    /// fault — the queue has moved past whatever was convicted.
+    async fn ack(&mut self, through: DeviceSeq) -> Result<(), EngineError> {
+        self.store.trim_oplog(through).await?;
+        self.scan_from = DeviceSeq(self.scan_from.0.max(through.0 + 1));
+        self.acked_through = Some(self.acked_through.map_or(through, |a| a.max(through)));
+        self.fault = None;
+        Ok(())
+    }
+
+    /// The held lease (if any) that satisfies `spec` right now:
+    /// covering, confirmed this incarnation, local deadline unexpired.
+    fn live_covering<'a>(
+        &self,
+        held: &'a [HeldLease],
+        space: SpaceId,
+        spec: &LeaseSpec,
+        now: Timestamp,
+    ) -> Option<&'a Lease> {
+        held.iter()
+            .filter(|h| self.confirmed.contains(&(space, h.lease.id)))
+            .filter(|h| now < h.deadline)
+            .find(|h| covers(h, spec))
+            .map(|h| &h.lease)
+    }
+
+    /// The lease refs a put over `keys` may present *right now*:
+    /// covering, write mode, confirmed this incarnation, local deadline
+    /// unexpired. Presenting nothing when coverage lapsed is deliberate —
+    /// the kernel's `NotCovered` is the signal to re-acquire, and a
+    /// locally-expired lease must never back a write (the two-clock
+    /// rule).
+    async fn live_write_leases(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+    ) -> Result<Vec<LeaseRef>, EngineError> {
+        let now = self.clock.now();
+        Ok(self
+            .store
+            .leases_covering(space, keys)
+            .await?
+            .into_iter()
+            .filter(|held| {
+                held.lease.mode == LeaseMode::Write
+                    && self.confirmed.contains(&(space, held.lease.id))
+                    && now < held.deadline
+            })
+            .map(|held| LeaseRef { id: held.lease.id, epoch: held.lease.epoch })
+            .collect())
+    }
+}
+
+/// Whether a held lease answers a spec: its prefix covers the requested
+/// one and its mode is adequate.
+fn covers(held: &HeldLease, spec: &LeaseSpec) -> bool {
+    spec.prefix.starts_with(&held.lease.prefix) && mode_covers(held.lease.mode, spec.mode)
+}
+
+/// Whether a held lease's mode satisfies a requested one: write covers
+/// everything it excludes others from; read covers only read.
+fn mode_covers(held: LeaseMode, want: LeaseMode) -> bool {
+    matches!((held, want), (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read))
+}
