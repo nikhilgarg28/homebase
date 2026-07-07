@@ -10,6 +10,7 @@
 //!   servers and clients, hand-cranked time for tests and the sim
 //! - [`messages`] — transport-neutral request/response messages for the
 //!   seven verbs, and [`KernelError`]
+//! - [`seal`] — AEAD seal metadata attached to encrypted value operations
 //! - [`space`] — [`SpaceId`] and the [`Space`] trait, the async verb
 //!   contract every request executes against
 //! - [`storage`] — [`OrderedStore`](storage::OrderedStore), the ordered
@@ -25,6 +26,7 @@ pub mod clock;
 pub mod key;
 pub mod lease;
 pub mod messages;
+pub mod seal;
 pub mod space;
 pub mod storage;
 pub mod tag;
@@ -33,5 +35,6 @@ pub use clock::{Clock, ManualClock, MonotonicClock, Timestamp};
 pub use key::{Key, KeyComponent};
 pub use lease::{Lease, LeaseId, LeaseMode, LeaseRef};
 pub use messages::KernelError;
+pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};
 pub use tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Epoch, Tag, Value, Ver};

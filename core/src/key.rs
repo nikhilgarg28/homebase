@@ -1,8 +1,8 @@
 //! Tuple keys and their order-preserving flat encoding.
 //!
-//! A kernel key is a tuple of byte strings (max [`MAX_COMPONENTS`] components
-//! of [`MAX_COMPONENT_LEN`] bytes each). Prefix means *component-wise* prefix:
-//! `["db","pay"]` never covers `["db","payroll"]`.
+//! A kernel key is a tuple of non-empty byte strings (max [`MAX_COMPONENTS`]
+//! components of [`MAX_COMPONENT_LEN`] bytes each). Prefix means
+//! *component-wise* prefix: `["db","pay"]` never covers `["db","payroll"]`.
 //!
 //! # Encoding
 //!
@@ -30,7 +30,7 @@ pub const MAX_COMPONENTS: usize = 16;
 /// Maximum byte length of a single key component.
 pub const MAX_COMPONENT_LEN: usize = 256;
 
-/// A single validated key component. Empty components are legal.
+/// A single validated key component.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyComponent(Vec<u8>);
 
@@ -38,6 +38,9 @@ impl KeyComponent {
     /// Creates a component from raw bytes, enforcing [`MAX_COMPONENT_LEN`].
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, KeyError> {
         let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Err(KeyError::EmptyComponent);
+        }
         if bytes.len() > MAX_COMPONENT_LEN {
             return Err(KeyError::ComponentTooLong { len: bytes.len() });
         }
@@ -122,7 +125,8 @@ impl Key {
 ///
 /// The storage layer decodes tuples longer than any user key (space id ⊕
 /// record kind ⊕ user components ⊕ suffixes); per-component length limits
-/// still apply. Empty input decodes to an empty sequence.
+/// still apply, and empty components are rejected. Empty input decodes to an
+/// empty sequence.
 pub fn decode_components(bytes: &[u8]) -> Result<Vec<KeyComponent>, DecodeError> {
     let mut components = Vec::new();
     let mut current = Vec::new();
@@ -186,6 +190,8 @@ pub fn encode_components(components: &[KeyComponent]) -> Vec<u8> {
 pub enum KeyError {
     /// Keys must have at least one component.
     Empty,
+    /// Key components must contain at least one byte.
+    EmptyComponent,
     /// More than [`MAX_COMPONENTS`] components.
     TooManyComponents { len: usize },
     /// A component longer than [`MAX_COMPONENT_LEN`] bytes.
@@ -196,6 +202,7 @@ impl fmt::Display for KeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "key must have at least one component"),
+            Self::EmptyComponent => write!(f, "key component must not be empty"),
             Self::TooManyComponents { len } => {
                 write!(f, "key has {len} components (max {MAX_COMPONENTS})")
             }
@@ -250,6 +257,14 @@ mod tests {
                 len: MAX_COMPONENT_LEN + 1
             }
         );
+        assert_eq!(
+            KeyComponent::new(Vec::new()).unwrap_err(),
+            KeyError::EmptyComponent
+        );
+        assert_eq!(
+            Key::from_bytes([&b""[..]]).unwrap_err(),
+            KeyError::EmptyComponent
+        );
         let too_many = vec![&b"x"[..]; MAX_COMPONENTS + 1];
         assert_eq!(
             Key::from_bytes(too_many).unwrap_err(),
@@ -277,7 +292,10 @@ mod tests {
             key(&[b"a\x00b"]).encode(),
             [0x61, 0x00, 0x01, 0x62, 0x00, 0x00]
         );
-        assert_eq!(key(&[b"a", b""]).encode(), [0x61, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            key(&[b"a", b"b"]).encode(),
+            [0x61, 0x00, 0x00, 0x62, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -295,7 +313,7 @@ mod tests {
         let cases = [
             (key(&[b"a"]), key(&[b"a\x00"])),
             (key(&[b"a", b"z"]), key(&[b"a\x00"])),
-            (key(&[b"a", b""]), key(&[b"a\x00"])),
+            (key(&[b"a", b"b"]), key(&[b"a\x00"])),
             (key(&[b"a\x00"]), key(&[b"a\x01"])),
             (key(&[b"db", b"pay"]), key(&[b"db", b"payroll"])),
         ];
@@ -316,6 +334,10 @@ mod tests {
         assert_eq!(
             Key::decode(&[0x61, 0x00, 0x00, 0x61]).unwrap_err(),
             DecodeError::Truncated
+        );
+        assert_eq!(
+            Key::decode(&[0x00, 0x00]).unwrap_err(),
+            DecodeError::InvalidKey(KeyError::EmptyComponent)
         );
         assert_eq!(
             Key::decode(&[0x00, 0x02, 0x00, 0x00]).unwrap_err(),

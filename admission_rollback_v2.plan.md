@@ -1,0 +1,734 @@
+---
+name: Admission rollback v2
+overview: Consolidated rebuild plan — original admission/rollback model plus post-plan API, submit/push policy, data-only submit surface, sync lease verbs, Seal-based E2EE value binding, explicit Delete op, and backlog items. Implement one phase at a time after stashing current WIP.
+todos:
+  - id: p0-baseline
+    content: "Phase 0: Confirm baseline — 2 committed test commits on main; stash WIP; workspace green"
+    status: pending
+  - id: p1-core-types
+    content: "Phase 1: Core wire + oplog types — Seal, BatchOp Set/Delete, RangeAssert, data-only PutBatch, LeaseKind, ListLeases, OplogRecord/Cursors; lease verbs stay separate"
+    status: pending
+  - id: p2-drop-epoch
+    content: "Phase 2: Remove lease Epoch — Tag/Lease/Fenced; keep LeaseId evidence diagnostic-only; record encode v2; sim audit"
+    status: pending
+  - id: p3-server-admission
+    content: "Phase 3: Server admission rewrite — multi-batch all-or-nothing, asserts, sequential data ops, writes allowed unless conflicting active lease"
+    status: pending
+  - id: p4-meta-rollback
+    content: "Phase 4: Client meta — per-space oplogs/ver_high, rollback(to), head/neck/tail persisted, forgotten lease release intents, certify [neck,tail), reserve_batch only, drop discard_from"
+    status: pending
+  - id: p5-data-submit
+    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, encode_batch_op; expose ensure()+release(), no public acquire()"
+    status: pending
+  - id: p6-push-ack
+    content: "Phase 6: Push + ack — PushOptions, disk head/neck/tail only, push_until wait-through, Submission::push sugar, data-only ack, Fork trim vs rollback"
+    status: pending
+  - id: p7-submit-push-api
+    content: "Phase 7: Submit/push ergonomics — submit_checked/submit_unchecked, push/push_until, Submission::push attribution sugar, caller-driven rollback"
+    status: pending
+  - id: p8-tests
+    content: "Phase 8: Tests — rollback.rs, engine/torture/equivalence/sim updates; client/tests/common helpers"
+    status: pending
+  - id: p9-aggregates
+    content: "Phase 9 (optional): Prefix aggregates — keep live_count correct for real Delete; DeleteRange prep"
+    status: pending
+  - id: p10-docs
+    content: "Phase 10: DESIGN.md + module docs — admission, submit policies, data batch API, lease reservations"
+    status: pending
+  - id: backlog-verify
+    content: "Backlog: verify feature for meta/server conformance + audit (not certify at open)"
+    status: pending
+  - id: backlog-resume
+    content: "Backlog: resume_pending() after open when online"
+    status: pending
+isProject: false
+---
+
+# Admission + rollback v2 (consolidated rebuild)
+
+**Supersedes:** [`admission_rollback_model_81337dca.plan.md`](admission_rollback_model_81337dca.plan.md)
+
+**Workflow:** Stash all current uncommitted WIP. Land each phase below as a focused commit. Review before starting the next phase. New ideas go in **Backlog** until explicitly promoted.
+
+---
+
+## Starting point (after stash)
+
+**Already on `main` (committed, keep):**
+
+| Commit | Content |
+|--------|---------|
+| `722b3cc` | `attach.rs`, `engine_encrypted.rs`, `equivalence.rs`, `fault_meta.rs` tests; minor cargo/doc touches |
+| `24e3ccd` | `client_torture.rs` DST harness |
+
+**Revert / do not carry from WIP:**
+
+- `.vscode/settings.json` theme change
+- `server/tests/lease_props.proptest-regressions` (artifact)
+
+**Everything else in the dirty tree is reimplemented phase-by-phase below** — do not cherry-pick the monolithic diff.
+
+---
+
+## Core invariants (unchanged + updated)
+
+### Unchanged
+
+- One `DeviceSeq` / oplog stream per **space** per device; device identity remains client-global, but queue state is space-scoped.
+- **head / neck / tail** cursors; `[neck, tail)` is the active certify/push window; dead rows in `[head, neck)` after rollback.
+- Anything in `[neck, tail)` not yet server-acked is **not guaranteed**. Callers that need per-write certainty hold the returned `Submission { seq }` and call `submission.push().await`, which is sugar over `space.push_until(seq).await`.
+- Device-seq **gaps are legal** after rollback.
+- Range asserts: `effective_prefix_max(prefix) == at` (equality).
+- Lease **evidence** may include `LeaseId`s for diagnostics / richer errors, but is never admission authority.
+- Leases are **reservations**, not required write capabilities: writes without a held lease are admitted when no active incompatible lease conflicts with their keys.
+- Client lease state is always a **subset of authority**: local active leases may lag server grants, but must never outlive local release intent.
+- Client coordination state is owned by a **single-owner event loop**. The loop serializes all correctness-state transitions and performs no slow work itself: blocking work (SQLite, bulk crypto) runs on worker threads, concurrent work (network, timers) runs in tasks, and both communicate with the loop via channels. The loop is the correctness chokepoint, never the performance chokepoint.
+- Data batches evaluate sequentially on server scratch; no lease acquire/release ops appear in the oplog or `PutBatch`.
+- Multi-batch `PutBatchRequest`: simulate sequentially, commit **all-or-nothing**.
+- **Fork** (duplicate device identity) is fatal; server-ahead catch-up uses **trim**, not rollback.
+- **`certify` at `Client::open`** — production safety net (not sim-only). Do **not** feature-gate.
+
+### Updated (post original plan)
+
+| Topic | Original plan | **v2 decision** |
+|-------|---------------|-----------------|
+| Space lease API | Lease ops folded into data commits | **Split:** data mutations via `Space::submit_checked` / `submit_unchecked`; leases stay sync named verbs, including repair listing |
+| Write admission | Every write needs presented write lease | **Optimistic by default:** write admitted unless an active incompatible lease covers/conflicts with the key |
+| Lease stealing | Stealable leases + `steal=true` preemption | **Removed:** no pre-deadline lease stealing; takeover is a later explicit/admin flow |
+| Client release state | Drop after server release | **Forgotten first:** local release intent removes authority before remote release; retained for retry until ack |
+| Lease deadline margin | 0.1% of TTL | **max(0.1% of TTL, 10ms)** floor for local authority expiry |
+| `BatchOp::Delete` | Separate delete op | **Explicit `Delete { key, ver, seal }`** — server-aware; no `Value::Absent` tombstone-on-Set |
+| Value binding | Opaque ciphertext + server `Tag` | **`Seal`** (scheme + nonce + AEAD tag) on all data ops; key-bound AAD at client |
+| Awaited data writes | Special `Sync` mode | **Sugar, not mechanism:** `Submission::push()` calls `space.push_until(seq).await` and extracts that seq's disposition |
+| Client session state | (implicit in-memory cursors) | **Disk-only:** `Client` holds device + session attach map; per-space oplog cursors load from `MetaStore` each push; `PushOptions` per push call |
+| Oplog scope | One client-level oplog | **Per-space oplog:** cross-space/client-level oplog deferred for future two-phase commits |
+| Meta reservation | `reserve_commit` + `reserve_batch` | **`reserve_batch` only** on trait; ver stamping in `Space::submit_*` |
+| Lease epoch | Removed in Phase 7 after 1–6 | **Early Phase 2** when starting fresh — no epoch-dependent code |
+| `resume_pending()` | Required in Phase 4 | **Backlog** — not in initial rebuild |
+
+---
+
+## Architecture (v2)
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Space
+    participant Meta
+    participant Push
+    participant Server
+
+    Note over App,Server: Typical write path
+    App->>Space: submit_checked(Set ops, asserts)
+    Space->>Meta: reserve_batch + append at tail
+    App->>Push: Space::push() or Submission::push()
+    Push->>Server: PutBatchRequest
+    Server-->>Push: per-batch results
+    Push->>Meta: trim data oplog
+
+    Note over App,Server: Lease reservation path
+    App->>Space: ensure(specs)
+    Space->>Server: acquire(specs)
+    Server-->>Space: leases with requested_at + prefix barriers
+    Space->>Server: read_at(prefixes)
+    Space->>Meta: record leases + advance watermarks
+
+    Note over App,Server: Lease repair path
+    App->>Space: repair_leases()
+    Space->>Server: list_leases(device)
+    Server-->>Space: leases with requested_at + prefix barriers
+    Space->>Server: read_at(prefixes)
+    Space->>Meta: reconcile active leases + advance watermarks
+
+    Note over App,Server: Abandon path (caller-driven)
+    Push-->>App: Stalled / Rejected
+    App->>Meta: rollback(to)
+    App->>Push: push rollback NoOp batch
+```
+
+---
+
+## Design: `Seal` + explicit `Delete` (brainstorm #1)
+
+**Decision (2026-07-06):** All client data mutations carry a **`Seal`**. The server stores it opaquely but distinguishes **Set** (key + seal + ciphertext) from **Delete** (key + seal only). Clients verify seals on read using key-bound AAD.
+
+### `Seal` wire shape (41 bytes fixed header)
+
+```rust
+#[repr(u8)]
+pub enum SealScheme {
+    AeadV1 = 0,
+}
+
+impl TryFrom<u8> for SealScheme {
+    type Error = UnknownSealScheme;
+    fn try_from(value: u8) -> Result<Self, Self::Error>;
+}
+
+impl From<SealScheme> for u8 {
+    fn from(value: SealScheme) -> u8;
+}
+
+pub struct Seal {
+    pub scheme: SealScheme,  // wire-encoded as u8; AeadV1 = 0
+    pub nonce: [u8; 24],     // AEAD nonce
+    pub aead: [u8; 16],       // Poly1305 authentication tag (not server admission Tag)
+    pub payload: Vec<u8>,     // opaque scheme extension; empty for AeadV1
+}
+```
+
+- **`scheme`** identifies the sealing/encryption scheme, not the op kind. Initial enum has one variant, `AeadV1 = 0`, with explicit checked conversion to/from the wire `u8`.
+- **Present (`Set`):** `BatchOp::Set { key, ver, seal, ciphertext }` — ciphertext follows the fixed seal header.
+- **Delete:** `BatchOp::Delete { key, ver, seal }` — seal only; AEAD plaintext is `b""`.
+- **Future `DeleteRange`:** same seal machinery over range metadata + prefix (backlog until specified).
+- **Scheme payload:** `Seal.payload` is opaque extension data for future schemes. For `SealScheme::AeadV1`, it must be empty and decoders should reject non-empty payloads.
+- **Empty Set privacy:** because the AEAD tag lives in `Seal.aead`, encrypting raw `b""` for a Set would produce empty ciphertext and leak "empty logical value" to the server. Do not use key material as a deterministic IV/nonce; the same key would repeat across writes. Key components are non-empty, but that does not make them safe nonces. Instead, the value cipher must encrypt a non-empty Set plaintext frame (for example a versioned length/value frame, with optional padding buckets later) so even an empty logical value has non-empty ciphertext.
+
+### AAD / verification (client-only; server opaque)
+
+When computing or verifying a seal, include in AEAD associated data:
+
+1. **Anonymized key** — `encode_key(key)` bytes (same as today's `value_aad` key component).
+2. **Write context** — device, device_seq, ver, and `cipher_epoch` / value-key epoch as today.
+3. **Scheme + op kind** — bind `scheme` and the explicit op kind (`Set`, `Delete`, later `DeleteRange`) so a delete seal cannot be replayed as a set seal on the same key/version context.
+
+Clients decrypt/verify on `read_at` / local replay; the kernel never interprets seal bytes.
+
+### Kernel storage model
+
+Replace `Value::Absent` with an explicit delete representation the server can recognize:
+
+```rust
+pub enum Value {
+    Present { seal: Seal, ciphertext: Vec<u8> },
+    Deleted { seal: Seal },
+}
+```
+
+- **`read_at` deltas** emit `Deleted { seal }` rows — replicas observe deletes.
+- **`get` / `list`** skip deleted rows (live entries only), same contract as today.
+- Server **`Tag`** (device, device_seq, ver, admission_seq) unchanged — admission metadata stays separate from AEAD seal and carries no lease id.
+
+### Why not tombstone-on-Set?
+
+- Honest delete on the wire and in admission (distinct op, no value smuggling).
+- Enables server-side delete awareness (`live_count`, future `DeleteRange`) without parsing ciphertext.
+- Cryptographic proof of intent: delete seal = AEAD over empty plaintext bound to this key only.
+
+### Open questions (resolve during Phase 1 / 5 implementation)
+
+| Question | Lean |
+|----------|------|
+| Scheme numbering | `SealScheme::AeadV1 = 0`; later variants only when encryption/sealing changes |
+| Scheme payload | `Seal.payload` exists for future extension; `AeadV1` requires it to be empty |
+| Plaintext mode | Seal with `SealScheme::AeadV1` passthrough/trivial AEAD placeholder if needed; same shapes on wire |
+| Zero-length present | Allowed via `Set`; distinct from `Delete` because op kind is bound in AAD |
+| Empty Set ciphertext | Must be non-empty via a Set plaintext frame; never derive nonce/IV from key components |
+| Key components | User key components must be non-empty; this is for key hygiene, not nonce derivation |
+| `stamp_*` in submit | Rename to `stamp_data_ops` — assign `ver` for both `Set` and `Delete` |
+| Per-write push sugar | `Submission::push()` applies to any submitted data op (`Set` **or** `Delete`) by pushing through the returned seq |
+
+---
+
+## Phase 0 — Baseline
+
+1. `git stash push -u -m "admission WIP pre-v2"`
+2. Confirm `cargo test --workspace` green on committed `main`
+3. Optional: add `lease_props.proptest-regressions` to `.gitignore`
+
+---
+
+## Phase 1 — Core types and wire surface
+
+**Files:** `core/src/messages.rs`, `core/src/lease.rs`, `core/src/tag.rs`, new `core/src/seal.rs` (or in `tag.rs`)
+
+### `Seal`
+
+```rust
+pub struct Seal {
+    pub scheme: SealScheme,
+    pub nonce: [u8; 24],
+    pub aead: [u8; 16],
+    pub payload: Vec<u8>,
+}
+```
+
+Fixed 41-byte wire header after `SealScheme <-> u8` encoding, followed by the scheme payload length/bytes in whatever wire encoding the transport uses. `AeadV1` requires an empty payload. `Set` ops carry additional ciphertext bytes; `Delete` ops do not.
+
+### Lease kinds
+
+```rust
+pub enum LeaseKind { Forever, Bounded(Duration) }
+// LeaseSpec { prefix, mode, kind }
+
+pub struct AcquireLeasesRequest {
+    pub device: DeviceId,
+    pub requested_at: HybridTimestamp, // client-minted; server treats as opaque
+    pub specs: Vec<LeaseSpec>,
+}
+
+pub struct AcquireLeasesResponse {
+    pub leases: Vec<Lease>,
+}
+
+pub struct Lease {
+    pub id: LeaseId,
+    pub prefix: Key,
+    pub mode: LeaseMode,
+    pub kind: LeaseKind,
+    pub requested_at: HybridTimestamp, // client clock from grant/refresh request
+    pub granted_at: Timestamp,     // server clock; diagnostic/repair input
+    pub ttl: Duration,
+    pub barrier: AdmissionSeq,     // effective_prefix_max(prefix) when this lease was granted/refreshed
+}
+```
+
+- `barrier` is **prefix-scoped in meaning** and global only in type: it is an `AdmissionSeq`, but its value is `effective_prefix_max(lease.prefix)` at grant/refresh time, not the server's global admission high-water. Writes outside the leased prefix/range do not affect the barrier the client must pull before treating the lease as local authority.
+- `requested_at` is minted by the client before sending the acquire/refresh request and stored on the lease. The server does not compare it with server time and must not use it for authority; it returns it so the owning client can anchor local deadline math in the client time domain.
+- Server lease expiry remains server-domain: `granted_at + ttl`. Client local usability is conservative: for bounded leases, local authority expires at `requested_at + ttl - margin`. Because the server grants at or after the client request timestamp, this may expire local authority earlier than server authority, preserving the subset invariant.
+
+### Lease repair
+
+```rust
+pub struct ListLeasesRequest {
+    pub device: DeviceId,
+}
+
+pub struct ListLeasesResponse {
+    pub leases: Vec<Lease>,
+}
+```
+
+- `ListLeasesResponse.leases` contains all active leases in the space held by `device`.
+- Leases carry original client `requested_at`, server `granted_at`, and original `ttl`, not remaining TTL. Server timestamps are never compared directly to client timestamps.
+- `ListLeasesResponse` does **not** include `server_now`. For bounded leases, the client reconstructs its conservative local deadline from the returned lease as `requested_at + ttl - margin`.
+- Each lease's `barrier` is the prefix-scoped `effective_prefix_max(prefix)` when that lease was granted/refreshed. Repaired leases are not local authority until their prefixes are pulled through their own barriers.
+- Client reconciliation records listed leases as Active/pending-barrier, drops local Active leases absent from the server response, and clears Forgotten release intents absent from the server response. Forgotten leases still present on the server remain Forgotten for retry.
+
+### Put batch shape
+
+```rust
+pub struct RangeAssert { pub prefix: Key, pub at: AdmissionSeq }
+
+pub enum BatchOp {
+    Set { key: Key, ver: Ver, seal: Seal, ciphertext: Vec<u8> },
+    Delete { key: Key, ver: Ver, seal: Seal },
+    NoOp,
+}
+
+pub struct PutBatch {
+    pub device_seq: DeviceSeq,
+    pub ops: Vec<BatchOp>,
+    pub range_asserts: Vec<RangeAssert>,
+    pub evidence: Vec<LeaseId>,  // diagnostic only; never admission authority
+}
+
+pub struct PutBatchResponse {
+    pub results: Vec<PutBatchResult>, // exactly one result per input batch
+}
+
+pub enum PutBatchResult {
+    Applied { admission_seq: AdmissionSeq },
+    Failed { error: BatchError },
+}
+```
+
+- Remove authoritative `PutBatchRequest.leases` and `LeaseRef`; keep `Vec<LeaseId>` evidence on data batches for diagnostics / richer errors only.
+- Keep lease verbs (`acquire` / `release` / `list_leases`) outside `PutBatch`; no `BatchOp::Acquire` or `BatchOp::Release`.
+- Acquire refreshes same-device compatible held leases in place where possible; no data push is required before lease calls.
+- Remove lease stealing entirely: no `stealable` field, no `steal` argument, and no pre-deadline preemption.
+- Replace `PutEntry` / `Value::Absent` tombstone path with `BatchOp` + `Value::{Present, Deleted}` (see Seal design).
+
+### Oplog (client-local)
+
+```rust
+pub struct OplogCursors { pub head, pub neck, pub tail: DeviceSeq }
+
+pub enum OplogRecord {
+    Commit {
+        ops: Vec<BatchOp>,
+        range_asserts: Vec<RangeAssert>,
+        evidence: Vec<LeaseId>,
+    },
+    Rollback {
+        marker: RollbackMarker,
+    },
+}
+```
+
+- Oplog storage is keyed by `(space_id, device_seq)` and each space has its own `OplogCursors`.
+- Checked vs unchecked is a client-side pre-append policy selected by the `submit_checked` / `submit_unchecked` API; it does not need to be stored in `OplogRecord` after local qualification succeeds.
+- `Submission::push()` is API sugar, not oplog state. The durable fact is still only the appended record at `device_seq`.
+- MetaStore methods that read/write oplog state take `space_id` explicitly: reservation, append, scan, trim, rollback, cursor load/certify.
+- `DeviceSeq` remains part of server tags and replay fences, but monotonicity is per `(space, device)`, matching server admission.
+- A future client-level oplog may be added only for cross-space/two-phase commit orchestration.
+
+**Exit:** core compiles; server/client stubs updated for new message shapes.
+
+---
+
+## Phase 2 — Remove lease `Epoch` (moved up)
+
+Do this early on a fresh branch so nothing new depends on epoch.
+
+| Remove | Replace |
+|--------|---------|
+| `Tag.epoch`, `Lease.epoch`, `LeaseRef` | No lease id/epoch in data tags; `LeaseId` remains lease-table identity only |
+| `CountersRecord.next_epoch` | deleted |
+| `KernelError::Fenced` | `LeaseInvalid` / `LeaseConflict` |
+| Evidence as `{id, epoch}` | `Vec<LeaseId>` diagnostic-only; never admission-checked |
+
+- Bump `DataRecord` / `LeaseRecord` encode (fresh test stores OK).
+- **Not in scope:** `cipher_epoch` / `SpaceEnvelope` rotation — unrelated crypto-key concern.
+
+**Exit:** grep clean for lease `Epoch`/`Fenced`/`LeaseRef` in core+server+client (except cipher/value-key epoch naming); evidence remains `Vec<LeaseId>` only.
+
+---
+
+## Phase 3 — Server admission rewrite
+
+**Files:** `server/src/space/data.rs`, `server/src/space/lease.rs`
+
+Rewritten semantics:
+
+1. Device seq fence: `device_seq > last_seq` (gaps OK).
+2. Per data batch: range asserts → sequential `Set` / `Delete` ops on scratch.
+3. **Set and Delete** require per-key `ver` monotonicity and must not conflict with any active incompatible lease held by another device/range; no presented lease is required.
+4. Multi-batch: all-or-nothing durable apply.
+5. Return `PutBatchResponse.results` with exactly one `PutBatchResult` per input batch.
+6. `evidence: Vec<LeaseId>` may be consulted only to improve rejection details; it never authorizes a write.
+7. Prefix aggregates: update on **data writes only** (`Set` and `Delete`); real deletes keep `live_count` accurate because the server can distinguish present vs deleted values.
+
+### Multi-batch result policy
+
+- V2 admission is still all-or-nothing: if any batch fails, no batch is durably applied.
+- Response shape is future-proofed as per-batch results:
+  - success path: every element is `Applied { admission_seq }`;
+  - failure path: failed/evaluated batches get `Failed { error }`; later batches may also get `Failed { error: NotEvaluated }`.
+- For range-assert / lease-assert style failures, evaluate all asserts in the failed batch and include all failed assertions in that batch's error details.
+- This response shape preserves room to relax all-or-nothing later without changing the client/server wire type.
+
+Lease verbs remain separate sync operations:
+
+- `acquire(requested_at, specs)` grants/refreshes reservations and returns leases carrying the stored client `requested_at` plus per-lease prefix barriers.
+- `release(ids)` drops reservations idempotently.
+- `list_leases(device)` returns active leases held by that device; each lease carries its original client `requested_at`, original `ttl`, server `granted_at`, and prefix-scoped grant barrier.
+- Incompatible active leases deny new acquires until released or expired; no steal path.
+- A held write lease by the same device should allow writes under it; an incompatible active lease by another device rejects the write.
+
+**Exit:** server unit/prop tests for sequential ops, asserts, per-batch result vector length, all failed asserts reported within a failed batch, multi-batch all-or-nothing, lease-conflict write rejection, and writes admitted without leases when no conflict exists.
+
+---
+
+## Phase 4 — Client meta: rollback + certify
+
+**Files:** `client/src/meta.rs`
+
+### Per-space oplogs
+
+- `ClientState` keeps device identity globally, but queue/cursor state under each `SpaceState`.
+- `OplogCursors { head, neck, tail }` and `OplogRecord::{Commit, Rollback}` records are keyed by `SpaceId` and persisted in `MetaStore`.
+- `MetaStore::reserve_batch`, `commit`, `oplog`, `trim_oplog`, `rollback`, and cursor/certify helpers take `space_id` and operate only on that space's queue.
+- `next_seq` is replaced by the space's `tail`; the "collapse `next_seq` vs tail" backlog item is part of this phase.
+- There is no separate in-memory scan pointer or second cursor set; every push iteration reloads or transactionally updates disk `head/neck/tail`.
+- Ver high-water is space-local and persisted with that space's state; stamping a write in one space must not consume or depend on another space's version high-water.
+
+### `rollback(to: DeviceSeq)`
+
+- Validate against that space's cursors: `neck <= to < tail`.
+- Append `OplogRecord::Rollback { marker }` at that space's `tail`; `neck = tail`; `tail += 1`; `head` unchanged.
+- Remove `discard_from`.
+
+### `reserve_batch` only
+
+- Single reservation path on `MetaStore` trait.
+- Caller assigns `ver` on Set/Delete ops before reserve (see Phase 5).
+- Conformance tests use a free `set_ops_from_entries(high, entries)` helper — not on trait.
+
+### `certify(state)`
+
+- For each space, walk `[neck, tail)` only; the space-local `ver_high` checks active ranges.
+- Lease records marked **Forgotten** never count as local authority, but remain durable release intents.
+- Called unconditionally at `Client::open`.
+
+### Lease release intents
+
+- Local lease records have an authority state: **Active** or **Forgotten**.
+- `release()` first persists `Forgotten` locally, then calls remote `release`.
+- If remote release succeeds, delete the local lease record.
+- If remote release fails or is unavailable, keep the Forgotten record so a later retry can release the server-side reservation.
+- `leases()` / local checked-write logic / evidence collection must treat Forgotten leases as non-existent authority.
+
+### Lease deadline margin
+
+- Local authority expires at `deadline - margin`, where `margin = max(ttl / 1000, 10ms)`.
+- Apply the same margin for active lease usability, checked-write local conflict/authority reads, and `leases()` reporting.
+
+**Exit:** meta unit tests for per-space cursors, cross-space queue isolation, rollback validation, certify gaps, reserve_batch, deadline-margin floor, and Forgotten leases never counting as local authority while remaining retryable.
+
+---
+
+## Phase 5 — Data-only `Space::submit_*` + lease API
+
+**Files:** `client/src/space.rs`, `client/src/cipher.rs`
+
+### Public API
+
+```rust
+// Data mutation surface on Space.
+space.submit_checked(ops: Vec<BatchOp>, range_asserts: Vec<RangeAssert>) -> Submission
+space.submit_unchecked(ops: Vec<BatchOp>, range_asserts: Vec<RangeAssert>) -> Submission
+
+pub struct Submission {
+    pub seq: DeviceSeq,
+    // private: owning Space handle/ref used by push()
+}
+
+impl Submission {
+    // Convenience only: calls space.push_until(self.seq).await and returns this seq's disposition.
+    pub async fn push(self) -> PushReceipt;
+}
+
+// Stream controls.
+space.push() -> PushOutcome
+space.push_until(seq: DeviceSeq) -> PushOutcome
+
+// Lease reservation surface.
+space.ensure(specs: Vec<LeaseSpec>) -> Ensured
+space.release(leases: Vec<LeaseId>) -> Released
+space.repair_leases() -> RepairedLeases
+```
+
+**Removed:** public `acquire()` and `Acquired`. `ensure()` is the only acquisition API and always performs the barrier pull before returning local authority. `release()` remains explicit and sync.
+
+### Inside `submit`
+
+1. **`stamp_data_ops`** — assign consecutive `ver` from the space-local disk `ver_high` for each `BatchOp::Set` and `BatchOp::Delete`.
+2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require an Active local lease covering that prefix and verify the local prefix seq/watermark equals the asserted `at`. Server admission remains authoritative.
+3. **`submit_unchecked`:** skip the local lease/range-assert gate; server admission still decides.
+4. **`reserve_batch`** → encode data ops (cipher `encode_batch_op`) → append to `MetaStore`.
+5. Return `Submission { seq }` after durable local append.
+6. `Submission::push()` is convenience only: it calls `space.push_until(seq).await` and extracts the disposition for this exact seq. It does not add a second admission/await mechanism.
+7. There is no empty-oplog precondition for `Submission::push()`. Semantics match "submit locally, then push through my seq"; earlier queued ops in the same space may be pushed first as part of reaching the target seq.
+
+### Inside `ensure` / `release`
+
+- `ensure()` mints client `requested_at`, calls the server `acquire` verb directly, records returned leases with local deadlines derived from `lease.requested_at + lease.ttl`, pulls every prefix needed to satisfy each lease's grant barrier, advances watermarks, and only then returns.
+- `ensure()` is allowed with non-empty local oplogs; it does not push buffered data first.
+- `release()` first marks leases Forgotten locally, then calls the server `release` verb, and deletes them locally only after success. It is not appended to the oplog.
+- A failed/unavailable release leaves Forgotten records behind for retry; callers and local checks treat them as already gone.
+- `repair_leases()` calls `list_leases(device)`, reconciles local Active/Forgotten leases to the server response, clears Forgotten records that are no longer live server-side, stamps repaired local deadlines from each returned lease's `requested_at + ttl`, pulls returned prefixes through each lease's grant barrier, and only then exposes repaired leases as usable.
+
+### Cipher
+
+- `encode_batch_op(device, seq, op, nonce)` for Set and Delete only.
+- **`encode_seal` / `verify_seal`** — AEAD with key-bound AAD (scheme + op kind + anonymized key/range descriptor + write context + `cipher_epoch`).
+- **Delete:** encrypt empty plaintext → `Seal` only; **Set:** encrypt payload → `Seal` + ciphertext.
+- **`decode_entry`** on read: verify seal binds to key; map `Value::Deleted` / `Present` for app layer.
+
+**Exit:** space driver tests for data submit API, `ensure()` barrier pull, release, release retry after unavailable server, lease repair after local state loss/staleness, and acquire/release/list_leases working while local data oplogs are non-empty.
+
+---
+
+## Phase 6 — Push + ack
+
+**Files:** `client/src/client.rs`, `client/src/space.rs`
+
+### Client shape
+
+- Client coordination runs as a single-owner event loop. Public `Space`/`Submission` handles send commands into the loop; all oplog cursor movement, lease-state changes, rollback decisions, and ack application happen there.
+- The loop does not perform slow work inline. SQLite/meta transactions and bulk crypto run on blocking worker threads; network calls and timers run as async tasks. Workers/tasks report results back over channels, and the loop applies them in serialized order.
+- Treat the loop as the correctness chokepoint, not the performance chokepoint: if a step can block or burn CPU, offload it and re-enter the loop only with the result.
+- No `ClientGlobals` (`next_seq`, `scan_from`, `push_cap` in memory).
+- `PushOptions { wait_through, cap }` per space push call.
+- Per-space cursors read from `MetaStore::load(space)` / equivalent each push iteration.
+
+### Push
+
+- Public push is space-scoped (`space.push()` and `space.push_until(seq)`); there is no public global `client.push()` that silently iterates spaces.
+- Push scans that space's disk `[neck, tail)`; coalesce up to `cap`; honor optional `wait_through`.
+- Rollback record → wire `NoOp` batch preserving sequence/fork semantics.
+
+### Ack (`through`)
+
+1. `trim_oplog(through)`.
+2. Advance disk cursors only; no lease hydration/drop happens during data ack.
+
+### Fork vs trim
+
+- `DeviceSeqRegression` where seq **not** in that space's local oplog → `Fork` (fatal).
+- Seq **in** that space's oplog → `trim_oplog(space, seq)` catch-up, not rollback.
+
+### Submission push sugar / wait-through
+
+- There is no separate `settle_seq` cursor or state machine.
+- `space.push()` is the low-level "move this space's stream as far as possible" control.
+- `space.push_until(seq)` is the low-level "move this space's stream until at least this seq has a disposition" control.
+- `submission.push()` is sugar over `space.push_until(self.seq).await`; it extracts and returns the target seq's disposition from the push outcome so the common "push my write" case is correctly attributed.
+- `space.push()` pushes the stream; `submission.push()` pushes until this submission has a disposition.
+- `submit_*` remains the only local append operation.
+- Success means that seq has been acked/trimmed from the target space's disk oplog.
+- On stall/failure at or before the target: return the target seq's failure/stall disposition — **no** automatic rollback.
+
+**Exit:** push/wait-through/ack tests; `Submission::push()` attribution tests; fork vs trim tests from engine.
+
+---
+
+## Phase 7 — Submit/push ergonomics (policy summary)
+
+| API | Meaning | On stall/failure |
+|-----|---------|------------------|
+| `space.submit_checked(ops, asserts)` | Local append after local lease/range-assert gate; requires Active local lease coverage and matching local prefix seq for each assert; returns `Submission { seq }` | Caller owns retry/push/rollback policy |
+| `space.submit_unchecked(ops, asserts)` | Local append without local gate; server admission still decides | Caller owns retry/push/rollback policy |
+| `space.push()` | Push this space's oplog as far as possible | Returns stream outcome |
+| `space.push_until(seq)` | Push this space until `seq` is acked/failed/stalled | Returns outcome containing disposition for relevant seqs |
+| `submission.push()` | Convenience for `space.push_until(submission.seq).await`, extracting this seq's disposition | Returns this seq's disposition; no automatic rollback |
+
+### App flow (document in Phase 10)
+
+```rust
+let submission = space.submit_checked(set_ops, asserts).await?;
+let receipt = submission.push().await?;
+
+space.ensure(vec![write_spec(db)]).await?;  // allowed even with pending data
+space.push().await?;
+```
+
+**Exit:** rollback.rs tests for checked/unchecked submit, `push_until` wait-through, `Submission::push()` disposition attribution, stall leaves oplog, disk cursors survive reopen.
+
+---
+
+## Phase 8 — Tests
+
+| Area | Action |
+|------|--------|
+| `client/tests/rollback.rs` | New — `submit_checked` / `submit_unchecked`, `push_until`, `Submission::push`, stall, rollback marker, cursors |
+| `client/tests/common/mod.rs` | Test helpers only (`set_op`, `blocking_ensure`, `blocking_release`, …) — **not** exported from crate |
+| `engine.rs` / torture / equivalence / sim | Update for PutBatch shape, data-only submit/push, Fork trim |
+| meta conformance | per-space head/neck/tail; space-local `ver_high`; certify `[neck,tail)` per space |
+| lease release | Forgotten lease is not authority, survives failed release, retries until remote ack deletes it |
+| lease deadlines | local usability margin is `max(ttl / 1000, 10ms)` |
+| lease repair | `list_leases` restores active server leases with per-lease prefix barrier pull, uses returned `requested_at + ttl` for local deadlines, drops stale local Active leases, and clears acked Forgotten leases |
+| client event loop | coordination-state transitions are serialized through the loop; blocking SQLite/bulk crypto are offloaded; network/timers return via channels |
+| server props | sequential ops, assert aggregation, per-batch results, multi-batch all-or-nothing, write-without-lease, lease-conflict rejection |
+
+Build on committed test harness (Phase 0).
+
+**Exit:** `cargo test --workspace` green.
+
+---
+
+## Phase 9 — Prefix aggregates + range delete prep (optional, staged)
+
+Seal + explicit `Delete` land in Phases 1/3/5. Phase 9 is follow-on kernel cleanup and `DeleteRange` prep.
+
+### Stage A — Keep `live_count` correct
+
+- Do **not** drop `live_count`. Real `BatchOp::Delete` gives the kernel enough information to maintain it correctly.
+- Update prefix aggregate tests for present → delete, delete → present, repeated delete, and zero-length present values.
+- Snapshot may keep the `live_count == 0` fast-path because deleted rows are server-visible and counted out of liveness.
+
+### Stage B — `DeleteRange` (when specified)
+
+- New `BatchOp::DeleteRange { prefix, ver, seal, ... }` — seal uses the same `{ scheme, nonce, aead }` shape with AEAD plaintext `b""` or specified range metadata, and AAD bound to op kind plus anonymized prefix/range descriptor.
+- Admission: range delete is rejected only when an active incompatible lease conflicts with the target prefix/range; single ver bump or per-key vers TBD at design time.
+- Prefix aggregate maintenance must remain exact under `DeleteRange`; define and test the `live_count` update strategy before landing the op.
+
+**Exit:** server props updated; cipher delete + delete-range roundtrip tests.
+
+---
+
+## Phase 10 — Documentation
+
+- `DESIGN.md`: data batches, per-space oplogs, single-owner client event loop, sync lease reservations, lease-conflict admission, range asserts, oplog submit/push policy, data submit API, caller-driven rollback.
+- `LAUNCH_CHECKLIST.md`: drop epoch/fenced items; update attach/genesis wording.
+- Module docs: per-space head/neck/tail; not-guaranteed-until-pushed; `Submission::push()` is sugar over `space.push_until(seq)`.
+
+---
+
+## Backlog (promote to phases when ready)
+
+Items from conversation + `TODO.md` — **not** scheduled in v2 rebuild unless you explicitly add them:
+
+### Client / meta
+
+- **`resume_pending()`** after open when online (`push_until` wait-through / rollback marker push / offline push retry semantics).
+- Client-level oplog for cross-space / two-phase commits if needed later.
+- **`verify` Cargo feature** — gate `meta::conformance`, `server::conformance`, `audit()`; keep `certify` always on.
+- Export `blocking_ensure` / `blocking_release` from crate vs test-only helpers.
+
+### Server / kernel
+
+- Human/admin lease takeover flow — later explicit feature, not pre-deadline stealing.
+- **Space certification / auth mode** at space creation.
+- **`DeleteRange`** — after single-key Delete + Seal stable (Phase 9B or new phase).
+
+### Leasing / correctness model (TODO OCC notes)
+
+- OCC as base case.
+- Forever reservations ≈ local SQLite semantics.
+- Forever with human-initiated takeover — explicit recovery path only.
+- Bounded — OCC with reduced contention.
+
+### Multilite / infra (existing TODO.md)
+
+- Client disk store (`DiskStore` / redb).
+- Serverless attach without leases.
+- Crate rename / repo move.
+- Identity spec reconciliation (`SpaceEnvelope`, etc.).
+
+---
+
+## Reviewable work batches
+
+Each batch should be reviewable as one commit. Every batch includes the listed tests and a small documentation/module-comment update so the behavior being landed is also described where future readers will look.
+
+| Batch | Scope | Tests | Docs |
+|-------|-------|-------|------|
+| B0 Baseline | Stash current WIP, confirm committed main, copy this plan into the repo | `cargo test --workspace` | Note baseline commit hashes and WIP exclusions in this plan |
+| B1 Seal primitives | Add `SealScheme::{AeadV1}`, checked `u8` conversions, `Seal { scheme, nonce, aead, payload }`, `RangeAssert`, explicit `BatchOp::{Set, Delete, NoOp}` scaffolding, and non-empty key components | core roundtrips/shape tests; unknown scheme rejects; `AeadV1` rejects non-empty payload; empty key components reject | core message/seal/key module docs for scheme vs op kind, payload, and non-empty Set plaintext framing |
+| B2 Lease wire model | Remove lease epochs/fencing/stealing types; add `Lease { requested_at, granted_at, ttl, barrier }`; add acquire/list/release request-response shapes | core encode/decode; no `Epoch`/`Fenced`/`LeaseRef` grep except unrelated crypto epoch | lease module docs for client/server clock domains and prefix-scoped barrier |
+| B3 PutBatch response + oplog shapes | Add per-batch `PutBatchResult`; change local oplog to `OplogRecord::{Commit {..}, Rollback {..}}`; keep evidence diagnostic-only | core serialization tests for result vectors and oplog enum variants | messages/oplog docs for all-or-nothing response semantics and evidence |
+| B4 Server lease verbs | Implement no-steal acquire/refresh, idempotent release, `list_leases(device)`, prefix-scoped barriers, `requested_at` storage | server lease unit/prop tests for refresh, expiry, list repair, no stealing, prefix barrier not global high-water | server lease docs for reservation semantics and deadline math |
+| B5 Server data admission | Replace legacy `PutEntry` / `Value::Absent` path with `BatchOp` + `Value::{Present, Deleted}`; admit Set/Delete without requiring a lease when no incompatible active lease conflicts; use evidence only for errors | server tests for write-without-lease, conflict rejection, same-device held lease, delete admission | server data docs for explicit deletes and leases as reservations, not capabilities |
+| B6 Server batch apply + aggregates | Multi-batch scratch apply, per-batch success/failure vector, aggregate all failed asserts in failed batch, maintain `live_count` for real deletes | server props for sequential ops, all-or-nothing, result length, assert aggregation, live_count Set/Delete transitions | server aggregate docs for Present/Deleted and live_count contract |
+| B7 Meta per-space state | Move oplogs/cursors and `ver_high` to per-space persisted state; all MetaStore methods take `space_id`; no in-memory cursor mirror | meta conformance for cross-space isolation, space-local versions, cursor persistence, gaps | meta docs for head/neck/tail and space-local versioning |
+| B8 Meta rollback/certify | Implement rollback marker append using `OplogRecord::Rollback`; certify `[neck, tail)` per space; keep `certify` always on | rollback validation tests, certify gap tests, reopen/certify tests | meta docs for rollback marker and fork-safety purpose |
+| B9 Client event loop scaffold | Route public client/space operations through single-owner coordination loop; offload SQLite/bulk crypto to blocking workers and network/timers to tasks | concurrency tests that state transitions only happen on loop; worker result ordering tests | client module docs for correctness chokepoint vs performance workers |
+| B10 Submit API + checked gate | Add `submit_checked`, `submit_unchecked`, `Submission { seq }`; checked mode verifies Active lease coverage and matching local prefix seq for every `RangeAssert`; stamp from space-local `ver_high` | client submit tests for checked success, missing lease rejection, seq mismatch rejection, unchecked bypass, space-local vers | space docs for submit vs push and checked range-assert semantics |
+| B11 Cipher integration | Implement `encode_batch_op`, Seal AAD with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
+| B12 Lease client API | Expose `ensure`, `release`, `repair_leases`; remove public acquire; implement Forgotten release intents, local deadline margin, barrier pulls | client lease tests for ensure barrier pull, non-empty oplog ensure, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant and repair algorithm |
+| B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits NoOp wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
+| B14 Fork/trim hardening | Distinguish fatal fork from server-ahead trim using per-space oplog membership; update engine/torture/equivalence/sim harnesses | fork vs trim tests; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for duplicate device identity and catch-up trim |
+| B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length present | server docs for why live_count remains and DeleteRange prerequisites |
+| B16 Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit wording and link this plan |
+
+Suggested commit messages: `batch NN: <short description>`. Promote optional or backlog work only by adding a new batch with its own tests/docs row.
+
+---
+
+## Key risks (updated)
+
+1. **Split data/lease API** — data writes go through `submit_checked` / `submit_unchecked`; lease reservation uses `ensure()` and explicit `release()`, never the oplog.
+2. **Local lease subset invariant** — release must mark Forgotten before network IO; Forgotten leases are retry state, not authority.
+3. **Per-space oplog migration** — every MetaStore oplog/cursor method must be audited for explicit `space_id`.
+4. **Lease barrier scope** — server-listed or newly acquired leases must not become usable until pulled through each lease's prefix-scoped grant barrier (`effective_prefix_max(prefix)`), not a global high-water.
+5. **Submission push is sugar, not mechanism** — `Submission::push()` must remain a thin wrapper over `space.push_until(seq)` with no empty-oplog precondition and no automatic rollback.
+6. **Lease deadline clock domains** — server expiry uses `granted_at + ttl`; client local authority expiry uses stored client-domain `requested_at + ttl`, then subtracts the `max(ttl / 1000, 10ms)` margin. This may expire locally early, preserving the subset invariant.
+7. **Seal scheme discipline** — present vs delete vs zero-length present must stay unambiguous via explicit wire op + op-kind-bound AAD; `scheme` is only the sealing scheme; empty Set must not leak as empty ciphertext.
+8. **Caller-driven rollback** — multilite must wire stall → rollback explicitly.
+9. **No `resume_pending`** initially — crash recovery gap until backlog item lands.
+10. **Multi-batch all-or-nothing** — client retries smaller windows on failure.
+11. **Epoch removed early** — breaking encode; all test stores recreated.
+12. **Monolithic WIP discarded** — do not merge stash; re-land by phase.
+
+---
+
+## How to use this plan
+
+1. Stash WIP.
+2. Pick the next batch in **Reviewable work batches**.
+3. Implement **only that batch** + its tests/docs row.
+4. Run `cargo test --workspace`.
+5. Commit with message `batch NN: <short description>`.
+6. Promote backlog items to new batches when you want them — one idea at a time.

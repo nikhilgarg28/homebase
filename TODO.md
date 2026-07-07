@@ -18,3 +18,10 @@ to detect that multilite db was written to from sqlite later
 - add more kinds of leases - forever lease, oneshot lease?
 - Clock - track lineage so that we can track incarnation key from process restart
 - Should client be renamed to be device or all device machinery (ID, seqnum etc) should be mapped to client (i.e ClientID)
+
+key ver today is global lamport - make it lamport per hash bucket 2^16
+
+support Device fencing
+
+codec for smuggle admission seq, keep 64 random seqs, use trailing 0s to decide etc.
+ensure key components can not be empty

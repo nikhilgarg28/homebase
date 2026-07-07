@@ -6,7 +6,7 @@ use proptest::prelude::*;
 /// Fully random keys across the whole legal shape space.
 fn arb_key() -> impl Strategy<Value = Key> {
     prop::collection::vec(
-        prop::collection::vec(any::<u8>(), 0..=MAX_COMPONENT_LEN),
+        prop::collection::vec(any::<u8>(), 1..=MAX_COMPONENT_LEN),
         1..=MAX_COMPONENTS,
     )
     .prop_map(|components| Key::from_bytes(components).unwrap())
@@ -17,7 +17,7 @@ fn arb_key() -> impl Strategy<Value = Key> {
 /// exactly on escape/terminator edge cases.
 fn arb_clustered_key() -> impl Strategy<Value = Key> {
     let byte = prop::sample::select(vec![0x00u8, 0x01, 0x02, 0xfe, 0xff, b'a']);
-    prop::collection::vec(prop::collection::vec(byte, 0..4), 1..=4)
+    prop::collection::vec(prop::collection::vec(byte, 1..4), 1..=4)
         .prop_map(|components| Key::from_bytes(components).unwrap())
 }
 

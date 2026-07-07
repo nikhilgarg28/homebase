@@ -18,6 +18,7 @@
 
 use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+use crate::seal::Seal;
 use crate::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Value, Ver};
 use std::fmt;
 use std::time::Duration;
@@ -112,6 +113,35 @@ pub struct ReleaseResponse {}
 
 // ---------------------------------------------------------------------------
 // put_batch
+
+/// Equality assertion for the server-visible max admission sequence under a
+/// component-wise prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeAssert {
+    pub prefix: Key,
+    pub at: AdmissionSeq,
+}
+
+/// One v2 data operation within a client batch.
+///
+/// Set ciphertext is separate from the AEAD tag stored in [`Seal`]. To avoid
+/// leaking empty logical values as empty ciphertexts, clients should encrypt a
+/// non-empty Set plaintext frame even when the application value is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchOp {
+    Set {
+        key: Key,
+        ver: Ver,
+        seal: Seal,
+        ciphertext: Vec<u8>,
+    },
+    Delete {
+        key: Key,
+        ver: Ver,
+        seal: Seal,
+    },
+    NoOp,
+}
 
 /// One write within a batch. Deletes are explicit: writing
 /// [`Value::Absent`] stores a tombstone.
