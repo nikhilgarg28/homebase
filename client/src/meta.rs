@@ -177,7 +177,6 @@ pub struct CodecRecord {
 /// which is what keeps offline authority across restarts. The clock
 /// high-water is the tripwire for wall regression: a poisoned open
 /// zeroes the stamp (structurally dead) until a renewal re-stamps it.
-/// Epochs remain the correctness backstop for writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldLease {
     pub lease: Lease,
@@ -1085,7 +1084,7 @@ const VER_HIGH_RECORD_VERSION: u8 = 1;
 const WATERMARK_RECORD_VERSION: u8 = 1;
 const CLOCK_RECORD_VERSION: u8 = 1;
 const CODEC_RECORD_VERSION: u8 = 1;
-const LEASE_RECORD_VERSION: u8 = 2;
+const LEASE_RECORD_VERSION: u8 = 3;
 const COMMIT_RECORD_VERSION: u8 = 1;
 
 impl DeviceRecord {
@@ -1207,17 +1206,20 @@ impl CodecRecord {
 impl HeldLease {
     pub fn encode(&self) -> Vec<u8> {
         let l = &self.lease;
-        let mut out = Vec::with_capacity(1 + 8 + 1 + 1 + 8 + 8 + 32 + 32 + 10);
+        let mut out = Vec::with_capacity(1 + 8 + 1 + 8 * 5 + 16 * 2 + 10);
         out.push(LEASE_RECORD_VERSION);
         out.extend_from_slice(&l.id.0.to_be_bytes());
         out.push(match l.mode {
             LeaseMode::Read => 0,
             LeaseMode::Write => 1,
         });
-        out.push(l.stealable as u8);
-        out.extend_from_slice(&l.epoch.0.to_be_bytes());
+        out.extend_from_slice(&l.requested_at.wall.0.to_be_bytes());
+        out.extend_from_slice(&l.requested_at.mono.0.to_be_bytes());
+        out.extend_from_slice(&l.requested_at.lineage.0);
+        out.extend_from_slice(&l.granted_at.0.to_be_bytes());
         let ttl_ms = l.ttl.as_millis().min(u64::MAX as u128) as u64;
         out.extend_from_slice(&ttl_ms.to_be_bytes());
+        out.extend_from_slice(&l.barrier.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.wall.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.mono.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.lineage.0);
@@ -1236,7 +1238,7 @@ impl HeldLease {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
         let version = r.u8()?;
-        if !matches!(version, 1 | LEASE_RECORD_VERSION) {
+        if version != LEASE_RECORD_VERSION {
             return None;
         }
         let id = LeaseId(r.u64()?);
@@ -1245,32 +1247,28 @@ impl HeldLease {
             1 => LeaseMode::Write,
             _ => return None,
         };
-        let stealable = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return None,
+        let requested_at = HybridTimestamp {
+            wall: Timestamp(r.u64()?),
+            mono: Timestamp(r.u64()?),
+            lineage: Lineage(r.bytes16()?),
         };
-        let epoch = homebase_core::tag::Epoch(r.u64()?);
+        let granted_at = Timestamp(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
+        let lease_barrier = AdmissionSeq(r.u64()?);
         let deadline = HybridTimestamp {
             wall: Timestamp(r.u64()?),
             mono: Timestamp(r.u64()?),
             lineage: Lineage(r.bytes16()?),
         };
-        let (retiring, barrier) = if version == 1 {
-            (false, None)
-        } else {
-            let retiring = match r.u8()? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
-            let barrier = match r.u8()? {
-                0 => None,
-                1 => Some(AdmissionSeq(r.u64()?)),
-                _ => return None,
-            };
-            (retiring, barrier)
+        let retiring = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let barrier = match r.u8()? {
+            0 => None,
+            1 => Some(AdmissionSeq(r.u64()?)),
+            _ => return None,
         };
         let prefix = Key::decode(r.rest()).ok()?;
         Some(Self {
@@ -1278,9 +1276,10 @@ impl HeldLease {
                 id,
                 prefix,
                 mode,
-                epoch,
+                requested_at,
+                granted_at,
                 ttl,
-                stealable,
+                barrier: lease_barrier,
             },
             deadline,
             barrier,
@@ -1440,9 +1439,10 @@ pub mod conformance {
                 id: LeaseId(42),
                 prefix: key(&[b"db", b"pay"]),
                 mode: LeaseMode::Write,
-                epoch: homebase_core::tag::Epoch(9),
+                requested_at: stamp(1_000),
+                granted_at: Timestamp(1_010),
                 ttl: Duration::from_secs(300),
-                stealable: true,
+                barrier: AdmissionSeq(13),
             },
             deadline: stamp(1_300),
             barrier: None,
@@ -1756,9 +1756,10 @@ pub mod conformance {
                 id: LeaseId(43),
                 prefix: key(&[b"db", b"hr"]),
                 mode: LeaseMode::Read,
-                epoch: homebase_core::tag::Epoch(10),
+                requested_at: stamp(1_700),
+                granted_at: Timestamp(1_705),
                 ttl: Duration::from_secs(300),
-                stealable: false,
+                barrier: AdmissionSeq(40),
             },
             deadline: stamp(2_000),
             barrier: Some(AdmissionSeq(40)),
@@ -1773,9 +1774,10 @@ pub mod conformance {
                 id: LeaseId(7),
                 prefix: key(&[b"dir"]),
                 mode: LeaseMode::Write,
-                epoch: homebase_core::tag::Epoch(1),
+                requested_at: stamp(800),
+                granted_at: Timestamp(805),
                 ttl: Duration::from_secs(60),
-                stealable: false,
+                barrier: AdmissionSeq(0),
             },
             deadline: stamp(900),
             barrier: None,
@@ -1892,7 +1894,6 @@ pub mod conformance {
 mod tests {
     use super::*;
     use homebase_core::storage::MemoryStore;
-    use homebase_core::tag::Epoch;
     use pollster::block_on;
 
     const SPACE: SpaceId = SpaceId([7; 16]);
@@ -1981,9 +1982,10 @@ mod tests {
                 id: LeaseId(42),
                 prefix: key(&[b"db", b"pay"]),
                 mode: LeaseMode::Write,
-                epoch: Epoch(9),
+                requested_at: stamp(1_000),
+                granted_at: Timestamp(1_010),
                 ttl: Duration::from_secs(300),
-                stealable: true,
+                barrier: AdmissionSeq(17),
             },
             deadline: stamp(1_234),
             barrier: Some(AdmissionSeq(17)),
@@ -2112,9 +2114,10 @@ mod tests {
                     id: LeaseId(1),
                     prefix: key(&[b"db"]),
                     mode: LeaseMode::Write,
-                    epoch: Epoch(1),
+                    requested_at: stamp(99_000),
+                    granted_at: Timestamp(99_010),
                     ttl: Duration::from_secs(1),
-                    stealable: false,
+                    barrier: AdmissionSeq(0),
                 },
                 // wall send = 100_000 − 1_000 = 99_000, far past the
                 // high-water: a stamp the recorded timeline never saw.

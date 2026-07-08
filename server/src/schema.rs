@@ -44,7 +44,7 @@
 //! add space id, kind, and suffix components), which is why they encode via
 //! [`encode_components`] rather than [`Key::encode`].
 
-use homebase_core::clock::Timestamp;
+use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::space::SpaceId;
@@ -216,7 +216,7 @@ pub fn counters_key(space: SpaceId) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // record values
 
-const LEASE_RECORD_VERSION: u8 = 1;
+const LEASE_RECORD_VERSION: u8 = 2;
 const COUNTERS_RECORD_VERSION: u8 = 1;
 const DATA_RECORD_VERSION: u8 = 1;
 const DEVICE_RECORD_VERSION: u8 = 1;
@@ -230,14 +230,18 @@ pub struct LeaseRecord {
     pub prefix: Key,
     pub mode: LeaseMode,
     pub device: DeviceId,
+    /// Client clock stamp supplied with the acquire request that granted this lease.
+    pub requested_at: HybridTimestamp,
+    /// Server clock stamp at grant/renewal.
+    pub granted_at: Timestamp,
+    /// Prefix-scoped admission barrier captured at grant.
+    pub barrier: AdmissionSeq,
     pub epoch: Epoch,
     /// Server-side deadline: the lease is live strictly before this instant
     /// (strict local expiry — at the deadline it is gone).
     pub deadline: Timestamp,
     /// The granted TTL, reused on renewal.
     pub ttl: Duration,
-    /// Opted in to pre-deadline preemption by `acquire(steal = true)`.
-    pub stealable: bool,
 }
 
 impl LeaseRecord {
@@ -246,15 +250,19 @@ impl LeaseRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 1 + 16 + 8 * 4 + 32);
+        let mut out = Vec::with_capacity(1 + 8 + 1 + 16 + 16 + 8 * 8 + 32);
         out.push(LEASE_RECORD_VERSION);
         out.extend_from_slice(&self.id.0.to_be_bytes());
         out.push(match self.mode {
             LeaseMode::Read => 0,
             LeaseMode::Write => 1,
         });
-        out.push(self.stealable as u8);
         out.extend_from_slice(&self.device.0);
+        out.extend_from_slice(&self.requested_at.wall.0.to_be_bytes());
+        out.extend_from_slice(&self.requested_at.mono.0.to_be_bytes());
+        out.extend_from_slice(&self.requested_at.lineage.0);
+        out.extend_from_slice(&self.granted_at.0.to_be_bytes());
+        out.extend_from_slice(&self.barrier.0.to_be_bytes());
         out.extend_from_slice(&self.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.0.to_be_bytes());
         let ttl_ms = self.ttl.as_millis().min(u64::MAX as u128) as u64;
@@ -274,12 +282,14 @@ impl LeaseRecord {
             1 => LeaseMode::Write,
             _ => return None,
         };
-        let stealable = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
         let device = DeviceId(r.bytes16()?);
+        let requested_at = HybridTimestamp {
+            wall: Timestamp(r.u64()?),
+            mono: Timestamp(r.u64()?),
+            lineage: Lineage(r.bytes16()?),
+        };
+        let granted_at = Timestamp(r.u64()?);
+        let barrier = AdmissionSeq(r.u64()?);
         let epoch = Epoch(r.u64()?);
         let deadline = Timestamp(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
@@ -289,10 +299,12 @@ impl LeaseRecord {
             prefix,
             mode,
             device,
+            requested_at,
+            granted_at,
+            barrier,
             epoch,
             deadline,
             ttl,
-            stealable,
         })
     }
 }
@@ -488,10 +500,12 @@ mod tests {
             prefix: Key::from_bytes([&b"db"[..], &b"pay"[..]]).unwrap(),
             mode: LeaseMode::Write,
             device: DeviceId([7; 16]),
+            requested_at: HybridTimestamp::ZERO,
+            granted_at: Timestamp(1000),
+            barrier: AdmissionSeq(3),
             epoch: Epoch(9),
             deadline: Timestamp(12345),
             ttl: Duration::from_secs(300),
-            stealable: false,
         }
     }
 
@@ -499,11 +513,6 @@ mod tests {
     fn lease_record_roundtrips() {
         let rec = sample_lease();
         assert_eq!(LeaseRecord::decode(&rec.encode()), Some(rec));
-        let stealable = LeaseRecord {
-            stealable: true,
-            ..sample_lease()
-        };
-        assert_eq!(LeaseRecord::decode(&stealable.encode()), Some(stealable));
     }
 
     #[test]

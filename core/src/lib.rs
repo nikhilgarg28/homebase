@@ -33,7 +33,7 @@ pub mod tag;
 
 pub use clock::{Clock, ManualClock, MonotonicClock, Timestamp};
 pub use key::{Key, KeyComponent};
-pub use lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+pub use lease::{Lease, LeaseId, LeaseMode};
 pub use messages::KernelError;
 pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};

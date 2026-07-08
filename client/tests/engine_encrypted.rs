@@ -1,16 +1,18 @@
 //! Encrypted-space crash-resume and ack-drop tortures.
 
-use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext, ValueNonce};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit};
+use homebase::cipher::{
+    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext, ValueNonce,
+};
+use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
-use homebase_core::messages::{GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest};
+use homebase_core::lease::LeaseMode;
+use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value, Ver};
+use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -63,7 +65,6 @@ fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(secs),
-        stealable: false,
     }
 }
 
@@ -111,11 +112,7 @@ async fn fetch_cipher(
     Entry {
         key: logical.clone(),
         value: cipher
-            .decode_value(
-                &encoded,
-                &stored.value,
-                ValueContext::from_tag(&stored.tag),
-            )
+            .decode_value(&encoded, &stored.value, ValueContext::from_tag(&stored.tag))
             .unwrap(),
         tag: stored.tag,
     }
@@ -148,10 +145,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             .unwrap();
             client.attach(&envelope).await.unwrap();
             let mut space_handle = client.space(space).await.unwrap();
-            let granted = space_handle
-                .acquire(vec![wspec(&db, 3_600)], false)
-                .await
-                .unwrap();
+            let granted = space_handle.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space_handle
                 .commit(vec![(row.clone(), val(b"secret"))])
                 .await
@@ -214,14 +208,8 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = space_handle
-            .acquire(vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
-        let lease = LeaseRef {
-            id: granted.leases[0].id,
-            epoch: granted.leases[0].epoch,
-        };
+        let granted = space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let lease = granted.leases[0].id;
         space_handle
             .commit(vec![(k1.clone(), val(b"one"))])
             .await
@@ -242,7 +230,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                 &space,
                 PutBatchRequest {
                     device: client.device(),
-                    leases: vec![lease],
+                    evidence: vec![lease],
                     batches: vec![
                         PutBatch {
                             device_seq: seq1,
@@ -274,34 +262,38 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
             fetch_cipher(&handle, space, &envelope, &k2).await.value,
             val(b"two")
         );
-        assert!(handle
-            .get(
-                &space,
-                GetRequest {
-                    keys: vec![k1.clone()],
-                },
-            )
-            .await
-            .unwrap()
-            .entries
-            .into_iter()
-            .next()
-            .flatten()
-            .is_none());
-        assert!(handle
-            .get(
-                &space,
-                GetRequest {
-                    keys: vec![encoded_k1],
-                },
-            )
-            .await
-            .unwrap()
-            .entries
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some());
+        assert!(
+            handle
+                .get(
+                    &space,
+                    GetRequest {
+                        keys: vec![k1.clone()],
+                    },
+                )
+                .await
+                .unwrap()
+                .entries
+                .into_iter()
+                .next()
+                .flatten()
+                .is_none()
+        );
+        assert!(
+            handle
+                .get(
+                    &space,
+                    GetRequest {
+                        keys: vec![encoded_k1],
+                    },
+                )
+                .await
+                .unwrap()
+                .entries
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some()
+        );
     });
 }
 
@@ -328,29 +320,13 @@ fn push_stall_recovers_via_ensure() {
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
-        space_handle
-            .acquire(vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
             .commit(vec![(row.clone(), val(b"v"))])
             .await
             .unwrap();
 
         clock.skew_wall(Duration::from_secs(3_600));
-        let outcome = client.push().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                PushOutcome::Stalled {
-                    error: KernelError::NotCovered { .. },
-                    ..
-                }
-            ),
-            "expired lease must stall, got {outcome:?}"
-        );
-
-        space_handle.ensure(vec![wspec(&db, 60)], false).await.unwrap();
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {

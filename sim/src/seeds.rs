@@ -1,6 +1,6 @@
 //! Seed counts for torture suites. Override via environment:
 //!
-//! - `HOMEBASE_TORTURE_SEEDS` — crash / steal / replica / persist (default 1000)
+//! - `HOMEBASE_TORTURE_SEEDS` — crash / lease contention / replica (default 1000)
 //! - `HOMEBASE_SCENARIO_SEEDS` — scenario harness (default 100)
 
 const DEFAULT_TORTURE: u64 = 1000;

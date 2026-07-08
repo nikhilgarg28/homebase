@@ -47,7 +47,6 @@ fn wspec(prefix: &Key) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(60),
-        stealable: false,
     }
 }
 
@@ -124,7 +123,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
             .await
             .unwrap();
         let mut space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db)], false).await.unwrap();
+        space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
         client.push().await.unwrap();
@@ -160,7 +159,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
 #[test]
 fn encrypted_pull_plus_oplog_matches_server_after_push() {
     block_on(async {
-        use homebase::cipher::{NameKey, NonceSource, SpaceKey, SpaceEnvelope, ValueNonce};
+        use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueNonce};
 
         #[derive(Clone)]
         struct TestNonceSource {
@@ -201,7 +200,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         .unwrap();
         client.attach(&envelope).await.unwrap();
         let mut space = client.space(space_id).await.unwrap();
-        space.acquire(vec![wspec(&db)], false).await.unwrap();
+        space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
         client.push().await.unwrap();
@@ -255,11 +254,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
                 .remove(0)
                 .unwrap();
             let decoded = cipher
-                .decode_value(
-                    encoded,
-                    &stored.value,
-                    ValueContext::from_tag(&stored.tag),
-                )
+                .decode_value(encoded, &stored.value, ValueContext::from_tag(&stored.tag))
                 .unwrap();
             assert_eq!(decoded, *plain);
         }

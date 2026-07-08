@@ -107,9 +107,9 @@ mod tests {
     use super::*;
     use futures::executor::{LocalPool, LocalSpawner};
     use futures::task::SpawnExt;
-    use homebase_core::clock::{ManualClock, Timestamp};
+    use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
     use homebase_core::key::Key;
-    use homebase_core::lease::{LeaseMode, LeaseRef};
+    use homebase_core::lease::LeaseMode;
     use homebase_core::messages::{
         AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
     };
@@ -167,24 +167,20 @@ mod tests {
         let granted = handle
             .acquire(AcquireRequest {
                 device: dev(1),
-                steal: false,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: key(&[b"db"]),
                     mode: LeaseMode::Write,
                     ttl: Duration::from_secs(60),
-                    stealable: false,
                 }],
             })
             .await
             .unwrap();
-        let lease = LeaseRef {
-            id: granted.leases[0].id,
-            epoch: granted.leases[0].epoch,
-        };
+        let lease = granted.leases[0].id;
         handle
             .put_batch(PutBatchRequest {
                 device: dev(1),
-                leases: vec![lease],
+                evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(1),
                     entries: vec![PutEntry {

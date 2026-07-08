@@ -122,6 +122,19 @@ impl ServerHandle for ClientTestServer {
         self.handle.release(req).await
     }
 
+    async fn list_leases(
+        &self,
+        space: &SpaceId,
+        req: homebase_core::messages::ListLeasesRequest,
+    ) -> Result<homebase_core::messages::ListLeasesResponse, homebase_core::space::SpaceError> {
+        if *space != self.space {
+            return Err(homebase_core::space::SpaceError::unavailable(
+                "space not served",
+            ));
+        }
+        self.handle.list_leases(req).await
+    }
+
     async fn put_batch(
         &self,
         space: &SpaceId,
@@ -196,12 +209,8 @@ impl HybridClock for SharedClock {
     }
 }
 
-type TestClient = Client<
-    OrderedMetaStore<SimStore>,
-    ClientTestServer,
-    SharedClock,
-    SystemNonceSource,
->;
+type TestClient =
+    Client<OrderedMetaStore<SimStore>, ClientTestServer, SharedClock, SystemNonceSource>;
 type ClientSlot = Rc<RefCell<Option<TestClient>>>;
 
 fn prefix() -> Key {
@@ -223,7 +232,6 @@ fn wspec() -> LeaseSpec {
         prefix: prefix(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(60),
-        stealable: true,
     }
 }
 
@@ -288,9 +296,8 @@ async fn driver(
                         .trim_oplog(admitted)
                         .await
                         .expect("trim after fork");
-                    *slot.borrow_mut() = Some(
-                        open_attached(sim.clone(), server.clone(), clock.clone()).await,
-                    );
+                    *slot.borrow_mut() =
+                        Some(open_attached(sim.clone(), server.clone(), clock.clone()).await);
                     std::mem::forget(guard);
                     coverage.borrow_mut().pushes += 1;
                     continue;
@@ -321,7 +328,7 @@ async fn driver(
             }
             Err(err) => panic!("unexpected space open: {err:?}"),
         };
-        if let Err(err) = space.ensure(vec![wspec()], true).await {
+        if let Err(err) = space.ensure(vec![wspec()]).await {
             match err {
                 SpaceDriverError::Storage(_) => coverage.borrow_mut().storage_errors += 1,
                 SpaceDriverError::Rejected(KernelError::Contended { .. }) => {}
@@ -350,11 +357,7 @@ async fn driver(
     }
 }
 
-async fn open_attached(
-    sim: SimStore,
-    server: ClientTestServer,
-    clock: SharedClock,
-) -> TestClient {
+async fn open_attached(sim: SimStore, server: ClientTestServer, clock: SharedClock) -> TestClient {
     let client = Client::open(
         OrderedMetaStore::new(sim),
         server,
@@ -403,14 +406,12 @@ async fn drain_push(
                 }
                 if matches!(
                     error,
-                    KernelError::NotCovered { .. }
-                        | KernelError::LeaseInvalid { .. }
-                        | KernelError::Fenced { .. }
+                    KernelError::NotCovered { .. } | KernelError::LeaseInvalid { .. }
                 ) {
                     let mut guard = take_client(slot);
                     let client = guard.client.as_mut().unwrap();
                     let space = client.space(SPACE).await.unwrap();
-                    let _ = space.ensure(vec![wspec()], true).await;
+                    let _ = space.ensure(vec![wspec()]).await;
                     finish_client(slot, guard);
                 }
             }
@@ -419,12 +420,10 @@ async fn drain_push(
                     .trim_oplog(admitted)
                     .await
                     .expect("trim after fork");
-                *slot.borrow_mut() = Some(
-                    open_attached(sim.clone(), server.clone(), clock.clone()).await,
-                );
+                *slot.borrow_mut() =
+                    Some(open_attached(sim.clone(), server.clone(), clock.clone()).await);
             }
-            Err(ClientError::Store(_))
-            | Err(ClientError::Space(SpaceDriverError::Storage(_))) => {
+            Err(ClientError::Store(_)) | Err(ClientError::Space(SpaceDriverError::Storage(_))) => {
                 coverage.borrow_mut().storage_errors += 1;
             }
             Err(err) => panic!("push failed during settle: {err:?}"),
@@ -522,9 +521,9 @@ fn phase_oracle(
         match (&ack.value, entry) {
             (Value::Absent, None) => {}
             (_, Some(entry)) if entry.value == ack.value => {}
-            (_, got) => panic!(
-                "acked value corrupted: {ack:?} got {got:?} (seed {seed}, phase {phase})"
-            ),
+            (_, got) => {
+                panic!("acked value corrupted: {ack:?} got {got:?} (seed {seed}, phase {phase})")
+            }
         }
     }
 }
@@ -577,13 +576,7 @@ fn run_seed(seed: u64) -> Coverage {
             server.clone(),
             shared.clone(),
         )));
-        pollster::block_on(drain_push(
-            &client,
-            &coverage,
-            &meta,
-            &server,
-            &shared,
-        ));
+        pollster::block_on(drain_push(&client, &coverage, &meta, &server, &shared));
         phase_oracle(
             &server,
             &acks,

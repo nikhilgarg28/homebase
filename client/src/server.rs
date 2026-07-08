@@ -29,9 +29,9 @@
 //! lie, and the contract only promises what every implementation can keep.
 
 use homebase_core::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListRequest, ListResponse,
-    PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest,
-    ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListLeasesRequest,
+    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space, SpaceError, SpaceId};
 use std::future::Future;
@@ -58,6 +58,12 @@ pub trait ServerHandle {
         space: &SpaceId,
         req: ReleaseRequest,
     ) -> impl Future<Output = Result<ReleaseResponse, SpaceError>> + Send;
+
+    fn list_leases(
+        &self,
+        space: &SpaceId,
+        req: ListLeasesRequest,
+    ) -> impl Future<Output = Result<ListLeasesResponse, SpaceError>> + Send;
 
     fn put_batch(
         &self,
@@ -121,6 +127,17 @@ where
         }
     }
 
+    async fn list_leases(
+        &self,
+        space: &SpaceId,
+        req: ListLeasesRequest,
+    ) -> Result<ListLeasesResponse, SpaceError> {
+        match self(space) {
+            Some(s) => s.list_leases(req).await,
+            None => Err(SpaceError::unavailable("space not served by this endpoint")),
+        }
+    }
+
     async fn put_batch(
         &self,
         space: &SpaceId,
@@ -179,6 +196,10 @@ impl Space for UnreachableSpace {
         match *self {}
     }
 
+    async fn list_leases(&self, _: ListLeasesRequest) -> Result<ListLeasesResponse, SpaceError> {
+        match *self {}
+    }
+
     async fn put_batch(&self, _: PutBatchRequest) -> Result<PutBatchResponse, SpaceError> {
         match *self {}
     }
@@ -226,6 +247,14 @@ impl ServerHandle for Offline {
         match *self {}
     }
 
+    async fn list_leases(
+        &self,
+        _space: &SpaceId,
+        _req: ListLeasesRequest,
+    ) -> Result<ListLeasesResponse, SpaceError> {
+        match *self {}
+    }
+
     async fn put_batch(
         &self,
         _space: &SpaceId,
@@ -259,8 +288,9 @@ pub mod conformance {
     //! in-process, and this suite is the definition of "observationally".
 
     use super::ServerHandle;
+    use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
-    use homebase_core::lease::{LeaseMode, LeaseRef};
+    use homebase_core::lease::LeaseMode;
     use homebase_core::messages::{
         AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
         PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
@@ -282,7 +312,6 @@ pub mod conformance {
             prefix: prefix.clone(),
             mode: LeaseMode::Write,
             ttl: Duration::from_secs(60),
-            stealable: false,
         }
     }
 
@@ -311,29 +340,26 @@ pub mod conformance {
                 &space,
                 AcquireRequest {
                     device: dev(1),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&db)],
-                    steal: false,
                 },
             )
             .await
             .expect("acquire on a served space");
         assert_eq!(granted.leases.len(), 1);
         assert_eq!(
-            granted.barrier,
+            granted.leases[0].barrier,
             AdmissionSeq(0),
             "fresh space: nothing admitted yet"
         );
-        let lease = LeaseRef {
-            id: granted.leases[0].id,
-            epoch: granted.leases[0].epoch,
-        };
+        let lease = granted.leases[0].id;
 
         let put = handle
             .put_batch(
                 &space,
                 PutBatchRequest {
                     device: dev(1),
-                    leases: vec![lease],
+                    evidence: vec![lease],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
                         entries: vec![PutEntry {
@@ -400,7 +426,7 @@ pub mod conformance {
                 &space,
                 RenewRequest {
                     device: dev(1),
-                    leases: vec![lease.id],
+                    leases: vec![lease],
                 },
             )
             .await
@@ -414,7 +440,7 @@ pub mod conformance {
                 &space,
                 ReleaseRequest {
                     device: dev(1),
-                    leases: vec![lease.id],
+                    leases: vec![lease],
                 },
             )
             .await
@@ -424,8 +450,8 @@ pub mod conformance {
                 &space,
                 AcquireRequest {
                     device: dev(2),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&db)],
-                    steal: false,
                 },
             )
             .await
@@ -467,8 +493,8 @@ pub mod conformance {
                 &space,
                 AcquireRequest {
                     device: dev(1),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&x)],
-                    steal: false,
                 },
             )
             .await
@@ -479,8 +505,8 @@ pub mod conformance {
                 &space,
                 AcquireRequest {
                     device: dev(2),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&x)],
-                    steal: false,
                 },
             )
             .await
@@ -495,7 +521,7 @@ pub mod conformance {
                 &space,
                 PutBatchRequest {
                     device: dev(2),
-                    leases: vec![],
+                    evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
                         entries: vec![PutEntry {
@@ -509,11 +535,8 @@ pub mod conformance {
             .await
             .unwrap_err();
         assert!(
-            matches!(
-                uncovered,
-                SpaceError::Kernel(KernelError::NotCovered { .. })
-            ),
-            "coverage refusal is a kernel decision, got {uncovered:?}"
+            matches!(uncovered, SpaceError::Kernel(KernelError::Contended { .. })),
+            "reservation refusal is a kernel decision, got {uncovered:?}"
         );
     }
 
@@ -538,8 +561,8 @@ pub mod conformance {
                 &unknown,
                 AcquireRequest {
                     device: dev(1),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&db)],
-                    steal: false,
                 },
             )
             .await
@@ -572,7 +595,7 @@ pub mod conformance {
                 &unknown,
                 PutBatchRequest {
                     device: dev(1),
-                    leases: vec![],
+                    evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
                         entries: vec![],

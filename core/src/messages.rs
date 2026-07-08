@@ -16,8 +16,9 @@
 //! enforcement on reads and writes is likewise a wire-layer concern; these
 //! types describe kernel semantics for a caller already inside a space.
 
+use crate::clock::HybridTimestamp;
 use crate::key::Key;
-use crate::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+use crate::lease::{Lease, LeaseId, LeaseMode};
 use crate::seal::Seal;
 use crate::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Value, Ver};
 use std::fmt;
@@ -36,9 +37,6 @@ pub struct LeaseSpec {
     /// Requested TTL; the grant may be shorter (kernel cap → class default
     /// → app pin).
     pub ttl: Duration,
-    /// Opt in to pre-deadline preemption by a later `steal = true` acquire
-    /// (see [`crate::lease`] module docs).
-    pub stealable: bool,
 }
 
 /// Batch lease acquisition. **All-or-nothing**: if any spec conflicts with a
@@ -48,11 +46,9 @@ pub struct LeaseSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcquireRequest {
     pub device: DeviceId,
+    /// Client-minted timestamp from the sending clock domain.
+    pub requested_at: HybridTimestamp,
     pub specs: Vec<LeaseSpec>,
-    /// Preempt stealable blockers pre-deadline. A spec still contends if
-    /// *any* of its incompatible live blockers is not stealable; a
-    /// successful steal purges the victims, and the fresh epochs fence them.
-    pub steal: bool,
 }
 
 /// Successful batch grant.
@@ -60,11 +56,6 @@ pub struct AcquireRequest {
 pub struct AcquireResponse {
     /// Granted leases, parallel to `specs`.
     pub leases: Vec<Lease>,
-    /// The acquire barrier: the admission high-water mark at grant time.
-    /// The caller must catch up (`read_at`) every acquired prefix to at
-    /// least this point before trusting local state — lease + barrier =
-    /// serializability, not just mutual exclusion.
-    pub barrier: AdmissionSeq,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +77,7 @@ pub struct RenewGrant {
     pub ttl: Duration,
     /// Another device wants an overlapping prefix. Demand-driven stickiness:
     /// the holder should release once past its min-hold and convenient;
-    /// until the deadline the steal stays denied.
+    /// until release or expiry the waiter stays contended.
     pub contended: bool,
 }
 
@@ -110,6 +101,20 @@ pub struct ReleaseRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseResponse {}
+
+// ---------------------------------------------------------------------------
+// list_leases
+
+/// Repair/inspection request for active leases held by one device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListLeasesRequest {
+    pub device: DeviceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListLeasesResponse {
+    pub leases: Vec<Lease>,
+}
 
 // ---------------------------------------------------------------------------
 // put_batch
@@ -165,14 +170,15 @@ pub struct PutBatch {
 
 /// Atomic write request (request = transaction; torn requests impossible).
 ///
-/// Admission requires: every entry's key covered by some presented **write**
-/// lease whose id and epoch are both live (epoch-fenced), and per-key `Ver`
-/// monotonicity. Read leases never authorize writes. Any violation rejects
+/// Admission requires: no entry's key overlaps a live foreign lease
+/// reservation, and every entry satisfies per-key `Ver` monotonicity.
+/// Presented lease ids are diagnostic evidence only. Any violation rejects
 /// the whole batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutBatchRequest {
     pub device: DeviceId,
-    pub leases: Vec<LeaseRef>,
+    /// Diagnostic lease evidence only; never admission authority.
+    pub evidence: Vec<LeaseId>,
     /// Successive client commits to admit atomically in one server turn.
     pub batches: Vec<PutBatch>,
 }
@@ -295,22 +301,18 @@ pub struct ReadAtResponse {
 pub enum KernelError {
     /// Acquire denied: a requested lease overlaps a live lease in an
     /// incompatible mode (write conflicts with everything; read conflicts
-    /// with write). Steals are denied until the holder's deadline unless
-    /// the blocker was granted stealable and the acquire passes `steal`.
+    /// with write).
     Contended {
         prefix: Key,
         /// Hint: remaining TTL of the blocking lease, if the server chooses
         /// to reveal it. Purely advisory backoff guidance.
         retry_after: Option<Duration>,
     },
-    /// The presented lease id is not live: expired (strict local expiry),
-    /// released, or never granted.
+    /// The presented lease id is not live: expired, released, or never
+    /// granted. Retained for lease verbs and diagnostics; put admission does
+    /// not treat evidence ids as authority.
     LeaseInvalid { lease: LeaseId },
-    /// The lease id is live but the presented epoch is stale — a fenced
-    /// zombie writer.
-    Fenced { lease: LeaseId },
-    /// A `put_batch` entry's key is not covered by any presented **write**
-    /// lease (read leases guard read sets; they never authorize writes).
+    /// Legacy coverage error. Reservation conflicts now use [`Contended`].
     NotCovered { key: Key },
     /// Per-key version monotonicity violated.
     VerRegression {
@@ -340,7 +342,6 @@ impl fmt::Display for KernelError {
                 None => write!(f, "prefix {prefix:?} is contended"),
             },
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
-            Self::Fenced { lease } => write!(f, "stale epoch presented for lease {lease:?}"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
             Self::VerRegression {
                 key,

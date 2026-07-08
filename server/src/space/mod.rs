@@ -23,9 +23,9 @@ use crate::error::Error;
 use crate::storage::OrderedStore;
 use homebase_core::clock::Timestamp;
 use homebase_core::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListRequest, ListResponse,
-    PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest,
-    ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListLeasesRequest,
+    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::SpaceId;
 use lease::LeaseManager;
@@ -52,8 +52,8 @@ impl Space {
         now: Timestamp,
         req: &AcquireRequest,
     ) -> Result<AcquireResponse, Error> {
-        let (leases, barrier) = self.leases.acquire(store, now, req).await?;
-        Ok(AcquireResponse { leases, barrier })
+        let leases = self.leases.acquire(store, now, req).await?;
+        Ok(AcquireResponse { leases })
     }
 
     pub async fn renew<S: OrderedStore>(
@@ -73,6 +73,15 @@ impl Space {
     ) -> Result<ReleaseResponse, Error> {
         self.leases.release(store, now, req).await?;
         Ok(ReleaseResponse {})
+    }
+
+    pub async fn list_leases<S: OrderedStore>(
+        &mut self,
+        store: &S,
+        now: Timestamp,
+        req: &ListLeasesRequest,
+    ) -> Result<ListLeasesResponse, Error> {
+        self.leases.list_leases(store, now, req).await
     }
 
     // -- data verbs ------------------------------------------------------------
@@ -115,8 +124,9 @@ impl Space {
 mod tests {
     use super::*;
     use crate::storage::MemoryStore;
+    use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
-    use homebase_core::lease::{LeaseMode, LeaseRef};
+    use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{
         KernelError, LeaseSpec, PutBatch, PutEntry, Range, RangeCursor, RangeCut,
     };
@@ -151,7 +161,7 @@ mod tests {
     }
 
     /// Space + store + a write lease over `("db",)` held by device 1.
-    fn setup() -> (Space, MemoryStore, LeaseRef) {
+    fn setup() -> (Space, MemoryStore, LeaseId) {
         let mut space = Space::new(SPACE);
         let store = MemoryStore::new();
         let resp = block_on(space.acquire(
@@ -159,31 +169,23 @@ mod tests {
             Timestamp(0),
             &AcquireRequest {
                 device: dev(1),
-                steal: false,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: key(&[b"db"]),
                     mode: LeaseMode::Write,
-                    stealable: false,
                     ttl: Duration::from_secs(3600),
                 }],
             },
         ))
         .unwrap();
-        let lease = &resp.leases[0];
-        (
-            space,
-            store,
-            LeaseRef {
-                id: lease.id,
-                epoch: lease.epoch,
-            },
-        )
+        let lease = resp.leases[0].id;
+        (space, store, lease)
     }
 
     fn put_batch(
         space: &mut Space,
         store: &MemoryStore,
-        lease: LeaseRef,
+        lease: LeaseId,
         device_seq: u64,
         entries: Vec<PutEntry>,
     ) -> Result<PutBatchResponse, Error> {
@@ -192,7 +194,7 @@ mod tests {
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(1),
-                leases: vec![lease],
+                evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
                     entries,
@@ -243,7 +245,7 @@ mod tests {
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(1),
-                leases: vec![lease],
+                evidence: vec![lease],
                 batches: vec![
                     PutBatch {
                         device_seq: DeviceSeq(1),
@@ -652,30 +654,27 @@ mod tests {
             Timestamp(2),
             &AcquireRequest {
                 device: dev(2),
-                steal: false,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: key(&[b"other"]),
                     mode: LeaseMode::Write,
-                    stealable: false,
                     ttl: Duration::from_secs(60),
                 }],
             },
         ))
         .unwrap();
         assert_eq!(
-            resp.barrier,
+            resp.leases[0].barrier,
             AdmissionSeq(1),
             "barrier = admission high water"
         );
     }
 
     #[test]
-    fn writes_without_write_lease_rejected() {
+    fn writes_without_covering_lease_allowed_when_unreserved() {
         let (mut space, store, lease) = setup();
         // Key outside the leased prefix.
         let outside = key(&[b"elsewhere"]);
-        let err =
-            put_batch(&mut space, &store, lease, 1, vec![put(&outside, b"v", 1)]).unwrap_err();
-        assert!(matches!(err, Error::Kernel(KernelError::NotCovered { .. })));
+        put_batch(&mut space, &store, lease, 1, vec![put(&outside, b"v", 1)]).unwrap();
     }
 }

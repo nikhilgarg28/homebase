@@ -7,7 +7,7 @@ use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
@@ -49,7 +49,6 @@ fn wspec(prefix: &Key) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(60),
-        stealable: false,
     }
 }
 
@@ -113,7 +112,7 @@ async fn run_flushed_crash_seed(seed: u64) {
             .await
             .unwrap();
         let mut space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db)], false).await.unwrap();
+        space.acquire(vec![wspec(&db)]).await.unwrap();
         space
             .commit(vec![(row.clone(), val(b"survived"))])
             .await
@@ -128,7 +127,7 @@ async fn run_flushed_crash_seed(seed: u64) {
         .await
         .unwrap();
     let mut space = client.space(SPACE).await.unwrap();
-    space.ensure(vec![wspec(&db)], false).await.unwrap();
+    space.ensure(vec![wspec(&db)]).await.unwrap();
     assert_eq!(
         client.push().await.unwrap(),
         PushOutcome::Drained {
@@ -141,11 +140,14 @@ async fn run_flushed_crash_seed(seed: u64) {
 #[test]
 fn unflushed_commit_is_lost_on_crash() {
     block_on(async {
-        let sim = SimStore::new(42, FaultConfig {
-            error_rate: 0.0,
-            flush_rate: 0.0,
-            max_latency_yields: 0,
-        });
+        let sim = SimStore::new(
+            42,
+            FaultConfig {
+                error_rate: 0.0,
+                flush_rate: 0.0,
+                max_latency_yields: 0,
+            },
+        );
         let mem = OrderedMetaStore::new(sim.clone());
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server();
@@ -161,7 +163,7 @@ fn unflushed_commit_is_lost_on_crash() {
                 .await
                 .unwrap();
             let mut space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db)], false).await.unwrap();
+            space.acquire(vec![wspec(&db)]).await.unwrap();
             space
                 .commit(vec![(row.clone(), val(b"volatile"))])
                 .await
@@ -193,11 +195,8 @@ fn ack_drop_trims_after_server_admitted() {
             .await
             .unwrap();
         let mut space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db)], false).await.unwrap();
-        let lease = LeaseRef {
-            id: granted.leases[0].id,
-            epoch: granted.leases[0].epoch,
-        };
+        let granted = space.acquire(vec![wspec(&db)]).await.unwrap();
+        let lease = granted.leases[0].id;
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
         space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
         sim.flush();
@@ -207,7 +206,7 @@ fn ack_drop_trims_after_server_admitted() {
                 &SPACE,
                 PutBatchRequest {
                     device: client.device(),
-                    leases: vec![lease],
+                    evidence: vec![lease],
                     batches: vec![
                         PutBatch {
                             device_seq: DeviceSeq(1),

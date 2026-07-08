@@ -18,9 +18,9 @@
 //!   (tombstones invisible, overwrites at final values);
 //! - the usual: full structural audit per phase, seeded replayability.
 
-use homebase_core::clock::{ManualClock, Timestamp};
+use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
     RangeCursor, RangeCut, ReadAtRequest,
@@ -79,7 +79,7 @@ struct WriterState {
     /// Last ver this client believes each pool key has. Refreshed from
     /// `VerRegression` when an unacked write survived a crash.
     vers: Rc<RefCell<BTreeMap<u64, u64>>>,
-    lease: Rc<RefCell<Option<LeaseRef>>>,
+    lease: Rc<RefCell<Option<LeaseId>>>,
     stamp: Rc<Cell<u64>>,
     rng_seed: u64,
 }
@@ -90,20 +90,16 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
         if state.lease.borrow().is_none() {
             let req = AcquireRequest {
                 device: WRITER,
-                steal: true,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: prefix(),
                     mode: LeaseMode::Write,
                     ttl: Duration::from_secs(60),
-                    stealable: true,
                 }],
             };
             match handle.acquire(req).await {
                 Ok(resp) => {
-                    *state.lease.borrow_mut() = Some(LeaseRef {
-                        id: resp.leases[0].id,
-                        epoch: resp.leases[0].epoch,
-                    });
+                    *state.lease.borrow_mut() = Some(resp.leases[0].id);
                 }
                 Err(SpaceError::Unavailable { .. }) => return,
                 Err(err) => panic!("unexpected acquire failure: {err:?}"),
@@ -124,7 +120,7 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
 
         let req = PutBatchRequest {
             device: WRITER,
-            leases: vec![state.lease.borrow().unwrap()],
+            evidence: vec![state.lease.borrow().unwrap()],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
                 entries: vec![PutEntry {

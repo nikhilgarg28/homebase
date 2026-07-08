@@ -29,9 +29,9 @@ use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 use homebase_core::clock::Clock;
 use homebase_core::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListRequest, ListResponse,
-    PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest,
-    ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListLeasesRequest,
+    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space as SpaceApi, SpaceError, SpaceId};
 use std::pin::Pin;
@@ -56,6 +56,7 @@ enum Command {
     Acquire(AcquireRequest, Reply<AcquireResponse>),
     Renew(RenewRequest, Reply<RenewResponse>),
     Release(ReleaseRequest, Reply<ReleaseResponse>),
+    ListLeases(ListLeasesRequest, Reply<ListLeasesResponse>),
     PutBatch(PutBatchRequest, Reply<PutBatchResponse>),
     Get(GetRequest, Reply<GetResponse>),
     List(ListRequest, Reply<ListResponse>),
@@ -104,6 +105,10 @@ impl<S: OrderedStore, C: Clock> SpaceActor<S, C> {
                 }
                 Command::Release(req, reply) => {
                     let result = self.machine.release(&*store, now, &req).await;
+                    let _ = reply.send(result.map_err(Into::into));
+                }
+                Command::ListLeases(req, reply) => {
+                    let result = self.machine.list_leases(&*store, now, &req).await;
                     let _ = reply.send(result.map_err(Into::into));
                 }
                 Command::PutBatch(req, reply) => {
@@ -175,6 +180,13 @@ impl SpaceApi for SpaceHandle {
         self.call(move |reply| Command::Release(req, reply))
     }
 
+    fn list_leases(
+        &self,
+        req: ListLeasesRequest,
+    ) -> impl Future<Output = Result<ListLeasesResponse, SpaceError>> + Send {
+        self.call(move |reply| Command::ListLeases(req, reply))
+    }
+
     fn put_batch(
         &self,
         req: PutBatchRequest,
@@ -207,9 +219,9 @@ mod tests {
     use crate::storage::MemoryStore;
     use futures::executor::LocalPool;
     use futures::task::LocalSpawnExt;
-    use homebase_core::clock::{ManualClock, Timestamp};
+    use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
     use homebase_core::key::Key;
-    use homebase_core::lease::{LeaseMode, LeaseRef};
+    use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{KernelError, LeaseSpec, PutBatch, PutEntry};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use std::time::Duration;
@@ -227,12 +239,11 @@ mod tests {
     fn acquire_req(device: u8, prefix: &Key, ttl_ms: u64) -> AcquireRequest {
         AcquireRequest {
             device: dev(device),
-            steal: false,
+            requested_at: HybridTimestamp::ZERO,
             specs: vec![LeaseSpec {
                 prefix: prefix.clone(),
                 mode: LeaseMode::Write,
                 ttl: Duration::from_millis(ttl_ms),
-                stealable: false,
             }],
         }
     }
@@ -240,14 +251,14 @@ mod tests {
     fn put_req(
         device: u8,
         seq: u64,
-        lease: LeaseRef,
+        lease: LeaseId,
         k: &Key,
         v: &[u8],
         ver: u64,
     ) -> PutBatchRequest {
         PutBatchRequest {
             device: dev(device),
-            leases: vec![lease],
+            evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
                 entries: vec![PutEntry {
@@ -275,10 +286,7 @@ mod tests {
         pool.run_until(async move {
             let prefix = key(&[b"db"]);
             let granted = handle.acquire(acquire_req(1, &prefix, 1000)).await.unwrap();
-            let lease = LeaseRef {
-                id: granted.leases[0].id,
-                epoch: granted.leases[0].epoch,
-            };
+            let lease = granted.leases[0].id;
 
             let k = key(&[b"db", b"row"]);
             let put = handle
@@ -345,10 +353,7 @@ mod tests {
                 .acquire(acquire_req(device, &prefix, 1000))
                 .await
                 .unwrap();
-            let lease = LeaseRef {
-                id: granted.leases[0].id,
-                epoch: granted.leases[0].epoch,
-            };
+            let lease = granted.leases[0].id;
             let mut seqs = Vec::new();
             for i in 1..=5u64 {
                 let k = key(&[format!("d{device}").as_bytes(), format!("k{i}").as_bytes()]);

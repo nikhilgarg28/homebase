@@ -67,7 +67,6 @@ fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(secs),
-        stealable: false,
     }
 }
 
@@ -126,10 +125,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
-        space_handle
-            .ensure(vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
             .commit(vec![(row.clone(), val(b"secret"))])
             .await
@@ -177,10 +173,7 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         .unwrap();
         writer.attach(&envelope).await.unwrap();
         let mut writer_space = writer.space(space).await.unwrap();
-        writer_space
-            .ensure(vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
             .commit(vec![(row1.clone(), val(b"one"))])
             .await
@@ -239,10 +232,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         .unwrap();
         writer.attach(&local_envelope).await.unwrap();
         let mut writer_space = writer.space(space).await.unwrap();
-        writer_space
-            .ensure(vec![wspec(&db, 60)], false)
-            .await
-            .unwrap();
+        writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
             .commit(vec![(row, val(b"before-link"))])
             .await

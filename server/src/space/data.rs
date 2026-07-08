@@ -8,9 +8,9 @@
 //!
 //! A batch admits if and only if, in this order:
 //!
-//! 1. every presented lease is live, owned, and epoch-exact, and every key
-//!    is covered by a presented **write** lease
-//!    ([`LeaseManager::validate_put`]);
+//! 1. every key has no live foreign lease reservation conflict
+//!    ([`LeaseManager::validate_put`]); presented lease ids are diagnostic
+//!    evidence only, not admission authority;
 //! 2. each client batch's `device_seq` strictly follows the device's stored
 //!    high water and the preceding batch in the request (replay and
 //!    out-of-order rejection);
@@ -65,14 +65,14 @@ pub async fn put_batch<S: OrderedStore>(
     now: Timestamp,
     req: &PutBatchRequest,
 ) -> Result<PutBatchResponse, Error> {
-    // 1. Lease coverage: per-key covering epochs, parallel to flattened entries.
+    // 1. Reservation conflicts: one legacy tag epoch per flattened entry.
     let keys: Vec<Key> = req
         .batches
         .iter()
         .flat_map(|batch| batch.entries.iter().map(|entry| entry.key.clone()))
         .collect();
     let epochs = leases
-        .validate_put(store, now, req.device, &req.leases, &keys)
+        .validate_put(store, now, req.device, &req.evidence, &keys)
         .await?;
 
     // 2. Device replay fence.

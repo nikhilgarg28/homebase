@@ -267,7 +267,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                 .collect();
             let request = PutBatchRequest {
                 device,
-                leases: live_write_leases(self.store(), self.clock(), space, &keys).await?,
+                evidence: live_write_leases(self.store(), self.clock(), space, &keys).await?,
                 batches,
             };
             match self.server.put_batch(&space, request).await {

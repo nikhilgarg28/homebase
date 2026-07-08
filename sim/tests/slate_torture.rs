@@ -6,9 +6,9 @@
 
 #![cfg(feature = "slatedb")]
 
-use homebase_core::clock::{ManualClock, Timestamp};
+use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
     AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
 };
@@ -33,34 +33,24 @@ fn key(parts: &[&[u8]]) -> Key {
     Key::from_bytes(parts.iter().copied()).unwrap()
 }
 
-async fn write_marker(
-    handle: &SpaceHandle,
-    device_seq: u64,
-    stealable: bool,
-    steal: bool,
-    marker: &[u8],
-) {
+async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
     let granted = handle
         .acquire(AcquireRequest {
             device: dev(),
-            steal,
+            requested_at: HybridTimestamp::ZERO,
             specs: vec![LeaseSpec {
                 prefix: key(&[b"db"]),
                 mode: LeaseMode::Write,
                 ttl: Duration::from_secs(60),
-                stealable,
             }],
         })
         .await
         .unwrap();
-    let lease = LeaseRef {
-        id: granted.leases[0].id,
-        epoch: granted.leases[0].epoch,
-    };
+    let lease = granted.leases[0].id;
     handle
         .put_batch(PutBatchRequest {
             device: dev(),
-            leases: vec![lease],
+            evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(device_seq),
                 entries: vec![PutEntry {
@@ -92,17 +82,18 @@ async fn slate_survives_flush_and_reopen() {
     let store = open_shard(root).await;
     let (actor, handle) = SpaceActor::new(SPACE, Arc::clone(&store), Arc::clone(&clock));
     let task = tokio::spawn(actor.run());
-    write_marker(&handle, 1, true, false, b"before-crash").await;
+    write_marker(&handle, 1, b"before-crash").await;
     store.flush().await.unwrap();
     drop(handle);
     task.abort();
     let _ = task.await;
 
-    // "Crash": reopen; stale lease record survived — steal it back.
+    // "Crash": reopen; the persisted lease survives until TTL expiry.
+    clock.advance(Duration::from_secs(60));
     let store2 = open_shard(root).await;
     let (actor2, handle2) = SpaceActor::new(SPACE, Arc::clone(&store2), clock);
     let task2 = tokio::spawn(actor2.run());
-    write_marker(&handle2, 2, true, true, b"after-reopen").await;
+    write_marker(&handle2, 2, b"after-reopen").await;
     store2.flush().await.unwrap();
 
     let got = handle2
@@ -131,27 +122,23 @@ async fn slate_seeded_writes_audit_clean() {
     let granted = handle
         .acquire(AcquireRequest {
             device: dev(),
-            steal: false,
+            requested_at: HybridTimestamp::ZERO,
             specs: vec![LeaseSpec {
                 prefix: key(&[b"load"]),
                 mode: LeaseMode::Write,
                 ttl: Duration::from_secs(60),
-                stealable: false,
             }],
         })
         .await
         .unwrap();
-    let lease = LeaseRef {
-        id: granted.leases[0].id,
-        epoch: granted.leases[0].epoch,
-    };
+    let lease = granted.leases[0].id;
 
     for seq in 1..=rng.random_range(5..15) {
         let k = key(&[b"load", format!("k{seq}").as_bytes()]);
         handle
             .put_batch(PutBatchRequest {
                 device: dev(),
-                leases: vec![lease],
+                evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(seq),
                     entries: vec![PutEntry {

@@ -25,3 +25,9 @@ support Device fencing
 
 codec for smuggle admission seq, keep 64 random seqs, use trailing 0s to decide etc.
 ensure key components can not be empty
+
+Ensure that prefix can be empty but keys can not be
+
+many responses should return global seqnum or return ops when range assert fails
+
+Add bucketing/padding to key components & values before encrypting

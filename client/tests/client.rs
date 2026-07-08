@@ -45,7 +45,6 @@ fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(secs),
-        stealable: false,
     }
 }
 
@@ -140,8 +139,8 @@ fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
 
         let mut space_a = client.space(id_a).await.unwrap();
         let mut space_b = client.space(id_b).await.unwrap();
-        space_a.ensure(vec![wspec(&db_a, 60)], false).await.unwrap();
-        space_b.ensure(vec![wspec(&db_b, 60)], false).await.unwrap();
+        space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
+        space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
             .commit(vec![(row_a.clone(), val(b"alpha"))])
@@ -237,8 +236,8 @@ fn global_push_drains_interleaved_spaces_in_seq_order() {
 
         let mut space_a = client.space(id_a).await.unwrap();
         let mut space_b = client.space(id_b).await.unwrap();
-        space_a.ensure(vec![wspec(&db_a, 60)], false).await.unwrap();
-        space_b.ensure(vec![wspec(&db_b, 60)], false).await.unwrap();
+        space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
+        space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
             .commit(vec![(row_a1.clone(), val(b"a1"))])
@@ -288,10 +287,7 @@ fn offline_commit_survives_until_online_push() {
             .unwrap();
             client.attach(&envelope).await.unwrap();
             let mut online_space = client.space(space).await.unwrap();
-            online_space
-                .ensure(vec![wspec(&db, 60)], false)
-                .await
-                .unwrap();
+            online_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         }
 
         let offline = open_offline(
@@ -358,7 +354,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
             let db = key(&[b"db"]);
             let row = key(&[b"db", b"k"]);
             let mut space = client.space(space).await.unwrap();
-            space.ensure(vec![wspec(&db, 60)], false).await.unwrap();
+            space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .commit(vec![(row.clone(), val(b"cached"))])
                 .await
@@ -408,10 +404,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         writer.attach(&envelope).await.unwrap();
         {
             let mut writer_space = writer.space(space).await.unwrap();
-            writer_space
-                .ensure(vec![wspec(&db, 60)], false)
-                .await
-                .unwrap();
+            writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             writer_space
                 .commit(vec![(row.clone(), val(b"roundtrip"))])
                 .await

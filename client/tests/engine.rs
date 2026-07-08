@@ -11,7 +11,7 @@ use homebase::server::ServerHandle;
 use homebase::{Client, ClientError, PushOutcome, SpaceDriverError};
 use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
     AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
     RangeCut, ReleaseRequest,
@@ -70,7 +70,6 @@ fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Write,
         ttl: Duration::from_secs(secs),
-        stealable: false,
     }
 }
 
@@ -79,7 +78,6 @@ fn rspec(prefix: &Key, secs: u64) -> LeaseSpec {
         prefix: prefix.clone(),
         mode: LeaseMode::Read,
         ttl: Duration::from_secs(secs),
-        stealable: false,
     }
 }
 
@@ -128,22 +126,19 @@ async fn foreign_put(
             &space,
             AcquireRequest {
                 device,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![wspec(prefix, 60)],
-                steal: false,
             },
         )
         .await
         .expect("foreign acquire");
-    let lease = LeaseRef {
-        id: granted.leases[0].id,
-        epoch: granted.leases[0].epoch,
-    };
+    let lease = granted.leases[0].id;
     handle
         .put_batch(
             &space,
             PutBatchRequest {
                 device,
-                leases: vec![lease],
+                evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: seq,
                     entries,
@@ -157,7 +152,7 @@ async fn foreign_put(
             &space,
             ReleaseRequest {
                 device,
-                leases: vec![lease.id],
+                leases: vec![lease],
             },
         )
         .await
@@ -229,7 +224,7 @@ fn push_drains_and_groups_same_space_neighbors() {
         let mut space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
 
         let (a1, a2, a3) = (
             key(&[b"db", b"a1"]),
@@ -295,7 +290,7 @@ fn push_cap_splits_groups() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
         space.commit(vec![(k1.clone(), val(b"1"))]).await.unwrap();
         space.commit(vec![(k2.clone(), val(b"2"))]).await.unwrap();
@@ -331,7 +326,7 @@ fn acquire_satisfies_covered_specs_locally() {
         let mut space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        let first = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let first = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(
             first.barrier, None,
             "no admitted writes means no catch-up barrier"
@@ -340,7 +335,7 @@ fn acquire_satisfies_covered_specs_locally() {
 
         // Asking again changes nothing: same lease, same epoch, no wire
         // grant — and so no new catch-up obligation.
-        let again = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let again = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(again.leases, vec![lease.clone()]);
         assert_eq!(again.barrier, None);
 
@@ -350,9 +345,8 @@ fn acquire_satisfies_covered_specs_locally() {
             prefix: key(&[b"db", b"sub"]),
             mode: LeaseMode::Read,
             ttl: Duration::from_secs(60),
-            stealable: false,
         };
-        let covered = space.acquire(vec![read_spec], false).await.unwrap();
+        let covered = space.acquire(vec![read_spec]).await.unwrap();
         assert_eq!(covered.leases, vec![lease.clone()]);
         assert_eq!(covered.barrier, None);
 
@@ -360,7 +354,7 @@ fn acquire_satisfies_covered_specs_locally() {
         // one is acquired, and the answer stays parallel to the specs.
         let other = key(&[b"other"]);
         let mixed = space
-            .acquire(vec![wspec(&db, 60), wspec(&other, 60)], false)
+            .acquire(vec![wspec(&db, 60), wspec(&other, 60)])
             .await
             .unwrap();
         assert_eq!(mixed.leases[0], lease);
@@ -376,10 +370,9 @@ fn acquire_satisfies_covered_specs_locally() {
         // local window — because the kernel treats a same-device
         // re-acquire of a live lease as contention.
         clock.advance(Duration::from_secs(60));
-        let revived = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let revived = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(revived.barrier, None);
         assert_eq!(revived.leases[0].id, lease.id, "renewed, not re-granted");
-        assert_eq!(revived.leases[0].epoch, lease.epoch, "the fence stands");
 
         // And the revived lease actually backs writes again.
         space
@@ -413,7 +406,7 @@ fn resume_keeps_wall_clock_authority() {
                 .unwrap();
 
             let mut space = client.space(SPACE).await.unwrap();
-            let granted = space.acquire(vec![wspec(&db, 3_600)], false).await.unwrap();
+            let granted = space.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
             granted.leases[0].id
             // crash: the engine drops here, the store survives
@@ -501,7 +494,7 @@ fn margin_applies_only_across_incarnations() {
                 .unwrap();
 
             let mut space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+            space.acquire(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
                 .await
@@ -581,7 +574,7 @@ fn suspend_expires_leases_within_a_lineage() {
         let mut space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space
             .commit(vec![(key(&[b"db", b"k"]), val(b"v"))])
             .await
@@ -593,19 +586,6 @@ fn suspend_expires_leases_within_a_lineage() {
         // knows the lease is long gone.
         clock.skew_wall(Duration::from_secs(3_600));
         assert!(!space.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
-        let outcome = client.push().await.unwrap();
-        assert!(
-            matches!(
-                &outcome,
-                PushOutcome::Stalled {
-                    error: KernelError::NotCovered { .. },
-                    ..
-                }
-            ),
-            "a slept-through lease must not back a write, got {outcome:?}"
-        );
-
-        space.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
@@ -635,7 +615,7 @@ fn backward_clock_step_poisons_stored_stamps() {
                 .unwrap();
 
             let mut space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+            space.acquire(vec![wspec(&db, 60)]).await.unwrap();
             space.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
         }
 
@@ -669,19 +649,13 @@ fn backward_clock_step_poisons_stored_stamps() {
         assert_eq!(state.clock_high, Some(Timestamp(2_000)));
         assert!(!space.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
 
-        // Zero-stamped means no authority: the push stalls. Renewal
-        // re-stamps on the new timeline — conservative by construction —
-        // and authority resumes.
-        let outcome = client.push().await.unwrap();
-        assert!(
-            matches!(
-                &outcome,
-                PushOutcome::Stalled {
-                    error: KernelError::NotCovered { .. },
-                    ..
-                }
-            ),
-            "poisoned stamps must not back writes, got {outcome:?}"
+        // Zero-stamped means no lease authority, but an unreserved write may
+        // still admit without lease evidence.
+        assert_eq!(
+            client.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(1))
+            }
         );
         space.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(
@@ -692,12 +666,6 @@ fn backward_clock_step_poisons_stored_stamps() {
                 .unwrap()
                 .deadline,
             hstamp(2_000 + 60_000, 2)
-        );
-        assert_eq!(
-            client.push().await.unwrap(),
-            PushOutcome::Drained {
-                acked_through: Some(DeviceSeq(1))
-            }
         );
         let _ = client;
 
@@ -736,36 +704,24 @@ fn local_expiry_gates_writes_before_the_server_does() {
 
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space.commit(vec![(k.clone(), val(b"v"))]).await.unwrap();
 
-        // Only the CLIENT clock reaches the deadline; the server still
-        // holds the lease live. The engine must refuse first — that
-        // asymmetry is the whole two-clock rule.
+        // Only the CLIENT clock reaches the deadline; locally the lease is
+        // not authority, but the unreserved write may still be admitted.
         clock.advance(Duration::from_secs(60));
-        let outcome = client.push().await.unwrap();
-        assert!(
-            matches!(
-                &outcome,
-                PushOutcome::Stalled {
-                    error: KernelError::NotCovered { .. },
-                    ..
-                }
-            ),
-            "a locally-expired lease must never back a write, got {outcome:?}"
-        );
-
-        // Renewal restarts the local window from this send.
-        space.renew(std::slice::from_ref(&db)).await.unwrap();
-        let leases = space.leases(std::slice::from_ref(&db)).await.unwrap();
-        assert_eq!(leases[0].held.deadline, hstamp(60_000 + 60_000, 1));
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
         );
+
+        // Renewal restarts the local window from this send.
+        space.renew(std::slice::from_ref(&db)).await.unwrap();
+        let leases = space.leases(std::slice::from_ref(&db)).await.unwrap();
+        assert_eq!(leases[0].held.deadline, hstamp(60_000 + 60_000, 1));
     });
 }
 
@@ -788,11 +744,8 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
-        let lease = LeaseRef {
-            id: granted.leases[0].id,
-            epoch: granted.leases[0].epoch,
-        };
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let lease = granted.leases[0].id;
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
         space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
 
@@ -803,7 +756,7 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
                 &SPACE,
                 PutBatchRequest {
                     device: client.device(),
-                    leases: vec![lease],
+                    evidence: vec![lease],
                     batches: vec![
                         PutBatch {
                             device_seq: DeviceSeq(1),
@@ -883,7 +836,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         // Simulate a buggy caller that marks the acquire barrier satisfied
         // without importing the foreign value's ver. The pusher still
         // degrades a group rejection into the faulty solo commit.
@@ -961,7 +914,7 @@ fn a_forked_store_is_fatal() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space.commit(vec![(k1.clone(), val(b"a"))]).await.unwrap();
 
@@ -1042,7 +995,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         assert!(matches!(
             space
                 .commit(vec![(k.clone(), val(b"too-soon"))])
@@ -1124,7 +1077,7 @@ fn ensure_acquires_pulls_and_makes_writes_locally_authorized() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        let acquired = space.ensure(vec![wspec(&db, 60)], false).await.unwrap();
+        let acquired = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(acquired.barrier, None);
         assert_eq!(acquired.leases.len(), 1);
         assert_eq!(
@@ -1179,7 +1132,7 @@ fn ensure_satisfies_read_lease_barriers_too() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        let acquired = space.ensure(vec![rspec(&db, 60)], false).await.unwrap();
+        let acquired = space.ensure(vec![rspec(&db, 60)]).await.unwrap();
         assert_eq!(acquired.barrier, None);
         assert_eq!(acquired.leases[0].mode, LeaseMode::Read);
         assert_eq!(
@@ -1209,7 +1162,7 @@ fn pending_release_blocks_writes_and_retries_explicitly() {
                 .unwrap();
 
             let mut space = client.space(SPACE).await.unwrap();
-            let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+            let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
             granted.leases[0].id
         };
 
@@ -1262,8 +1215,8 @@ fn pending_release_blocks_writes_and_retries_explicitly() {
                 &SPACE,
                 AcquireRequest {
                     device: dev(2),
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![wspec(&db, 60)],
-                    steal: false,
                 },
             )
             .await
@@ -1291,7 +1244,7 @@ fn release_rejects_when_queued_writes_are_covered() {
             .unwrap();
 
         let mut space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space.commit(vec![(k, val(b"queued"))]).await.unwrap();
 
         assert!(matches!(
@@ -1325,7 +1278,7 @@ fn unavailable_leaves_the_queue_intact() {
 
         let mut space = client.space(SPACE).await.unwrap();
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         drop(client);
 
         let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
@@ -1371,7 +1324,7 @@ fn renew_reports_invalid_and_forgets() {
         let mut space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        let granted = space.acquire(vec![wspec(&db, 60)], false).await.unwrap();
+        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let lease_id = granted.leases[0].id;
 
         // The SERVER's clock passes the deadline: strict local expiry,

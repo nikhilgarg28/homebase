@@ -18,9 +18,9 @@
 //!    per-prefix aggregates (max admission seq, live count) equal a
 //!    brute-force recomputation from the data records.
 
-use homebase_core::clock::Timestamp;
+use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
     PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest,
@@ -140,7 +140,7 @@ struct Replica {
 struct Harness {
     space: Space,
     store: MemoryStore,
-    leases: Vec<LeaseRef>,
+    leases: Vec<LeaseId>,
 }
 
 impl Harness {
@@ -154,20 +154,16 @@ impl Harness {
                 Timestamp(0),
                 &AcquireRequest {
                     device: dev(d),
-                    steal: false,
+                    requested_at: HybridTimestamp::ZERO,
                     specs: vec![LeaseSpec {
                         prefix: dev_prefix(d),
                         mode: LeaseMode::Write,
-                        stealable: false,
                         ttl: Duration::from_secs(1 << 30),
                     }],
                 },
             ))
             .unwrap();
-            leases.push(LeaseRef {
-                id: resp.leases[0].id,
-                epoch: resp.leases[0].epoch,
-            });
+            leases.push(resp.leases[0].id);
         }
         Self {
             space,
@@ -187,7 +183,7 @@ impl Harness {
             Timestamp(1),
             &PutBatchRequest {
                 device: dev(device),
-                leases: vec![self.leases[device]],
+                evidence: vec![self.leases[device]],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
                     entries,

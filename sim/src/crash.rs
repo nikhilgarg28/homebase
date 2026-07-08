@@ -6,9 +6,9 @@
 use crate::check;
 use crate::exec::SimExecutor;
 use crate::store::{FaultConfig, SimStore};
-use homebase_core::clock::{ManualClock, Timestamp};
+use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
 };
@@ -81,7 +81,7 @@ pub struct Coverage {
 
 #[derive(Clone)]
 pub struct DeviceState {
-    pub lease: Arc<Mutex<Option<LeaseRef>>>,
+    pub lease: Arc<Mutex<Option<LeaseId>>>,
     pub next_seq: Arc<AtomicU64>,
 }
 
@@ -100,27 +100,23 @@ pub async fn client(
         if state.lease.lock().unwrap().is_none() {
             let req = AcquireRequest {
                 device: dev(d),
-                steal: true,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: prefix(d),
                     mode: LeaseMode::Write,
                     ttl: Duration::from_secs(60),
-                    stealable: true,
                 }],
             };
             match handle.acquire(req).await {
                 Ok(resp) => {
-                    *state.lease.lock().unwrap() = Some(LeaseRef {
-                        id: resp.leases[0].id,
-                        epoch: resp.leases[0].epoch,
-                    });
+                    *state.lease.lock().unwrap() = Some(resp.leases[0].id);
                 }
                 Err(SpaceError::Unavailable { .. }) => {
                     coverage.lock().unwrap().unavailable += 1;
                     return;
                 }
                 Err(SpaceError::Kernel(err)) => {
-                    panic!("stealable self-handoff can never contend: {err:?}")
+                    panic!("per-device prefix should not contend: {err:?}")
                 }
             }
             continue;
@@ -130,7 +126,7 @@ pub async fn client(
         let lease = state.lease.lock().unwrap().unwrap();
         let req = PutBatchRequest {
             device: dev(d),
-            leases: vec![lease],
+            evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
                 entries: vec![PutEntry {

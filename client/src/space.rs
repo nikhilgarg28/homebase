@@ -8,7 +8,7 @@ use crate::meta::{Committed, HeldLease, MetaStore};
 use crate::server::ServerHandle;
 use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{Lease, LeaseId, LeaseMode, LeaseRef};
+use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, KernelError, LeaseSpec, Range, RangeCursor, RangeCut, ReadAtRequest,
     ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
@@ -170,11 +170,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
         Ok(committed)
     }
 
-    pub async fn acquire(
-        &self,
-        specs: Vec<LeaseSpec>,
-        steal: bool,
-    ) -> Result<Acquired, SpaceDriverError> {
+    pub async fn acquire(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
         let specs = self.encode_specs(specs)?;
         let space = self.id;
         if specs.is_empty() {
@@ -238,8 +234,8 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
                 &space,
                 AcquireRequest {
                     device: self.device(),
+                    requested_at: send,
                     specs: missing,
-                    steal,
                 },
             )
             .await?;
@@ -253,7 +249,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
             fresh.push(HeldLease {
                 lease: lease.clone(),
                 deadline: send.saturating_add(lease.ttl),
-                barrier: pending_barrier(response.barrier, watermark),
+                barrier: pending_barrier(lease.barrier, watermark),
                 retiring: false,
             });
         }
@@ -274,12 +270,8 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
         })
     }
 
-    pub async fn ensure(
-        &self,
-        specs: Vec<LeaseSpec>,
-        steal: bool,
-    ) -> Result<Acquired, SpaceDriverError> {
-        let acquired = self.acquire(specs, steal).await?;
+    pub async fn ensure(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
+        let acquired = self.acquire(specs).await?;
         if acquired.barrier.is_none() {
             return Ok(acquired);
         }
@@ -535,7 +527,6 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
                     prefix: self.cipher().encode_key(&spec.prefix)?,
                     mode: spec.mode,
                     ttl: spec.ttl,
-                    stealable: spec.stealable,
                 })
             })
             .collect()
@@ -615,7 +606,7 @@ pub(crate) async fn live_write_leases<M: MetaStore, C: HybridClock>(
     clock: &C,
     space: SpaceId,
     keys: &[Key],
-) -> Result<Vec<LeaseRef>, SpaceDriverError> {
+) -> Result<Vec<LeaseId>, SpaceDriverError> {
     let now = clock.stamp();
     let mut out = Vec::new();
     for held in store.leases_covering(space, keys).await? {
@@ -629,10 +620,7 @@ pub(crate) async fn live_write_leases<M: MetaStore, C: HybridClock>(
             && !held.deadline.expired(&now, lease_margin(held.lease.ttl))
             && barrier_satisfied(held.barrier, watermark)
         {
-            out.push(LeaseRef {
-                id: held.lease.id,
-                epoch: held.lease.epoch,
-            });
+            out.push(held.lease.id);
         }
     }
     Ok(out)

@@ -4,9 +4,9 @@ use homebase_sim::seeds;
 use homebase_sim::torture;
 
 #[test]
-fn steal_races_between_devices() {
+fn contention_races_between_devices() {
     for seed in seeds::scenario_seeds() {
-        torture::run_steal_race(seed);
+        torture::run_contention_race(seed);
     }
 }
 
@@ -18,9 +18,9 @@ fn contended_handoff() {
 }
 
 #[test]
-fn zombie_writer_after_expiry() {
+fn expired_evidence_write_after_expiry() {
     for seed in seeds::scenario_seeds() {
-        torture::run_zombie_writer(seed);
+        torture::run_expired_evidence_write(seed);
     }
 }
 

@@ -6,9 +6,9 @@
 //! is why request bodies never carry a `SpaceId`.
 
 use crate::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, KernelError, ListRequest,
-    ListResponse, PutBatchRequest, PutBatchResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest,
-    ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, GetRequest, GetResponse, KernelError, ListLeasesRequest,
+    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use std::fmt;
 use std::future::Future;
@@ -103,6 +103,11 @@ pub trait Space {
         &self,
         req: ReleaseRequest,
     ) -> impl Future<Output = Result<ReleaseResponse, SpaceError>> + Send;
+
+    fn list_leases(
+        &self,
+        req: ListLeasesRequest,
+    ) -> impl Future<Output = Result<ListLeasesResponse, SpaceError>> + Send;
 
     fn put_batch(
         &self,

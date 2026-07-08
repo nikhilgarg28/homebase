@@ -5,31 +5,23 @@
 //! write leases. Two leases are in conflict when their prefixes overlap
 //! (one is a component-wise prefix of the other) and their modes are
 //! incompatible. There is no read→write upgrade, ever — release and
-//! re-acquire instead. The server clock exists in exactly one code path —
-//! lease deadlines — timed via [`crate::clock`].
+//! re-acquire instead.
 //!
-//! # Stealable leases
+//! Leases are reservations, not write capabilities: data admission may
+//! proceed without a held lease when no active incompatible lease conflicts
+//! with the write. Held lease ids may still travel as diagnostic evidence.
 //!
-//! A lease may opt in to preemption at acquire time (`stealable`). An
-//! acquire with `steal = true` takes a prefix *pre-deadline* if every
-//! incompatible live blocker is stealable: the blockers are purged and the
-//! new grant's fresh epoch fences their holders — a victim's next put or
-//! renew fails, so correctness never depends on it noticing. Leases not
-//! marked stealable keep strict pre-deadline denial. This is the
-//! single-active-device primitive: one stealable write lease on the account
-//! prefix, and activating a new device steals it.
+//! # Clock domains
 //!
-//! # Asymmetric expiry
-//!
-//! Grants carry a TTL *duration*, never an absolute deadline. The client
-//! counts the TTL from request-send on its monotonic clock; the server
-//! counts from receipt. The client's window therefore starts strictly
-//! earlier and expires strictly earlier — a client that respects its local
-//! deadline can never write after the server has re-granted the prefix.
-//! Epochs remain the correctness backstop; timestamps are availability.
+//! A lease records both the client-minted request timestamp and the server
+//! grant timestamp. The server judges expiry by `granted_at + ttl`; the
+//! client judges local authority conservatively by `requested_at + ttl`
+//! minus its local safety margin. The two timestamps are never compared to
+//! each other.
 
+use crate::clock::{HybridTimestamp, Timestamp};
 use crate::key::Key;
-use crate::tag::Epoch;
+use crate::tag::AdmissionSeq;
 use std::time::Duration;
 
 /// Lease mode. Prefix overlap alone is not a conflict; the modes decide.
@@ -51,29 +43,27 @@ impl LeaseMode {
     }
 }
 
-/// Unique identifier of a lease grant. Never reused within a space; a
-/// re-grant of the same prefix is a new `LeaseId` and a new [`Epoch`].
+/// Unique identifier of a lease grant. Never reused within a space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeaseId(pub u64);
 
 /// A granted lease, as returned to the client by `acquire`.
 ///
-/// Deliberately carries no absolute deadline — see the module docs on
-/// asymmetric expiry. The server keeps its own deadline bookkeeping
-/// internally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub id: LeaseId,
     /// The covered prefix: every key that starts (component-wise) with it.
     pub prefix: Key,
     pub mode: LeaseMode,
-    pub epoch: Epoch,
+    /// Client clock stamp from the acquire/refresh request that created this lease.
+    pub requested_at: HybridTimestamp,
+    /// Server clock stamp at grant/refresh.
+    pub granted_at: Timestamp,
     /// Granted TTL. May be shorter than requested (kernel cap → class
     /// default → app pin).
     pub ttl: Duration,
-    /// Whether this lease may be preempted pre-deadline by an
-    /// `acquire(steal = true)` (see the module docs).
-    pub stealable: bool,
+    /// Prefix-scoped admission barrier: `effective_prefix_max(prefix)` at grant.
+    pub barrier: AdmissionSeq,
 }
 
 impl Lease {
@@ -83,21 +73,9 @@ impl Lease {
     }
 }
 
-/// Proof-of-lease presented with `put_batch`.
-///
-/// Both fields must match the server's live lease table: the id proves the
-/// grant still exists (strict local expiry — expired is gone), the epoch
-/// fences a zombie holder of a superseded grant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LeaseRef {
-    pub id: LeaseId,
-    pub epoch: Epoch,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tag::Epoch;
 
     #[test]
     fn covers_is_component_wise() {
@@ -105,9 +83,10 @@ mod tests {
             id: LeaseId(1),
             prefix: Key::from_bytes([&b"db"[..], &b"pay"[..]]).unwrap(),
             mode: LeaseMode::Write,
-            epoch: Epoch(7),
+            requested_at: HybridTimestamp::ZERO,
+            granted_at: Timestamp::ZERO,
             ttl: Duration::from_secs(300),
-            stealable: false,
+            barrier: AdmissionSeq(0),
         };
         let covered = Key::from_bytes([&b"db"[..], &b"pay"[..], &b"row1"[..]]).unwrap();
         let sibling = Key::from_bytes([&b"db"[..], &b"payroll"[..]]).unwrap();

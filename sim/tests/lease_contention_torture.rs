@@ -1,26 +1,23 @@
-//! Steal races, contended handoff, and zombie writers on one shared prefix
+//! Lease contention and stale holders on one shared prefix
 //! — under seeded schedules, storage faults, lease expiry, and crashes.
 //!
-//! Three devices fight over a single stealable write lease (the
-//! single-active-device pattern) guarding one counter key. A holder
-//! increments the counter read-modify-write style; rivals either steal the
-//! lease outright or ask politely and get `Contended`; holders sometimes
-//! release voluntarily (clean handoff) and sometimes just lose the lease —
-//! to a steal, to TTL expiry (the clock is cranked hard enough to expire
-//! tenures), or to a crash. Every stale writer must be *fenced*, never
-//! admitted.
+//! Three devices fight over one write lease guarding one counter key. A
+//! holder increments the counter read-modify-write style; rivals either
+//! acquire after handoff/expiry or get `Contended`; holders sometimes release
+//! voluntarily (clean handoff) and sometimes just lose the lease to TTL
+//! expiry or a crash. Stale holders may write when no foreign reservation is
+//! live, but must retry on reservation or version fences.
 //!
 //! **The mutual-exclusion oracle:** each increment writes `read value + 1`
 //! while exclusively holding the lease, so across every device and every
 //! crash, acknowledged counter values must be strictly increasing in
-//! admission order. A single lost update — two writers basing on the same
-//! read — shows up as a duplicate or regressing value. Ver regressions and
-//! epoch fences firing where mutual exclusion should have prevented them
-//! panic outright.
+//! admission order. A single lost update — two admitted writers basing on the
+//! same read — shows up as a duplicate or regressing value. Reservation and
+//! version rejections are expected retry paths for stale local lease state.
 
-use homebase_core::clock::{ManualClock, Timestamp};
+use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
-use homebase_core::lease::{LeaseMode, LeaseRef};
+use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
     ReleaseRequest,
@@ -79,9 +76,9 @@ struct Ack {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Coverage {
-    steals: u32,
+    grants: u32,
     contended: u32,
-    /// Stale holder rejected (stolen, expired, or crash-lost lease record).
+    /// Stale holder retried after a reservation or version fence.
     fenced: u32,
     released: u32,
 }
@@ -89,7 +86,7 @@ struct Coverage {
 /// Per-device state that survives crashes.
 #[derive(Clone)]
 struct DeviceState {
-    lease: Rc<RefCell<Option<LeaseRef>>>,
+    lease: Rc<RefCell<Option<LeaseId>>>,
     next_seq: Rc<Cell<u64>>,
     rng_seed: u64,
 }
@@ -105,34 +102,23 @@ async fn client(
     for _ in 0..ATTEMPTS_PER_PHASE {
         let held = *state.lease.borrow();
         let Some(lease) = held else {
-            // Rival move: usually a steal, sometimes a polite ask that
-            // exercises the Contended path.
-            let steal = rng.random_bool(0.7);
+            // Rival move: acquire if the prefix is free, otherwise exercise
+            // the Contended path.
             let req = AcquireRequest {
                 device: dev(d),
-                steal,
+                requested_at: HybridTimestamp::ZERO,
                 specs: vec![LeaseSpec {
                     prefix: shared_prefix(),
                     mode: LeaseMode::Write,
                     ttl: Duration::from_millis(200),
-                    stealable: true,
                 }],
             };
             match handle.acquire(req).await {
                 Ok(resp) => {
-                    *state.lease.borrow_mut() = Some(LeaseRef {
-                        id: resp.leases[0].id,
-                        epoch: resp.leases[0].epoch,
-                    });
-                    if steal {
-                        coverage.borrow_mut().steals += 1;
-                    }
+                    *state.lease.borrow_mut() = Some(resp.leases[0].id);
+                    coverage.borrow_mut().grants += 1;
                 }
                 Err(SpaceError::Kernel(KernelError::Contended { .. })) => {
-                    assert!(
-                        !steal,
-                        "steal over all-stealable blockers can never contend"
-                    );
                     coverage.borrow_mut().contended += 1;
                 }
                 Err(SpaceError::Unavailable { .. }) => return,
@@ -162,7 +148,7 @@ async fn client(
         let seq = state.next_seq.get();
         let req = PutBatchRequest {
             device: dev(d),
-            leases: vec![lease],
+            evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
                 entries: vec![PutEntry {
@@ -186,7 +172,7 @@ async fn client(
                     match handle
                         .release(ReleaseRequest {
                             device: dev(d),
-                            leases: vec![lease.id],
+                            leases: vec![lease],
                         })
                         .await
                     {
@@ -199,9 +185,12 @@ async fn client(
                     }
                 }
             }
-            // The zombie path: our lease was stolen, expired, or its record
-            // died with a crash. The kernel must fence us — and does.
-            Err(SpaceError::Kernel(KernelError::LeaseInvalid { .. })) => {
+            // Stale local lease state is not authority. A live foreign
+            // reservation fences us; if there is no reservation, the per-key
+            // version fence catches an obsolete read.
+            Err(SpaceError::Kernel(KernelError::Contended { .. }))
+            | Err(SpaceError::Kernel(KernelError::LeaseInvalid { .. }))
+            | Err(SpaceError::Kernel(KernelError::VerRegression { .. })) => {
                 coverage.borrow_mut().fenced += 1;
                 *state.lease.borrow_mut() = None;
             }
@@ -210,9 +199,6 @@ async fn client(
                 state.next_seq.set(current.0 + 1);
             }
             Err(SpaceError::Unavailable { .. }) => return,
-            // Under correct mutual exclusion these are unreachable: a ver
-            // regression means two holders based on one read; a stale-epoch
-            // fence means an id survived a steal.
             Err(SpaceError::Kernel(err)) => {
                 panic!("mutual exclusion breached: {err:?} at device {d}")
             }
@@ -301,7 +287,7 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
         }
 
         // Mutual exclusion: acked values strictly increase in admission
-        // order, across devices, steals, expiries, and crashes.
+        // order, across devices, expiries, and crashes.
         let acks = acks.borrow();
         let mut ordered: Vec<&Ack> = acks.iter().collect();
         ordered.sort_by_key(|a| a.admission_seq);
@@ -321,24 +307,30 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
 }
 
 #[test]
-fn steal_torture_seeds_hold_mutual_exclusion() {
+fn contention_torture_seeds_hold_mutual_exclusion() {
     let mut total = Coverage::default();
     for seed in seeds::torture_seeds() {
         let (_, coverage) = run_seed(seed);
-        total.steals += coverage.steals;
+        total.grants += coverage.grants;
         total.contended += coverage.contended;
         total.fenced += coverage.fenced;
         total.released += coverage.released;
     }
     println!("coverage across seeds: {total:?}");
-    assert!(total.steals > 0, "no steals happened: {total:?}");
+    assert!(
+        total.grants > 0,
+        "no successful lease grants happened: {total:?}"
+    );
     assert!(total.contended > 0, "no contention observed: {total:?}");
-    assert!(total.fenced > 0, "no zombie writer was fenced: {total:?}");
+    assert!(
+        total.fenced > 0,
+        "no stale holder retry path observed: {total:?}"
+    );
     assert!(total.released > 0, "no voluntary handoff: {total:?}");
 }
 
 #[test]
-fn steal_torture_replays_identically() {
+fn contention_torture_replays_identically() {
     for seed in [3, 11] {
         assert_eq!(
             run_seed(seed).0,
