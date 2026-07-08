@@ -293,7 +293,7 @@ mod tests {
                 .put_batch(put_req(1, 1, lease, &k, b"v", 1))
                 .await
                 .unwrap();
-            assert_eq!(put.admission_seqs, vec![AdmissionSeq(1)]);
+            assert_eq!(put.applied_admission_seq(0), Some(AdmissionSeq(1)));
 
             let got = handle
                 .get(GetRequest {
@@ -361,7 +361,7 @@ mod tests {
                     .put_batch(put_req(device, i, lease, &k, b"v", 1))
                     .await
                     .unwrap();
-                seqs.push(resp.admission_seqs[0].0);
+                seqs.push(resp.applied_admission_seq(0).unwrap().0);
             }
             seqs
         };

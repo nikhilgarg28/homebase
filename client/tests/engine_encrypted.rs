@@ -234,11 +234,11 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                     batches: vec![
                         PutBatch {
                             device_seq: seq1,
-                            entries: state.oplog[&seq1].entries.clone(),
+                            entries: state.oplog[&seq1].entries().to_vec(),
                         },
                         PutBatch {
                             device_seq: seq2,
-                            entries: state.oplog[&seq2].entries.clone(),
+                            entries: state.oplog[&seq2].entries().to_vec(),
                         },
                     ],
                 },

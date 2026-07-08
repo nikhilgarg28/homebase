@@ -52,7 +52,7 @@ use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
     GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
-    PutBatchResponse, Range, RangeCut, ReadAtRequest, ReadAtResponse,
+    PutBatchResponse, PutBatchResult, Range, RangeCut, ReadAtRequest, ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Tag};
@@ -104,7 +104,7 @@ pub async fn put_batch<S: OrderedStore>(
     // one; `old_seqs` remembers each stored key's current changelog slot.
     let mut counters = counters(space, store).await?;
     let mut next_admission_seq = AdmissionSeq(counters.admission_high_water + 1);
-    let mut admission_seqs = Vec::with_capacity(req.batches.len());
+    let mut results = Vec::with_capacity(req.batches.len());
 
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
@@ -112,7 +112,7 @@ pub async fn put_batch<S: OrderedStore>(
     let mut epochs = epochs.into_iter();
     for client_batch in &req.batches {
         let seq = next_admission_seq;
-        admission_seqs.push(seq);
+        results.push(PutBatchResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
         for entry in &client_batch.entries {
             let epoch = epochs
@@ -209,7 +209,7 @@ pub async fn put_batch<S: OrderedStore>(
     batch.put(counters_key(space), counters.encode());
     store.apply(batch).await?;
 
-    Ok(PutBatchResponse { admission_seqs })
+    Ok(PutBatchResponse { results })
 }
 
 pub async fn get<S: OrderedStore>(

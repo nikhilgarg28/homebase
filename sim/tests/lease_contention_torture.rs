@@ -163,7 +163,7 @@ async fn client(
                 acks.borrow_mut().push(Ack {
                     device: d,
                     value: current.0 + 1,
-                    admission_seq: resp.admission_seqs[0].0,
+                    admission_seq: resp.applied_admission_seq(0).unwrap().0,
                 });
                 state.next_seq.set(seq + 1);
 

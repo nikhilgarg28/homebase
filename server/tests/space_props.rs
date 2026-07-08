@@ -190,7 +190,7 @@ impl Harness {
                 }],
             },
         ))
-        .map(|resp| resp.admission_seqs[0])
+        .map(|resp| resp.applied_admission_seq(0).unwrap())
     }
 }
 

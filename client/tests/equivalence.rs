@@ -88,10 +88,10 @@ fn replay_oplog_plaintext(
     device: DeviceId,
 ) -> BTreeMap<Key, Value> {
     for (seq, record) in &state.oplog {
-        if record.space != space {
+        if record.space().unwrap() != space {
             continue;
         }
-        for entry in &record.entries {
+        for entry in record.entries() {
             view.insert(entry.key.clone(), entry.value.clone());
             let _ = (seq, device);
         }
@@ -219,7 +219,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         let cipher = envelope.open().unwrap();
         let encoded_k2 = cipher.encode_key(&k2).unwrap();
         for (seq, record) in &state.oplog {
-            for entry in &record.entries {
+            for entry in record.entries() {
                 if entry.key != encoded_k2 {
                     continue;
                 }

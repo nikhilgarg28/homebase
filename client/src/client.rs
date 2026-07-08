@@ -14,7 +14,7 @@ use crate::meta::{CodecRecord, MetaStore, certify};
 use crate::server::{ServerHandle, offline_router};
 use crate::space::{DEFAULT_PUSH_CAP, PushOutcome, Space, SpaceDriverError, live_write_leases};
 use homebase_core::clock::HybridClock;
-use homebase_core::messages::{KernelError, PutBatch, PutBatchRequest};
+use homebase_core::messages::{KernelError, PutBatch, PutBatchRequest, PutBatchResult};
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
 use homebase_core::tag::{DeviceId, DeviceSeq};
@@ -235,28 +235,30 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             };
             let head = *head;
             self.globals.borrow_mut().scan_from = head;
-            let space = head_record.space;
+            let space = head_record
+                .space()
+                .expect("push does not emit rollback records yet");
             let mut last = head;
             let mut batches = vec![PutBatch {
                 device_seq: head,
-                entries: head_record.entries.clone(),
+                entries: head_record.entries().to_vec(),
             }];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
-                        || record.space != space
+                        || record.space() != Some(space)
                         || batches
                             .iter()
                             .map(|batch| batch.entries.len())
                             .sum::<usize>()
-                            + record.entries.len()
+                            + record.entries().len()
                             > push_cap
                     {
                         break;
                     }
                     batches.push(PutBatch {
                         device_seq: *seq,
-                        entries: record.entries.clone(),
+                        entries: record.entries().to_vec(),
                     });
                     last = *seq;
                 }
@@ -265,13 +267,44 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                 .iter()
                 .flat_map(|batch| batch.entries.iter().map(|entry| entry.key.clone()))
                 .collect();
+            let batch_count = batches.len();
             let request = PutBatchRequest {
                 device,
                 evidence: live_write_leases(self.store(), self.clock(), space, &keys).await?,
                 batches,
             };
             match self.server.put_batch(&space, request).await {
-                Ok(_) => {
+                Ok(response) => {
+                    if response.results.len() != batch_count {
+                        return Err(ClientError::Space(SpaceDriverError::Unavailable {
+                            reason: format!(
+                                "malformed put_batch response: {} results for {} batches",
+                                response.results.len(),
+                                batch_count
+                            ),
+                        }));
+                    }
+                    if let Some((failed, error)) =
+                        response
+                            .results
+                            .iter()
+                            .enumerate()
+                            .find_map(|(i, result)| match result {
+                                PutBatchResult::Applied { .. } => None,
+                                PutBatchResult::Failed { error } => Some((i, error.clone())),
+                            })
+                    {
+                        let at = DeviceSeq(head.0 + failed as u64);
+                        if last > head {
+                            probe = true;
+                            continue;
+                        }
+                        return Ok(PushOutcome::Stalled {
+                            at,
+                            error,
+                            acked_through: acked,
+                        });
+                    }
                     self.ack(last).await?;
                     acked = Some(last);
                     probe = false;

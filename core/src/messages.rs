@@ -185,8 +185,26 @@ pub struct PutBatchRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutBatchResponse {
-    /// Admission points assigned to each input batch, in order.
-    pub admission_seqs: Vec<AdmissionSeq>,
+    /// One result per input batch, in order. Current in-process admission is
+    /// still all-or-nothing, so a successful response contains only
+    /// [`PutBatchResult::Applied`]; failed elements are the wire shape for
+    /// richer per-batch reporting.
+    pub results: Vec<PutBatchResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PutBatchResult {
+    Applied { admission_seq: AdmissionSeq },
+    Failed { error: KernelError },
+}
+
+impl PutBatchResponse {
+    pub fn applied_admission_seq(&self, index: usize) -> Option<AdmissionSeq> {
+        match self.results.get(index) {
+            Some(PutBatchResult::Applied { admission_seq }) => Some(*admission_seq),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,3 +381,34 @@ impl fmt::Display for KernelError {
 }
 
 impl std::error::Error for KernelError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(parts: &[&[u8]]) -> Key {
+        Key::from_bytes(parts.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn put_batch_response_reports_one_result_per_batch() {
+        let response = PutBatchResponse {
+            results: vec![
+                PutBatchResult::Applied {
+                    admission_seq: AdmissionSeq(7),
+                },
+                PutBatchResult::Failed {
+                    error: KernelError::VerRegression {
+                        key: key(&[b"db", b"row"]),
+                        current: Ver(3),
+                        attempted: Ver(3),
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(7)));
+        assert_eq!(response.applied_admission_seq(1), None);
+    }
+}

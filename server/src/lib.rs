@@ -192,7 +192,8 @@ mod tests {
             })
             .await
             .unwrap()
-            .admission_seqs[0]
+            .applied_admission_seq(0)
+            .unwrap()
     }
 
     async fn read_marker(handle: &SpaceHandle) -> Option<Vec<u8>> {

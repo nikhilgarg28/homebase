@@ -161,9 +161,9 @@ fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
             state.oplog.keys().copied().collect::<Vec<_>>(),
             vec![DeviceSeq(1), DeviceSeq(2), DeviceSeq(3)]
         );
-        assert_eq!(state.oplog[&DeviceSeq(1)].space, id_a);
-        assert_eq!(state.oplog[&DeviceSeq(2)].space, id_b);
-        assert_eq!(state.oplog[&DeviceSeq(3)].space, id_a);
+        assert_eq!(state.oplog[&DeviceSeq(1)].space().unwrap(), id_a);
+        assert_eq!(state.oplog[&DeviceSeq(2)].space().unwrap(), id_b);
+        assert_eq!(state.oplog[&DeviceSeq(3)].space().unwrap(), id_a);
 
         client.push().await.unwrap();
 

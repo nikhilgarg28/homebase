@@ -440,10 +440,10 @@ fn replay_oplog(
     state: &homebase::meta::ClientState,
 ) -> BTreeMap<Key, Value> {
     for record in state.oplog.values() {
-        if record.space != SPACE {
+        if record.space().unwrap() != SPACE {
             continue;
         }
-        for entry in &record.entries {
+        for entry in record.entries() {
             view.insert(entry.key.clone(), entry.value.clone());
         }
     }

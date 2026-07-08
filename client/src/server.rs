@@ -373,8 +373,8 @@ pub mod conformance {
             .await
             .expect("covered put");
         assert_eq!(
-            put.admission_seqs,
-            vec![AdmissionSeq(1)],
+            put.applied_admission_seq(0),
+            Some(AdmissionSeq(1)),
             "fresh space: first admission"
         );
 

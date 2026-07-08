@@ -264,7 +264,8 @@ pub fn run_expired_evidence_write(seed: u64) {
             h.put_batch(put_one(1, 1, l.unwrap(), &k, b"expired-evidence", 1))
                 .await
                 .unwrap()
-                .admission_seqs[0],
+                .applied_admission_seq(0)
+                .unwrap(),
         );
     });
     exec.run_until_stalled();

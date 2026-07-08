@@ -141,7 +141,7 @@ pub async fn client(
                 acks.lock().unwrap().push(Ack {
                     device: d,
                     device_seq: seq,
-                    admission_seq: resp.admission_seqs[0].0,
+                    admission_seq: resp.applied_admission_seq(0).unwrap().0,
                 });
                 state.next_seq.store(seq + 1, Ordering::SeqCst);
                 completed += 1;

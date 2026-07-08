@@ -208,7 +208,7 @@ mod tests {
         let (mut space, store, lease) = setup();
         let k = key(&[b"db", b"t", b"r1"]);
         let resp = put_batch(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
-        assert_eq!(resp.admission_seqs, vec![AdmissionSeq(1)]);
+        assert_eq!(resp.applied_admission_seq(0), Some(AdmissionSeq(1)));
 
         let got = block_on(space.get(
             &store,
@@ -259,7 +259,9 @@ mod tests {
             },
         ))
         .unwrap();
-        assert_eq!(resp.admission_seqs, vec![AdmissionSeq(1), AdmissionSeq(2)]);
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.applied_admission_seq(0), Some(AdmissionSeq(1)));
+        assert_eq!(resp.applied_admission_seq(1), Some(AdmissionSeq(2)));
 
         let got = block_on(space.get(&store, &GetRequest { keys: vec![k1, k2] })).unwrap();
         let first = got.entries[0].as_ref().unwrap();

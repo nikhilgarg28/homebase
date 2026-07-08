@@ -153,7 +153,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
         self.check_local_write_authority(&encoded).await?;
         let device = self.device();
         let mut reserved = self.client.store().reserve_commit(self.id, encoded).await?;
-        for entry in &mut reserved.record.entries {
+        for entry in reserved.record.entries_mut() {
             let nonce = self
                 .client
                 .next_nonce()
@@ -456,12 +456,12 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
             return Ok(());
         }
         for (seq, record) in &state.oplog {
-            if record.space != self.id {
+            if record.space() != Some(self.id) {
                 continue;
             }
             for held in &releasing {
                 if record
-                    .entries
+                    .entries()
                     .iter()
                     .any(|entry| entry.key.starts_with(&held.lease.prefix))
                 {
