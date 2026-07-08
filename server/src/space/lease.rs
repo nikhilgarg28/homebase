@@ -25,7 +25,7 @@ use homebase_core::messages::{
     RenewRequest, RenewResponse,
 };
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId, Epoch};
+use homebase_core::tag::{AdmissionSeq, DeviceId};
 use std::collections::BTreeSet;
 
 /// Lease verbs for one space, over any [`OrderedStore`].
@@ -112,12 +112,10 @@ impl LeaseManager {
                 requested_at: req.requested_at,
                 granted_at: now,
                 barrier,
-                epoch: Epoch(counters.next_epoch),
                 deadline: now.saturating_add(spec.ttl),
                 ttl: spec.ttl,
             };
             counters.next_lease_id += 1;
-            counters.next_epoch += 1;
             self.put_records(&mut batch, &record);
             leases.push(public_lease(&record));
         }
@@ -218,9 +216,7 @@ impl LeaseManager {
 
     /// The reservation check `put_batch` admission runs. Presented ids are
     /// diagnostic evidence only; they never authorize or reject admission. A
-    /// key may be written when no live foreign lease overlaps it. Returns one
-    /// epoch per key for the legacy tag field; writes use epoch 0 until the
-    /// tag model is revised.
+    /// key may be written when no live foreign lease overlaps it.
     pub async fn validate_put<S: OrderedStore>(
         &self,
         store: &S,
@@ -228,8 +224,7 @@ impl LeaseManager {
         device: DeviceId,
         _evidence: &[LeaseId],
         keys: &[Key],
-    ) -> Result<Vec<Epoch>, Error> {
-        let mut epochs = Vec::with_capacity(keys.len());
+    ) -> Result<(), Error> {
         for key in keys {
             let (live, _) = self.overlapping(store, now, key).await?;
             if live.iter().any(|rec| rec.device != device) {
@@ -239,9 +234,8 @@ impl LeaseManager {
                 }
                 .into());
             }
-            epochs.push(Epoch(0));
         }
-        Ok(epochs)
+        Ok(())
     }
 
     /// All lease records whose prefix overlaps `prefix` (ancestor, exact, or
@@ -555,7 +549,7 @@ mod tests {
         let foreign = acquire_one(&mut mgr, &store, 0, 2, &other_row, LeaseMode::Read, 50).unwrap();
 
         // Own reservations do not block writes; evidence remains diagnostic.
-        let epochs = block_on(mgr.validate_put(
+        block_on(mgr.validate_put(
             &store,
             Timestamp(10),
             dev(1),
@@ -563,21 +557,17 @@ mod tests {
             std::slice::from_ref(&row),
         ))
         .unwrap();
-        assert_eq!(epochs.len(), 1);
 
         // No covering evidence is fine when no foreign lease overlaps.
         let free = key(&[b"free", b"row"]);
-        assert_eq!(
-            block_on(mgr.validate_put(
-                &store,
-                Timestamp(10),
-                dev(1),
-                &[],
-                std::slice::from_ref(&free)
-            ))
-            .unwrap(),
-            vec![Epoch(0)]
-        );
+        block_on(mgr.validate_put(
+            &store,
+            Timestamp(10),
+            dev(1),
+            &[],
+            std::slice::from_ref(&free),
+        ))
+        .unwrap();
 
         // Foreign reservations block uncovered writes.
         assert!(matches!(
@@ -593,17 +583,14 @@ mod tests {
 
         // Evidence is diagnostic only: foreign, unknown, and expired ids do
         // not reject an otherwise unreserved write.
-        assert_eq!(
-            block_on(mgr.validate_put(
-                &store,
-                Timestamp(10),
-                dev(1),
-                &[foreign.id, LeaseId(999), write.id],
-                std::slice::from_ref(&free)
-            ))
-            .unwrap(),
-            vec![Epoch(0)]
-        );
+        block_on(mgr.validate_put(
+            &store,
+            Timestamp(10),
+            dev(1),
+            &[foreign.id, LeaseId(999), write.id],
+            std::slice::from_ref(&free),
+        ))
+        .unwrap();
 
         // Foreign reservations block even when the request presents the
         // foreign lease as evidence.

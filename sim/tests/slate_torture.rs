@@ -53,11 +53,14 @@ async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
             evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(device_seq),
-                entries: vec![PutEntry {
-                    key: key(&[b"db", b"marker"]),
-                    value: Value::Present(marker.to_vec()),
-                    ver: Ver(device_seq),
-                }],
+                ops: vec![
+                    PutEntry {
+                        key: key(&[b"db", b"marker"]),
+                        value: Value::Present(marker.to_vec()),
+                        ver: Ver(device_seq),
+                    }
+                    .into(),
+                ],
             }],
         })
         .await
@@ -141,11 +144,14 @@ async fn slate_seeded_writes_audit_clean() {
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(seq),
-                    entries: vec![PutEntry {
-                        key: k,
-                        value: Value::Present(format!("v{seq}").into_bytes()),
-                        ver: Ver(1),
-                    }],
+                    ops: vec![
+                        PutEntry {
+                            key: k,
+                            value: Value::Present(format!("v{seq}").into_bytes()),
+                            ver: Ver(1),
+                        }
+                        .into(),
+                    ],
                 }],
             })
             .await

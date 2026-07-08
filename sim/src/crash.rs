@@ -129,11 +129,14 @@ pub async fn client(
             evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
-                entries: vec![PutEntry {
-                    key: user_key(d, seq),
-                    value: Value::Present(value(d, seq)),
-                    ver: Ver(1),
-                }],
+                ops: vec![
+                    PutEntry {
+                        key: user_key(d, seq),
+                        value: Value::Present(value(d, seq)),
+                        ver: Ver(1),
+                    }
+                    .into(),
+                ],
             }],
         };
         match handle.put_batch(req).await {

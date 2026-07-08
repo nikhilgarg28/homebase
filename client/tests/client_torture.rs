@@ -9,8 +9,8 @@ use homebase_core::clock::{HybridClock, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutBatchResponse, Range,
-    RangeCut,
+    AcquireRequest, BatchOp, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutBatchResponse,
+    Range, RangeCut,
 };
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::storage::MemoryStore;
@@ -148,13 +148,13 @@ impl ServerHandle for ClientTestServer {
         let resp = self.handle.put_batch(req.clone()).await?;
         let mut acks = self.acks.lock().unwrap();
         for batch in &req.batches {
-            for entry in &batch.entries {
-                let key_index = pool_index(&entry.key);
+            for op in &batch.ops {
+                let Some((key, value)) = op_ack(op) else {
+                    continue;
+                };
+                let key_index = pool_index(key);
                 acks.retain(|ack| ack.key_index != key_index);
-                acks.push(Ack {
-                    key_index,
-                    value: entry.value.clone(),
-                });
+                acks.push(Ack { key_index, value });
             }
         }
         Ok(resp)
@@ -197,6 +197,16 @@ impl ServerHandle for ClientTestServer {
             ));
         }
         self.handle.read_at(req).await
+    }
+}
+
+fn op_ack(op: &BatchOp) -> Option<(&Key, Value)> {
+    match op {
+        BatchOp::Set {
+            key, ciphertext, ..
+        } => Some((key, Value::Present(ciphertext.clone()))),
+        BatchOp::Delete { key, .. } => Some((key, Value::Absent)),
+        BatchOp::NoOp => None,
     }
 }
 

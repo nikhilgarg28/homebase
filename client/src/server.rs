@@ -362,11 +362,14 @@ pub mod conformance {
                     evidence: vec![lease],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
-                        entries: vec![PutEntry {
-                            key: k.clone(),
-                            value: Value::Present(marker.to_vec()),
-                            ver: Ver(1),
-                        }],
+                        ops: vec![
+                            PutEntry {
+                                key: k.clone(),
+                                value: Value::Present(marker.to_vec()),
+                                ver: Ver(1),
+                            }
+                            .into(),
+                        ],
                     }],
                 },
             )
@@ -524,11 +527,14 @@ pub mod conformance {
                     evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
-                        entries: vec![PutEntry {
-                            key: key(&[b"x", b"k"]),
-                            value: Value::Present(b"v".to_vec()),
-                            ver: Ver(1),
-                        }],
+                        ops: vec![
+                            PutEntry {
+                                key: key(&[b"x", b"k"]),
+                                value: Value::Present(b"v".to_vec()),
+                                ver: Ver(1),
+                            }
+                            .into(),
+                        ],
                     }],
                 },
             )
@@ -598,7 +604,7 @@ pub mod conformance {
                     evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
-                        entries: vec![],
+                        ops: vec![],
                     }],
                 },
             )

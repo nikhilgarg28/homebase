@@ -210,19 +210,25 @@ fn ack_drop_trims_after_server_admitted() {
                     batches: vec![
                         PutBatch {
                             device_seq: DeviceSeq(1),
-                            entries: vec![PutEntry {
-                                key: k1.clone(),
-                                value: val(b"one"),
-                                ver: Ver(1),
-                            }],
+                            ops: vec![
+                                PutEntry {
+                                    key: k1.clone(),
+                                    value: val(b"one"),
+                                    ver: Ver(1),
+                                }
+                                .into(),
+                            ],
                         },
                         PutBatch {
                             device_seq: DeviceSeq(2),
-                            entries: vec![PutEntry {
-                                key: k2.clone(),
-                                value: val(b"two"),
-                                ver: Ver(2),
-                            }],
+                            ops: vec![
+                                PutEntry {
+                                    key: k2.clone(),
+                                    value: val(b"two"),
+                                    ver: Ver(2),
+                                }
+                                .into(),
+                            ],
                         },
                     ],
                 },

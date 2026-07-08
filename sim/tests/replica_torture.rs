@@ -123,11 +123,14 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             evidence: vec![state.lease.borrow().unwrap()],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
-                entries: vec![PutEntry {
-                    key: pool_key(key_index),
-                    value: value.clone(),
-                    ver: Ver(ver),
-                }],
+                ops: vec![
+                    PutEntry {
+                        key: pool_key(key_index),
+                        value: value.clone(),
+                        ver: Ver(ver),
+                    }
+                    .into(),
+                ],
             }],
         };
         match handle.put_batch(req).await {

@@ -22,8 +22,8 @@ use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
-    PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest,
+    AcquireRequest, BatchOp, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch,
+    PutBatchRequest, PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -176,7 +176,7 @@ impl Harness {
         &mut self,
         device: usize,
         device_seq: u64,
-        entries: Vec<PutEntry>,
+        ops: Vec<BatchOp>,
     ) -> Result<AdmissionSeq, Error> {
         block_on(self.space.put_batch(
             &self.store,
@@ -186,7 +186,7 @@ impl Harness {
                 evidence: vec![self.leases[device]],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
-                    entries,
+                    ops,
                 }],
             },
         ))
@@ -403,14 +403,17 @@ proptest! {
                         let ver = current + 1;
                         vers.insert(suffix, ver);
                         let value = if tombstone { None } else { Some(model.fresh_value()) };
-                        entries.push(PutEntry {
+                        entries.push(
+                            PutEntry {
                             key: user_key(device, suffix),
                             value: match &value {
                                 Some(v) => Value::Present(v.clone()),
                                 None => Value::Absent,
                             },
                             ver: Ver(ver),
-                        });
+                            }
+                            .into(),
+                        );
                         staged.push((suffix, value, ver));
                     }
 
@@ -434,7 +437,8 @@ proptest! {
                         key: user_key(device, suffix),
                         value: Value::Present(b"never-lands".to_vec()),
                         ver: Ver(current), // equal, not greater → regression
-                    }];
+                    }
+                    .into()];
                     let err = h.put(device, model.device_seq[device] + 1, entries).unwrap_err();
                     prop_assert!(
                         matches!(err, Error::Kernel(KernelError::VerRegression { .. })),
@@ -452,7 +456,8 @@ proptest! {
                         key: user_key(device, suffix),
                         value: Value::Present(b"never-lands".to_vec()),
                         ver: Ver(ver),
-                    }];
+                    }
+                    .into()];
                     let err = h.put(device, model.device_seq[device], entries).unwrap_err();
                     prop_assert!(
                         matches!(err, Error::Kernel(KernelError::DeviceSeqRegression { .. })),

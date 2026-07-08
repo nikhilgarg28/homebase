@@ -31,3 +31,7 @@ Ensure that prefix can be empty but keys can not be
 many responses should return global seqnum or return ops when range assert fails
 
 Add bucketing/padding to key components & values before encrypting
+
+Store crc for each client as well as global space? Use that to identify 
+divergences + optinally identify when older seqnum is pushed and see if it's 
+identical or different

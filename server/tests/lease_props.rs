@@ -8,7 +8,7 @@
 //! 1. no two live leases overlap with incompatible modes;
 //! 2. the by-id and by-prefix indexes hold identical record sets;
 //! 3. live records in the store are exactly the model's live leases;
-//! 4. lease ids and internal epochs strictly increase and never recur.
+//! 4. lease ids strictly increase and never recur.
 
 use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
@@ -67,7 +67,6 @@ fn arb_cmd() -> impl Strategy<Value = Cmd> {
 #[derive(Clone, Debug)]
 struct MLease {
     id: u64,
-    epoch: u64,
     prefix: Prefix,
     mode: LeaseMode,
     device: u8,
@@ -80,7 +79,6 @@ struct MLease {
 struct Model {
     now: u64,
     next_id: u64,
-    next_epoch: u64,
     leases: Vec<MLease>,
 }
 
@@ -163,7 +161,6 @@ fn check_invariants(store: &MemoryStore, model: &Model) -> Result<(), TestCaseEr
     );
     for (id, rec) in &store_live {
         let m = model_live[id];
-        prop_assert_eq!(rec.epoch.0, m.epoch);
         prop_assert_eq!(rec.mode, m.mode);
         prop_assert_eq!(rec.device, DeviceId([m.device; 16]));
         prop_assert_eq!(rec.deadline.0, m.deadline);
@@ -227,7 +224,6 @@ proptest! {
                             prop_assert_eq!(lease.mode, *mode);
                             model.leases.push(MLease {
                                 id: model.next_id,
-                                epoch: model.next_epoch,
                                 prefix: prefix.clone(),
                                 mode: *mode,
                                 device: *device,
@@ -236,7 +232,6 @@ proptest! {
                                 gone: false,
                             });
                             model.next_id += 1;
-                            model.next_epoch += 1;
                         }
                     }
                 }

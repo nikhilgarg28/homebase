@@ -183,11 +183,14 @@ mod tests {
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(1),
-                    entries: vec![PutEntry {
-                        key: key(&[b"db", b"marker"]),
-                        value: Value::Present(marker.to_vec()),
-                        ver: Ver(1),
-                    }],
+                    ops: vec![
+                        PutEntry {
+                            key: key(&[b"db", b"marker"]),
+                            value: Value::Present(marker.to_vec()),
+                            ver: Ver(1),
+                        }
+                        .into(),
+                    ],
                 }],
             })
             .await

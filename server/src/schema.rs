@@ -236,7 +236,6 @@ pub struct LeaseRecord {
     pub granted_at: Timestamp,
     /// Prefix-scoped admission barrier captured at grant.
     pub barrier: AdmissionSeq,
-    pub epoch: Epoch,
     /// Server-side deadline: the lease is live strictly before this instant
     /// (strict local expiry — at the deadline it is gone).
     pub deadline: Timestamp,
@@ -250,7 +249,7 @@ impl LeaseRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8 + 1 + 16 + 16 + 8 * 8 + 32);
+        let mut out = Vec::with_capacity(1 + 8 + 1 + 16 + 16 + 8 * 7 + 32);
         out.push(LEASE_RECORD_VERSION);
         out.extend_from_slice(&self.id.0.to_be_bytes());
         out.push(match self.mode {
@@ -263,7 +262,6 @@ impl LeaseRecord {
         out.extend_from_slice(&self.requested_at.lineage.0);
         out.extend_from_slice(&self.granted_at.0.to_be_bytes());
         out.extend_from_slice(&self.barrier.0.to_be_bytes());
-        out.extend_from_slice(&self.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.0.to_be_bytes());
         let ttl_ms = self.ttl.as_millis().min(u64::MAX as u128) as u64;
         out.extend_from_slice(&ttl_ms.to_be_bytes());
@@ -290,7 +288,6 @@ impl LeaseRecord {
         };
         let granted_at = Timestamp(r.u64()?);
         let barrier = AdmissionSeq(r.u64()?);
-        let epoch = Epoch(r.u64()?);
         let deadline = Timestamp(r.u64()?);
         let ttl = Duration::from_millis(r.u64()?);
         let prefix = Key::decode(r.rest()).ok()?;
@@ -302,7 +299,6 @@ impl LeaseRecord {
             requested_at,
             granted_at,
             barrier,
-            epoch,
             deadline,
             ttl,
         })
@@ -315,7 +311,6 @@ impl LeaseRecord {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CountersRecord {
     pub next_lease_id: u64,
-    pub next_epoch: u64,
     /// Last admitted batch's admission seq (0 = nothing admitted yet).
     /// Incremented by `put_batch`; read by `acquire` as the barrier.
     pub admission_high_water: u64,
@@ -323,10 +318,9 @@ pub struct CountersRecord {
 
 impl CountersRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8 * 3);
+        let mut out = Vec::with_capacity(1 + 8 * 2);
         out.push(COUNTERS_RECORD_VERSION);
         out.extend_from_slice(&self.next_lease_id.to_be_bytes());
-        out.extend_from_slice(&self.next_epoch.to_be_bytes());
         out.extend_from_slice(&self.admission_high_water.to_be_bytes());
         out
     }
@@ -338,7 +332,6 @@ impl CountersRecord {
         }
         Some(Self {
             next_lease_id: r.u64()?,
-            next_epoch: r.u64()?,
             admission_high_water: r.u64()?,
         })
     }
@@ -503,7 +496,6 @@ mod tests {
             requested_at: HybridTimestamp::ZERO,
             granted_at: Timestamp(1000),
             barrier: AdmissionSeq(3),
-            epoch: Epoch(9),
             deadline: Timestamp(12345),
             ttl: Duration::from_secs(300),
         }
@@ -542,7 +534,6 @@ mod tests {
     fn counters_record_roundtrips() {
         let rec = CountersRecord {
             next_lease_id: 1,
-            next_epoch: 2,
             admission_high_water: 3,
         };
         assert_eq!(CountersRecord::decode(&rec.encode()), Some(rec));

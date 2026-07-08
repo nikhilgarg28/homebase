@@ -141,7 +141,7 @@ async fn foreign_put(
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: seq,
-                    entries,
+                    ops: entries.into_iter().map(Into::into).collect(),
                 }],
             },
         )
@@ -760,19 +760,25 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
                     batches: vec![
                         PutBatch {
                             device_seq: DeviceSeq(1),
-                            entries: vec![PutEntry {
-                                key: k1.clone(),
-                                value: val(b"one"),
-                                ver: Ver(1),
-                            }],
+                            ops: vec![
+                                PutEntry {
+                                    key: k1.clone(),
+                                    value: val(b"one"),
+                                    ver: Ver(1),
+                                }
+                                .into(),
+                            ],
                         },
                         PutBatch {
                             device_seq: DeviceSeq(2),
-                            entries: vec![PutEntry {
-                                key: k2.clone(),
-                                value: val(b"two"),
-                                ver: Ver(2),
-                            }],
+                            ops: vec![
+                                PutEntry {
+                                    key: k2.clone(),
+                                    value: val(b"two"),
+                                    ver: Ver(2),
+                                }
+                                .into(),
+                            ],
                         },
                     ],
                 },

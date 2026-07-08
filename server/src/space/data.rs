@@ -14,13 +14,13 @@
 //! 2. each client batch's `device_seq` strictly follows the device's stored
 //!    high water and the preceding batch in the request (replay and
 //!    out-of-order rejection);
-//! 3. every entry's `ver` strictly exceeds the stored ver for its key
-//!    (within a batch, later entries for the same key check against earlier
-//!    ones — the batch behaves like a sequence).
+//! 3. every Set/Delete has a valid seal and its `ver` strictly exceeds the
+//!    stored ver for its key (within a batch, later ops for the same key
+//!    check against earlier ones — the batch behaves like a sequence).
 //!
 //! On admission each client batch takes the next admission seq and the request
 //! writes, atomically:
-//! data records, changelog moves (delete the key's old changelog entry,
+//! data records for Set/Delete ops, changelog moves (delete the key's old changelog entry,
 //! insert the new one), per-prefix aggregates along every written key's
 //! prefix path (max admission seq + live-key delta; see
 //! [`PrefixMetaRecord`]), the device high water, and the counters.
@@ -51,11 +51,11 @@ use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_su
 use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
-    GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
+    BatchOp, GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
     PutBatchResponse, PutBatchResult, Range, RangeCut, ReadAtRequest, ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Tag};
+use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Epoch, Tag, Value, Ver};
 use std::collections::BTreeMap;
 
 pub async fn put_batch<S: OrderedStore>(
@@ -65,13 +65,13 @@ pub async fn put_batch<S: OrderedStore>(
     now: Timestamp,
     req: &PutBatchRequest,
 ) -> Result<PutBatchResponse, Error> {
-    // 1. Reservation conflicts: one legacy tag epoch per flattened entry.
+    // 1. Reservation conflicts over mutating ops; NoOp carries no key.
     let keys: Vec<Key> = req
         .batches
         .iter()
-        .flat_map(|batch| batch.entries.iter().map(|entry| entry.key.clone()))
+        .flat_map(|batch| batch.ops.iter().filter_map(op_key).cloned())
         .collect();
-    let epochs = leases
+    leases
         .validate_put(store, now, req.device, &req.evidence, &keys)
         .await?;
 
@@ -109,50 +109,49 @@ pub async fn put_batch<S: OrderedStore>(
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
     let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
-    let mut epochs = epochs.into_iter();
     for client_batch in &req.batches {
         let seq = next_admission_seq;
         results.push(PutBatchResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
-        for entry in &client_batch.entries {
-            let epoch = epochs
-                .next()
-                .expect("lease validation returned one epoch per key");
-            let current_ver = match staged.get(&entry.key) {
+        for op in &client_batch.ops {
+            let Some((key, ver, value)) = op_write(op)? else {
+                continue;
+            };
+            let current_ver = match staged.get(key) {
                 Some(rec) => Some(rec.tag.ver),
                 None => {
-                    let stored = data(space, store, &entry.key).await?;
+                    let stored = data(space, store, key).await?;
                     if let Some(rec) = &stored {
-                        old_seqs.insert(entry.key.clone(), rec.tag.admission_seq);
+                        old_seqs.insert(key.clone(), rec.tag.admission_seq);
                     }
                     was_live.insert(
-                        entry.key.clone(),
+                        key.clone(),
                         stored.as_ref().is_some_and(|rec| rec.value.is_present()),
                     );
                     stored.map(|rec| rec.tag.ver)
                 }
             };
             if let Some(current) = current_ver {
-                if entry.ver <= current {
+                if ver <= current {
                     return Err(KernelError::VerRegression {
-                        key: entry.key.clone(),
+                        key: key.clone(),
                         current,
-                        attempted: entry.ver,
+                        attempted: ver,
                     }
                     .into());
                 }
             }
             staged.insert(
-                entry.key.clone(),
+                key.clone(),
                 DataRecord {
                     tag: Tag {
                         device: req.device,
                         device_seq: client_batch.device_seq,
-                        epoch,
-                        ver: entry.ver,
+                        epoch: Epoch(0),
+                        ver,
                         admission_seq: seq,
                     },
-                    value: entry.value.clone(),
+                    value,
                 },
             );
         }
@@ -210,6 +209,38 @@ pub async fn put_batch<S: OrderedStore>(
     store.apply(batch).await?;
 
     Ok(PutBatchResponse { results })
+}
+
+fn op_key(op: &BatchOp) -> Option<&Key> {
+    match op {
+        BatchOp::Set { key, .. } | BatchOp::Delete { key, .. } => Some(key),
+        BatchOp::NoOp => None,
+    }
+}
+
+fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value)>, Error> {
+    match op {
+        BatchOp::Set {
+            key,
+            ver,
+            seal,
+            ciphertext,
+        } => {
+            seal.validate_payload()
+                .map_err(|err| KernelError::InvalidSeal {
+                    reason: err.to_string(),
+                })?;
+            Ok(Some((key, *ver, Value::Present(ciphertext.clone()))))
+        }
+        BatchOp::Delete { key, ver, seal } => {
+            seal.validate_payload()
+                .map_err(|err| KernelError::InvalidSeal {
+                    reason: err.to_string(),
+                })?;
+            Ok(Some((key, *ver, Value::Absent)))
+        }
+        BatchOp::NoOp => Ok(None),
+    }
 }
 
 pub async fn get<S: OrderedStore>(

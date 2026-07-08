@@ -14,7 +14,8 @@ use crate::meta::{CodecRecord, MetaStore, certify};
 use crate::server::{ServerHandle, offline_router};
 use crate::space::{DEFAULT_PUSH_CAP, PushOutcome, Space, SpaceDriverError, live_write_leases};
 use homebase_core::clock::HybridClock;
-use homebase_core::messages::{KernelError, PutBatch, PutBatchRequest, PutBatchResult};
+use homebase_core::key::Key;
+use homebase_core::messages::{BatchOp, KernelError, PutBatch, PutBatchRequest, PutBatchResult};
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
 use homebase_core::tag::{DeviceId, DeviceSeq};
@@ -241,16 +242,18 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             let mut last = head;
             let mut batches = vec![PutBatch {
                 device_seq: head,
-                entries: head_record.entries().to_vec(),
+                ops: head_record
+                    .entries()
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
             }];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
                         || record.space() != Some(space)
-                        || batches
-                            .iter()
-                            .map(|batch| batch.entries.len())
-                            .sum::<usize>()
+                        || batches.iter().map(|batch| batch.ops.len()).sum::<usize>()
                             + record.entries().len()
                             > push_cap
                     {
@@ -258,14 +261,14 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                     }
                     batches.push(PutBatch {
                         device_seq: *seq,
-                        entries: record.entries().to_vec(),
+                        ops: record.entries().iter().cloned().map(Into::into).collect(),
                     });
                     last = *seq;
                 }
             }
             let keys: Vec<_> = batches
                 .iter()
-                .flat_map(|batch| batch.entries.iter().map(|entry| entry.key.clone()))
+                .flat_map(|batch| batch.ops.iter().filter_map(op_key).cloned())
                 .collect();
             let batch_count = batches.len();
             let request = PutBatchRequest {
@@ -412,6 +415,13 @@ impl fmt::Display for ClientError {
                 )
             }
         }
+    }
+}
+
+fn op_key(op: &BatchOp) -> Option<&Key> {
+    match op {
+        BatchOp::Set { key, .. } | BatchOp::Delete { key, .. } => Some(key),
+        BatchOp::NoOp => None,
     }
 }
 

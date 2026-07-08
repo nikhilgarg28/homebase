@@ -128,8 +128,9 @@ mod tests {
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{
-        KernelError, LeaseSpec, PutBatch, PutEntry, Range, RangeCursor, RangeCut,
+        BatchOp, KernelError, LeaseSpec, PutBatch, PutEntry, Range, RangeCursor, RangeCut,
     };
+    use homebase_core::seal::Seal;
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use pollster::block_on;
     use std::time::Duration;
@@ -144,20 +145,22 @@ mod tests {
         Key::from_bytes(components.iter().copied()).unwrap()
     }
 
-    fn put(k: &Key, value: &[u8], ver: u64) -> PutEntry {
+    fn put(k: &Key, value: &[u8], ver: u64) -> BatchOp {
         PutEntry {
             key: k.clone(),
             value: Value::Present(value.to_vec()),
             ver: Ver(ver),
         }
+        .into()
     }
 
-    fn del(k: &Key, ver: u64) -> PutEntry {
+    fn del(k: &Key, ver: u64) -> BatchOp {
         PutEntry {
             key: k.clone(),
             value: Value::Absent,
             ver: Ver(ver),
         }
+        .into()
     }
 
     /// Space + store + a write lease over `("db",)` held by device 1.
@@ -187,7 +190,7 @@ mod tests {
         store: &MemoryStore,
         lease: LeaseId,
         device_seq: u64,
-        entries: Vec<PutEntry>,
+        ops: Vec<BatchOp>,
     ) -> Result<PutBatchResponse, Error> {
         block_on(space.put_batch(
             store,
@@ -197,7 +200,7 @@ mod tests {
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
-                    entries,
+                    ops,
                 }],
             },
         ))
@@ -236,6 +239,33 @@ mod tests {
     }
 
     #[test]
+    fn scheme_zero_rejects_non_empty_seal_payload() {
+        let (mut space, store, lease) = setup();
+        let k = key(&[b"db", b"payload"]);
+        let mut seal = Seal::empty_aead_v1();
+        seal.payload.push(1);
+
+        let err = put_batch(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![BatchOp::Set {
+                key: k,
+                ver: Ver(1),
+                seal,
+                ciphertext: b"v".to_vec(),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Kernel(KernelError::InvalidSeal { .. })
+        ));
+    }
+
+    #[test]
     fn put_batch_coalesces_successive_client_batches_atomically() {
         let (mut space, store, lease) = setup();
         let k1 = key(&[b"db", b"t", b"r1"]);
@@ -249,11 +279,11 @@ mod tests {
                 batches: vec![
                     PutBatch {
                         device_seq: DeviceSeq(1),
-                        entries: vec![put(&k1, b"v1", 1)],
+                        ops: vec![put(&k1, b"v1", 1)],
                     },
                     PutBatch {
                         device_seq: DeviceSeq(2),
-                        entries: vec![put(&k2, b"v2", 2)],
+                        ops: vec![put(&k2, b"v2", 2)],
                     },
                 ],
             },

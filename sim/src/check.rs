@@ -13,10 +13,10 @@
 //!    contract;
 //! 2. counters: `admission_high_water` equals the max changelog seq
 //!    (counters commit atomically with the batch they describe, so a
-//!    surviving prefix is always self-consistent), and lease id/epoch
-//!    counters strictly exceed every surviving lease record's;
+//!    surviving prefix is always self-consistent), and the lease id counter
+//!    strictly exceeds every surviving lease record's id;
 //! 3. lease indexes: by-id and by-prefix hold identical record sets, ids
-//!    and epochs unique;
+//!    unique;
 //! 4. per-prefix aggregates equal recomputation from the data records;
 //! 5. per-device high waters bound every surviving data tag.
 
@@ -97,7 +97,6 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         .map(|bytes| CountersRecord::decode(&bytes).expect("undecodable counters"))
         .unwrap_or(CountersRecord {
             next_lease_id: 0,
-            next_epoch: 0,
             admission_high_water: 0,
         });
     assert_eq!(
@@ -122,24 +121,12 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         .collect();
     assert_eq!(by_id, by_prefix, "lease indexes diverged");
 
-    let mut epochs = BTreeSet::new();
     for rec in by_id.values() {
-        assert!(
-            epochs.insert(rec.epoch.0),
-            "duplicate epoch {:?}",
-            rec.epoch
-        );
         assert!(
             rec.id.0 < counters.next_lease_id,
             "lease id {:?} not below counter {}",
             rec.id,
             counters.next_lease_id
-        );
-        assert!(
-            rec.epoch.0 < counters.next_epoch,
-            "epoch {:?} not below counter {}",
-            rec.epoch,
-            counters.next_epoch
         );
     }
 

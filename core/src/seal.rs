@@ -86,6 +86,17 @@ pub struct Seal {
 }
 
 impl Seal {
+    /// Empty scheme-0 seal. This is useful for tests and for the legacy
+    /// PutEntry-to-BatchOp bridge until the value cipher emits real seals.
+    pub fn empty_aead_v1() -> Self {
+        Self {
+            scheme: SealScheme::AeadV1,
+            nonce: [0; SEAL_NONCE_LEN],
+            aead: [0; SEAL_AEAD_TAG_LEN],
+            payload: Vec::new(),
+        }
+    }
+
     /// Validates that the opaque payload is allowed for this scheme.
     pub fn validate_payload(&self) -> Result<(), SealPayloadError> {
         match self.scheme {

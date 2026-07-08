@@ -148,14 +148,32 @@ pub enum BatchOp {
     NoOp,
 }
 
-/// One write within a batch. Deletes are explicit: writing
-/// [`Value::Absent`] stores a tombstone.
+/// Legacy client-local write shape. The server wire format uses [`BatchOp`];
+/// this remains the bridge for the current client oplog encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutEntry {
     pub key: Key,
     pub value: Value,
     /// Must be strictly greater than the stored `Ver` for this key.
     pub ver: Ver,
+}
+
+impl From<PutEntry> for BatchOp {
+    fn from(entry: PutEntry) -> Self {
+        match entry.value {
+            Value::Present(ciphertext) => Self::Set {
+                key: entry.key,
+                ver: entry.ver,
+                seal: Seal::empty_aead_v1(),
+                ciphertext,
+            },
+            Value::Absent => Self::Delete {
+                key: entry.key,
+                ver: entry.ver,
+                seal: Seal::empty_aead_v1(),
+            },
+        }
+    }
 }
 
 /// One client commit within an atomic put request.
@@ -165,13 +183,14 @@ pub struct PutBatch {
     /// commit. A request may coalesce successive client commits without
     /// erasing their individual seq identity.
     pub device_seq: DeviceSeq,
-    pub entries: Vec<PutEntry>,
+    pub ops: Vec<BatchOp>,
 }
 
 /// Atomic write request (request = transaction; torn requests impossible).
 ///
-/// Admission requires: no entry's key overlaps a live foreign lease
-/// reservation, and every entry satisfies per-key `Ver` monotonicity.
+/// Admission requires: no Set/Delete key overlaps a live foreign lease
+/// reservation, every Set/Delete has a valid [`Seal`], and every Set/Delete
+/// satisfies per-key `Ver` monotonicity.
 /// Presented lease ids are diagnostic evidence only. Any violation rejects
 /// the whole batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -332,6 +351,8 @@ pub enum KernelError {
     LeaseInvalid { lease: LeaseId },
     /// Legacy coverage error. Reservation conflicts now use [`Contended`].
     NotCovered { key: Key },
+    /// A Set/Delete seal is malformed for its declared scheme.
+    InvalidSeal { reason: String },
     /// Per-key version monotonicity violated.
     VerRegression {
         key: Key,
@@ -361,6 +382,7 @@ impl fmt::Display for KernelError {
             },
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
+            Self::InvalidSeal { reason } => write!(f, "invalid seal: {reason}"),
             Self::VerRegression {
                 key,
                 current,
