@@ -12,6 +12,7 @@ getrandom = "0.4.3"
 hkdf = "0.13.0"
 hmac = "0.13.0"
 homebase-core.workspace = true
+futures-channel.workspace = true
 sha2 = "0.11.0"
 
 [dev-dependencies]

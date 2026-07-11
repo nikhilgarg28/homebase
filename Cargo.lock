@@ -964,6 +964,7 @@ name = "homebase"
 version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
+ "futures-channel",
  "getrandom 0.4.3",
  "hkdf",
  "hmac",

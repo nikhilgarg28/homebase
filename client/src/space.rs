@@ -110,7 +110,9 @@ pub struct Space<'a, M, H, C, N = SystemNonceSource> {
     id: SpaceId,
 }
 
-impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a, M, H, C, N> {
+impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'static>
+    Space<'a, M, H, C, N>
+{
     pub(crate) fn new(client: &'a Client<M, H, C, N>, id: SpaceId) -> Self {
         Self { client, id }
     }
@@ -128,6 +130,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn leases(&self, prefixes: &[Key]) -> Result<Vec<LeaseState>, SpaceDriverError> {
+        let _permit = self.enter().await?;
         let now = self.client.clock().stamp();
         let prefixes = self.encode_keys(prefixes)?;
         let mut out = Vec::new();
@@ -144,32 +147,55 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn commit(&self, entries: Vec<(Key, Value)>) -> Result<Committed, SpaceDriverError> {
+        let _permit = self.enter().await?;
         let cipher = self.cipher();
-        let mut encoded = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            let key = cipher.encode_key(&key)?;
-            encoded.push((key, value));
-        }
+        let name_cipher = cipher.clone();
+        let encoded = self
+            .client
+            .run_blocking(move || {
+                entries
+                    .into_iter()
+                    .map(|(key, value)| Ok((name_cipher.encode_key(&key)?, value)))
+                    .collect::<Result<Vec<_>, CipherError>>()
+            })
+            .await
+            .map_err(coordination_unavailable)??;
         self.check_local_write_authority(&encoded).await?;
         let device = self.device();
-        let mut reserved = self.client.store().reserve_commit(self.id, encoded).await?;
-        for entry in reserved.record.entries_mut() {
-            let nonce = self
-                .client
-                .next_nonce()
-                .map_err(|reason| SpaceDriverError::Nonce { reason })?;
-            let context = ValueContext {
-                device,
-                device_seq: reserved.seq,
-                ver: entry.ver,
-            };
-            entry.value = cipher.encode_value(&entry.key, &entry.value, context, nonce)?;
-        }
+        let reserved = self.client.store().reserve_commit(self.id, encoded).await?;
+        let nonces = (0..reserved.record.entries().len())
+            .map(|_| {
+                self.client
+                    .next_nonce()
+                    .map_err(|reason| SpaceDriverError::Nonce { reason })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let reserved = self
+            .client
+            .run_blocking(move || {
+                let mut reserved = reserved;
+                for (entry, nonce) in reserved.record.entries_mut().iter_mut().zip(nonces) {
+                    let context = ValueContext {
+                        device,
+                        device_seq: reserved.seq,
+                        ver: entry.ver,
+                    };
+                    entry.value = cipher.encode_value(&entry.key, &entry.value, context, nonce)?;
+                }
+                Ok::<_, CipherError>(reserved)
+            })
+            .await
+            .map_err(coordination_unavailable)??;
         let committed = self.client.store().commit(self.id, reserved).await?;
         Ok(committed)
     }
 
     pub async fn acquire(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
+        let _permit = self.enter().await?;
+        self.acquire_inner(specs).await
+    }
+
+    async fn acquire_inner(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
         let specs = self.encode_specs(specs)?;
         let space = self.id;
         if specs.is_empty() {
@@ -270,7 +296,8 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn ensure(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
-        let acquired = self.acquire(specs).await?;
+        let _permit = self.enter().await?;
+        let acquired = self.acquire_inner(specs).await?;
         if acquired.barrier.is_none() {
             return Ok(acquired);
         }
@@ -297,6 +324,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn renew(&self, prefixes: &[Key]) -> Result<RenewResponse, SpaceDriverError> {
+        let _permit = self.enter().await?;
         let prefixes = self.encode_keys(prefixes)?;
         let held = if prefixes.is_empty() {
             Vec::new()
@@ -315,6 +343,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn release(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
+        let _permit = self.enter().await?;
         if ids.is_empty() {
             return Ok(());
         }
@@ -335,8 +364,21 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
     }
 
     pub async fn pull(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
+        let _permit = self.enter().await?;
         let range = self.cipher().encode_range(&range)?;
         self.pull_encoded(range).await
+    }
+
+    async fn enter(
+        &self,
+    ) -> Result<crate::coordination::SpacePermit<crate::client::ClientSession<N>>, SpaceDriverError>
+    {
+        self.client
+            .enter_space(self.id)
+            .await
+            .map_err(|error| SpaceDriverError::Unavailable {
+                reason: error.to_string(),
+            })
     }
 
     async fn pull_encoded(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
@@ -369,19 +411,25 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
             .store()
             .advance_watermark(space, &range, response.at, ver_seen)
             .await?;
-        for cut in &mut response.ranges {
-            let entries = match cut {
-                RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
-            };
-            for entry in entries {
-                entry.value = cipher.decode_value(
-                    &entry.key,
-                    &entry.value,
-                    ValueContext::from_tag(&entry.tag),
-                )?;
-            }
-        }
-        Ok(response)
+        self.client
+            .run_blocking(move || {
+                for cut in &mut response.ranges {
+                    let entries = match cut {
+                        RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
+                    };
+                    for entry in entries {
+                        entry.value = cipher.decode_value(
+                            &entry.key,
+                            &entry.value,
+                            ValueContext::from_tag(&entry.tag),
+                        )?;
+                    }
+                }
+                Ok::<_, CipherError>(response)
+            })
+            .await
+            .map_err(coordination_unavailable)?
+            .map_err(Into::into)
     }
 
     fn lease_live(&self, held: &HeldLease, now: &HybridTimestamp) -> bool {
@@ -651,4 +699,10 @@ fn mode_covers(held: LeaseMode, want: LeaseMode) -> bool {
         (held, want),
         (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read)
     )
+}
+
+fn coordination_unavailable(error: crate::coordination::CoordinationError) -> SpaceDriverError {
+    SpaceDriverError::Unavailable {
+        reason: error.to_string(),
+    }
 }

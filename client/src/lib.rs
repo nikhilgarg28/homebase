@@ -25,6 +25,7 @@
 
 pub mod cipher;
 pub mod client;
+mod coordination;
 pub mod meta;
 pub mod server;
 pub mod space;

@@ -5,11 +5,24 @@
 //! spaces. Open a client over any [`MetaStore`] implementation, then
 //! [`attach`](Client::attach) an envelope and [`space`](Client::space) to
 //! work in it.
+//!
+//! # Coordination model
+//!
+//! One small event loop owns session state and grants per-space workflows
+//! in FIFO order. It performs no storage, crypto, network, timer, or other
+//! slow work. Public futures do network work in their executor task; bulk
+//! crypto runs on the client's blocking pool; MetaStore adapters are
+//! responsible for moving blocking SQLite work onto that same kind of
+//! worker boundary. Results re-enter through channels and only the granted
+//! workflow applies coordination-state transitions. Different spaces may
+//! progress concurrently, so the loop is the correctness chokepoint rather
+//! than a global performance chokepoint.
 
 use crate::cipher::{
     CipherError, NonceSource, SpaceCipher, SpaceEnvelope, SystemNonceSource, V1_KEY_EPOCH,
     ValueNonce,
 };
+use crate::coordination::{BlockingPool, CoordinationError, Coordinator, SpacePermit};
 use crate::meta::{CodecRecord, MetaStore, certify};
 use crate::server::{ServerHandle, offline_router};
 use crate::space::{DEFAULT_PUSH_CAP, PushOutcome, Space, SpaceDriverError, live_write_leases};
@@ -19,15 +32,16 @@ use homebase_core::messages::{BatchOp, KernelError, PutBatch, PutBatchRequest, P
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
 use homebase_core::tag::{DeviceId, DeviceSeq};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Client-global scalars. Oplog cursors live only in the MetaStore.
-#[derive(Clone, Debug)]
-pub(crate) struct ClientGlobals {
+/// Fast session state owned exclusively by the coordination loop. Durable
+/// oplog, cursor, and lease truth remains in MetaStore.
+pub(crate) struct ClientSession<N> {
     pub(crate) device: DeviceId,
     pub(crate) push_cap: usize,
+    nonce_source: N,
+    attached: BTreeMap<SpaceId, SpaceCipher>,
 }
 
 /// One device across many spaces.
@@ -35,12 +49,13 @@ pub struct Client<M, H, C, N = SystemNonceSource> {
     store: M,
     server: H,
     clock: C,
-    nonce_source: RefCell<N>,
-    pub(crate) globals: RefCell<ClientGlobals>,
-    attached: RefCell<BTreeMap<SpaceId, SpaceCipher>>,
+    coordinator: Coordinator<ClientSession<N>>,
+    workers: BlockingPool,
 }
 
-impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H, C, N> {
+impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'static>
+    Client<M, H, C, N>
+{
     /// Open a client over durable truth, a server endpoint, and a clock.
     ///
     /// `fresh` is used only when the store has no device record yet.
@@ -82,33 +97,37 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
         }
         store.record_clock(now.wall).await?;
 
+        let coordinator = Coordinator::new(ClientSession {
+            device,
+            push_cap: DEFAULT_PUSH_CAP,
+            nonce_source,
+            attached: BTreeMap::new(),
+        })?;
+        let workers = BlockingPool::new(2)?;
         Ok(Self {
             store,
             server,
             clock,
-            nonce_source: RefCell::new(nonce_source),
-            globals: RefCell::new(ClientGlobals {
-                device,
-                push_cap: DEFAULT_PUSH_CAP,
-            }),
-            attached: RefCell::new(BTreeMap::new()),
+            coordinator,
+            workers,
         })
     }
 
     pub fn device(&self) -> DeviceId {
-        self.globals.borrow().device
+        self.coordinator.call(|session| session.device)
     }
 
     /// Replace the grouping cap (entries per wire batch).
     pub fn with_push_cap(&self, cap: usize) -> &Self {
         assert!(cap > 0, "a zero cap would ship nothing");
-        self.globals.borrow_mut().push_cap = cap;
+        self.coordinator.call(move |session| session.push_cap = cap);
         self
     }
 
     /// Whether this space's cipher is attached in this client session.
     pub fn is_attached(&self, id: SpaceId) -> bool {
-        self.attached.borrow().contains_key(&id)
+        self.coordinator
+            .call(move |session| session.attached.contains_key(&id))
     }
 
     /// Attach a space for this session. Persists the envelope to the codec
@@ -117,6 +136,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
     pub async fn attach(&self, envelope: &SpaceEnvelope) -> Result<(), ClientError> {
         let cipher = envelope.open()?;
         let id = cipher.space_id();
+        let _permit = self.enter_space(id).await?;
 
         let state = self.store.load().await?;
         match state.spaces.get(&id).and_then(|s| s.codec.as_ref()) {
@@ -143,7 +163,9 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             return Ok(());
         }
 
-        self.attached.borrow_mut().insert(id, cipher);
+        self.coordinator.call(move |session| {
+            session.attached.insert(id, cipher);
+        });
         Ok(())
     }
 
@@ -157,17 +179,24 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
 
     /// Space ids attached in this session, in order.
     pub fn attached(&self) -> Vec<SpaceId> {
-        self.attached.borrow().keys().copied().collect()
+        self.coordinator
+            .call(|session| session.attached.keys().copied().collect())
     }
 
     async fn attach_from_codec(&self, id: SpaceId) -> Result<(), ClientError> {
+        let _permit = self.enter_space(id).await?;
+        if self.is_attached(id) {
+            return Ok(());
+        }
         let state = self.store.load().await?;
         let Some(record) = state.spaces.get(&id).and_then(|s| s.codec.as_ref()) else {
             return Err(ClientError::MissingCodec(id));
         };
         let envelope = SpaceEnvelope::decode(&record.sealed)?;
         let cipher = envelope.open_expected(id)?;
-        self.attached.borrow_mut().insert(id, cipher);
+        self.coordinator.call(move |session| {
+            session.attached.insert(id, cipher);
+        });
         Ok(())
     }
 
@@ -184,15 +213,33 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
     }
 
     pub(crate) fn cipher(&self, id: SpaceId) -> SpaceCipher {
-        self.attached
-            .borrow()
-            .get(&id)
-            .expect("space must be attached")
-            .clone()
+        self.coordinator.call(move |session| {
+            session
+                .attached
+                .get(&id)
+                .expect("space must be attached")
+                .clone()
+        })
     }
 
     pub(crate) fn next_nonce(&self) -> Result<ValueNonce, String> {
-        self.nonce_source.borrow_mut().next_nonce()
+        self.coordinator
+            .call(|session| session.nonce_source.next_nonce())
+    }
+
+    pub(crate) async fn enter_space(
+        &self,
+        space: SpaceId,
+    ) -> Result<SpacePermit<ClientSession<N>>, CoordinationError> {
+        self.coordinator.enter(space).await
+    }
+
+    pub(crate) async fn run_blocking<F, R>(&self, work: F) -> Result<R, CoordinationError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.workers.run(work).await
     }
 
     /// Drain every persisted per-space oplog. This compatibility entry point
@@ -221,6 +268,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
     }
 
     async fn push_space(&self, space: SpaceId) -> Result<PushOutcome, ClientError> {
+        let _permit = self.enter_space(space).await?;
         let mut acked = None;
         let mut probe = false;
         loop {
@@ -236,7 +284,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                     acked_through: acked,
                 });
             }
-            let push_cap = self.globals.borrow().push_cap;
+            let push_cap = self.coordinator.call(|session| session.push_cap);
             let until = DeviceSeq(
                 cursors
                     .neck
@@ -244,7 +292,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                     .saturating_add(push_cap as u64 - 1)
                     .min(cursors.tail.0 - 1),
             );
-            let device = self.globals.borrow().device;
+            let device = self.device();
 
             let window = self.store.oplog(space, cursors.neck, until).await?;
             let Some((head, head_record)) = window.first() else {
@@ -359,6 +407,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
     /// Retire a space's active oplog window after a definitive rejection.
     /// Retry an ambiguous push before calling this method.
     pub async fn rollback(&self, space: SpaceId, to: DeviceSeq) -> Result<(), ClientError> {
+        let _permit = self.enter_space(space).await?;
         self.store.rollback(space, to).await?;
         Ok(())
     }
@@ -377,7 +426,7 @@ pub async fn open_offline<M, C, N>(
 where
     M: MetaStore,
     C: HybridClock,
-    N: NonceSource,
+    N: NonceSource + Send + 'static,
 {
     Client::open(store, offline_router(), clock, fresh, nonce_source).await
 }
@@ -389,6 +438,7 @@ pub enum ClientError {
     Cipher(CipherError),
     MissingCodec(SpaceId),
     CodecMismatch { id: SpaceId },
+    Coordination { reason: String },
 }
 
 impl From<StorageError> for ClientError {
@@ -409,6 +459,14 @@ impl From<CipherError> for ClientError {
     }
 }
 
+impl From<CoordinationError> for ClientError {
+    fn from(err: CoordinationError) -> Self {
+        Self::Coordination {
+            reason: err.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -422,6 +480,7 @@ impl fmt::Display for ClientError {
                     "envelope does not match persisted codec for space {id:?}"
                 )
             }
+            Self::Coordination { reason } => write!(f, "{reason}"),
         }
     }
 }
