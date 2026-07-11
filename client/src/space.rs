@@ -165,8 +165,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
             };
             entry.value = cipher.encode_value(&entry.key, &entry.value, context, nonce)?;
         }
-        let committed = self.client.store().commit(reserved).await?;
-        self.client.bump_next_seq(committed.seq);
+        let committed = self.client.store().commit(self.id, reserved).await?;
         Ok(committed)
     }
 
@@ -455,10 +454,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
         if releasing.is_empty() {
             return Ok(());
         }
-        for (seq, record) in &state.oplog {
-            if record.space() != Some(self.id) {
-                continue;
-            }
+        for (seq, record) in &space_state.oplog {
             for held in &releasing {
                 if record
                     .entries()

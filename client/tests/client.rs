@@ -1,5 +1,5 @@
 //! Client-layer integration: multi-space coordination, offline physics,
-//! global push ordering, and codec-cache resume.
+//! per-space sequencing, and codec-cache resume.
 
 use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext};
 use homebase::meta::{OrderedMetaStore, audit};
@@ -109,7 +109,7 @@ fn device_minted_once_across_incarnations() {
 }
 
 #[test]
-fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
+fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
     block_on(async {
         let envelope_a = SpaceEnvelope::mint(NameKey([1; 32]), SpaceKey([2; 32]));
         let envelope_b = SpaceEnvelope::mint(NameKey([3; 32]), SpaceKey([4; 32]));
@@ -156,14 +156,24 @@ fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
             .unwrap();
 
         let state = audit(&OrderedMetaStore::new(&mem)).await;
-        assert_eq!(state.oplog.len(), 3);
+        assert_eq!(state.spaces[&id_a].oplog.len(), 2);
+        assert_eq!(state.spaces[&id_b].oplog.len(), 1);
         assert_eq!(
-            state.oplog.keys().copied().collect::<Vec<_>>(),
-            vec![DeviceSeq(1), DeviceSeq(2), DeviceSeq(3)]
+            state.spaces[&id_a]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(1), DeviceSeq(2)]
         );
-        assert_eq!(state.oplog[&DeviceSeq(1)].space().unwrap(), id_a);
-        assert_eq!(state.oplog[&DeviceSeq(2)].space().unwrap(), id_b);
-        assert_eq!(state.oplog[&DeviceSeq(3)].space().unwrap(), id_a);
+        assert_eq!(
+            state.spaces[&id_b]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(1)]
+        );
 
         client.push().await.unwrap();
 
@@ -201,7 +211,7 @@ fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
 }
 
 #[test]
-fn global_push_drains_interleaved_spaces_in_seq_order() {
+fn global_push_compatibility_drains_independent_space_streams() {
     block_on(async {
         let id_a = SpaceId([10; 16]);
         let id_b = SpaceId([11; 16]);
@@ -259,7 +269,7 @@ fn global_push_drains_interleaved_spaces_in_seq_order() {
             let entry = fetch(&handle, id, &row).await.unwrap();
             seqs.push(entry.tag.device_seq);
         }
-        assert_eq!(seqs, vec![DeviceSeq(1), DeviceSeq(2), DeviceSeq(3)]);
+        assert_eq!(seqs, vec![DeviceSeq(1), DeviceSeq(1), DeviceSeq(2)]);
     });
 }
 
@@ -305,7 +315,12 @@ fn offline_commit_survives_until_online_push() {
                 .await
                 .unwrap();
         }
-        assert_eq!(audit(&OrderedMetaStore::new(&mem)).await.oplog.len(), 1);
+        assert_eq!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&space]
+                .oplog
+                .len(),
+            1
+        );
 
         let online = Client::open(
             OrderedMetaStore::new(&mem),

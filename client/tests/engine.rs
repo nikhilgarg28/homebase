@@ -172,7 +172,12 @@ fn hstamp(ms: u64, lin: u8) -> HybridTimestamp {
 
 /// The queue length, read from durable truth (the engine keeps no copy).
 async fn queued(mem: &MemoryStore) -> usize {
-    audit(&OrderedMetaStore::new(mem)).await.oplog.len()
+    audit(&OrderedMetaStore::new(mem))
+        .await
+        .spaces
+        .values()
+        .map(|space| space.oplog.len())
+        .sum()
 }
 
 /// Byte-for-byte copy of a store: the file-copy fork, made literal.
@@ -263,8 +268,8 @@ fn push_drains_and_groups_same_space_neighbors() {
 
         // The trim is durable, and a drained queue pushes as a no-op.
         let state = audit(&OrderedMetaStore::new(&mem)).await;
-        assert!(state.oplog.is_empty());
-        assert_eq!(state.next_seq, Some(DeviceSeq(4)));
+        assert!(state.spaces[&SPACE].oplog.is_empty());
+        assert_eq!(state.spaces[&SPACE].cursors.tail, DeviceSeq(4));
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
@@ -801,7 +806,11 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
         let entry = fetch(&handle, SPACE, &k1).await.unwrap();
         assert_eq!(entry.value, val(b"one"));
         assert_eq!(entry.tag.ver, Ver(1), "admitted exactly once, no replay");
-        assert!(audit(&OrderedMetaStore::new(&mem)).await.oplog.is_empty());
+        assert!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
+                .oplog
+                .is_empty()
+        );
     });
 }
 
@@ -883,7 +892,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
         }
         // The rollback: the convicted commit falls, and everything after
         // it falls too (it may have read what the fault wrote).
-        client.discard_from(DeviceSeq(2)).await.unwrap();
+        client.discard_from(SPACE, DeviceSeq(2)).await.unwrap();
         assert_eq!(queued(&mem).await, 0);
         assert_eq!(
             client.push().await.unwrap(),
@@ -900,7 +909,11 @@ fn group_rejection_probes_to_the_faulty_commit() {
             fetch(&handle, SPACE, &y).await.is_none(),
             "the suffix rolled back"
         );
-        assert!(audit(&OrderedMetaStore::new(&mem)).await.oplog.is_empty());
+        assert!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
+                .oplog
+                .is_empty()
+        );
     });
 }
 

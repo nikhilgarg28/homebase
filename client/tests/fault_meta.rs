@@ -172,7 +172,10 @@ fn unflushed_commit_is_lost_on_crash() {
 
         sim.crash();
         let state = audit(&OrderedMetaStore::new(sim)).await;
-        assert!(state.oplog.is_empty(), "unflushed commit must not survive");
+        assert!(
+            state.spaces.values().all(|space| space.oplog.is_empty()),
+            "unflushed commit must not survive"
+        );
     });
 }
 
@@ -244,6 +247,10 @@ fn ack_drop_trims_after_server_admitted() {
                 acked_through: Some(DeviceSeq(2))
             }
         );
-        assert!(audit(&OrderedMetaStore::new(sim)).await.oplog.is_empty());
+        assert!(
+            audit(&OrderedMetaStore::new(sim)).await.spaces[&SPACE]
+                .oplog
+                .is_empty()
+        );
     });
 }

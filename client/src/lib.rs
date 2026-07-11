@@ -10,12 +10,12 @@
 //!   [`server::conformance`].
 //!
 //! - [`meta`] — **contract 2 of 3**: [`MetaStore`](meta::MetaStore), a
-//!   device's durable truth (identity, one shared seq stream, one oplog,
-//!   per-space range watermarks/leases/codec cache) expressed as the transition
+//!   device's durable truth (global identity and clock tripwire; per-space
+//!   oplog cursors, version high-water, range watermarks, leases, and codec cache) expressed as the transition
 //!   vocabulary itself — every method one atomic, durable, async step.
 //!
 //! - [`client`] — the device-scoped coordinator: one store, one device
-//!   identity, one shared oplog, one pusher — over many [`Space`] drivers.
+//!   identity, and persisted per-space oplogs — over many [`Space`] drivers.
 //!
 //! - [`space`] — per-space commit, pull, and lease operations, reached
 //!   through [`Client::attach`] and [`Client::space`].

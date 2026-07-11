@@ -87,10 +87,10 @@ fn replay_oplog_plaintext(
     space: SpaceId,
     device: DeviceId,
 ) -> BTreeMap<Key, Value> {
-    for (seq, record) in &state.oplog {
-        if record.space().unwrap() != space {
-            continue;
-        }
+    let Some(space_state) = state.spaces.get(&space) else {
+        return view;
+    };
+    for (seq, record) in &space_state.oplog {
         for entry in record.entries() {
             view.insert(entry.key.clone(), entry.value.clone());
             let _ = (seq, device);
@@ -129,7 +129,12 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
         client.push().await.unwrap();
 
         space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
-        assert_eq!(audit(&OrderedMetaStore::new(&mem)).await.oplog.len(), 1);
+        assert_eq!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
+                .oplog
+                .len(),
+            1
+        );
 
         let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
         let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
@@ -218,7 +223,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         let cipher = envelope.open().unwrap();
         let encoded_k2 = cipher.encode_key(&k2).unwrap();
-        for (seq, record) in &state.oplog {
+        for (seq, record) in &state.spaces[&space_id].oplog {
             for entry in record.entries() {
                 if entry.key != encoded_k2 {
                     continue;

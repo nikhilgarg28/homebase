@@ -1,7 +1,7 @@
 //! The client: one device's local-first view of many spaces.
 //!
 //! [`Client`] is the device-scoped coordinator — one [`MetaStore`], one
-//! device identity, one shared oplog, one pusher — over many attached
+//! device identity, and independent persisted per-space oplogs — over many attached
 //! spaces. Open a client over any [`MetaStore`] implementation, then
 //! [`attach`](Client::attach) an envelope and [`space`](Client::space) to
 //! work in it.
@@ -23,12 +23,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Client-global scalars: device identity and the shared oplog cursor.
+/// Client-global scalars. Oplog cursors live only in the MetaStore.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientGlobals {
     pub(crate) device: DeviceId,
-    pub(crate) next_seq: DeviceSeq,
-    pub(crate) scan_from: DeviceSeq,
     pub(crate) push_cap: usize,
 }
 
@@ -84,8 +82,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
         }
         store.record_clock(now.wall).await?;
 
-        let next_seq = state.next_seq.unwrap_or(DeviceSeq(1));
-        let scan_from = state.oplog.keys().next().copied().unwrap_or(next_seq);
         Ok(Self {
             store,
             server,
@@ -93,8 +89,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             nonce_source: RefCell::new(nonce_source),
             globals: RefCell::new(ClientGlobals {
                 device,
-                next_seq,
-                scan_from,
                 push_cap: DEFAULT_PUSH_CAP,
             }),
             attached: RefCell::new(BTreeMap::new()),
@@ -201,44 +195,63 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
         self.nonce_source.borrow_mut().next_nonce()
     }
 
-    pub(crate) fn bump_next_seq(&self, seq: DeviceSeq) {
-        self.globals.borrow_mut().next_seq = DeviceSeq(seq.0 + 1);
+    /// Drain every persisted per-space oplog. This compatibility entry point
+    /// becomes space-scoped when the push API batch lands.
+    pub async fn push(&self) -> Result<PushOutcome, ClientError> {
+        let state = self.store.load().await?;
+        let mut acked = None;
+        for (space, space_state) in state.spaces {
+            if space_state.cursors.neck >= space_state.cursors.tail {
+                continue;
+            }
+            match self.push_space(space).await? {
+                PushOutcome::Drained {
+                    acked_through: space_acked,
+                } => {
+                    if space_acked.is_some() {
+                        acked = space_acked;
+                    }
+                }
+                stalled @ PushOutcome::Stalled { .. } => return Ok(stalled),
+            }
+        }
+        Ok(PushOutcome::Drained {
+            acked_through: acked,
+        })
     }
 
-    /// Drain the shared oplog. See [`crate::space`] module docs for recovery algebra.
-    pub async fn push(&self) -> Result<PushOutcome, ClientError> {
+    async fn push_space(&self, space: SpaceId) -> Result<PushOutcome, ClientError> {
         let mut acked = None;
         let mut probe = false;
         loop {
-            let globals = self.globals.borrow_mut();
-            if globals.scan_from >= globals.next_seq {
+            let state = self.store.load().await?;
+            let Some(space_state) = state.spaces.get(&space) else {
+                return Ok(PushOutcome::Drained {
+                    acked_through: acked,
+                });
+            };
+            let cursors = space_state.cursors;
+            if cursors.neck >= cursors.tail {
                 return Ok(PushOutcome::Drained {
                     acked_through: acked,
                 });
             }
+            let push_cap = self.globals.borrow().push_cap;
             let until = DeviceSeq(
-                globals
-                    .scan_from
+                cursors
+                    .neck
                     .0
-                    .saturating_add(globals.push_cap as u64 - 1)
-                    .min(globals.next_seq.0 - 1),
+                    .saturating_add(push_cap as u64 - 1)
+                    .min(cursors.tail.0 - 1),
             );
-            let scan_from = globals.scan_from;
-            let next_seq = globals.next_seq;
-            let push_cap = globals.push_cap;
-            let device = globals.device;
-            drop(globals);
+            let device = self.globals.borrow().device;
 
-            let window = self.store.oplog(scan_from, until).await?;
+            let window = self.store.oplog(space, cursors.neck, until).await?;
             let Some((head, head_record)) = window.first() else {
-                self.globals.borrow_mut().scan_from = DeviceSeq(until.0 + 1);
+                self.store.trim_oplog(space, until).await?;
                 continue;
             };
             let head = *head;
-            self.globals.borrow_mut().scan_from = head;
-            let space = head_record
-                .space()
-                .expect("push does not emit rollback records yet");
             let mut last = head;
             let mut batches = vec![PutBatch {
                 device_seq: head,
@@ -253,7 +266,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
-                        || record.space() != Some(space)
                         || batches.iter().map(|batch| batch.ops.len()).sum::<usize>()
                             + record.entries().len()
                             > push_cap
@@ -310,19 +322,19 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                             acked_through: acked,
                         });
                     }
-                    self.ack(last).await?;
+                    self.store.trim_oplog(space, last).await?;
                     acked = Some(last);
                     probe = false;
                 }
                 Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
-                    let ours =
-                        current < next_seq && !self.store.oplog(current, current).await?.is_empty();
+                    let ours = current < cursors.tail
+                        && !self.store.oplog(space, current, current).await?.is_empty();
                     if !ours {
                         return Err(ClientError::Space(SpaceDriverError::Fork {
                             admitted: current,
                         }));
                     }
-                    self.ack(current).await?;
+                    self.store.trim_oplog(space, current).await?;
                     acked = Some(current);
                     probe = false;
                 }
@@ -344,16 +356,9 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
         }
     }
 
-    /// Rollback: drop every queued commit with seq ≥ `from`.
-    pub async fn discard_from(&self, from: DeviceSeq) -> Result<(), ClientError> {
-        self.store.discard_from(from).await?;
-        Ok(())
-    }
-
-    async fn ack(&self, through: DeviceSeq) -> Result<(), ClientError> {
-        self.store.trim_oplog(through).await?;
-        let mut globals = self.globals.borrow_mut();
-        globals.scan_from = DeviceSeq(globals.scan_from.0.max(through.0 + 1));
+    /// Temporary pre-rollback API: drop one space's queued suffix.
+    pub async fn discard_from(&self, space: SpaceId, from: DeviceSeq) -> Result<(), ClientError> {
+        self.store.discard_from(space, from).await?;
         Ok(())
     }
 }

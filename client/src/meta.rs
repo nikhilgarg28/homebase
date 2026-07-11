@@ -25,14 +25,11 @@
 //!
 //! # The state doctrine
 //!
-//! **A client serves any number of spaces** — with client-level singletons
-//! where one suffices: one device identity, one shared `DeviceSeq`
-//! stream, one oplog, one ver counter. (Multilite's policy of exactly one
-//! data space plus a companion link space is layered above.) The server
-//! requires only *strictly increasing per (space, device), gaps legal*,
-//! so every space sees a strictly increasing subsequence of the one
-//! stream; likewise the single queue drains in order, each space
-//! receiving its commits in order.
+//! **A client serves any number of spaces.** Device identity and the wall
+//! clock tripwire are client-global; each space owns its persisted
+//! `head`/`neck`/`tail` cursors, oplog, and ver high-water. The server's
+//! replay fence is per `(space, device)`, so independent local streams
+//! match the authority's sequencing domain directly.
 //!
 //! **The queue is keyed by the wire seq, assigned by reservation.**
 //! [`reserve_commit`](MetaStore::reserve_commit) stamps each batch with
@@ -45,18 +42,28 @@
 //! with queued commits on one device id would interleave the stream);
 //! storeless engine-tier consumers are separate devices.
 //!
-//! **Two cursors, two directions — they never meet.** Range watermarks are
+//! `neck` is the start of the local active window, not a cached copy of
+//! the server's replay high-water. Normally an acknowledged trim advances
+//! it past the admitted prefix. The server may instead be ahead after a
+//! response is lost; retry then uses local oplog membership to prove and
+//! trim the server's current seq. Rollback may also put `neck` ahead of the
+//! server by making retained rows below it inactive. Consequently there is
+//! no permanent ordering invariant between `neck` and the server frontier;
+//! the durable invariant is local: `head <= neck <= tail`, with only
+//! `[neck, tail)` eligible for push.
+//!
+//! **Two cursor domains — they never meet.** Range watermarks are
 //! the *pull* cursors: per space and exact range, in the server's
 //! `AdmissionSeq` domain — "this range has synced down through here."
 //! Effective watermark lookup walks ancestor ranges and takes the max.
-//! Trim is *push* acknowledgment:
-//! client-level, in the device's own `DeviceSeq` domain — "the server
-//! admitted my queue through here, drop the prefix." Different sequence
-//! spaces, never compared: a write-only client trims forever without a
-//! range watermark; a read-only one advances range watermarks without ever trimming.
+//! Trim is *push* acknowledgment in that space's own `DeviceSeq` domain:
+//! "the server admitted my queue through here, drop the prefix."
+//! Different sequence spaces, never compared: a write-only client trims
+//! forever without a range watermark; a read-only one advances range
+//! watermarks without ever trimming.
 //!
-//! **Vers are assigned by the store: one Lamport high-water, no per-key
-//! table.** The protocol's per-key ver chains stay (the untrusted-server
+//! **Vers are assigned by the store: one Lamport high-water per space,
+//! no per-key table.** The protocol's per-key ver chains stay (the untrusted-server
 //! rollback tripwire, the exclusion auditor, what makes fork-recovery
 //! requeues safe) — but per-key monotonicity does not require per-key
 //! state: [`reserve_commit`](MetaStore::reserve_commit) stamps entries
@@ -122,20 +129,34 @@ pub struct DeviceRecord {
     pub id: DeviceId,
 }
 
-/// The next `DeviceSeq` a commit reservation will be stamped with — one
-/// stream shared by every space, advanced atomically inside
-/// [`MetaStore::commit`] (the reserved assignment and the queue entry are
-/// one record: write-ahead by construction).
+/// One space's durable oplog cursors. `tail` is the next `DeviceSeq` to
+/// reserve; `[neck, tail)` is the active push/certify window; `head`
+/// bounds retained history. `{1, 1, 1}` is the canonical empty frontier:
+/// no seq has been admitted or retained, `[neck, tail)` is empty, and the
+/// first append receives `DeviceSeq(1)` (the server's empty high-water is
+/// `DeviceSeq(0)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SeqRecord {
-    pub next: DeviceSeq,
+pub struct OplogCursors {
+    pub head: DeviceSeq,
+    pub neck: DeviceSeq,
+    pub tail: DeviceSeq,
+}
+
+impl Default for OplogCursors {
+    fn default() -> Self {
+        Self {
+            head: DeviceSeq(1),
+            neck: DeviceSeq(1),
+            tail: DeviceSeq(1),
+        }
+    }
 }
 
 /// The ver high-water: every commit stamps its entries with consecutive
 /// vers above it and advances it past them; every pull raises it to the
 /// maximum ver observed.
-/// One counter serves every key of every space (see the module docs for
-/// why per-key monotonicity needs no per-key state).
+/// Each space has one counter serving all of its keys (see the module
+/// docs for why per-key monotonicity needs no per-key state).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerHighRecord {
     pub high: Ver,
@@ -192,8 +213,9 @@ pub struct HeldLease {
     pub retiring: bool,
 }
 
-/// One unshipped record in the single queue, keyed by the `DeviceSeq` it
-/// ships under. Runtime currently emits only [`OplogRecord::Commit`];
+/// One unshipped record in a space's queue, keyed by the `DeviceSeq` it
+/// ships under. The containing storage key identifies the space. Runtime
+/// currently emits only [`OplogRecord::Commit`];
 /// rollback markers are durable vocabulary for the rollback plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OplogRecord {
@@ -201,7 +223,6 @@ pub enum OplogRecord {
     /// submit API lands; `range_asserts` and `evidence` are present now so the
     /// durable shape is ready.
     Commit {
-        space: SpaceId,
         entries: Vec<PutEntry>,
         range_asserts: Vec<RangeAssert>,
         evidence: Vec<LeaseId>,
@@ -217,6 +238,9 @@ pub enum OplogRecord {
 /// One space's slice of the loaded state.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SpaceState {
+    pub cursors: OplogCursors,
+    pub ver_high: Option<Ver>,
+    pub oplog: BTreeMap<DeviceSeq, OplogRecord>,
     pub watermarks: BTreeMap<Range, AdmissionSeq>,
     pub codec: Option<CodecRecord>,
     pub leases: BTreeMap<LeaseId, HeldLease>,
@@ -227,25 +251,19 @@ pub struct SpaceState {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ClientState {
     pub device: Option<DeviceId>,
-    /// The seq the next commit will be stamped with.
-    pub next_seq: Option<DeviceSeq>,
-    /// The ver the next commit's entries will exceed.
-    pub ver_high: Option<Ver>,
     /// The wall-clock high-water (see [`ClockRecord`]).
     pub clock_high: Option<Timestamp>,
-    /// The one queue, keyed by wire seq; commit records name their space.
-    pub oplog: BTreeMap<DeviceSeq, OplogRecord>,
     pub spaces: BTreeMap<SpaceId, SpaceState>,
 }
 
 /// The recomputation oracle — the client twin of the server-side `check`.
 /// Panics with context on any violation:
 ///
-/// 1. vers are **strictly increasing per (space, key)** across the queue
+/// 1. vers are **strictly increasing per key** within each space's queue
 ///    in commit order — a regression would bounce off the server as
 ///    `VerRegression`;
-/// 2. the counters cover the queue: `next_seq` exceeds every queued seq
-///    and `ver_high` is at least every queued ver — a lagging counter
+/// 2. each space's cursors cover its queue and `ver_high` is at least
+///    every queued ver — a lagging durable scalar
 ///    means a torn commit (the assignment and the entry are one atomic
 ///    transition).
 ///
@@ -276,41 +294,44 @@ pub fn certify(state: &ClientState) {
         }
     }
 
-    let mut last_ver: BTreeMap<(SpaceId, &Key), Ver> = BTreeMap::new();
-    for record in state.oplog.values() {
-        let Some(space) = record.space() else {
-            continue;
-        };
-        for entry in record.entries() {
-            if let Some(previous) = last_ver.get(&(space, &entry.key)) {
-                assert!(
-                    entry.ver > *previous,
-                    "oplog vers regress in {:?} at {:?}: {previous:?} then {:?}",
-                    space,
-                    entry.key,
-                    entry.ver
-                );
-            }
-            last_ver.insert((space, &entry.key), entry.ver);
-        }
-    }
-
-    if let Some((max_seq, _)) = state.oplog.last_key_value() {
-        let next = state.next_seq.expect("queued commits require a seq record");
+    for (space_id, space) in &state.spaces {
         assert!(
-            next > *max_seq,
-            "next_seq lags the oplog: next {next:?}, queued through {max_seq:?}"
+            space.cursors.head <= space.cursors.neck && space.cursors.neck <= space.cursors.tail,
+            "oplog cursors out of order in {space_id:?}: {:?}",
+            space.cursors
         );
-        let queued_high = state
+        let mut last_ver: BTreeMap<&Key, Ver> = BTreeMap::new();
+        for (seq, record) in &space.oplog {
+            assert!(
+                *seq >= space.cursors.head && *seq < space.cursors.tail,
+                "oplog seq {seq:?} outside persisted cursors {:?} in {space_id:?}",
+                space.cursors
+            );
+            for entry in record.entries() {
+                if let Some(previous) = last_ver.get(&entry.key) {
+                    assert!(
+                        entry.ver > *previous,
+                        "oplog vers regress in {:?} at {:?}: {previous:?} then {:?}",
+                        space_id,
+                        entry.key,
+                        entry.ver
+                    );
+                }
+                last_ver.insert(&entry.key, entry.ver);
+            }
+        }
+        let queued_high = space
             .oplog
             .values()
             .flat_map(|r| r.entries().iter().map(|e| e.ver))
             .max();
         if let Some(queued_high) = queued_high {
-            let high = state.ver_high.expect("queued commits require a ver record");
+            let high = space
+                .ver_high
+                .expect("queued commits require a space-local ver record");
             assert!(
                 high >= queued_high,
-                "ver high lags the oplog: high {high:?}, queued {queued_high:?}"
+                "ver high lags the oplog in {space_id:?}: high {high:?}, queued {queued_high:?}"
             );
         }
     }
@@ -337,13 +358,14 @@ pub trait MetaStore {
     // cheap; implementations are free to buffer for performance — the
     // single-driver discipline means no one else invalidates them.
 
-    /// The queued commits with `from ≤ seq ≤ through`, ascending — the
-    /// one queue read. The pusher walks the queue in bounded seq windows
+    /// One space's queued commits with `from ≤ seq ≤ through`, ascending.
+    /// The pusher walks the queue in bounded seq windows
     /// (an empty answer inside a window is a legal gap, not the end);
-    /// `oplog(s, s)` is the point lookup (the fork check: a seq the
+    /// `oplog(space, s, s)` is the point lookup (the fork check: a seq the
     /// server claims we sent must still be queued).
     fn oplog(
         &self,
+        space: SpaceId,
         from: DeviceSeq,
         through: DeviceSeq,
     ) -> impl Future<Output = Result<Vec<(DeviceSeq, OplogRecord)>, StorageError>> + Send;
@@ -392,14 +414,17 @@ pub trait MetaStore {
     /// Returns what was assigned.
     fn commit(
         &self,
+        space: SpaceId,
         reserved: ReservedCommit,
     ) -> impl Future<Output = Result<Committed, StorageError>> + Send;
 
-    /// Acknowledged commits leave the queue: deletes every queued entry
-    /// with seq ≤ `through`. Prefix-only **by construction** — pushes are
-    /// FIFO, so a later seq cannot be acknowledged before an earlier one
-    /// and a gap is unrepresentable. Idempotent: re-acknowledging is a
-    /// no-op.
+    /// Acknowledged commits leave one space's queue: advances `neck`
+    /// through the admitted prefix, deletes those retained rows, and
+    /// advances `head` with the trim in the same atomic transition.
+    /// Deletes every queued entry with seq ≤ `through`. Prefix-only **by
+    /// construction**: pushes are FIFO, and absent seqs created by a
+    /// discarded suffix are crossed by advancing the durable cursors.
+    /// Idempotent: re-acknowledging is a no-op.
     ///
     /// No staged-group record exists on purpose: the admitted set is
     /// always a prefix of the queue, so a pusher recovers any grouping —
@@ -408,6 +433,7 @@ pub trait MetaStore {
     /// one. Grouping is a wire-time choice, never durable state.
     fn trim_oplog(
         &self,
+        space: SpaceId,
         through: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -422,6 +448,7 @@ pub trait MetaStore {
     /// the queue — legal, and [`certify`] treats it so.
     fn discard_from(
         &self,
+        space: SpaceId,
         from: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -530,10 +557,10 @@ pub enum StoreNamespace {
 ///
 /// ```text
 /// (Meta, Client, Device)               → DeviceRecord
-/// (Meta, Client, Seq)                  → SeqRecord
-/// (Meta, Client, Ver)                  → VerHighRecord
 /// (Meta, Client, Clock)                → ClockRecord
-/// (Meta, Client, Oplog, seq_be)        → OplogRecord
+/// (Meta, Space, id, Cursors)           → OplogCursors
+/// (Meta, Space, id, Ver)               → VerHighRecord
+/// (Meta, Space, id, Oplog, seq_be)     → OplogRecord
 /// (Meta, Space, id, Watermark, range)  → WatermarkRecord (exact range cursor)
 /// (Meta, Space, id, Codec)             → CodecRecord
 /// (Meta, Space, id, Lease, prefix)      → LeaseRecord
@@ -561,9 +588,6 @@ enum Root {
 #[repr(u8)]
 enum ClientKind {
     Device = 0,
-    Seq = 1,
-    Ver = 2,
-    Oplog = 3,
     Clock = 4,
 }
 
@@ -574,6 +598,9 @@ enum SpaceKind {
     Watermark = 0,
     Codec = 1,
     Lease = 2,
+    Cursors = 3,
+    Ver = 4,
+    Oplog = 5,
 }
 
 fn byte_component(b: u8) -> KeyComponent {
@@ -614,24 +641,24 @@ fn device_key() -> Vec<u8> {
     encode_components(&client_kind(ClientKind::Device))
 }
 
-fn seq_key() -> Vec<u8> {
-    encode_components(&client_kind(ClientKind::Seq))
-}
-
-fn ver_key() -> Vec<u8> {
-    encode_components(&client_kind(ClientKind::Ver))
-}
-
 fn clock_key() -> Vec<u8> {
     encode_components(&client_kind(ClientKind::Clock))
 }
 
-fn oplog_scan() -> Vec<u8> {
-    encode_components(&client_kind(ClientKind::Oplog))
+fn cursors_key(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::Cursors))
 }
 
-fn oplog_key(seq: DeviceSeq) -> Vec<u8> {
-    let mut components = client_kind(ClientKind::Oplog);
+fn ver_key(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::Ver))
+}
+
+fn oplog_scan(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::Oplog))
+}
+
+fn oplog_key(space: SpaceId, seq: DeviceSeq) -> Vec<u8> {
+    let mut components = space_kind(space, SpaceKind::Oplog);
     components.push(u64_component(seq.0));
     encode_components(&components)
 }
@@ -731,28 +758,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                                 DeviceRecord::decode(&bytes).expect("undecodable device record");
                             out.device = Some(record.id);
                         }
-                        k if k == ClientKind::Seq as u8 => {
-                            assert_eq!(components.len(), 3, "seq key has no suffix");
-                            let record = SeqRecord::decode(&bytes).expect("undecodable seq record");
-                            out.next_seq = Some(record.next);
-                        }
-                        k if k == ClientKind::Ver as u8 => {
-                            assert_eq!(components.len(), 3, "ver key has no suffix");
-                            let record =
-                                VerHighRecord::decode(&bytes).expect("undecodable ver record");
-                            out.ver_high = Some(record.high);
-                        }
                         k if k == ClientKind::Clock as u8 => {
                             assert_eq!(components.len(), 3, "clock key has no suffix");
                             let record =
                                 ClockRecord::decode(&bytes).expect("undecodable clock record");
                             out.clock_high = Some(record.high_water);
-                        }
-                        k if k == ClientKind::Oplog as u8 => {
-                            let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
-                            let record =
-                                OplogRecord::decode(&bytes).expect("undecodable commit record");
-                            out.oplog.insert(seq, record);
                         }
                         other => panic!("unknown client record kind {other}"),
                     }
@@ -790,6 +800,23 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                             );
                             space.leases.insert(record.lease.id, record);
                         }
+                        k if k == SpaceKind::Cursors as u8 => {
+                            assert_eq!(components.len(), 4, "cursor key has no suffix");
+                            space.cursors =
+                                OplogCursors::decode(&bytes).expect("undecodable oplog cursors");
+                        }
+                        k if k == SpaceKind::Ver as u8 => {
+                            assert_eq!(components.len(), 4, "ver key has no suffix");
+                            let record =
+                                VerHighRecord::decode(&bytes).expect("undecodable ver record");
+                            space.ver_high = Some(record.high);
+                        }
+                        k if k == SpaceKind::Oplog as u8 => {
+                            let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
+                            let record =
+                                OplogRecord::decode(&bytes).expect("undecodable commit record");
+                            space.oplog.insert(seq, record);
+                        }
                         other => panic!("unknown space record kind {other}"),
                     }
                 }
@@ -801,6 +828,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
 
     async fn oplog(
         &self,
+        space: SpaceId,
         from: DeviceSeq,
         through: DeviceSeq,
     ) -> Result<Vec<(DeviceSeq, OplogRecord)>, StorageError> {
@@ -808,11 +836,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         if from > through {
             return Ok(out);
         }
-        let end = homebase_core::storage::prefix_successor(&oplog_scan());
-        let mut scan = self.store.scan(oplog_key(from), end);
+        let end = homebase_core::storage::prefix_successor(&oplog_scan(space));
+        let mut scan = self.store.scan(oplog_key(space, from), end);
         while let Some((storage_key, bytes)) = scan.next().await? {
             let components = decode_components(&storage_key).expect("undecodable storage key");
-            let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
+            let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
             if seq > through {
                 break;
             }
@@ -875,15 +903,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         space: SpaceId,
         entries: Vec<(Key, Value)>,
     ) -> Result<ReservedCommit, StorageError> {
-        let seq = match self.store.get(&seq_key()).await? {
-            Some(bytes) => {
-                SeqRecord::decode(&bytes)
-                    .expect("undecodable seq record")
-                    .next
-            }
-            None => DeviceSeq(1),
+        let cursors = match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
         };
-        let high = match self.store.get(&ver_key()).await? {
+        let high = match self.store.get(&ver_key(space)).await? {
             Some(bytes) => {
                 VerHighRecord::decode(&bytes)
                     .expect("undecodable ver record")
@@ -901,15 +925,19 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             })
             .collect();
         let ver_high = Ver(high.0 + entries.len() as u64);
-        let record = OplogRecord::commit(space, entries);
+        let record = OplogRecord::commit(entries);
         Ok(ReservedCommit {
-            seq,
+            seq: cursors.tail,
             ver_high,
             record,
         })
     }
 
-    async fn commit(&self, reserved: ReservedCommit) -> Result<Committed, StorageError> {
+    async fn commit(
+        &self,
+        space: SpaceId,
+        reserved: ReservedCommit,
+    ) -> Result<Committed, StorageError> {
         let entries_len = reserved.record.entries().len() as u64;
         let expected_high = Ver(reserved
             .ver_high
@@ -918,15 +946,11 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             .ok_or_else(|| {
                 StorageError("malformed commit reservation: ver high below entry count".into())
             })?);
-        let current_seq = match self.store.get(&seq_key()).await? {
-            Some(bytes) => {
-                SeqRecord::decode(&bytes)
-                    .expect("undecodable seq record")
-                    .next
-            }
-            None => DeviceSeq(1),
+        let current_cursors = match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
         };
-        let current_high = match self.store.get(&ver_key()).await? {
+        let current_high = match self.store.get(&ver_key(space)).await? {
             Some(bytes) => {
                 VerHighRecord::decode(&bytes)
                     .expect("undecodable ver record")
@@ -934,23 +958,24 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
             None => Ver(0),
         };
-        if current_seq != reserved.seq || current_high != expected_high {
+        if current_cursors.tail != reserved.seq || current_high != expected_high {
             return Err(StorageError(
                 "stale commit reservation: counters advanced before commit".into(),
             ));
         }
 
         let mut batch = WriteBatch::new();
-        batch.put(oplog_key(reserved.seq), reserved.record.encode());
+        batch.put(oplog_key(space, reserved.seq), reserved.record.encode());
         batch.put(
-            seq_key(),
-            SeqRecord {
-                next: DeviceSeq(reserved.seq.0 + 1),
+            cursors_key(space),
+            OplogCursors {
+                tail: DeviceSeq(reserved.seq.0 + 1),
+                ..current_cursors
             }
             .encode(),
         );
         batch.put(
-            ver_key(),
+            ver_key(space),
             VerHighRecord {
                 high: reserved.ver_high,
             }
@@ -963,16 +988,34 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         })
     }
 
-    async fn trim_oplog(&self, through: DeviceSeq) -> Result<(), StorageError> {
-        let queued = collect_scan(self.store.scan_prefix(&oplog_scan())).await?;
+    async fn trim_oplog(&self, space: SpaceId, through: DeviceSeq) -> Result<(), StorageError> {
+        let cursors = match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
+        };
+        let queued = collect_scan(self.store.scan_prefix(&oplog_scan(space))).await?;
         let mut batch = WriteBatch::new();
         for (storage_key, _) in queued {
             let components = decode_components(&storage_key).expect("undecodable storage key");
-            let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
+            let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
             if seq > through {
                 break; // ordered scan: everything after is newer
             }
             batch.delete(storage_key);
+        }
+        let advanced = DeviceSeq(through.0.saturating_add(1).min(cursors.tail.0));
+        let head = cursors.head.max(advanced);
+        let neck = cursors.neck.max(advanced);
+        if head != cursors.head || neck != cursors.neck {
+            batch.put(
+                cursors_key(space),
+                OplogCursors {
+                    head,
+                    neck,
+                    tail: cursors.tail,
+                }
+                .encode(),
+            );
         }
         if !batch.is_empty() {
             self.store.apply(batch).await?;
@@ -980,12 +1023,12 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         Ok(())
     }
 
-    async fn discard_from(&self, from: DeviceSeq) -> Result<(), StorageError> {
-        let queued = collect_scan(self.store.scan_prefix(&oplog_scan())).await?;
+    async fn discard_from(&self, space: SpaceId, from: DeviceSeq) -> Result<(), StorageError> {
+        let queued = collect_scan(self.store.scan_prefix(&oplog_scan(space))).await?;
         let mut batch = WriteBatch::new();
         for (storage_key, _) in queued {
             let components = decode_components(&storage_key).expect("undecodable storage key");
-            let seq = DeviceSeq(u64_at(&components, 3, "commit seq"));
+            let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
             if seq >= from {
                 batch.delete(storage_key);
             }
@@ -1003,7 +1046,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         at: AdmissionSeq,
         ver_seen: Ver,
     ) -> Result<(), StorageError> {
-        let high = match self.store.get(&ver_key()).await? {
+        let high = match self.store.get(&ver_key(space)).await? {
             Some(bytes) => {
                 VerHighRecord::decode(&bytes)
                     .expect("undecodable ver record")
@@ -1014,7 +1057,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         let mut batch = WriteBatch::new();
         batch.put(watermark_key(space, range), WatermarkRecord { at }.encode());
         batch.put(
-            ver_key(),
+            ver_key(space),
             VerHighRecord {
                 high: high.max(ver_seen),
             }
@@ -1088,14 +1131,13 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
 // implementations are free to shred records into columns)
 
 const DEVICE_RECORD_VERSION: u8 = 1;
-const SEQ_RECORD_VERSION: u8 = 1;
+const CURSORS_RECORD_VERSION: u8 = 1;
 const VER_HIGH_RECORD_VERSION: u8 = 1;
 const WATERMARK_RECORD_VERSION: u8 = 1;
 const CLOCK_RECORD_VERSION: u8 = 1;
 const CODEC_RECORD_VERSION: u8 = 1;
 const LEASE_RECORD_VERSION: u8 = 3;
-const LEGACY_COMMIT_RECORD_VERSION: u8 = 1;
-const OPLOG_RECORD_VERSION: u8 = 2;
+const OPLOG_RECORD_VERSION: u8 = 3;
 
 impl DeviceRecord {
     pub fn encode(&self) -> Vec<u8> {
@@ -1116,22 +1158,26 @@ impl DeviceRecord {
     }
 }
 
-impl SeqRecord {
+impl OplogCursors {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8);
-        out.push(SEQ_RECORD_VERSION);
-        out.extend_from_slice(&self.next.0.to_be_bytes());
+        let mut out = Vec::with_capacity(1 + 24);
+        out.push(CURSORS_RECORD_VERSION);
+        out.extend_from_slice(&self.head.0.to_be_bytes());
+        out.extend_from_slice(&self.neck.0.to_be_bytes());
+        out.extend_from_slice(&self.tail.0.to_be_bytes());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != SEQ_RECORD_VERSION {
+        if r.u8()? != CURSORS_RECORD_VERSION {
             return None;
         }
-        let next = DeviceSeq(r.u64()?);
+        let head = DeviceSeq(r.u64()?);
+        let neck = DeviceSeq(r.u64()?);
+        let tail = DeviceSeq(r.u64()?);
         r.end()?;
-        Some(Self { next })
+        Some(Self { head, neck, tail })
     }
 }
 
@@ -1299,19 +1345,11 @@ impl HeldLease {
 }
 
 impl OplogRecord {
-    pub fn commit(space: SpaceId, entries: Vec<PutEntry>) -> Self {
+    pub fn commit(entries: Vec<PutEntry>) -> Self {
         Self::Commit {
-            space,
             entries,
             range_asserts: Vec::new(),
             evidence: Vec::new(),
-        }
-    }
-
-    pub fn space(&self) -> Option<SpaceId> {
-        match self {
-            Self::Commit { space, .. } => Some(*space),
-            Self::Rollback { .. } => None,
         }
     }
 
@@ -1340,13 +1378,11 @@ impl OplogRecord {
         let mut out = vec![OPLOG_RECORD_VERSION];
         match self {
             Self::Commit {
-                space,
                 entries,
                 range_asserts,
                 evidence,
             } => {
                 out.push(0);
-                out.extend_from_slice(&space.0);
                 encode_entries(&mut out, entries);
                 out.extend_from_slice(&(range_asserts.len() as u32).to_be_bytes());
                 for assert in range_asserts {
@@ -1371,15 +1407,8 @@ impl OplogRecord {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
         match r.u8()? {
-            LEGACY_COMMIT_RECORD_VERSION => {
-                let space = SpaceId(r.bytes16()?);
-                let entries = decode_entries(&mut r)?;
-                r.end()?;
-                Some(Self::commit(space, entries))
-            }
             OPLOG_RECORD_VERSION => match r.u8()? {
                 0 => {
-                    let space = SpaceId(r.bytes16()?);
                     let entries = decode_entries(&mut r)?;
                     let assert_count = r.u32()? as usize;
                     let mut range_asserts = Vec::with_capacity(assert_count.min(1024));
@@ -1396,7 +1425,6 @@ impl OplogRecord {
                     }
                     r.end()?;
                     Some(Self::Commit {
-                        space,
                         entries,
                         range_asserts,
                         evidence,
@@ -1571,7 +1599,7 @@ pub mod conformance {
         entries: Vec<(Key, Value)>,
     ) -> Committed {
         let reserved = store.reserve_commit(space, entries).await.unwrap();
-        store.commit(reserved).await.unwrap()
+        store.commit(space, reserved).await.unwrap()
     }
 
     /// Drives the whole lifecycle against a **fresh** store. Panics on any
@@ -1593,9 +1621,7 @@ pub mod conformance {
         store.record_device(device).await.unwrap();
         assert_eq!(audit(store).await.device, Some(device));
 
-        // Three commits through the one queue, two spaces interleaved.
-        // The store assigns both counters: seqs dense from 1, vers
-        // climbing from the high-water.
+        // Two spaces have independent sequence and version streams.
         let first = commit_entries(
             store,
             space,
@@ -1621,8 +1647,8 @@ pub mod conformance {
         assert_eq!(
             second,
             Committed {
-                seq: DeviceSeq(2),
-                ver_high: Ver(3)
+                seq: DeviceSeq(1),
+                ver_high: Ver(1)
             }
         );
         let third = commit_entries(
@@ -1634,75 +1660,107 @@ pub mod conformance {
         assert_eq!(
             third,
             Committed {
-                seq: DeviceSeq(3),
-                ver_high: Ver(4)
+                seq: DeviceSeq(2),
+                ver_high: Ver(3)
             }
         );
 
         let state = audit(store).await;
-        assert_eq!(state.next_seq, Some(DeviceSeq(4)));
-        assert_eq!(state.ver_high, Some(Ver(4)));
-        assert_eq!(state.oplog.len(), 3);
-        assert_eq!(state.oplog[&DeviceSeq(1)].space().unwrap(), space);
-        assert_eq!(state.oplog[&DeviceSeq(1)].entries()[0].ver, Ver(1));
+        let data = &state.spaces[&space];
         assert_eq!(
-            state.oplog[&DeviceSeq(1)].entries()[1].ver,
+            data.cursors,
+            OplogCursors {
+                head: DeviceSeq(1),
+                neck: DeviceSeq(1),
+                tail: DeviceSeq(3),
+            }
+        );
+        assert_eq!(data.ver_high, Some(Ver(3)));
+        assert_eq!(data.oplog.len(), 2);
+        assert_eq!(data.oplog[&DeviceSeq(1)].entries()[0].ver, Ver(1));
+        assert_eq!(
+            data.oplog[&DeviceSeq(1)].entries()[1].ver,
             Ver(2),
             "consecutive in order"
         );
-        assert_eq!(state.oplog[&DeviceSeq(2)].space().unwrap(), link);
         assert_eq!(
-            state.oplog[&DeviceSeq(3)].entries()[0].ver,
-            Ver(4),
-            "chain continued"
+            data.oplog[&DeviceSeq(2)].entries()[0].ver,
+            Ver(3),
+            "the space-local chain continued"
         );
+        let links = &state.spaces[&link];
+        assert_eq!(links.cursors.tail, DeviceSeq(2));
+        assert_eq!(links.ver_high, Some(Ver(1)));
+        assert_eq!(links.oplog[&DeviceSeq(1)].entries()[0].ver, Ver(1));
 
-        // The queue read sees exactly what load sees: a seq range,
-        // ascending; a point lookup is the one-seq range.
-        let window = store.oplog(DeviceSeq(1), DeviceSeq(2)).await.unwrap();
+        // Queue reads are explicitly space-scoped.
+        let window = store
+            .oplog(space, DeviceSeq(1), DeviceSeq(2))
+            .await
+            .unwrap();
         assert_eq!(
             window.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
             vec![DeviceSeq(1), DeviceSeq(2)],
             "a range read is inclusive on both ends"
         );
-        assert_eq!(window[0].1, state.oplog[&DeviceSeq(1)]);
+        assert_eq!(window[0].1, data.oplog[&DeviceSeq(1)]);
         assert_eq!(
             store
-                .oplog(DeviceSeq(1), DeviceSeq(u64::MAX))
+                .oplog(space, DeviceSeq(1), DeviceSeq(u64::MAX))
                 .await
                 .unwrap()
                 .len(),
-            3,
-            "an open-ended range reads the whole queue"
+            2,
+            "an open-ended range reads only this space's queue"
         );
         assert_eq!(
-            store.oplog(DeviceSeq(2), DeviceSeq(2)).await.unwrap(),
-            vec![(DeviceSeq(2), state.oplog[&DeviceSeq(2)].clone())]
+            store.oplog(link, DeviceSeq(1), DeviceSeq(1)).await.unwrap(),
+            vec![(DeviceSeq(1), links.oplog[&DeviceSeq(1)].clone())]
         );
         assert!(
             store
-                .oplog(DeviceSeq(9), DeviceSeq(9))
+                .oplog(space, DeviceSeq(9), DeviceSeq(9))
                 .await
                 .unwrap()
                 .is_empty(),
             "never minted"
         );
 
-        // A push ack trims the acknowledged prefix — nothing else to
-        // clear; grouping is a wire-time choice, never durable state.
-        store.trim_oplog(DeviceSeq(1)).await.unwrap();
+        // A push ack advances this space's neck and physically trims its
+        // retained prefix, advancing head in the same transition.
+        store.trim_oplog(space, DeviceSeq(1)).await.unwrap();
         let state = audit(store).await;
         assert_eq!(
-            state.oplog.keys().copied().collect::<Vec<_>>(),
-            vec![DeviceSeq(2), DeviceSeq(3)],
+            state.spaces[&space]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(2)],
             "trim takes a prefix"
         );
-        assert_eq!(state.next_seq, Some(DeviceSeq(4)));
-        store.trim_oplog(DeviceSeq(1)).await.unwrap();
-        assert_eq!(audit(store).await.oplog.len(), 2, "re-ack is a no-op");
+        assert_eq!(
+            state.spaces[&space].cursors,
+            OplogCursors {
+                head: DeviceSeq(2),
+                neck: DeviceSeq(2),
+                tail: DeviceSeq(3),
+            }
+        );
+        assert_eq!(
+            state.spaces[&link].oplog.len(),
+            1,
+            "other space is isolated"
+        );
+        store.trim_oplog(space, DeviceSeq(1)).await.unwrap();
+        assert_eq!(
+            audit(store).await.spaces[&space].oplog.len(),
+            1,
+            "re-ack is a no-op"
+        );
         assert!(
             store
-                .oplog(DeviceSeq(1), DeviceSeq(1))
+                .oplog(space, DeviceSeq(1), DeviceSeq(1))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1718,7 +1776,8 @@ pub mod conformance {
             .unwrap();
         let state = audit(store).await;
         assert_eq!(state.spaces[&space].watermarks[&db_range], AdmissionSeq(40));
-        assert_eq!(state.ver_high, Some(Ver(10)));
+        assert_eq!(state.spaces[&space].ver_high, Some(Ver(10)));
+        assert_eq!(state.spaces[&link].ver_high, Some(Ver(1)));
         assert_eq!(
             store.watermark(space, &db_range).await.unwrap(),
             Some(AdmissionSeq(40))
@@ -1737,7 +1796,7 @@ pub mod conformance {
         assert_eq!(
             fourth,
             Committed {
-                seq: DeviceSeq(4),
+                seq: DeviceSeq(3),
                 ver_high: Ver(11)
             }
         );
@@ -1747,7 +1806,7 @@ pub mod conformance {
             .advance_watermark(space, &db_range, AdmissionSeq(41), Ver(5))
             .await
             .unwrap();
-        assert_eq!(audit(store).await.ver_high, Some(Ver(11)));
+        assert_eq!(audit(store).await.spaces[&space].ver_high, Some(Ver(11)));
         store
             .advance_watermark(space, &Range::Full, AdmissionSeq(50), Ver(5))
             .await
@@ -1782,23 +1841,27 @@ pub mod conformance {
         assert_eq!(
             dup,
             Committed {
-                seq: DeviceSeq(5),
+                seq: DeviceSeq(4),
                 ver_high: Ver(13)
             }
         );
         let state = audit(store).await;
-        let entries = state.oplog[&DeviceSeq(5)].entries();
+        let entries = state.spaces[&space].oplog[&DeviceSeq(4)].entries();
         assert_eq!(entries[0].ver, Ver(12));
         assert_eq!(entries[1].ver, Ver(13));
 
         // A merged wire batch acks under its last seq; the group ack
         // drops everything through it and nothing after — prefix-only by
         // construction, no gap is even expressible.
-        store.trim_oplog(DeviceSeq(4)).await.unwrap();
+        store.trim_oplog(space, DeviceSeq(3)).await.unwrap();
         let state = audit(store).await;
         assert_eq!(
-            state.oplog.keys().copied().collect::<Vec<_>>(),
-            vec![DeviceSeq(5)],
+            state.spaces[&space]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(4)],
             "later commits survive a deep trim"
         );
 
@@ -1810,14 +1873,22 @@ pub mod conformance {
             vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))],
         )
         .await;
-        store.discard_from(doomed.seq).await.unwrap();
+        store.discard_from(space, doomed.seq).await.unwrap();
         let state = audit(store).await;
         assert_eq!(
-            state.oplog.keys().copied().collect::<Vec<_>>(),
-            vec![DeviceSeq(5)],
+            state.spaces[&space]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(4)],
             "discard takes a suffix"
         );
-        assert_eq!(state.next_seq, Some(DeviceSeq(7)), "counters never rewind");
+        assert_eq!(
+            state.spaces[&space].cursors.tail,
+            DeviceSeq(6),
+            "tail never rewinds"
+        );
 
         // A commit after a discard leaves a gap — legal, because the seq
         // counter never rewinds. The state still certifies and the head
@@ -1828,16 +1899,20 @@ pub mod conformance {
             vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))],
         )
         .await;
-        assert_eq!(after_gap.seq, DeviceSeq(7));
+        assert_eq!(after_gap.seq, DeviceSeq(6));
         let state = audit(store).await;
         assert_eq!(
-            state.oplog.keys().copied().collect::<Vec<_>>(),
-            vec![DeviceSeq(5), DeviceSeq(7)],
+            state.spaces[&space]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(4), DeviceSeq(6)],
             "a discarded seq is never re-minted"
         );
         assert!(
             store
-                .oplog(DeviceSeq(6), DeviceSeq(6))
+                .oplog(space, DeviceSeq(5), DeviceSeq(5))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1845,13 +1920,13 @@ pub mod conformance {
         );
         assert_eq!(
             store
-                .oplog(DeviceSeq(1), DeviceSeq(u64::MAX))
+                .oplog(space, DeviceSeq(1), DeviceSeq(u64::MAX))
                 .await
                 .unwrap()
                 .iter()
                 .map(|(seq, _)| *seq)
                 .collect::<Vec<_>>(),
-            vec![DeviceSeq(5), DeviceSeq(7)],
+            vec![DeviceSeq(4), DeviceSeq(6)],
             "the range read walks straight over the gap"
         );
 
@@ -2012,8 +2087,6 @@ mod tests {
     use pollster::block_on;
 
     const SPACE: SpaceId = SpaceId([7; 16]);
-    const LINK: SpaceId = SpaceId([8; 16]);
-
     fn key(components: &[&[u8]]) -> Key {
         Key::from_bytes(components.iter().copied()).unwrap()
     }
@@ -2027,34 +2100,32 @@ mod tests {
     }
 
     fn sample_commit() -> OplogRecord {
-        OplogRecord::commit(
-            SPACE,
-            vec![
-                PutEntry {
-                    key: key(&[b"db", b"a"]),
-                    value: Value::Present(b"ciphertext".to_vec()),
-                    ver: Ver(3),
-                },
-                PutEntry {
-                    key: key(&[b"db", b"gone"]),
-                    value: Value::Absent,
-                    ver: Ver(3),
-                },
-                PutEntry {
-                    key: key(&[b"db", b"empty"]),
-                    value: Value::Present(vec![]),
-                    ver: Ver(3),
-                },
-            ],
-        )
+        OplogRecord::commit(vec![
+            PutEntry {
+                key: key(&[b"db", b"a"]),
+                value: Value::Present(b"ciphertext".to_vec()),
+                ver: Ver(3),
+            },
+            PutEntry {
+                key: key(&[b"db", b"gone"]),
+                value: Value::Absent,
+                ver: Ver(3),
+            },
+            PutEntry {
+                key: key(&[b"db", b"empty"]),
+                value: Value::Present(vec![]),
+                ver: Ver(3),
+            },
+        ])
     }
 
     /// A hand-built state whose counters cover its queue, for corrupting.
     fn covered_state() -> ClientState {
         let mut state = ClientState::default();
-        state.oplog.insert(DeviceSeq(1), sample_commit());
-        state.next_seq = Some(DeviceSeq(2));
-        state.ver_high = Some(Ver(3));
+        let space = state.spaces.entry(SPACE).or_default();
+        space.oplog.insert(DeviceSeq(1), sample_commit());
+        space.cursors.tail = DeviceSeq(2);
+        space.ver_high = Some(Ver(3));
         state
     }
 
@@ -2065,10 +2136,12 @@ mod tests {
         };
         assert_eq!(DeviceRecord::decode(&device.encode()), Some(device));
 
-        let seq = SeqRecord {
-            next: DeviceSeq(17),
+        let cursors = OplogCursors {
+            head: DeviceSeq(3),
+            neck: DeviceSeq(7),
+            tail: DeviceSeq(17),
         };
-        assert_eq!(SeqRecord::decode(&seq.encode()), Some(seq));
+        assert_eq!(OplogCursors::decode(&cursors.encode()), Some(cursors));
 
         let ver = VerHighRecord { high: Ver(9) };
         assert_eq!(VerHighRecord::decode(&ver.encode()), Some(ver));
@@ -2110,7 +2183,7 @@ mod tests {
 
         let commit = sample_commit();
         assert_eq!(OplogRecord::decode(&commit.encode()), Some(commit));
-        let empty = OplogRecord::commit(LINK, vec![]);
+        let empty = OplogRecord::commit(vec![]);
         assert_eq!(OplogRecord::decode(&empty.encode()), Some(empty));
         let rollback = OplogRecord::Rollback {
             marker: DeviceSeq(7),
@@ -2118,7 +2191,6 @@ mod tests {
         assert_eq!(OplogRecord::decode(&rollback.encode()), Some(rollback));
 
         let rich = OplogRecord::Commit {
-            space: SPACE,
             entries: vec![],
             range_asserts: vec![RangeAssert {
                 prefix: key(&[b"db"]),
@@ -2131,9 +2203,9 @@ mod tests {
 
     #[test]
     fn fixed_records_reject_trailing_garbage() {
-        let mut bytes = SeqRecord { next: DeviceSeq(1) }.encode();
+        let mut bytes = OplogCursors::default().encode();
         bytes.push(0);
-        assert_eq!(SeqRecord::decode(&bytes), None);
+        assert_eq!(OplogCursors::decode(&bytes), None);
 
         let mut bytes = sample_commit().encode();
         bytes.push(0);
@@ -2145,10 +2217,10 @@ mod tests {
         let brand = meta_scan_all();
         for storage_key in [
             device_key(),
-            seq_key(),
-            ver_key(),
+            cursors_key(SPACE),
+            ver_key(SPACE),
             clock_key(),
-            oplog_key(DeviceSeq(1)),
+            oplog_key(SPACE, DeviceSeq(1)),
             watermark_key(SPACE, &Range::Full),
             watermark_key(SPACE, &Range::Prefix(key(&[b"db"]))),
             codec_key(SPACE),
@@ -2160,7 +2232,7 @@ mod tests {
             );
         }
         assert!(
-            oplog_key(DeviceSeq(1)) < oplog_key(DeviceSeq(2)),
+            oplog_key(SPACE, DeviceSeq(1)) < oplog_key(SPACE, DeviceSeq(2)),
             "queue drains in order"
         );
 
@@ -2210,32 +2282,31 @@ mod tests {
         // never rewinds) — a legal history, not corruption. Distinct
         // keys keep the ver chains clean.
         let mut state = covered_state();
-        state.oplog.insert(
+        let space = state.spaces.get_mut(&SPACE).unwrap();
+        space.oplog.insert(
             DeviceSeq(3),
-            OplogRecord::commit(
-                SPACE,
-                vec![PutEntry {
-                    key: key(&[b"db", b"later"]),
-                    value: Value::Present(b"x".to_vec()),
-                    ver: Ver(4),
-                }],
-            ),
+            OplogRecord::commit(vec![PutEntry {
+                key: key(&[b"db", b"later"]),
+                value: Value::Present(b"x".to_vec()),
+                ver: Ver(4),
+            }]),
         );
-        state.next_seq = Some(DeviceSeq(4));
-        state.ver_high = Some(Ver(4));
+        space.cursors.tail = DeviceSeq(4);
+        space.ver_high = Some(Ver(4));
         certify(&state);
     }
 
     #[test]
     fn certify_allows_rollback_marker_without_entries() {
         let mut state = ClientState::default();
-        state.oplog.insert(
+        let space = state.spaces.entry(SPACE).or_default();
+        space.oplog.insert(
             DeviceSeq(1),
             OplogRecord::Rollback {
                 marker: DeviceSeq(1),
             },
         );
-        state.next_seq = Some(DeviceSeq(2));
+        space.cursors.tail = DeviceSeq(2);
         certify(&state);
     }
 
@@ -2275,27 +2346,25 @@ mod tests {
         let mut state = covered_state();
         // A stale ver for a key seq 1 already advanced — the regression
         // the server would bounce.
-        state.oplog.insert(
+        let space = state.spaces.get_mut(&SPACE).unwrap();
+        space.oplog.insert(
             DeviceSeq(2),
-            OplogRecord::commit(
-                SPACE,
-                vec![PutEntry {
-                    key: key(&[b"db", b"a"]),
-                    value: Value::Present(b"stale".to_vec()),
-                    ver: Ver(2),
-                }],
-            ),
+            OplogRecord::commit(vec![PutEntry {
+                key: key(&[b"db", b"a"]),
+                value: Value::Present(b"stale".to_vec()),
+                ver: Ver(2),
+            }]),
         );
-        state.next_seq = Some(DeviceSeq(3));
+        space.cursors.tail = DeviceSeq(3);
         certify(&state);
     }
 
     #[test]
-    #[should_panic(expected = "next_seq lags the oplog")]
+    #[should_panic(expected = "outside persisted cursors")]
     fn certify_catches_lagging_seq() {
         let mut state = covered_state();
         // A queue entry the seq counter never covered: a torn commit.
-        state.next_seq = Some(DeviceSeq(1));
+        state.spaces.get_mut(&SPACE).unwrap().cursors.tail = DeviceSeq(1);
         certify(&state);
     }
 
@@ -2303,7 +2372,7 @@ mod tests {
     #[should_panic(expected = "ver high lags the oplog")]
     fn certify_catches_lagging_ver_high() {
         let mut state = covered_state();
-        state.ver_high = Some(Ver(1));
+        state.spaces.get_mut(&SPACE).unwrap().ver_high = Some(Ver(1));
         certify(&state);
     }
 }

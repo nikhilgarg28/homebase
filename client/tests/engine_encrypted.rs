@@ -119,7 +119,12 @@ async fn fetch_cipher(
 }
 
 async fn queued(mem: &MemoryStore) -> usize {
-    audit(&OrderedMetaStore::new(mem)).await.oplog.len()
+    audit(&OrderedMetaStore::new(mem))
+        .await
+        .spaces
+        .values()
+        .map(|space| space.oplog.len())
+        .sum()
 }
 
 #[test]
@@ -222,7 +227,8 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         let cipher = envelope.open().unwrap();
         let encoded_k1 = cipher.encode_key(&k1).unwrap();
         let state = audit(&OrderedMetaStore::new(&mem)).await;
-        let seq1 = *state.oplog.keys().next().unwrap();
+        let oplog = &state.spaces[&space].oplog;
+        let seq1 = *oplog.keys().next().unwrap();
         let seq2 = DeviceSeq(seq1.0 + 1);
 
         handle
@@ -235,7 +241,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                         PutBatch {
                             device_seq: seq1,
                             range_asserts: vec![],
-                            ops: state.oplog[&seq1]
+                            ops: oplog[&seq1]
                                 .entries()
                                 .iter()
                                 .cloned()
@@ -245,7 +251,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                         PutBatch {
                             device_seq: seq2,
                             range_asserts: vec![],
-                            ops: state.oplog[&seq2]
+                            ops: oplog[&seq2]
                                 .entries()
                                 .iter()
                                 .cloned()

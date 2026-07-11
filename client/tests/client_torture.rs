@@ -303,7 +303,7 @@ async fn driver(
                 Err(ClientError::Space(SpaceDriverError::Fork { admitted })) => {
                     guard.client.take();
                     OrderedMetaStore::new(sim.clone())
-                        .trim_oplog(admitted)
+                        .trim_oplog(SPACE, admitted)
                         .await
                         .expect("trim after fork");
                     *slot.borrow_mut() =
@@ -404,7 +404,7 @@ async fn drain_push(
                 if matches!(error, KernelError::VerRegression { .. }) {
                     let mut guard = take_client(slot);
                     let client = guard.client.as_mut().unwrap();
-                    match client.discard_from(at).await {
+                    match client.discard_from(SPACE, at).await {
                         Ok(()) => {}
                         Err(ClientError::Store(_)) => {
                             coverage.borrow_mut().storage_errors += 1;
@@ -427,7 +427,7 @@ async fn drain_push(
             }
             Err(ClientError::Space(SpaceDriverError::Fork { admitted })) => {
                 OrderedMetaStore::new(sim.clone())
-                    .trim_oplog(admitted)
+                    .trim_oplog(SPACE, admitted)
                     .await
                     .expect("trim after fork");
                 *slot.borrow_mut() =
@@ -449,10 +449,10 @@ fn replay_oplog(
     mut view: BTreeMap<Key, Value>,
     state: &homebase::meta::ClientState,
 ) -> BTreeMap<Key, Value> {
-    for record in state.oplog.values() {
-        if record.space().unwrap() != SPACE {
-            continue;
-        }
+    let Some(space) = state.spaces.get(&SPACE) else {
+        return view;
+    };
+    for record in space.oplog.values() {
         for entry in record.entries() {
             view.insert(entry.key.clone(), entry.value.clone());
         }
