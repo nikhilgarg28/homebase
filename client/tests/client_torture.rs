@@ -454,8 +454,18 @@ fn replay_oplog(
         return view;
     };
     for record in space.oplog.values() {
-        for entry in record.entries() {
-            view.insert(entry.key.clone(), entry.value.clone());
+        for op in record.ops() {
+            match op {
+                BatchOp::Set {
+                    key, ciphertext, ..
+                } => {
+                    view.insert(key.clone(), Value::Present(ciphertext.clone()));
+                }
+                BatchOp::Delete { key, .. } => {
+                    view.insert(key.clone(), Value::Absent);
+                }
+                BatchOp::NoOp => {}
+            }
         }
     }
     view

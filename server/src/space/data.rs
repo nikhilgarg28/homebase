@@ -58,6 +58,7 @@ use homebase_core::messages::{
     PutBatchResponse, PutBatchResult, Range, RangeAssertFailure, RangeCut, ReadAtRequest,
     ReadAtResponse,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Epoch, Tag, Value, Ver};
 use std::collections::BTreeMap;
@@ -128,7 +129,7 @@ pub async fn put_batch<S: OrderedStore>(
         next_admission_seq = AdmissionSeq(seq.0 + 1);
         let mut touched_prefixes = Vec::new();
         for op in &client_batch.ops {
-            let Some((key, ver, value)) = op_write(op)? else {
+            let Some((key, ver, value, seal)) = op_write(op)? else {
                 continue;
             };
             let current_ver = match staged.get(key) {
@@ -166,6 +167,7 @@ pub async fn put_batch<S: OrderedStore>(
                         admission_seq: seq,
                     },
                     value,
+                    seal,
                 },
             );
             touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
@@ -277,7 +279,7 @@ fn prefix_meta_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value)>, Error> {
+fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value, Seal)>, Error> {
     match op {
         BatchOp::Set {
             key,
@@ -289,14 +291,19 @@ fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value)>, Error> {
                 .map_err(|err| KernelError::InvalidSeal {
                     reason: err.to_string(),
                 })?;
-            Ok(Some((key, *ver, Value::Present(ciphertext.clone()))))
+            Ok(Some((
+                key,
+                *ver,
+                Value::Present(ciphertext.clone()),
+                seal.clone(),
+            )))
         }
         BatchOp::Delete { key, ver, seal } => {
             seal.validate_payload()
                 .map_err(|err| KernelError::InvalidSeal {
                     reason: err.to_string(),
                 })?;
-            Ok(Some((key, *ver, Value::Absent)))
+            Ok(Some((key, *ver, Value::Absent, seal.clone())))
         }
         BatchOp::NoOp => Ok(None),
     }
@@ -313,6 +320,7 @@ pub async fn get<S: OrderedStore>(
             rec.value.is_present().then(|| Entry {
                 key: key.clone(),
                 value: rec.value,
+                seal: rec.seal,
                 tag: rec.tag,
             })
         });
@@ -354,6 +362,7 @@ pub async fn list<S: OrderedStore>(
         entries.push(Entry {
             key,
             value: rec.value,
+            seal: rec.seal,
             tag: rec.tag,
         });
     }
@@ -396,6 +405,7 @@ async fn snapshot<S: OrderedStore>(
             entries.push(Entry {
                 key,
                 value: rec.value,
+                seal: rec.seal,
                 tag: rec.tag,
             });
         }
@@ -419,6 +429,7 @@ async fn snapshot<S: OrderedStore>(
         entries.push(Entry {
             key,
             value: rec.value,
+            seal: rec.seal,
             tag: rec.tag,
         });
     }
@@ -455,6 +466,7 @@ async fn delta<S: OrderedStore>(
         entries.push(Entry {
             key,
             value: rec.value,
+            seal: rec.seal,
             tag: rec.tag,
         });
     }

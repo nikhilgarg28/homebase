@@ -1,16 +1,16 @@
 //! pull ⊕ replay(unshipped oplog) ≡ server plaintext after push.
 
-use homebase::cipher::{SpaceEnvelope, SystemNonceSource, ValueContext};
+use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
+use homebase_core::messages::{BatchOp, GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value};
+use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Epoch, Tag, Value};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -91,8 +91,18 @@ fn replay_oplog_plaintext(
         return view;
     };
     for (seq, record) in &space_state.oplog {
-        for entry in record.entries() {
-            view.insert(entry.key.clone(), entry.value.clone());
+        for op in record.ops() {
+            match op {
+                BatchOp::Set {
+                    key, ciphertext, ..
+                } => {
+                    view.insert(key.clone(), Value::Present(ciphertext.clone()));
+                }
+                BatchOp::Delete { key, .. } => {
+                    view.insert(key.clone(), Value::Absent);
+                }
+                BatchOp::NoOp => {}
+            }
             let _ = (seq, device);
         }
     }
@@ -236,21 +246,27 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         let cipher = envelope.open().unwrap();
         let encoded_k2 = cipher.encode_key(&k2).unwrap();
         for (seq, record) in &state.spaces[&space_id].oplog {
-            for entry in record.entries() {
-                if entry.key != encoded_k2 {
+            for op in record.ops() {
+                if op.key() != Some(&encoded_k2) {
                     continue;
                 }
-                let plain = cipher
-                    .decode_value(
-                        &entry.key,
-                        &entry.value,
-                        ValueContext {
-                            device: client.device(),
-                            device_seq: *seq,
-                            ver: entry.ver,
-                        },
-                    )
-                    .unwrap();
+                let entry = Entry {
+                    key: encoded_k2.clone(),
+                    value: match op {
+                        BatchOp::Set { ciphertext, .. } => Value::Present(ciphertext.clone()),
+                        BatchOp::Delete { .. } => Value::Absent,
+                        BatchOp::NoOp => continue,
+                    },
+                    seal: op.seal().unwrap().clone(),
+                    tag: Tag {
+                        device: client.device(),
+                        device_seq: *seq,
+                        epoch: Epoch(0),
+                        ver: op.ver().unwrap(),
+                        admission_seq: AdmissionSeq(0),
+                    },
+                };
+                let plain = cipher.decode_entry_value(&entry).unwrap();
                 expected.insert(encoded_k2.clone(), plain);
             }
         }
@@ -270,9 +286,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
                 .entries
                 .remove(0)
                 .unwrap();
-            let decoded = cipher
-                .decode_value(encoded, &stored.value, ValueContext::from_tag(&stored.tag))
-                .unwrap();
+            let decoded = cipher.decode_entry_value(&stored).unwrap();
             assert_eq!(decoded, *plain);
         }
     });

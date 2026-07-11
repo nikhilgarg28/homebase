@@ -21,7 +21,7 @@
 //!   through [`Client::attach`] and [`Client::space`].
 //!
 //! - [`cipher`] — the privacy boundary: `SpaceEnvelope`, space-id
-//!   commitment, deterministic name pseudonyms, and value envelopes.
+//!   commitment, deterministic name pseudonyms, and detached value seals.
 
 pub mod cipher;
 pub mod client;
@@ -33,6 +33,6 @@ pub mod space;
 pub use client::{Client, ClientError, open_offline};
 pub use server::{Offline, ServerHandle};
 pub use space::{
-    Acquired, DEFAULT_PUSH_CAP, LeaseState, PushOutcome, Space, SpaceDriverError, Submission,
-    lease_margin,
+    Acquired, DEFAULT_PUSH_CAP, LeaseState, Mutation, PushOutcome, Space, SpaceDriverError,
+    Submission, lease_margin,
 };

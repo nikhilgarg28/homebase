@@ -132,7 +132,7 @@ mod tests {
         BatchOp, KernelError, LeaseSpec, PutBatch, PutBatchResult, PutEntry, Range, RangeAssert,
         RangeCursor, RangeCut,
     };
-    use homebase_core::seal::Seal;
+    use homebase_core::seal::{SEAL_AEAD_TAG_LEN, SEAL_NONCE_LEN, Seal, SealScheme};
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
     use pollster::block_on;
     use std::time::Duration;
@@ -163,6 +163,15 @@ mod tests {
             ver: Ver(ver),
         }
         .into()
+    }
+
+    fn seal(n: u8) -> Seal {
+        Seal {
+            scheme: SealScheme::AeadV1,
+            nonce: [n; SEAL_NONCE_LEN],
+            aead: [n.wrapping_add(1); SEAL_AEAD_TAG_LEN],
+            payload: Vec::new(),
+        }
     }
 
     fn prefix_meta(device: DeviceId, seq: u64, live_count: u64) -> PrefixMetaRecord {
@@ -852,6 +861,69 @@ mod tests {
             panic!("expected delta")
         };
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn seal_survives_set_get_and_delete_delta() {
+        let (mut space, store, lease) = setup();
+        let row = key(&[b"db", b"sealed"]);
+        let set_seal = seal(7);
+        let delete_seal = seal(9);
+
+        put_batch(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![BatchOp::Set {
+                key: row.clone(),
+                ver: Ver(1),
+                seal: set_seal.clone(),
+                ciphertext: b"ciphertext".to_vec(),
+            }],
+        )
+        .unwrap();
+        let stored = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![row.clone()],
+            },
+        ))
+        .unwrap()
+        .entries
+        .remove(0)
+        .unwrap();
+        assert_eq!(stored.seal, set_seal);
+
+        put_batch(
+            &mut space,
+            &store,
+            lease,
+            2,
+            vec![BatchOp::Delete {
+                key: row.clone(),
+                ver: Ver(2),
+                seal: delete_seal.clone(),
+            }],
+        )
+        .unwrap();
+        let delta = block_on(space.read_at(
+            &store,
+            &ReadAtRequest {
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db"])),
+                    since: Some(AdmissionSeq(1)),
+                }],
+            },
+        ))
+        .unwrap();
+        let RangeCut::Delta(changes) = &delta.ranges[0] else {
+            panic!("expected delta")
+        };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, row);
+        assert_eq!(changes[0].value, Value::Absent);
+        assert_eq!(changes[0].seal, delete_seal);
     }
 
     #[test]

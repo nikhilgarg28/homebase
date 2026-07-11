@@ -1,15 +1,15 @@
 //! Encrypted-space crash-resume and ack-drop tortures.
 
 use homebase::cipher::{
-    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext, ValueNonce,
+    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
 use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
-use homebase::{Client, PushOutcome};
+use homebase::{Client, Mutation, PushOutcome};
 use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest};
+use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value};
@@ -109,11 +109,11 @@ async fn fetch_cipher(
         .entries
         .remove(0)
         .unwrap();
+    let value = cipher.decode_entry_value(&stored).unwrap();
     Entry {
         key: logical.clone(),
-        value: cipher
-            .decode_value(&encoded, &stored.value, ValueContext::from_tag(&stored.tag))
-            .unwrap(),
+        value,
+        seal: stored.seal,
         tag: stored.tag,
     }
 }
@@ -125,6 +125,65 @@ async fn queued(mem: &MemoryStore) -> usize {
         .values()
         .map(|space| space.oplog.len())
         .sum()
+}
+
+#[test]
+fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
+    block_on(async {
+        let envelope = SpaceEnvelope::mint(NameKey([18; 32]), SpaceKey([19; 32]));
+        let space = envelope.space_id();
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), space);
+        let client = Client::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(1),
+            TestNonceSource::new(1),
+        )
+        .await
+        .unwrap();
+        client.attach(&envelope).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
+        let db = key(&[b"db"]);
+        let row = key(&[b"db", b"empty"]);
+        space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
+
+        space_handle
+            .submit_checked(
+                vec![Mutation::Set {
+                    key: row.clone(),
+                    value: Vec::new(),
+                }],
+                vec![],
+            )
+            .await
+            .unwrap();
+        client.push().await.unwrap();
+        let first = space_handle.pull(Range::Prefix(db.clone())).await.unwrap();
+        let RangeCut::Snapshot(entries) = &first.ranges[0] else {
+            panic!("expected snapshot")
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, Value::Present(Vec::new()));
+
+        space_handle
+            .submit_checked(vec![Mutation::Delete { key: row.clone() }], vec![])
+            .await
+            .unwrap();
+        client.push().await.unwrap();
+        let second = space_handle.pull(Range::Prefix(db)).await.unwrap();
+        let RangeCut::Delta(entries) = &second.ranges[0] else {
+            panic!("expected delta")
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].key,
+            envelope.open().unwrap().encode_key(&row).unwrap()
+        );
+        assert_eq!(entries[0].value, Value::Absent);
+    });
 }
 
 #[test]
@@ -241,22 +300,12 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                         PutBatch {
                             device_seq: seq1,
                             range_asserts: vec![],
-                            ops: oplog[&seq1]
-                                .entries()
-                                .iter()
-                                .cloned()
-                                .map(Into::into)
-                                .collect(),
+                            ops: oplog[&seq1].ops().to_vec(),
                         },
                         PutBatch {
                             device_seq: seq2,
                             range_asserts: vec![],
-                            ops: oplog[&seq2]
-                                .entries()
-                                .iter()
-                                .cloned()
-                                .map(Into::into)
-                                .collect(),
+                            ops: oplog[&seq2].ops().to_vec(),
                         },
                     ],
                 },

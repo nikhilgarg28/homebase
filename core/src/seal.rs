@@ -86,8 +86,7 @@ pub struct Seal {
 }
 
 impl Seal {
-    /// Empty scheme-0 seal. This is useful for tests and for the legacy
-    /// PutEntry-to-BatchOp bridge until the value cipher emits real seals.
+    /// Empty scheme-0 seal for plaintext mode and internal test/staging paths.
     pub fn empty_aead_v1() -> Self {
         Self {
             scheme: SealScheme::AeadV1,
@@ -107,7 +106,71 @@ impl Seal {
             }),
         }
     }
+
+    /// Stable storage/wire encoding: scheme, nonce, tag, payload length,
+    /// then opaque scheme payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SEAL_FIXED_HEADER_LEN + 4 + self.payload.len());
+        out.push(self.scheme.to_u8());
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.aead);
+        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, SealDecodeError> {
+        if bytes.len() < SEAL_FIXED_HEADER_LEN + 4 {
+            return Err(SealDecodeError::Malformed);
+        }
+        let scheme = SealScheme::from_u8(bytes[0]).map_err(SealDecodeError::UnknownScheme)?;
+        let nonce = bytes[1..1 + SEAL_NONCE_LEN]
+            .try_into()
+            .map_err(|_| SealDecodeError::Malformed)?;
+        let tag_start = 1 + SEAL_NONCE_LEN;
+        let aead = bytes[tag_start..tag_start + SEAL_AEAD_TAG_LEN]
+            .try_into()
+            .map_err(|_| SealDecodeError::Malformed)?;
+        let len_start = tag_start + SEAL_AEAD_TAG_LEN;
+        let payload_len = u32::from_be_bytes(
+            bytes[len_start..len_start + 4]
+                .try_into()
+                .map_err(|_| SealDecodeError::Malformed)?,
+        ) as usize;
+        let payload = bytes
+            .get(len_start + 4..)
+            .filter(|payload| payload.len() == payload_len)
+            .ok_or(SealDecodeError::Malformed)?
+            .to_vec();
+        let seal = Self {
+            scheme,
+            nonce,
+            aead,
+            payload,
+        };
+        seal.validate_payload().map_err(SealDecodeError::Payload)?;
+        Ok(seal)
+    }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SealDecodeError {
+    Malformed,
+    UnknownScheme(UnknownSealScheme),
+    Payload(SealPayloadError),
+}
+
+impl fmt::Display for SealDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed => write!(f, "malformed seal"),
+            Self::UnknownScheme(error) => write!(f, "{error}"),
+            Self::Payload(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SealDecodeError {}
 
 /// Invalid scheme-specific seal payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,5 +252,20 @@ mod tests {
                 payload_len: 1
             })
         );
+    }
+
+    #[test]
+    fn seal_roundtrips_storage_encoding() {
+        let seal = Seal {
+            scheme: SealScheme::AeadV1,
+            nonce: [3; SEAL_NONCE_LEN],
+            aead: [4; SEAL_AEAD_TAG_LEN],
+            payload: vec![],
+        };
+        assert_eq!(Seal::decode(&seal.encode()), Ok(seal));
+        assert!(matches!(
+            Seal::decode(&[99; SEAL_FIXED_HEADER_LEN + 4]),
+            Err(SealDecodeError::UnknownScheme(UnknownSealScheme(99)))
+        ));
     }
 }

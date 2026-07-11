@@ -159,8 +159,31 @@ pub enum BatchOp {
     NoOp,
 }
 
-/// Legacy client-local write shape. The server wire format uses [`BatchOp`];
-/// this remains the bridge for the current client oplog encoding.
+impl BatchOp {
+    pub fn key(&self) -> Option<&Key> {
+        match self {
+            Self::Set { key, .. } | Self::Delete { key, .. } => Some(key),
+            Self::NoOp => None,
+        }
+    }
+
+    pub fn ver(&self) -> Option<Ver> {
+        match self {
+            Self::Set { ver, .. } | Self::Delete { ver, .. } => Some(*ver),
+            Self::NoOp => None,
+        }
+    }
+
+    pub fn seal(&self) -> Option<&Seal> {
+        match self {
+            Self::Set { seal, .. } | Self::Delete { seal, .. } => Some(seal),
+            Self::NoOp => None,
+        }
+    }
+}
+
+/// Internal unstamped-value bridge used while the client reserves versions.
+/// Persisted oplog and server wire records use [`BatchOp`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutEntry {
     pub key: Key,

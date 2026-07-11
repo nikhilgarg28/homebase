@@ -268,7 +268,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let record = &state.spaces[&SPACE].oplog[&submission.seq];
         assert_eq!(record.range_asserts().len(), 1);
         assert_eq!(record.range_asserts()[0].prefix, target);
-        assert_eq!(record.entries()[0].ver, Ver(2));
+        assert_eq!(record.ops()[0].ver(), Some(Ver(2)));
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
@@ -439,7 +439,7 @@ fn child_or_sibling_lease_does_not_cover_range_assert() {
         for prefix in [db, key(&[b"db", b"right"])] {
             let error = space
                 .submit_checked(
-                    vec![],
+                    Vec::<homebase::Mutation>::new(),
                     vec![RangeAssert {
                         prefix: prefix.clone(),
                         upto: AdmissionSeq(0),

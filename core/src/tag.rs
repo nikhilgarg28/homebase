@@ -6,6 +6,7 @@
 //! and fork detection — not for querying.
 
 use crate::key::Key;
+use crate::seal::Seal;
 use std::fmt;
 
 /// Identifies a writing device: 16 opaque bytes, UUID-shaped.
@@ -97,5 +98,6 @@ impl Value {
 pub struct Entry {
     pub key: Key,
     pub value: Value,
+    pub seal: Seal,
     pub tag: Tag,
 }

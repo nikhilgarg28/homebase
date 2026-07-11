@@ -1,6 +1,6 @@
 use homebase::Client;
 use homebase::cipher::{
-    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext, ValueNonce,
+    NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
 use homebase::meta::OrderedMetaStore;
 use homebase::server::ServerHandle;
@@ -137,16 +137,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
         assert!(fetch(&handle, space, &row).await.is_none());
         let stored = fetch(&handle, space, &encoded_row).await.unwrap();
         assert_ne!(stored.value, val(b"secret"));
-        assert_eq!(
-            cipher
-                .decode_value(
-                    &encoded_row,
-                    &stored.value,
-                    ValueContext::from_tag(&stored.tag)
-                )
-                .unwrap(),
-            val(b"secret")
-        );
+        assert_eq!(cipher.decode_entry_value(&stored).unwrap(), val(b"secret"));
     });
 }
 

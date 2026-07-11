@@ -19,7 +19,7 @@
 //! than a global performance chokepoint.
 
 use crate::cipher::{
-    CipherError, NonceSource, SpaceCipher, SpaceEnvelope, SystemNonceSource, V1_KEY_EPOCH,
+    CipherError, NonceSource, SpaceCipher, SpaceEnvelope, SystemNonceSource, V1_CIPHER_EPOCH,
     ValueNonce,
 };
 use crate::coordination::{BlockingPool, CoordinationError, Coordinator, SpacePermit};
@@ -145,7 +145,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                     .record_codec(
                         id,
                         &CodecRecord {
-                            space_key_epoch: V1_KEY_EPOCH,
+                            cipher_epoch: V1_CIPHER_EPOCH,
                             sealed: envelope.encode(),
                         },
                     )
@@ -304,18 +304,13 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             let mut batches = vec![PutBatch {
                 device_seq: head,
                 range_asserts: head_record.range_asserts().to_vec(),
-                ops: head_record
-                    .entries()
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
+                ops: head_record.ops().to_vec(),
             }];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
                         || batches.iter().map(|batch| batch.ops.len()).sum::<usize>()
-                            + record.entries().len()
+                            + record.ops().len()
                             > push_cap
                     {
                         break;
@@ -323,7 +318,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                     batches.push(PutBatch {
                         device_seq: *seq,
                         range_asserts: record.range_asserts().to_vec(),
-                        ops: record.entries().iter().cloned().map(Into::into).collect(),
+                        ops: record.ops().to_vec(),
                     });
                     last = *seq;
                 }

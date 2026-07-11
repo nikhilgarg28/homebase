@@ -111,7 +111,7 @@
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
-use homebase_core::messages::{PutEntry, Range, RangeAssert};
+use homebase_core::messages::{BatchOp, PutEntry, Range, RangeAssert};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -186,7 +186,7 @@ pub struct ClockRecord {
 /// the bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecRecord {
-    pub space_key_epoch: u64,
+    pub cipher_epoch: u64,
     pub sealed: Vec<u8>,
 }
 
@@ -219,11 +219,8 @@ pub struct HeldLease {
 /// preserving sequence continuity on the next push.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OplogRecord {
-    /// Legacy data commit shape. `entries` will become `BatchOp` once the
-    /// submit API lands; `range_asserts` and `evidence` are present now so the
-    /// durable shape is ready.
     Commit {
-        entries: Vec<PutEntry>,
+        ops: Vec<BatchOp>,
         range_asserts: Vec<RangeAssert>,
         evidence: Vec<LeaseId>,
     },
@@ -323,23 +320,26 @@ pub fn certify(state: &ClientState) {
             }
         }
         for (_, record) in space.active_oplog() {
-            for entry in record.entries() {
-                if let Some(previous) = last_ver.get(&entry.key) {
+            for op in record.ops() {
+                let Some((key, ver)) = op.key().zip(op.ver()) else {
+                    continue;
+                };
+                if let Some(previous) = last_ver.get(key) {
                     assert!(
-                        entry.ver > *previous,
+                        ver > *previous,
                         "oplog vers regress in {:?} at {:?}: {previous:?} then {:?}",
                         space_id,
-                        entry.key,
-                        entry.ver
+                        key,
+                        ver
                     );
                 }
-                last_ver.insert(&entry.key, entry.ver);
+                last_ver.insert(key, ver);
             }
         }
         let queued_high = space
             .active_oplog()
             .map(|(_, record)| record)
-            .flat_map(|r| r.entries().iter().map(|e| e.ver))
+            .flat_map(|r| r.ops().iter().filter_map(BatchOp::ver))
             .max();
         if let Some(queued_high) = queued_high {
             let high = space
@@ -934,17 +934,20 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
             None => Ver(0),
         };
-        let entries: Vec<PutEntry> = entries
+        let ops: Vec<BatchOp> = entries
             .into_iter()
             .enumerate()
-            .map(|(i, (key, value))| PutEntry {
-                key,
-                value,
-                ver: Ver(high.0 + 1 + i as u64),
+            .map(|(i, (key, value))| {
+                PutEntry {
+                    key,
+                    value,
+                    ver: Ver(high.0 + 1 + i as u64),
+                }
+                .into()
             })
             .collect();
-        let ver_high = Ver(high.0 + entries.len() as u64);
-        let record = OplogRecord::commit_with_asserts(entries, range_asserts);
+        let ver_high = Ver(high.0 + ops.len() as u64);
+        let record = OplogRecord::commit_with_asserts(ops, range_asserts);
         Ok(ReservedCommit {
             seq: cursors.tail,
             ver_high,
@@ -957,7 +960,12 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         space: SpaceId,
         reserved: ReservedCommit,
     ) -> Result<Committed, StorageError> {
-        let entries_len = reserved.record.entries().len() as u64;
+        let entries_len = reserved
+            .record
+            .ops()
+            .iter()
+            .filter_map(BatchOp::ver)
+            .count() as u64;
         let expected_high = Ver(reserved
             .ver_high
             .0
@@ -1292,7 +1300,7 @@ impl CodecRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + 8 + self.sealed.len());
         out.push(CODEC_RECORD_VERSION);
-        out.extend_from_slice(&self.space_key_epoch.to_be_bytes());
+        out.extend_from_slice(&self.cipher_epoch.to_be_bytes());
         out.extend_from_slice(&self.sealed);
         out
     }
@@ -1303,7 +1311,7 @@ impl CodecRecord {
             return None;
         }
         Some(Self {
-            space_key_epoch: r.u64()?,
+            cipher_epoch: r.u64()?,
             sealed: r.rest().to_vec(),
         })
     }
@@ -1395,21 +1403,21 @@ impl HeldLease {
 }
 
 impl OplogRecord {
-    pub fn commit(entries: Vec<PutEntry>) -> Self {
-        Self::commit_with_asserts(entries, Vec::new())
+    pub fn commit(ops: Vec<BatchOp>) -> Self {
+        Self::commit_with_asserts(ops, Vec::new())
     }
 
-    pub fn commit_with_asserts(entries: Vec<PutEntry>, range_asserts: Vec<RangeAssert>) -> Self {
+    pub fn commit_with_asserts(ops: Vec<BatchOp>, range_asserts: Vec<RangeAssert>) -> Self {
         Self::Commit {
-            entries,
+            ops,
             range_asserts,
             evidence: Vec::new(),
         }
     }
 
-    pub fn entries(&self) -> &[PutEntry] {
+    pub fn ops(&self) -> &[BatchOp] {
         match self {
-            Self::Commit { entries, .. } => entries,
+            Self::Commit { ops, .. } => ops,
             Self::Rollback { .. } => &[],
         }
     }
@@ -1421,10 +1429,10 @@ impl OplogRecord {
         }
     }
 
-    pub fn entries_mut(&mut self) -> &mut Vec<PutEntry> {
+    pub fn ops_mut(&mut self) -> &mut Vec<BatchOp> {
         match self {
-            Self::Commit { entries, .. } => entries,
-            Self::Rollback { .. } => panic!("rollback records do not carry entries"),
+            Self::Commit { ops, .. } => ops,
+            Self::Rollback { .. } => panic!("rollback records do not carry ops"),
         }
     }
 
@@ -1432,12 +1440,12 @@ impl OplogRecord {
         let mut out = vec![OPLOG_RECORD_VERSION];
         match self {
             Self::Commit {
-                entries,
+                ops,
                 range_asserts,
                 evidence,
             } => {
                 out.push(0);
-                encode_entries(&mut out, entries);
+                encode_ops(&mut out, ops);
                 out.extend_from_slice(&(range_asserts.len() as u32).to_be_bytes());
                 for assert in range_asserts {
                     let prefix = assert.prefix.encode();
@@ -1463,7 +1471,7 @@ impl OplogRecord {
         match r.u8()? {
             OPLOG_RECORD_VERSION => match r.u8()? {
                 0 => {
-                    let entries = decode_entries(&mut r)?;
+                    let ops = decode_ops(&mut r)?;
                     let assert_count = r.u32()? as usize;
                     let mut range_asserts = Vec::with_capacity(assert_count.min(1024));
                     for _ in 0..assert_count {
@@ -1479,7 +1487,7 @@ impl OplogRecord {
                     }
                     r.end()?;
                     Some(Self::Commit {
-                        entries,
+                        ops,
                         range_asserts,
                         evidence,
                     })
@@ -1496,42 +1504,67 @@ impl OplogRecord {
     }
 }
 
-fn encode_entries(out: &mut Vec<u8>, entries: &[PutEntry]) {
-    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for entry in entries {
-        let key = entry.key.encode();
+fn encode_ops(out: &mut Vec<u8>, ops: &[BatchOp]) {
+    out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+    for op in ops {
+        let (kind, key, ver, seal, ciphertext) = match op {
+            BatchOp::NoOp => {
+                out.push(0);
+                continue;
+            }
+            BatchOp::Set {
+                key,
+                ver,
+                seal,
+                ciphertext,
+            } => (1, key, ver, seal, Some(ciphertext.as_slice())),
+            BatchOp::Delete { key, ver, seal } => (2, key, ver, seal, None),
+        };
+        out.push(kind);
+        let key = key.encode();
         out.extend_from_slice(&(key.len() as u32).to_be_bytes());
         out.extend_from_slice(&key);
-        out.extend_from_slice(&entry.ver.0.to_be_bytes());
-        match &entry.value {
-            Value::Absent => out.push(0),
-            Value::Present(bytes) => {
-                out.push(1);
-                out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                out.extend_from_slice(bytes);
-            }
+        out.extend_from_slice(&ver.0.to_be_bytes());
+        let seal = seal.encode();
+        out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
+        out.extend_from_slice(&seal);
+        if let Some(ciphertext) = ciphertext {
+            out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+            out.extend_from_slice(ciphertext);
         }
     }
 }
 
-fn decode_entries(r: &mut Reader<'_>) -> Option<Vec<PutEntry>> {
+fn decode_ops(r: &mut Reader<'_>) -> Option<Vec<BatchOp>> {
     let count = r.u32()? as usize;
-    let mut entries = Vec::with_capacity(count.min(1024));
+    let mut ops = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
+        let kind = r.u8()?;
+        if kind == 0 {
+            ops.push(BatchOp::NoOp);
+            continue;
+        }
         let key_len = r.u32()? as usize;
         let key = Key::decode(r.take(key_len)?).ok()?;
         let ver = Ver(r.u64()?);
-        let value = match r.u8()? {
-            0 => Value::Absent,
+        let seal_len = r.u32()? as usize;
+        let seal = homebase_core::seal::Seal::decode(r.take(seal_len)?).ok()?;
+        let op = match kind {
             1 => {
                 let len = r.u32()? as usize;
-                Value::Present(r.take(len)?.to_vec())
+                BatchOp::Set {
+                    key,
+                    ver,
+                    seal,
+                    ciphertext: r.take(len)?.to_vec(),
+                }
             }
+            2 => BatchOp::Delete { key, ver, seal },
             _ => return None,
         };
-        entries.push(PutEntry { key, value, ver });
+        ops.push(op);
     }
-    Some(entries)
+    Some(ops)
 }
 
 fn single_byte(components: &[KeyComponent], index: usize, what: &str) -> u8 {
@@ -1734,21 +1767,21 @@ pub mod conformance {
         );
         assert_eq!(data.ver_high, Some(Ver(3)));
         assert_eq!(data.oplog.len(), 2);
-        assert_eq!(data.oplog[&DeviceSeq(1)].entries()[0].ver, Ver(1));
+        assert_eq!(data.oplog[&DeviceSeq(1)].ops()[0].ver(), Some(Ver(1)));
         assert_eq!(
-            data.oplog[&DeviceSeq(1)].entries()[1].ver,
-            Ver(2),
+            data.oplog[&DeviceSeq(1)].ops()[1].ver(),
+            Some(Ver(2)),
             "consecutive in order"
         );
         assert_eq!(
-            data.oplog[&DeviceSeq(2)].entries()[0].ver,
-            Ver(3),
+            data.oplog[&DeviceSeq(2)].ops()[0].ver(),
+            Some(Ver(3)),
             "the space-local chain continued"
         );
         let links = &state.spaces[&link];
         assert_eq!(links.cursors.tail, DeviceSeq(2));
         assert_eq!(links.ver_high, Some(Ver(1)));
-        assert_eq!(links.oplog[&DeviceSeq(1)].entries()[0].ver, Ver(1));
+        assert_eq!(links.oplog[&DeviceSeq(1)].ops()[0].ver(), Some(Ver(1)));
 
         // Queue reads are explicitly space-scoped.
         let window = store
@@ -1903,9 +1936,9 @@ pub mod conformance {
             }
         );
         let state = audit(store).await;
-        let entries = state.spaces[&space].oplog[&DeviceSeq(4)].entries();
-        assert_eq!(entries[0].ver, Ver(12));
-        assert_eq!(entries[1].ver, Ver(13));
+        let ops = state.spaces[&space].oplog[&DeviceSeq(4)].ops();
+        assert_eq!(ops[0].ver(), Some(Ver(12)));
+        assert_eq!(ops[1].ver(), Some(Ver(13)));
 
         // A merged wire batch acks under its last seq; the group ack
         // drops everything through it and nothing after — prefix-only by
@@ -2073,7 +2106,7 @@ pub mod conformance {
             .record_codec(
                 space,
                 &CodecRecord {
-                    space_key_epoch: 0,
+                    cipher_epoch: 0,
                     sealed: b"sealed".to_vec(),
                 },
             )
@@ -2118,7 +2151,7 @@ pub mod conformance {
         assert_eq!(
             state.spaces[&space].codec,
             Some(CodecRecord {
-                space_key_epoch: 0,
+                cipher_epoch: 0,
                 sealed: b"sealed".to_vec()
             })
         );
@@ -2175,6 +2208,7 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use homebase_core::seal::{SEAL_AEAD_TAG_LEN, SEAL_NONCE_LEN, SealScheme};
     use homebase_core::storage::MemoryStore;
     use pollster::block_on;
 
@@ -2191,22 +2225,33 @@ mod tests {
         }
     }
 
+    fn seal(n: u8) -> homebase_core::seal::Seal {
+        homebase_core::seal::Seal {
+            scheme: SealScheme::AeadV1,
+            nonce: [n; SEAL_NONCE_LEN],
+            aead: [n.wrapping_add(1); SEAL_AEAD_TAG_LEN],
+            payload: Vec::new(),
+        }
+    }
+
     fn sample_commit() -> OplogRecord {
         OplogRecord::commit(vec![
-            PutEntry {
+            BatchOp::Set {
                 key: key(&[b"db", b"a"]),
-                value: Value::Present(b"ciphertext".to_vec()),
                 ver: Ver(3),
+                seal: seal(1),
+                ciphertext: b"ciphertext".to_vec(),
             },
-            PutEntry {
+            BatchOp::Delete {
                 key: key(&[b"db", b"gone"]),
-                value: Value::Absent,
                 ver: Ver(3),
+                seal: seal(2),
             },
-            PutEntry {
+            BatchOp::Set {
                 key: key(&[b"db", b"empty"]),
-                value: Value::Present(vec![]),
                 ver: Ver(3),
+                seal: seal(3),
+                ciphertext: vec![],
             },
         ])
     }
@@ -2252,7 +2297,7 @@ mod tests {
         assert_eq!(ClockRecord::decode(&clock.encode()), Some(clock));
 
         let codec = CodecRecord {
-            space_key_epoch: 0,
+            cipher_epoch: 0,
             sealed: b"sealed-bundle".to_vec(),
         };
         assert_eq!(CodecRecord::decode(&codec.encode()), Some(codec));
@@ -2283,7 +2328,7 @@ mod tests {
         assert_eq!(OplogRecord::decode(&rollback.encode()), Some(rollback));
 
         let rich = OplogRecord::Commit {
-            entries: vec![],
+            ops: vec![],
             range_asserts: vec![RangeAssert {
                 prefix: key(&[b"db"]),
                 upto: AdmissionSeq(11),
@@ -2377,11 +2422,14 @@ mod tests {
         let space = state.spaces.get_mut(&SPACE).unwrap();
         space.oplog.insert(
             DeviceSeq(3),
-            OplogRecord::commit(vec![PutEntry {
-                key: key(&[b"db", b"later"]),
-                value: Value::Present(b"x".to_vec()),
-                ver: Ver(4),
-            }]),
+            OplogRecord::commit(vec![
+                PutEntry {
+                    key: key(&[b"db", b"later"]),
+                    value: Value::Present(b"x".to_vec()),
+                    ver: Ver(4),
+                }
+                .into(),
+            ]),
         );
         space.cursors.tail = DeviceSeq(4);
         space.ver_high = Some(Ver(4));
@@ -2410,11 +2458,14 @@ mod tests {
         let space = state.spaces.get_mut(&SPACE).unwrap();
         space.oplog.insert(
             DeviceSeq(2),
-            OplogRecord::commit(vec![PutEntry {
-                key: key(&[b"db", b"a"]),
-                value: Value::Present(b"rejected".to_vec()),
-                ver: Ver(2),
-            }]),
+            OplogRecord::commit(vec![
+                PutEntry {
+                    key: key(&[b"db", b"a"]),
+                    value: Value::Present(b"rejected".to_vec()),
+                    ver: Ver(2),
+                }
+                .into(),
+            ]),
         );
         space.oplog.insert(
             DeviceSeq(3),
@@ -2524,11 +2575,14 @@ mod tests {
         let space = state.spaces.get_mut(&SPACE).unwrap();
         space.oplog.insert(
             DeviceSeq(2),
-            OplogRecord::commit(vec![PutEntry {
-                key: key(&[b"db", b"a"]),
-                value: Value::Present(b"stale".to_vec()),
-                ver: Ver(2),
-            }]),
+            OplogRecord::commit(vec![
+                PutEntry {
+                    key: key(&[b"db", b"a"]),
+                    value: Value::Present(b"stale".to_vec()),
+                    ver: Ver(2),
+                }
+                .into(),
+            ]),
         );
         space.cursors.tail = DeviceSeq(3);
         certify(&state);

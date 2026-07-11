@@ -1,7 +1,7 @@
 //! Client-layer integration: multi-space coordination, offline physics,
 //! per-space sequencing, and codec-cache resume.
 
-use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext};
+use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource};
 use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, open_offline};
@@ -188,23 +188,11 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
         assert_ne!(stored_a.value, val(b"beta"));
         assert_ne!(stored_b.value, val(b"alpha2"));
         assert_eq!(
-            cipher_a
-                .decode_value(
-                    &encoded_a,
-                    &stored_a.value,
-                    ValueContext::from_tag(&stored_a.tag)
-                )
-                .unwrap(),
+            cipher_a.decode_entry_value(&stored_a).unwrap(),
             val(b"alpha2")
         );
         assert_eq!(
-            cipher_b
-                .decode_value(
-                    &encoded_b,
-                    &stored_b.value,
-                    ValueContext::from_tag(&stored_b.tag)
-                )
-                .unwrap(),
+            cipher_b.decode_entry_value(&stored_b).unwrap(),
             val(b"beta")
         );
     });
@@ -336,12 +324,7 @@ fn offline_commit_survives_until_online_push() {
         let cipher = envelope.open().unwrap();
         let encoded = cipher.encode_key(&row).unwrap();
         let stored = fetch(&handle, space, &encoded).await.unwrap();
-        assert_eq!(
-            cipher
-                .decode_value(&encoded, &stored.value, ValueContext::from_tag(&stored.tag))
-                .unwrap(),
-            val(b"offline")
-        );
+        assert_eq!(cipher.decode_entry_value(&stored).unwrap(), val(b"offline"));
     });
 }
 

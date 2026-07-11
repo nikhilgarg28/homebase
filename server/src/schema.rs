@@ -48,6 +48,7 @@
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{LeaseId, LeaseMode};
+use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Epoch, Tag, Value, Ver};
 use std::time::Duration;
@@ -345,6 +346,7 @@ impl CountersRecord {
 pub struct DataRecord {
     pub tag: Tag,
     pub value: Value,
+    pub seal: Seal,
 }
 
 impl DataRecord {
@@ -353,13 +355,16 @@ impl DataRecord {
             Value::Present(bytes) => bytes.len(),
             Value::Absent => 0,
         };
-        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 1 + value_len);
+        let seal = self.seal.encode();
+        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 + seal.len() + 1 + value_len);
         out.push(DATA_RECORD_VERSION);
         out.extend_from_slice(&self.tag.device.0);
         out.extend_from_slice(&self.tag.device_seq.0.to_be_bytes());
         out.extend_from_slice(&self.tag.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.tag.ver.0.to_be_bytes());
         out.extend_from_slice(&self.tag.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
+        out.extend_from_slice(&seal);
         match &self.value {
             Value::Absent => out.push(0),
             Value::Present(bytes) => {
@@ -382,12 +387,14 @@ impl DataRecord {
             ver: Ver(r.u64()?),
             admission_seq: AdmissionSeq(r.u64()?),
         };
+        let seal_len = r.u32()? as usize;
+        let seal = Seal::decode(r.take(seal_len)?).ok()?;
         let value = match r.u8()? {
             0 => Value::Absent,
             1 => Value::Present(r.rest().to_vec()),
             _ => return None,
         };
-        Some(Self { tag, value })
+        Some(Self { tag, value, seal })
     }
 }
 
@@ -537,10 +544,22 @@ impl<'a> Reader<'a> {
         Some(u64::from_be_bytes(slice.try_into().unwrap()))
     }
 
+    fn u32(&mut self) -> Option<u32> {
+        let slice = self.bytes.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(u32::from_be_bytes(slice.try_into().unwrap()))
+    }
+
     fn bytes16(&mut self) -> Option<[u8; 16]> {
         let slice = self.bytes.get(self.pos..self.pos + 16)?;
         self.pos += 16;
         Some(slice.try_into().unwrap())
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let slice = self.bytes.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        Some(slice)
     }
 
     fn rest(&self) -> &'a [u8] {
@@ -637,11 +656,13 @@ mod tests {
         let present = DataRecord {
             tag: tag.clone(),
             value: Value::Present(b"ct".to_vec()),
+            seal: Seal::empty_aead_v1(),
         };
         assert_eq!(DataRecord::decode(&present.encode()), Some(present));
         let tombstone = DataRecord {
             tag,
             value: Value::Absent,
+            seal: Seal::empty_aead_v1(),
         };
         assert_eq!(DataRecord::decode(&tombstone.encode()), Some(tombstone));
     }

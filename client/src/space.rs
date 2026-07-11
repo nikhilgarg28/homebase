@@ -9,7 +9,7 @@
 //! skips that preflight. Both durably append to this space's oplog and return
 //! a [`Submission`]. Neither method performs network admission.
 
-use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource, ValueContext};
+use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
 use crate::client::Client;
 use crate::meta::{Committed, HeldLease, MetaStore};
 use crate::server::ServerHandle;
@@ -146,6 +146,23 @@ pub struct Submission {
     pub seq: DeviceSeq,
 }
 
+/// One logical client mutation. Version, nonce, seal, and ciphertext are
+/// assigned internally when the mutation is appended to the oplog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mutation {
+    Set { key: Key, value: Vec<u8> },
+    Delete { key: Key },
+}
+
+impl From<(Key, Value)> for Mutation {
+    fn from((key, value): (Key, Value)) -> Self {
+        match value {
+            Value::Present(value) => Self::Set { key, value },
+            Value::Absent => Self::Delete { key },
+        }
+    }
+}
+
 /// A handle to one space within a [`Client`].
 pub struct Space<'a, M, H, C, N = SystemNonceSource> {
     client: &'a Client<M, H, C, N>,
@@ -190,13 +207,18 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
 
     /// Append a local data batch after substantiating every range assertion
     /// from active local lease state and a sufficient local coverage cut.
-    pub async fn submit_checked(
+    pub async fn submit_checked<I, T>(
         &self,
-        entries: Vec<(Key, Value)>,
+        mutations: I,
         range_asserts: Vec<RangeAssert>,
-    ) -> Result<Submission, SpaceDriverError> {
+    ) -> Result<Submission, SpaceDriverError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Mutation>,
+    {
         let _permit = self.enter().await?;
-        let (encoded, range_asserts) = self.encode_submission(entries, range_asserts).await?;
+        let mutations = mutations.into_iter().map(Into::into).collect();
+        let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
         self.check_range_asserts(&range_asserts).await?;
         let committed = self.persist_submission(encoded, range_asserts).await?;
         Ok(Submission { seq: committed.seq })
@@ -204,28 +226,40 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
 
     /// Append a local data batch without checking lease-backed range
     /// assertions. The server still evaluates every assertion on push.
-    pub async fn submit_unchecked(
+    pub async fn submit_unchecked<I, T>(
         &self,
-        entries: Vec<(Key, Value)>,
+        mutations: I,
         range_asserts: Vec<RangeAssert>,
-    ) -> Result<Submission, SpaceDriverError> {
+    ) -> Result<Submission, SpaceDriverError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Mutation>,
+    {
         let _permit = self.enter().await?;
-        let (encoded, range_asserts) = self.encode_submission(entries, range_asserts).await?;
+        let mutations = mutations.into_iter().map(Into::into).collect();
+        let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
         let committed = self.persist_submission(encoded, range_asserts).await?;
         Ok(Submission { seq: committed.seq })
     }
 
     async fn encode_submission(
         &self,
-        entries: Vec<(Key, Value)>,
+        mutations: Vec<Mutation>,
         range_asserts: Vec<RangeAssert>,
     ) -> Result<(Vec<(Key, Value)>, Vec<RangeAssert>), SpaceDriverError> {
         let name_cipher = self.cipher();
         self.client
             .run_blocking(move || -> Result<_, CipherError> {
-                let entries = entries
+                let entries = mutations
                     .into_iter()
-                    .map(|(key, value)| Ok((name_cipher.encode_key(&key)?, value)))
+                    .map(|mutation| match mutation {
+                        Mutation::Set { key, value } => {
+                            Ok((name_cipher.encode_key(&key)?, Value::Present(value)))
+                        }
+                        Mutation::Delete { key } => {
+                            Ok((name_cipher.encode_key(&key)?, Value::Absent))
+                        }
+                    })
                     .collect::<Result<Vec<_>, CipherError>>()?;
                 let range_asserts = range_asserts
                     .into_iter()
@@ -255,7 +289,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .store()
             .reserve_commit(self.id, encoded, range_asserts)
             .await?;
-        let nonces = (0..reserved.record.entries().len())
+        let nonces = (0..reserved.record.ops().len())
             .map(|_| {
                 self.client
                     .next_nonce()
@@ -266,13 +300,28 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .client
             .run_blocking(move || {
                 let mut reserved = reserved;
-                for (entry, nonce) in reserved.record.entries_mut().iter_mut().zip(nonces) {
-                    let context = ValueContext {
-                        device,
-                        device_seq: reserved.seq,
-                        ver: entry.ver,
+                for (op, nonce) in reserved.record.ops_mut().iter_mut().zip(nonces) {
+                    let entry = match op {
+                        homebase_core::messages::BatchOp::Set {
+                            key,
+                            ver,
+                            ciphertext,
+                            ..
+                        } => homebase_core::messages::PutEntry {
+                            key: key.clone(),
+                            value: Value::Present(ciphertext.clone()),
+                            ver: *ver,
+                        },
+                        homebase_core::messages::BatchOp::Delete { key, ver, .. } => {
+                            homebase_core::messages::PutEntry {
+                                key: key.clone(),
+                                value: Value::Absent,
+                                ver: *ver,
+                            }
+                        }
+                        homebase_core::messages::BatchOp::NoOp => continue,
                     };
-                    entry.value = cipher.encode_value(&entry.key, &entry.value, context, nonce)?;
+                    *op = cipher.encode_batch_op(device, reserved.seq, &entry, nonce)?;
                 }
                 Ok::<_, CipherError>(reserved)
             })
@@ -510,11 +559,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                         RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
                     };
                     for entry in entries {
-                        entry.value = cipher.decode_value(
-                            &entry.key,
-                            &entry.value,
-                            ValueContext::from_tag(&entry.tag),
-                        )?;
+                        entry.value = cipher.decode_entry_value(entry)?;
                     }
                 }
                 Ok::<_, CipherError>(response)
@@ -596,11 +641,10 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         }
         for (seq, record) in space_state.active_oplog() {
             for held in &releasing {
-                if record
-                    .entries()
-                    .iter()
-                    .any(|entry| entry.key.starts_with(&held.lease.prefix))
-                {
+                if record.ops().iter().any(|op| {
+                    op.key()
+                        .is_some_and(|key| key.starts_with(&held.lease.prefix))
+                }) {
                     return Err(SpaceDriverError::ReleaseBlocked {
                         lease: held.lease.id,
                         at: *seq,
