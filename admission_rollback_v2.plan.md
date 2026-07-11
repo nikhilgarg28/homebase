@@ -78,7 +78,7 @@ isProject: false
 - **head / neck / tail** cursors; `[neck, tail)` is the active certify/push window; dead rows in `[head, neck)` after rollback.
 - Anything in `[neck, tail)` not yet server-acked is **not guaranteed**. Callers that need per-write certainty hold the returned `Submission { seq }` and call `submission.push().await`, which is sugar over `space.push_until(seq).await`.
 - Device-seq **gaps are legal** after rollback.
-- Range asserts: `effective_prefix_max(prefix) == at` (equality).
+- Range asserts: the greatest historical admission under the prefix from a device other than the submitter must be `<= upto`; same-device predecessors are carried by the `DeviceSeq`/history chain.
 - Lease **evidence** may include `LeaseId`s for diagnostics / richer errors, but is never admission authority.
 - Leases are **reservations**, not required write capabilities: writes without a held lease are admitted when no active incompatible lease conflicts with their keys.
 - Client lease state is always a **subset of authority**: local active leases may lag server grants, but must never outlive local release intent.

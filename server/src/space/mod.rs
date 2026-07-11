@@ -123,6 +123,7 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{PrefixMetaRecord, prefix_meta_key};
     use crate::storage::MemoryStore;
     use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
@@ -162,6 +163,13 @@ mod tests {
             ver: Ver(ver),
         }
         .into()
+    }
+
+    fn prefix_meta(device: DeviceId, seq: u64, live_count: u64) -> PrefixMetaRecord {
+        let mut record = PrefixMetaRecord::empty();
+        record.observe(device, AdmissionSeq(seq));
+        record.live_count = live_count;
+        record
     }
 
     /// Space + store + a write lease over `("db",)` held by device 1.
@@ -217,6 +225,30 @@ mod tests {
                 }],
             },
         ))
+    }
+
+    fn put_batch_as(
+        space: &mut Space,
+        store: &MemoryStore,
+        device: DeviceId,
+        device_seq: u64,
+        range_asserts: Vec<RangeAssert>,
+        ops: Vec<BatchOp>,
+    ) -> PutBatchResponse {
+        block_on(space.put_batch(
+            store,
+            Timestamp(1),
+            &PutBatchRequest {
+                device,
+                evidence: vec![],
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(device_seq),
+                    range_asserts,
+                    ops,
+                }],
+            },
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -318,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn range_asserts_see_scratch_state_from_earlier_coalesced_batches() {
+    fn range_asserts_allow_earlier_same_device_batches_at_one_offline_cut() {
         let (mut space, store, lease) = setup();
         let root = key(&[b"db"]);
         let k1 = key(&[b"db", b"t", b"r1"]);
@@ -340,7 +372,7 @@ mod tests {
                         device_seq: DeviceSeq(2),
                         range_asserts: vec![RangeAssert {
                             prefix: root,
-                            at: AdmissionSeq(1),
+                            upto: AdmissionSeq(0),
                         }],
                         ops: vec![put(&k2, b"v2", 1)],
                     },
@@ -354,31 +386,50 @@ mod tests {
     }
 
     #[test]
-    fn range_assert_failure_reports_all_batches_and_applies_nothing() {
-        let (mut space, store, lease) = setup();
+    fn foreign_range_assert_failure_reports_all_batches_and_applies_nothing() {
+        let mut space = Space::new(SPACE);
+        let store = MemoryStore::new();
         let root = key(&[b"db"]);
         let k1 = key(&[b"db", b"t", b"r1"]);
         let k2 = key(&[b"db", b"t", b"r2"]);
+
+        block_on(space.put_batch(
+            &store,
+            Timestamp(1),
+            &PutBatchRequest {
+                device: dev(1),
+                evidence: vec![],
+                batches: vec![PutBatch {
+                    device_seq: DeviceSeq(1),
+                    range_asserts: vec![],
+                    ops: vec![put(&k1, b"v1", 1)],
+                }],
+            },
+        ))
+        .unwrap();
 
         let resp = block_on(space.put_batch(
             &store,
             Timestamp(1),
             &PutBatchRequest {
-                device: dev(1),
-                evidence: vec![lease],
+                device: dev(2),
+                evidence: vec![],
                 batches: vec![
                     PutBatch {
                         device_seq: DeviceSeq(1),
-                        range_asserts: vec![],
-                        ops: vec![put(&k1, b"v1", 1)],
+                        range_asserts: vec![RangeAssert {
+                            prefix: root.clone(),
+                            upto: AdmissionSeq(0),
+                        }],
+                        ops: vec![put(&k2, b"v2", 1)],
                     },
                     PutBatch {
                         device_seq: DeviceSeq(2),
                         range_asserts: vec![RangeAssert {
                             prefix: root.clone(),
-                            at: AdmissionSeq(0),
+                            upto: AdmissionSeq(0),
                         }],
-                        ops: vec![put(&k2, b"v2", 1)],
+                        ops: vec![],
                     },
                 ],
             },
@@ -397,7 +448,7 @@ mod tests {
                 failures,
                 &vec![homebase_core::messages::RangeAssertFailure {
                     prefix: root.clone(),
-                    expected: AdmissionSeq(0),
+                    upto: AdmissionSeq(0),
                     actual: AdmissionSeq(1),
                 }]
             );
@@ -410,9 +461,69 @@ mod tests {
             },
         ))
         .unwrap();
+        assert_eq!(
+            got.entries[0].as_ref().unwrap().value,
+            Value::Present(b"v1".to_vec())
+        );
+        let got = block_on(space.get(&store, &GetRequest { keys: vec![k2] })).unwrap();
         assert!(got.entries[0].is_none());
-        put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v1", 1)])
-            .expect("failed range assert did not advance device seq");
+    }
+
+    #[test]
+    fn foreign_history_survives_a_later_own_delete() {
+        let mut space = Space::new(SPACE);
+        let store = MemoryStore::new();
+        let root = key(&[b"db"]);
+        let row = key(&[b"db", b"row"]);
+
+        put_batch_as(
+            &mut space,
+            &store,
+            dev(1),
+            1,
+            vec![],
+            vec![put(&row, b"one", 1)],
+        );
+        put_batch_as(
+            &mut space,
+            &store,
+            dev(2),
+            1,
+            vec![],
+            vec![put(&row, b"foreign", 2)],
+        );
+        put_batch_as(&mut space, &store, dev(1), 2, vec![], vec![del(&row, 3)]);
+
+        let meta = block_on(store.get(&prefix_meta_key(SPACE, root.components())))
+            .unwrap()
+            .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(meta.first.device, dev(1));
+        assert_eq!(meta.first.admission_seq, AdmissionSeq(3));
+        assert_eq!(meta.second.device, dev(2));
+        assert_eq!(meta.second.admission_seq, AdmissionSeq(2));
+
+        let response = put_batch_as(
+            &mut space,
+            &store,
+            dev(1),
+            3,
+            vec![RangeAssert {
+                prefix: root.clone(),
+                upto: AdmissionSeq(1),
+            }],
+            vec![],
+        );
+        assert!(matches!(
+            &response.results[0],
+            PutBatchResult::Failed {
+                error: KernelError::RangeAssertFailed { failures }
+            } if failures == &vec![homebase_core::messages::RangeAssertFailure {
+                prefix: root,
+                upto: AdmissionSeq(1),
+                actual: AdmissionSeq(2),
+            }]
+        ));
     }
 
     #[test]
@@ -436,48 +547,24 @@ mod tests {
         // Two live keys: every ancestor counts both, at seq 2.
         put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
         put_batch(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
-        let expect = PrefixMetaRecord {
-            max_admission_seq: 2,
-            live_count: 2,
-        };
+        let expect = prefix_meta(dev(1), 2, 2);
         assert_eq!(meta(&store, &root), Some(expect));
         assert_eq!(meta(&store, &table), Some(expect));
         assert_eq!(
             meta(&store, &k1),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 1,
-                live_count: 1
-            }),
+            Some(prefix_meta(dev(1), 1, 1)),
             "leaf prefix untouched by the sibling's write"
         );
 
         // Overwrite: max seq advances, live count doesn't.
         put_batch(&mut space, &store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
-        assert_eq!(
-            meta(&store, &root),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 3,
-                live_count: 2
-            })
-        );
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 3, 2)));
 
         // Tombstone: count drops; the record persists at live_count 0.
         put_batch(&mut space, &store, lease, 4, vec![del(&k1, 3)]).unwrap();
         put_batch(&mut space, &store, lease, 5, vec![del(&k2, 2)]).unwrap();
-        assert_eq!(
-            meta(&store, &root),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 5,
-                live_count: 0
-            })
-        );
-        assert_eq!(
-            meta(&store, &k1),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 4,
-                live_count: 0
-            })
-        );
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 5, 0)));
+        assert_eq!(meta(&store, &k1), Some(prefix_meta(dev(1), 4, 0)));
 
         // Intra-batch create+tombstone of a fresh key nets zero.
         let k3 = key(&[b"db", b"t", b"r3"]);
@@ -489,35 +576,17 @@ mod tests {
             vec![put(&k3, b"blip", 1), del(&k3, 2)],
         )
         .unwrap();
-        assert_eq!(
-            meta(&store, &root),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 6,
-                live_count: 0
-            })
-        );
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 6, 0)));
 
         // Repeated delete advances high water but keeps live count stable.
         put_batch(&mut space, &store, lease, 7, vec![del(&k1, 4)]).unwrap();
-        assert_eq!(
-            meta(&store, &root),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 7,
-                live_count: 0
-            })
-        );
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 7, 0)));
 
         // Delete -> present and a zero-length present both count as live.
         let k4 = key(&[b"db", b"t", b"r4"]);
         put_batch(&mut space, &store, lease, 8, vec![put(&k1, b"back", 5)]).unwrap();
         put_batch(&mut space, &store, lease, 9, vec![put(&k4, b"", 1)]).unwrap();
-        assert_eq!(
-            meta(&store, &root),
-            Some(PrefixMetaRecord {
-                max_admission_seq: 9,
-                live_count: 2
-            })
-        );
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 9, 2)));
     }
 
     #[test]

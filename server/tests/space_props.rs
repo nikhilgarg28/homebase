@@ -298,7 +298,7 @@ fn check_aggregates(store: &MemoryStore) -> Result<(), TestCaseError> {
     .into_iter()
     .map(|(k, v)| {
         let rec = PrefixMetaRecord::decode(&v).unwrap();
-        (k, (rec.max_admission_seq, rec.live_count))
+        (k, (rec.max_admission_seq().0, rec.live_count))
     })
     .collect();
     prop_assert_eq!(&stored, &expected, "aggregates diverged from data records");

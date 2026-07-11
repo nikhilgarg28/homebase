@@ -1443,7 +1443,7 @@ impl OplogRecord {
                     let prefix = assert.prefix.encode();
                     out.extend_from_slice(&(prefix.len() as u32).to_be_bytes());
                     out.extend_from_slice(&prefix);
-                    out.extend_from_slice(&assert.at.0.to_be_bytes());
+                    out.extend_from_slice(&assert.upto.0.to_be_bytes());
                 }
                 out.extend_from_slice(&(evidence.len() as u32).to_be_bytes());
                 for lease in evidence {
@@ -1469,8 +1469,8 @@ impl OplogRecord {
                     for _ in 0..assert_count {
                         let prefix_len = r.u32()? as usize;
                         let prefix = Key::decode(r.take(prefix_len)?).ok()?;
-                        let at = AdmissionSeq(r.u64()?);
-                        range_asserts.push(RangeAssert { prefix, at });
+                        let upto = AdmissionSeq(r.u64()?);
+                        range_asserts.push(RangeAssert { prefix, upto });
                     }
                     let evidence_count = r.u32()? as usize;
                     let mut evidence = Vec::with_capacity(evidence_count.min(1024));
@@ -2286,7 +2286,7 @@ mod tests {
             entries: vec![],
             range_asserts: vec![RangeAssert {
                 prefix: key(&[b"db"]),
-                at: AdmissionSeq(11),
+                upto: AdmissionSeq(11),
             }],
             evidence: vec![LeaseId(99)],
         };

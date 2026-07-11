@@ -25,10 +25,11 @@
 //! duplicate the data record so a delta never needs point lookups.
 //!
 //! **PrefixMeta is the durable augmented tree**: per `(depth, prefix)`, the
-//! max admission seq and live-key count under that prefix, updated along
-//! every written key's full prefix path in the same atomic batch as the
-//! write. Reads use it to answer "anything new under this prefix since my
-//! cursor?" and "any live keys here?" without scanning.
+//! two greatest historical admission points from distinct devices plus the
+//! live-key count, updated along every written key's full prefix path in the
+//! same atomic batch as the write. Two heads preserve the global maximum for
+//! reads and the maximum excluding one submitting device for causal range
+//! assertions, even after overwrite or delete.
 //!
 //! The by-prefix index carries an explicit **depth** component (number of
 //! prefix components). That makes both conflict-check queries ordinary
@@ -390,24 +391,81 @@ impl DataRecord {
     }
 }
 
+/// One device's latest historical admission under a prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceAdmission {
+    pub device: DeviceId,
+    pub admission_seq: AdmissionSeq,
+}
+
+impl DeviceAdmission {
+    const EMPTY: Self = Self {
+        device: DeviceId([0; 16]),
+        admission_seq: AdmissionSeq(0),
+    };
+}
+
 /// Write-time aggregates for one `(depth, prefix)`: the durable form of the
-/// augmented range-max tree. Once a prefix has been written it keeps its
-/// record forever (`live_count` may drop back to 0; `max_admission_seq`
-/// never regresses).
+/// augmented range-max tree. `first` and `second` are the greatest historical
+/// admissions from distinct devices. They never regress or disappear after
+/// overwrite/delete, while `live_count` may return to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixMetaRecord {
-    /// Admission seq of the latest batch that wrote any key under this
-    /// prefix (tombstones included).
-    pub max_admission_seq: u64,
+    pub first: DeviceAdmission,
+    pub second: DeviceAdmission,
     /// Number of live (non-tombstoned) keys under this prefix.
     pub live_count: u64,
 }
 
 impl PrefixMetaRecord {
+    pub const fn empty() -> Self {
+        Self {
+            first: DeviceAdmission::EMPTY,
+            second: DeviceAdmission::EMPTY,
+            live_count: 0,
+        }
+    }
+
+    pub fn max_admission_seq(self) -> AdmissionSeq {
+        self.first.admission_seq.max(self.second.admission_seq)
+    }
+
+    pub fn max_excluding(self, device: DeviceId) -> AdmissionSeq {
+        if self.first.device != device {
+            self.first.admission_seq
+        } else {
+            self.second.admission_seq
+        }
+    }
+
+    pub fn observe(&mut self, device: DeviceId, admission_seq: AdmissionSeq) {
+        let observed = DeviceAdmission {
+            device,
+            admission_seq,
+        };
+        if self.first.admission_seq.0 == 0 {
+            self.first = observed;
+        } else if self.first.device == device {
+            self.first.admission_seq = self.first.admission_seq.max(admission_seq);
+        } else if self.second.admission_seq.0 == 0 {
+            self.second = observed;
+        } else if self.second.device == device {
+            self.second.admission_seq = self.second.admission_seq.max(admission_seq);
+        } else if admission_seq > self.second.admission_seq {
+            self.second = observed;
+        }
+        if self.second.admission_seq > self.first.admission_seq {
+            std::mem::swap(&mut self.first, &mut self.second);
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8 * 2);
+        let mut out = Vec::with_capacity(1 + (16 + 8) * 2 + 8);
         out.push(PREFIX_META_RECORD_VERSION);
-        out.extend_from_slice(&self.max_admission_seq.to_be_bytes());
+        out.extend_from_slice(&self.first.device.0);
+        out.extend_from_slice(&self.first.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.second.device.0);
+        out.extend_from_slice(&self.second.admission_seq.0.to_be_bytes());
         out.extend_from_slice(&self.live_count.to_be_bytes());
         out
     }
@@ -418,7 +476,14 @@ impl PrefixMetaRecord {
             return None;
         }
         Some(Self {
-            max_admission_seq: r.u64()?,
+            first: DeviceAdmission {
+                device: DeviceId(r.bytes16()?),
+                admission_seq: AdmissionSeq(r.u64()?),
+            },
+            second: DeviceAdmission {
+                device: DeviceId(r.bytes16()?),
+                admission_seq: AdmissionSeq(r.u64()?),
+            },
             live_count: r.u64()?,
         })
     }
@@ -509,11 +574,32 @@ mod tests {
 
     #[test]
     fn prefix_meta_record_roundtrips() {
-        let rec = PrefixMetaRecord {
-            max_admission_seq: 17,
-            live_count: 4,
-        };
+        let mut rec = PrefixMetaRecord::empty();
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(17));
+        rec.observe(DeviceId([2; 16]), AdmissionSeq(11));
+        rec.live_count = 4;
         assert_eq!(PrefixMetaRecord::decode(&rec.encode()), Some(rec));
+        assert_eq!(rec.max_excluding(DeviceId([1; 16])), AdmissionSeq(11));
+        assert_eq!(rec.max_excluding(DeviceId([3; 16])), AdmissionSeq(17));
+    }
+
+    #[test]
+    fn prefix_meta_keeps_two_distinct_device_heads() {
+        let mut rec = PrefixMetaRecord::empty();
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(1));
+        rec.observe(DeviceId([2; 16]), AdmissionSeq(2));
+        rec.observe(DeviceId([3; 16]), AdmissionSeq(3));
+        assert_eq!(rec.first.device, DeviceId([3; 16]));
+        assert_eq!(rec.second.device, DeviceId([2; 16]));
+
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(4));
+        assert_eq!(rec.first.device, DeviceId([1; 16]));
+        assert_eq!(rec.second.device, DeviceId([3; 16]));
+        assert_eq!(rec.max_excluding(DeviceId([1; 16])), AdmissionSeq(3));
+        assert_eq!(rec.max_excluding(DeviceId([3; 16])), AdmissionSeq(4));
+
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(2));
+        assert_eq!(rec.first.admission_seq, AdmissionSeq(4));
     }
 
     #[test]

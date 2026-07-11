@@ -14,7 +14,7 @@ use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
     AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
-    RangeAssert, RangeCut, ReleaseRequest,
+    RangeAssert, RangeAssertFailure, RangeCut, ReleaseRequest,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{MemoryStore, OrderedStore, WriteBatch, collect_scan};
@@ -219,6 +219,111 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PutEntry {
+                key: key(&[b"db", b"sibling"]),
+                value: val(b"foreign"),
+                ver: Ver(1),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        space.ensure(vec![rspec(&db, 60)]).await.unwrap();
+        let target = key(&[b"db", b"target"]);
+        assert_eq!(
+            OrderedMetaStore::new(&mem)
+                .watermark(SPACE, &Range::Prefix(target.clone()))
+                .await
+                .unwrap(),
+            Some(AdmissionSeq(1)),
+            "the parent pull covers the child through the global cut"
+        );
+
+        let submission = space
+            .submit_checked(
+                vec![(key(&[b"db", b"target", b"row"]), val(b"value"))],
+                vec![RangeAssert {
+                    prefix: target.clone(),
+                    upto: AdmissionSeq(0),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(submission.seq, DeviceSeq(1));
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        let record = &state.spaces[&SPACE].oplog[&submission.seq];
+        assert_eq!(record.range_asserts().len(), 1);
+        assert_eq!(record.range_asserts()[0].prefix, target);
+        assert_eq!(record.entries()[0].ver, Ver(2));
+        assert_eq!(
+            client.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(1))
+            }
+        );
+    });
+}
+
+#[test]
+fn dependent_asserting_submissions_push_across_request_boundaries() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client.with_push_cap(1);
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let db = key(&[b"db"]);
+        space.ensure(vec![rspec(&db, 60)]).await.unwrap();
+
+        for name in [&b"one"[..], &b"two"[..]] {
+            space
+                .submit_checked(
+                    vec![(key(&[b"db", name]), val(name))],
+                    vec![RangeAssert {
+                        prefix: db.clone(),
+                        upto: AdmissionSeq(0),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            client.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(2))
+            }
+        );
+    });
+}
+
+#[test]
+fn dependent_asserting_submissions_push_when_coalesced() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
         let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
             .await
             .unwrap();
@@ -230,23 +335,121 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let db = key(&[b"db"]);
         space.ensure(vec![rspec(&db, 60)]).await.unwrap();
 
-        let submission = space
+        for name in [&b"one"[..], &b"two"[..]] {
+            space
+                .submit_checked(
+                    vec![(key(&[b"db", name]), val(name))],
+                    vec![RangeAssert {
+                        prefix: db.clone(),
+                        upto: AdmissionSeq(0),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            client.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(2))
+            }
+        );
+    });
+}
+
+#[test]
+fn foreign_write_after_upto_stalls_and_keeps_submission_queued() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let server_clock = Arc::new(ManualClock::new(Timestamp(0)));
+        let handle = spawn_server(Arc::clone(&server_clock), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let db = key(&[b"db"]);
+        space.ensure(vec![rspec(&db, 60)]).await.unwrap();
+        space
             .submit_checked(
-                vec![(key(&[b"db", b"row"]), val(b"value"))],
+                vec![(key(&[b"db", b"mine"]), val(b"mine"))],
                 vec![RangeAssert {
                     prefix: db.clone(),
-                    at: AdmissionSeq(0),
+                    upto: AdmissionSeq(0),
                 }],
             )
             .await
             .unwrap();
 
-        assert_eq!(submission.seq, DeviceSeq(1));
-        let state = audit(&OrderedMetaStore::new(&mem)).await;
-        let record = &state.spaces[&SPACE].oplog[&submission.seq];
-        assert_eq!(record.range_asserts().len(), 1);
-        assert_eq!(record.range_asserts()[0].prefix, db);
-        assert_eq!(record.entries()[0].ver, Ver(1));
+        server_clock.advance(Duration::from_secs(61));
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PutEntry {
+                key: key(&[b"db", b"foreign"]),
+                value: val(b"foreign"),
+                ver: Ver(1),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+
+        assert_eq!(
+            client.push().await.unwrap(),
+            PushOutcome::Stalled {
+                at: DeviceSeq(1),
+                error: KernelError::RangeAssertFailed {
+                    failures: vec![RangeAssertFailure {
+                        prefix: db,
+                        upto: AdmissionSeq(0),
+                        actual: AdmissionSeq(1),
+                    }],
+                },
+                acked_through: None,
+            }
+        );
+        assert_eq!(queued(&mem).await, 1);
+    });
+}
+
+#[test]
+fn child_or_sibling_lease_does_not_cover_range_assert() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let db = key(&[b"db"]);
+        let child = key(&[b"db", b"left"]);
+        space.ensure(vec![rspec(&child, 60)]).await.unwrap();
+
+        for prefix in [db, key(&[b"db", b"right"])] {
+            let error = space
+                .submit_checked(
+                    vec![],
+                    vec![RangeAssert {
+                        prefix: prefix.clone(),
+                        upto: AdmissionSeq(0),
+                    }],
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, SpaceDriverError::RangeAssertAuthority { prefix });
+        }
+        assert_eq!(queued(&mem).await, 0);
     });
 }
 
@@ -271,7 +474,7 @@ fn checked_submit_rejects_assert_without_active_lease() {
                 vec![(key(&[b"db", b"row"]), val(b"value"))],
                 vec![RangeAssert {
                     prefix: db.clone(),
-                    at: AdmissionSeq(0),
+                    upto: AdmissionSeq(0),
                 }],
             )
             .await
@@ -283,7 +486,7 @@ fn checked_submit_rejects_assert_without_active_lease() {
 }
 
 #[test]
-fn checked_submit_rejects_assert_that_differs_from_local_watermark() {
+fn checked_submit_rejects_assert_beyond_local_watermark() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -304,7 +507,7 @@ fn checked_submit_rejects_assert_that_differs_from_local_watermark() {
                 vec![(key(&[b"db", b"row"]), val(b"value"))],
                 vec![RangeAssert {
                     prefix: db.clone(),
-                    at: AdmissionSeq(7),
+                    upto: AdmissionSeq(7),
                 }],
             )
             .await
@@ -312,9 +515,9 @@ fn checked_submit_rejects_assert_that_differs_from_local_watermark() {
 
         assert_eq!(
             error,
-            SpaceDriverError::RangeAssertMismatch {
+            SpaceDriverError::RangeAssertAhead {
                 prefix: db,
-                asserted: AdmissionSeq(7),
+                upto: AdmissionSeq(7),
                 local: AdmissionSeq(0),
             }
         );
@@ -342,7 +545,7 @@ fn unchecked_submit_bypasses_local_assert_gate() {
                 vec![(key(&[b"db", b"row"]), val(b"value"))],
                 vec![RangeAssert {
                     prefix: key(&[b"db"]),
-                    at: AdmissionSeq(99),
+                    upto: AdmissionSeq(99),
                 }],
             )
             .await
@@ -350,7 +553,7 @@ fn unchecked_submit_bypasses_local_assert_gate() {
 
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert_eq!(
-            state.spaces[&SPACE].oplog[&submission.seq].range_asserts()[0].at,
+            state.spaces[&SPACE].oplog[&submission.seq].range_asserts()[0].upto,
             AdmissionSeq(99)
         );
     });
@@ -668,7 +871,7 @@ fn resume_keeps_wall_clock_authority() {
                     vec![(k.clone(), val(b"later"))],
                     vec![RangeAssert {
                         prefix: db.clone(),
-                        at: AdmissionSeq(0),
+                        upto: AdmissionSeq(0),
                     }],
                 )
                 .await
@@ -755,7 +958,7 @@ fn margin_applies_only_across_incarnations() {
                     vec![(key(&[b"db", b"k2"]), val(b"v2"))],
                     vec![RangeAssert {
                         prefix: db.clone(),
-                        at: AdmissionSeq(0),
+                        upto: AdmissionSeq(0),
                     }],
                 )
                 .await
@@ -1257,7 +1460,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
                     vec![(k.clone(), val(b"too-soon"))],
                     vec![RangeAssert {
                         prefix: db.clone(),
-                        at: AdmissionSeq(0),
+                        upto: AdmissionSeq(0),
                     }],
                 )
                 .await
@@ -1284,7 +1487,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
                 vec![(k.clone(), val(b"mine"))],
                 vec![RangeAssert {
                     prefix: db.clone(),
-                    at: AdmissionSeq(1),
+                    upto: AdmissionSeq(1),
                 }],
             )
             .await
@@ -1462,7 +1665,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
                     vec![(key(&[b"db", b"k"]), val(b"v"))],
                     vec![RangeAssert {
                         prefix: db.clone(),
-                        at: AdmissionSeq(0),
+                        upto: AdmissionSeq(0),
                     }],
                 )
                 .await

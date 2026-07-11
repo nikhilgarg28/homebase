@@ -119,18 +119,22 @@ pub struct ListLeasesResponse {
 // ---------------------------------------------------------------------------
 // put_batch
 
-/// Equality assertion for the server-visible max admission sequence under a
-/// component-wise prefix.
+/// Inclusive upper bound on foreign-device admissions under a prefix.
+///
+/// For a batch submitted by device `D`, this asserts that every historical
+/// write under `prefix` from a device other than `D` was admitted at or
+/// before `upto`. Earlier writes from `D` are ordered by its `DeviceSeq`
+/// stream and do not invalidate the assertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeAssert {
     pub prefix: Key,
-    pub at: AdmissionSeq,
+    pub upto: AdmissionSeq,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeAssertFailure {
     pub prefix: Key,
-    pub expected: AdmissionSeq,
+    pub upto: AdmissionSeq,
     pub actual: AdmissionSeq,
 }
 

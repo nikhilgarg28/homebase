@@ -146,7 +146,7 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         .into_iter()
         .map(|(k, v)| {
             let rec = PrefixMetaRecord::decode(&v).expect("undecodable prefix meta");
-            (k, (rec.max_admission_seq, rec.live_count))
+            (k, (rec.max_admission_seq().0, rec.live_count))
         })
         .collect();
     assert_eq!(stored, expected, "aggregates diverged from recomputation");

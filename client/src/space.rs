@@ -3,8 +3,9 @@
 //! [`Client::space`](crate::client::Client::space).
 //!
 //! Data mutation has two local-only entry points. [`Space::submit_checked`]
-//! requires every supplied range assertion to be backed by a live local
-//! lease and an equal local prefix watermark; [`Space::submit_unchecked`]
+//! requires every supplied range assertion to be backed by a live covering
+//! lease and a local coverage watermark greater than or equal to `upto`;
+//! [`Space::submit_unchecked`]
 //! skips that preflight. Both durably append to this space's oplog and return
 //! a [`Submission`]. Neither method performs network admission.
 
@@ -48,9 +49,9 @@ pub enum SpaceDriverError {
     RangeAssertAuthority {
         prefix: Key,
     },
-    RangeAssertMismatch {
+    RangeAssertAhead {
         prefix: Key,
-        asserted: AdmissionSeq,
+        upto: AdmissionSeq,
         local: AdmissionSeq,
     },
     ReleaseBlocked {
@@ -95,13 +96,13 @@ impl fmt::Display for SpaceDriverError {
             Self::RangeAssertAuthority { prefix } => {
                 write!(f, "no active local lease for asserted prefix {prefix:?}")
             }
-            Self::RangeAssertMismatch {
+            Self::RangeAssertAhead {
                 prefix,
-                asserted,
+                upto,
                 local,
             } => write!(
                 f,
-                "range assertion for {prefix:?} is {asserted:?}, local prefix watermark is {local:?}"
+                "range assertion for {prefix:?} is upto {upto:?}, local coverage watermark is only {local:?}"
             ),
             Self::ReleaseBlocked { lease, at } => {
                 write!(f, "lease {lease:?} still covers queued write {at:?}")
@@ -188,7 +189,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
     }
 
     /// Append a local data batch after substantiating every range assertion
-    /// from active local lease state and the exact local prefix watermark.
+    /// from active local lease state and a sufficient local coverage cut.
     pub async fn submit_checked(
         &self,
         entries: Vec<(Key, Value)>,
@@ -231,7 +232,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                     .map(|assert| {
                         Ok(RangeAssert {
                             prefix: name_cipher.encode_key(&assert.prefix)?,
-                            at: assert.at,
+                            upto: assert.upto,
                         })
                     })
                     .collect::<Result<Vec<_>, CipherError>>()?;
@@ -658,10 +659,10 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                 .watermark(self.id, &Range::Prefix(assert.prefix.clone()))
                 .await?
                 .unwrap_or(AdmissionSeq(0));
-            if local != assert.at {
-                return Err(SpaceDriverError::RangeAssertMismatch {
+            if local < assert.upto {
+                return Err(SpaceDriverError::RangeAssertAhead {
                     prefix: assert.prefix.clone(),
-                    asserted: assert.at,
+                    upto: assert.upto,
                     local,
                 });
             }

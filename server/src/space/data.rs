@@ -14,8 +14,9 @@
 //! 2. each client batch's `device_seq` strictly follows the device's stored
 //!    high water and the preceding batch in the request (replay and
 //!    out-of-order rejection);
-//! 3. each batch's range asserts match the scratch prefix high-water as of
-//!    that batch (including earlier coalesced batches, excluding this batch);
+//! 3. each batch's range asserts bound the greatest historical admission
+//!    under the prefix from devices other than the submitter; earlier
+//!    coalesced or previously admitted batches from this device are expected;
 //! 4. every Set/Delete has a valid seal and its `ver` strictly exceeds the
 //!    stored ver for its key (within a batch, later ops for the same key
 //!    check against earlier ones — the batch behaves like a sequence).
@@ -24,7 +25,7 @@
 //! writes, atomically:
 //! data records for Set/Delete ops, changelog moves (delete the key's old changelog entry,
 //! insert the new one), per-prefix aggregates along every written key's
-//! prefix path (max admission seq + live-key delta; see
+//! prefix path (two distinct-device historical heads + live-key delta; see
 //! [`PrefixMetaRecord`]), the device high water, and the counters.
 //!
 //! # Reads
@@ -36,7 +37,7 @@
 //! included. The one-record-per-key changelog (see [`crate::schema`]) makes
 //! a delta a single seq-ordered scan; each changed key appears exactly once,
 //! already at its final state. The per-prefix aggregates short-circuit both
-//! read shapes: a delta whose prefix has `max_admission_seq ≤ cursor` and a
+//! read shapes: a delta whose prefix has `max_admission_seq() ≤ cursor` and a
 //! snapshot whose prefix has `live_count == 0` return empty without
 //! scanning. (A delta that does have news still walks the whole changelog
 //! past the cursor and filters by prefix; descending the aggregate tree to
@@ -112,10 +113,9 @@ pub async fn put_batch<S: OrderedStore>(
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
     let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
-    let mut scratch_prefix_high: BTreeMap<Vec<u8>, AdmissionSeq> = BTreeMap::new();
+    let mut touched_prefix_high: BTreeMap<Vec<u8>, AdmissionSeq> = BTreeMap::new();
     for client_batch in &req.batches {
-        let failures =
-            range_assert_failures(space, store, &scratch_prefix_high, client_batch).await?;
+        let failures = range_assert_failures(space, store, req.device, client_batch).await?;
         if !failures.is_empty() {
             return Ok(failed_response(
                 req.batches.len(),
@@ -171,7 +171,7 @@ pub async fn put_batch<S: OrderedStore>(
             touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
         }
         for meta_key in touched_prefixes {
-            scratch_prefix_high
+            touched_prefix_high
                 .entry(meta_key)
                 .and_modify(|at| *at = (*at).max(seq))
                 .or_insert(seq);
@@ -203,20 +203,15 @@ pub async fn put_batch<S: OrderedStore>(
         }
     }
     for (meta_key, delta) in live_deltas {
-        let current = match store.get(&meta_key).await? {
+        let mut updated = match store.get(&meta_key).await? {
             Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record"),
-            None => PrefixMetaRecord {
-                max_admission_seq: 0,
-                live_count: 0,
-            },
+            None => PrefixMetaRecord::empty(),
         };
-        let updated = PrefixMetaRecord {
-            max_admission_seq: counters.admission_high_water,
-            live_count: current
-                .live_count
-                .checked_add_signed(delta)
-                .expect("live count underflow: aggregates diverged from data records"),
-        };
+        updated.observe(req.device, touched_prefix_high[&meta_key]);
+        updated.live_count = updated
+            .live_count
+            .checked_add_signed(delta)
+            .expect("live count underflow: aggregates diverged from data records");
         batch.put(meta_key, updated.encode());
     }
     batch.put(
@@ -235,30 +230,22 @@ pub async fn put_batch<S: OrderedStore>(
 async fn range_assert_failures<S: OrderedStore>(
     space: SpaceId,
     store: &S,
-    scratch_prefix_high: &BTreeMap<Vec<u8>, AdmissionSeq>,
+    device: DeviceId,
     batch: &homebase_core::messages::PutBatch,
 ) -> Result<Vec<RangeAssertFailure>, Error> {
     let mut failures = Vec::new();
     for assert in &batch.range_asserts {
         let meta_key = prefix_meta_key(space, assert.prefix.components());
-        let actual = match scratch_prefix_high.get(&meta_key) {
-            Some(at) => *at,
-            None => {
-                let max = match store.get(&meta_key).await? {
-                    Some(bytes) => {
-                        PrefixMetaRecord::decode(&bytes)
-                            .expect("corrupt prefix meta record")
-                            .max_admission_seq
-                    }
-                    None => 0,
-                };
-                AdmissionSeq(max)
-            }
+        let actual = match store.get(&meta_key).await? {
+            Some(bytes) => PrefixMetaRecord::decode(&bytes)
+                .expect("corrupt prefix meta record")
+                .max_excluding(device),
+            None => AdmissionSeq(0),
         };
-        if actual != assert.at {
+        if actual > assert.upto {
             failures.push(RangeAssertFailure {
                 prefix: assert.prefix.clone(),
-                expected: assert.at,
+                upto: assert.upto,
                 actual,
             });
         }
@@ -451,7 +438,7 @@ async fn delta<S: OrderedStore>(
         // Aggregate short-circuit: nothing under this prefix since the cursor.
         match prefix_meta(space, store, prefix).await? {
             None => return Ok(Vec::new()),
-            Some(meta) if meta.max_admission_seq <= since.0 => return Ok(Vec::new()),
+            Some(meta) if meta.max_admission_seq() <= since => return Ok(Vec::new()),
             Some(_) => {}
         }
     }
