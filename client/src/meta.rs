@@ -225,10 +225,19 @@ pub enum DeviceOp {
         entries: Vec<DeviceEntry>,
         range_asserts: Vec<RangeAssert>,
         evidence: Vec<LeaseId>,
+        submit_mode: SubmitMode,
     },
     Rollback {
         marker: DeviceSeq,
     },
+}
+
+/// Local qualification policy used when a commit entered the oplog.
+/// This is never sent to the server or included in value AAD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitMode {
+    Checked,
+    Unchecked,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +436,7 @@ pub trait MetaStore {
         space: SpaceId,
         mutation_count: usize,
         range_asserts: Vec<RangeAssert>,
+        submit_mode: SubmitMode,
     ) -> impl Future<Output = Result<ReservedCommit, StorageError>> + Send;
 
     /// Commit a reservation: advances the counters and appends the
@@ -547,6 +557,7 @@ pub struct ReservedCommit {
     pub ver_high: Ver,
     pub versions: Vec<Ver>,
     pub range_asserts: Vec<RangeAssert>,
+    pub submit_mode: SubmitMode,
 }
 
 /// Load-then-certify: the audit entry point for any implementation.
@@ -924,6 +935,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         space: SpaceId,
         mutation_count: usize,
         range_asserts: Vec<RangeAssert>,
+        submit_mode: SubmitMode,
     ) -> Result<ReservedCommit, StorageError> {
         let cursors = match self.store.get(&cursors_key(space)).await? {
             Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
@@ -946,6 +958,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             ver_high,
             versions,
             range_asserts,
+            submit_mode,
         })
     }
 
@@ -987,7 +1000,8 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         }
 
         let mut batch = WriteBatch::new();
-        let record = DeviceOp::commit_with_asserts(entries, reserved.range_asserts);
+        let record =
+            DeviceOp::commit_with_asserts(entries, reserved.range_asserts, reserved.submit_mode);
         batch.put(oplog_key(space, reserved.seq), record.encode());
         batch.put(
             cursors_key(space),
@@ -1191,7 +1205,7 @@ const WATERMARK_RECORD_VERSION: u8 = 1;
 const CLOCK_RECORD_VERSION: u8 = 1;
 const CODEC_RECORD_VERSION: u8 = 1;
 const LEASE_RECORD_VERSION: u8 = 3;
-const OPLOG_RECORD_VERSION: u8 = 3;
+const OPLOG_RECORD_VERSION: u8 = 4;
 
 impl DeviceRecord {
     pub fn encode(&self) -> Vec<u8> {
@@ -1400,14 +1414,19 @@ impl HeldLease {
 
 impl DeviceOp {
     pub fn commit(entries: Vec<DeviceEntry>) -> Self {
-        Self::commit_with_asserts(entries, Vec::new())
+        Self::commit_with_asserts(entries, Vec::new(), SubmitMode::Unchecked)
     }
 
-    pub fn commit_with_asserts(entries: Vec<DeviceEntry>, range_asserts: Vec<RangeAssert>) -> Self {
+    pub fn commit_with_asserts(
+        entries: Vec<DeviceEntry>,
+        range_asserts: Vec<RangeAssert>,
+        submit_mode: SubmitMode,
+    ) -> Self {
         Self::Commit {
             entries,
             range_asserts,
             evidence: Vec::new(),
+            submit_mode,
         }
     }
 
@@ -1425,6 +1444,13 @@ impl DeviceOp {
         }
     }
 
+    pub fn submit_mode(&self) -> Option<SubmitMode> {
+        match self {
+            Self::Commit { submit_mode, .. } => Some(*submit_mode),
+            Self::Rollback { .. } => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![OPLOG_RECORD_VERSION];
         match self {
@@ -1432,8 +1458,13 @@ impl DeviceOp {
                 entries,
                 range_asserts,
                 evidence,
+                submit_mode,
             } => {
                 out.push(0);
+                out.push(match submit_mode {
+                    SubmitMode::Unchecked => 0,
+                    SubmitMode::Checked => 1,
+                });
                 encode_entries(&mut out, entries);
                 out.extend_from_slice(&(range_asserts.len() as u32).to_be_bytes());
                 for assert in range_asserts {
@@ -1460,6 +1491,11 @@ impl DeviceOp {
         match r.u8()? {
             OPLOG_RECORD_VERSION => match r.u8()? {
                 0 => {
+                    let submit_mode = match r.u8()? {
+                        0 => SubmitMode::Unchecked,
+                        1 => SubmitMode::Checked,
+                        _ => return None,
+                    };
                     let entries = decode_entries(&mut r)?;
                     let assert_count = r.u32()? as usize;
                     let mut range_asserts = Vec::with_capacity(assert_count.min(1024));
@@ -1479,6 +1515,7 @@ impl DeviceOp {
                         entries,
                         range_asserts,
                         evidence,
+                        submit_mode,
                     })
                 }
                 1 => {
@@ -1672,7 +1709,7 @@ pub mod conformance {
         mutations: Vec<Mutation>,
     ) -> Committed {
         let reserved = store
-            .reserve_commit(space, mutations.len(), Vec::new())
+            .reserve_commit(space, mutations.len(), Vec::new(), SubmitMode::Unchecked)
             .await
             .unwrap();
         let entries = mutations
@@ -2350,6 +2387,7 @@ mod tests {
                 upto: AdmissionSeq(11),
             }],
             evidence: vec![LeaseId(99)],
+            submit_mode: SubmitMode::Checked,
         };
         assert_eq!(DeviceOp::decode(&rich.encode()), Some(rich));
     }
@@ -2485,10 +2523,16 @@ mod tests {
         block_on(async {
             let inner = MemoryStore::new();
             let store = OrderedMetaStore::new(&inner);
-            let first = store.reserve_commit(SPACE, 1, Vec::new()).await.unwrap();
+            let first = store
+                .reserve_commit(SPACE, 1, Vec::new(), SubmitMode::Unchecked)
+                .await
+                .unwrap();
             let first_entry = set_entry(key(&[b"db", b"a"]), b"one", first.versions[0]);
             store.commit(SPACE, first, vec![first_entry]).await.unwrap();
-            let second = store.reserve_commit(SPACE, 1, Vec::new()).await.unwrap();
+            let second = store
+                .reserve_commit(SPACE, 1, Vec::new(), SubmitMode::Unchecked)
+                .await
+                .unwrap();
             let second_entry = set_entry(key(&[b"db", b"b"]), b"two", second.versions[0]);
             let second = store
                 .commit(SPACE, second, vec![second_entry])

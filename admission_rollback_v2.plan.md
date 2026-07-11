@@ -18,7 +18,7 @@ todos:
     content: "Phase 4: Client meta — per-space oplogs/ver_high, rollback(to), head/neck/tail persisted, forgotten lease release intents, certify [neck,tail), reserve_batch only, drop discard_from"
     status: pending
   - id: p5-data-submit
-    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose ensure()+release(), no public acquire()"
+    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose ensure()+release_checked/release_unchecked, no public acquire()"
     status: pending
   - id: p6-push-ack
     content: "Phase 6: Push + ack — PushOptions, disk head/neck/tail only, push_until wait-through, Submission::push sugar, data-only ack, Fork trim vs rollback"
@@ -465,7 +465,7 @@ Lease verbs remain separate sync operations:
 ### Lease release intents
 
 - Local lease records have an authority state: **Active** or **Forgotten**.
-- `release()` first persists `Forgotten` locally, then calls remote `release`.
+- Both client release methods first persist `Forgotten` locally, then call the remote `release` verb.
 - If remote release succeeds, delete the local lease record.
 - If remote release fails or is unavailable, keep the Forgotten record so a later retry can release the server-side reservation.
 - `leases()` / local checked-write logic / evidence collection must treat Forgotten leases as non-existent authority.
@@ -506,11 +506,12 @@ space.push_until(seq: DeviceSeq) -> PushOutcome
 
 // Lease reservation surface.
 space.ensure(specs: Vec<LeaseSpec>) -> Ensured
-space.release(leases: Vec<LeaseId>) -> Released
+space.release_checked(leases: Vec<LeaseId>) -> Released
+space.release_unchecked(leases: Vec<LeaseId>) -> Released
 space.repair_leases() -> RepairedLeases
 ```
 
-**Removed:** public `acquire()` and `Acquired`. `ensure()` is the only acquisition API and always performs the barrier pull before returning local authority. `release()` remains explicit and sync.
+**Removed:** public `acquire()` and `Acquired`. `ensure()` is the only acquisition API and always performs the barrier pull before returning local authority. `release_checked()` and `release_unchecked()` remain explicit and sync.
 
 ### Inside `submit`
 
@@ -526,7 +527,9 @@ space.repair_leases() -> RepairedLeases
 
 - `ensure()` mints client `requested_at`, calls the server `acquire` verb directly, records returned leases with local deadlines derived from `lease.requested_at + lease.ttl`, pulls every prefix needed to satisfy each lease's grant barrier, advances watermarks, and only then returns.
 - `ensure()` is allowed with non-empty local oplogs; it does not push buffered data first.
-- `release()` first marks leases Forgotten locally, then calls the server `release` verb, and deletes them locally only after success. It is not appended to the oplog.
+- Every `DeviceOp::Commit` persists a local-only `SubmitMode::{Checked, Unchecked}` field. It is not sent to the server or included in AAD.
+- `release_checked()` scans active checked commits and refuses to remove the last live covering reservation for any queued range assertion. Coverage is re-evaluated after excluding the complete release set; unchecked commits do not block it.
+- `release_unchecked()` skips that guard. Both release methods first mark leases Forgotten locally, then call the server `release` verb, and delete them locally only after success. Release is not appended to the oplog.
 - A failed/unavailable release leaves Forgotten records behind for retry; callers and local checks treat them as already gone.
 - `repair_leases()` calls `list_leases(device)`, reconciles local Active/Forgotten leases to the server response, clears Forgotten records that are no longer live server-side, stamps repaired local deadlines from each returned lease's `requested_at + ttl`, pulls returned prefixes through each lease's grant barrier, and only then exposes repaired leases as usable.
 
@@ -717,7 +720,7 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | B10a Causal range assertions | Rename `RangeAssert.at` to inclusive `upto`; maintain the two greatest historical admission points from distinct devices per prefix; server checks maximum excluding the submitting device `<= upto`; local checked gate requires an Active covering read/write lease with satisfied barrier and effective coverage watermark `>= upto`; preserve same-device dependent submissions across coalesced and split pushes | core/schema roundtrips; same-device offline dependency chain in one and multiple requests; foreign write after `upto` rejects; foreign write remains visible after own overwrite/delete; parent lease+watermark covers child; sibling and child coverage reject; local watermark above `upto` accepts; document same-device fork test as completed by B14 | core/server/client docs for inclusive `upto`, top-two distinct-device history, local coverage direction, offline chains, and B14 dependency |
 | B11 Cipher integration | Implement sealing with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
 | B11a Canonical entry model | Replace intermediate `BatchOp`/`PutEntry`/`Value`/combined `Tag` shapes with `Mutation`, `DeviceTag`, `DeviceEntry`, `AdmissionTag`, and `AdmittedEntry`; rename `PutBatch` family to `AdmissionBatch`/`AdmissionRequest`/`AdmissionResponse`; rename local oplog record to `DeviceOp`; represent rollback on wire as empty `entries` | full core/server/client/sim target checks; cipher tamper tests; engine, crash, equivalence, and torture suites migrated to the canonical object boundaries | core tag/messages docs plus this plan and DESIGN terminology |
-| B12 Lease client API | Expose `ensure`, `release`, `repair_leases`; remove public acquire; implement Forgotten release intents, local deadline margin, barrier pulls | client lease tests for ensure barrier pull, non-empty oplog ensure, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant and repair algorithm |
+| B12 Lease client API | Expose `ensure`, `release_checked`, `release_unchecked`, `repair_leases`; remove public acquire; persist local `SubmitMode`; implement Forgotten release intents, local deadline margin, barrier pulls; initially re-evaluate checked assertion coverage by scanning the active oplog and track an indexed optimization in `TODO.md` | client lease tests for ensure barrier pull, non-empty oplog ensure, checked release blocks only checked assertions losing their last reservation, unchecked release, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant, guarded release, and repair algorithm |
 | B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits an empty-entry wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
 | B14 Fork/trim + history head | Add per-space persisted confirmed `HistoryHead`; server-recompute a cumulative canonical batch hash and require the expected prior head; atomically advance client head with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; empty rollback-batch chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative history commitment, duplicate device identity, catch-up trim, and honest-server threat boundary |
 | B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length Set | server docs for why live_count remains and DeleteRange prerequisites |
@@ -729,7 +732,7 @@ Suggested commit messages: `batch NN: <short description>`. Promote optional or 
 
 ## Key risks (updated)
 
-1. **Split data/lease API** — data writes go through `submit_checked` / `submit_unchecked`; lease reservation uses `ensure()` and explicit `release()`, never the oplog.
+1. **Split data/lease API** — data writes go through `submit_checked` / `submit_unchecked`; lease reservation uses `ensure()` and explicit checked/unchecked release methods, never the oplog.
 2. **Local lease subset invariant** — release must mark Forgotten before network IO; Forgotten leases are retry state, not authority.
 3. **Per-space oplog migration** — every MetaStore oplog/cursor method must be audited for explicit `space_id`.
 4. **Lease barrier scope** — server-listed or newly acquired leases must not become usable until pulled through each lease's prefix-scoped grant barrier (`effective_prefix_max(prefix)`), not a global high-water.

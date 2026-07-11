@@ -6,7 +6,7 @@
 //! deterministic run.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit};
+use homebase::meta::{MetaStore, OrderedMetaStore, SubmitMode, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, ClientError, PushOutcome, SpaceDriverError};
 use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, Timestamp};
@@ -311,6 +311,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         let record = &state.spaces[&SPACE].oplog[&submission.seq];
         assert_eq!(record.range_asserts().len(), 1);
+        assert_eq!(record.submit_mode(), Some(SubmitMode::Checked));
         assert_eq!(record.range_asserts()[0].prefix, target);
         assert_eq!(record.entries()[0].ver(), Ver(2));
         assert_eq!(
@@ -1740,7 +1741,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
 
         let space = client.space(SPACE).await.unwrap();
         assert!(matches!(
-            space.release(&[lease_id]).await.unwrap_err(),
+            space.release_unchecked(&[lease_id]).await.unwrap_err(),
             SpaceDriverError::Unavailable { .. }
         ));
         let state = audit(&OrderedMetaStore::new(&mem)).await;
@@ -1777,7 +1778,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
 
         // An explicit release retry finishes the saga and drops the local
         // record; a new device can acquire immediately.
-        space.release(&[lease_id]).await.unwrap();
+        space.release_unchecked(&[lease_id]).await.unwrap();
         let other = handle
             .acquire(
                 &SPACE,
@@ -1794,7 +1795,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
 }
 
 #[test]
-fn release_rejects_when_queued_writes_are_covered() {
+fn checked_release_preserves_checked_assertion_reservations() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -1814,12 +1815,21 @@ fn release_rejects_when_queued_writes_are_covered() {
         let space = client.space(SPACE).await.unwrap();
         let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space
-            .submit_checked(vec![set(k, b"queued")], vec![])
+            .submit_checked(
+                vec![set(k, b"queued")],
+                vec![RangeAssert {
+                    prefix: db.clone(),
+                    upto: AdmissionSeq(0),
+                }],
+            )
             .await
             .unwrap();
 
         assert!(matches!(
-            space.release(&[granted.leases[0].id]).await.unwrap_err(),
+            space
+                .release_checked(&[granted.leases[0].id])
+                .await
+                .unwrap_err(),
             SpaceDriverError::ReleaseBlocked {
                 lease,
                 at: DeviceSeq(1)
@@ -1831,13 +1841,95 @@ fn release_rejects_when_queued_writes_are_covered() {
         );
 
         client.rollback(SPACE, DeviceSeq(1)).await.unwrap();
-        space.release(&[granted.leases[0].id]).await.unwrap();
+        space
+            .release_checked(&[granted.leases[0].id])
+            .await
+            .unwrap();
         assert!(
             audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
                 .leases
                 .is_empty(),
-            "retired writes below neck no longer block lease release"
+            "retired assertions below neck no longer block lease release"
         );
+    });
+}
+
+#[test]
+fn checked_release_ignores_unchecked_assertions() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let granted = space.acquire(vec![rspec(&db, 60)]).await.unwrap();
+        let submission = space
+            .submit_unchecked(
+                Vec::<Mutation>::new(),
+                vec![RangeAssert {
+                    prefix: db,
+                    upto: AdmissionSeq(0),
+                }],
+            )
+            .await
+            .unwrap();
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(
+            state.spaces[&SPACE].oplog[&submission.seq].submit_mode(),
+            Some(SubmitMode::Unchecked)
+        );
+
+        space
+            .release_checked(&[granted.leases[0].id])
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn checked_release_accepts_replacement_coverage() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let child = key(&[b"db", b"child"]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let acquired = space
+            .acquire(vec![rspec(&db, 60), rspec(&child, 60)])
+            .await
+            .unwrap();
+        let parent = acquired
+            .leases
+            .iter()
+            .find(|lease| lease.prefix == db)
+            .unwrap();
+        space
+            .submit_checked(
+                Vec::<Mutation>::new(),
+                vec![RangeAssert {
+                    prefix: child,
+                    upto: AdmissionSeq(0),
+                }],
+            )
+            .await
+            .unwrap();
+
+        space.release_checked(&[parent.id]).await.unwrap();
     });
 }
 

@@ -2,7 +2,7 @@
 //! boundary, crash/reopen, and ack-drop recovery.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit, conformance};
+use homebase::meta::{MetaStore, OrderedMetaStore, SubmitMode, audit, conformance};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -276,7 +276,10 @@ fn unflushed_rollback_crash_recovers_the_complete_pre_transition_state() {
         );
         let meta = OrderedMetaStore::new(sim.clone());
         for name in [b"a".as_slice(), b"b".as_slice()] {
-            let reserved = meta.reserve_commit(SPACE, 1, Vec::new()).await.unwrap();
+            let reserved = meta
+                .reserve_commit(SPACE, 1, Vec::new(), SubmitMode::Unchecked)
+                .await
+                .unwrap();
             let entry = wire_entry(
                 dev(1),
                 reserved.seq,

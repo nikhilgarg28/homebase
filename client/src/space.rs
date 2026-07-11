@@ -7,11 +7,14 @@
 //! lease and a local coverage watermark greater than or equal to `upto`;
 //! [`Space::submit_unchecked`]
 //! skips that preflight. Both durably append to this space's oplog and return
-//! a [`Submission`]. Neither method performs network admission.
+//! a [`Submission`]. Neither method performs network admission. The persisted
+//! submit mode also lets [`Space::release_checked`] preserve reservation
+//! coverage for checked assertions; [`Space::release_unchecked`] deliberately
+//! skips that potentially expensive local scan.
 
 use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
 use crate::client::Client;
-use crate::meta::{Committed, HeldLease, MetaStore};
+use crate::meta::{Committed, HeldLease, MetaStore, SubmitMode};
 use crate::server::ServerHandle;
 use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
@@ -107,7 +110,10 @@ impl fmt::Display for SpaceDriverError {
                 "range assertion for {prefix:?} is upto {upto:?}, local coverage watermark is only {local:?}"
             ),
             Self::ReleaseBlocked { lease, at } => {
-                write!(f, "lease {lease:?} still covers queued write {at:?}")
+                write!(
+                    f,
+                    "releasing lease {lease:?} would leave checked submission {at:?} unreserved"
+                )
             }
         }
     }
@@ -205,7 +211,9 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let mutations = mutations.into_iter().map(Into::into).collect();
         let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
         self.check_range_asserts(&range_asserts).await?;
-        let committed = self.persist_submission(encoded, range_asserts).await?;
+        let committed = self
+            .persist_submission(encoded, range_asserts, SubmitMode::Checked)
+            .await?;
         Ok(Submission { seq: committed.seq })
     }
 
@@ -223,7 +231,9 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let _permit = self.enter().await?;
         let mutations = mutations.into_iter().map(Into::into).collect();
         let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
-        let committed = self.persist_submission(encoded, range_asserts).await?;
+        let committed = self
+            .persist_submission(encoded, range_asserts, SubmitMode::Unchecked)
+            .await?;
         Ok(Submission { seq: committed.seq })
     }
 
@@ -267,13 +277,14 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         &self,
         encoded: Vec<Mutation>,
         range_asserts: Vec<RangeAssert>,
+        submit_mode: SubmitMode,
     ) -> Result<Committed, SpaceDriverError> {
         let cipher = self.cipher();
         let device = self.device();
         let reserved = self
             .client
             .store()
-            .reserve_commit(self.id, encoded.len(), range_asserts)
+            .reserve_commit(self.id, encoded.len(), range_asserts, submit_mode)
             .await?;
         let nonces = (0..encoded.len())
             .map(|_| {
@@ -467,12 +478,32 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         self.renew_ids(self.id, &ids, &held).await
     }
 
-    pub async fn release(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
+    /// Release leases only if every checked, unpushed range assertion keeps
+    /// another live covering reservation after the whole release set is removed.
+    pub async fn release_checked(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
         let _permit = self.enter().await?;
         if ids.is_empty() {
             return Ok(());
         }
-        self.reject_release_if_queued_writes(ids).await?;
+        self.reject_release_if_checked_assertions_lose_coverage(ids)
+            .await?;
+        self.release_inner(ids).await
+    }
+
+    /// Release leases without preserving reservation coverage for queued
+    /// checked assertions. Server admission still evaluates those assertions.
+    pub async fn release_unchecked(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
+        let _permit = self.enter().await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.release_inner(ids).await
+    }
+
+    async fn release_inner(&self, ids: &[LeaseId]) -> Result<(), SpaceDriverError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         self.client.store().retire_leases(self.id, ids).await?;
         self.client
             .server()
@@ -622,7 +653,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         Ok(response)
     }
 
-    async fn reject_release_if_queued_writes(
+    async fn reject_release_if_checked_assertions_lose_coverage(
         &self,
         ids: &[LeaseId],
     ) -> Result<(), SpaceDriverError> {
@@ -637,17 +668,38 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         if releasing.is_empty() {
             return Ok(());
         }
+        let now = self.client.clock().stamp();
         for (seq, record) in space_state.active_oplog() {
-            for held in &releasing {
-                if record
-                    .entries()
-                    .iter()
-                    .any(|entry| entry.key().starts_with(&held.lease.prefix))
-                {
-                    return Err(SpaceDriverError::ReleaseBlocked {
-                        lease: held.lease.id,
-                        at: *seq,
-                    });
+            if record.submit_mode() != Some(SubmitMode::Checked) {
+                continue;
+            }
+            for assertion in record.range_asserts() {
+                let mut released_guard = None;
+                for held in &releasing {
+                    if assertion.prefix.starts_with(&held.lease.prefix)
+                        && self.lease_usable_for_held(held, &now).await?
+                    {
+                        released_guard = Some(held.lease.id);
+                        break;
+                    }
+                }
+                let Some(lease) = released_guard else {
+                    continue;
+                };
+                let mut replacement = false;
+                for held in space_state.leases.values() {
+                    if ids.contains(&held.lease.id)
+                        || !assertion.prefix.starts_with(&held.lease.prefix)
+                    {
+                        continue;
+                    }
+                    if self.lease_usable_for_held(held, &now).await? {
+                        replacement = true;
+                        break;
+                    }
+                }
+                if !replacement {
+                    return Err(SpaceDriverError::ReleaseBlocked { lease, at: *seq });
                 }
             }
         }
