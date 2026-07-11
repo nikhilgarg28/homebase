@@ -152,7 +152,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             let space_handle = client.space(space).await.unwrap();
             let granted = space_handle.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space_handle
-                .commit(vec![(row.clone(), val(b"secret"))])
+                .submit_checked(vec![(row.clone(), val(b"secret"))], vec![])
                 .await
                 .unwrap();
             granted.leases[0].id
@@ -180,7 +180,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
         assert_eq!(client.device(), dev(1));
 
         space_handle
-            .commit(vec![(row.clone(), val(b"after-resume"))])
+            .submit_checked(vec![(row.clone(), val(b"after-resume"))], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
@@ -216,11 +216,11 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         let granted = space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let lease = granted.leases[0].id;
         space_handle
-            .commit(vec![(k1.clone(), val(b"one"))])
+            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
             .await
             .unwrap();
         space_handle
-            .commit(vec![(k2.clone(), val(b"two"))])
+            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
             .await
             .unwrap();
 
@@ -340,7 +340,7 @@ fn push_stall_recovers_via_ensure() {
         let row = key(&[b"db", b"k"]);
         space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
-            .commit(vec![(row.clone(), val(b"v"))])
+            .submit_checked(vec![(row.clone(), val(b"v"))], vec![])
             .await
             .unwrap();
 

@@ -308,7 +308,7 @@ pub struct ListLeasesResponse {
 ### Put batch shape
 
 ```rust
-pub struct RangeAssert { pub prefix: Key, pub at: AdmissionSeq }
+pub struct RangeAssert { pub prefix: Key, pub upto: AdmissionSeq }
 
 pub enum BatchOp {
     Set { key: Key, ver: Ver, seal: Seal, ciphertext: Vec<u8> },
@@ -338,6 +338,13 @@ pub enum PutBatchResult {
 - Acquire refreshes same-device compatible held leases in place where possible; no data push is required before lease calls.
 - Remove lease stealing entirely: no `stealable` field, no `steal` argument, and no pre-deadline preemption.
 - Replace `PutEntry` / `Value::Absent` tombstone path with `BatchOp` + `Value::{Present, Deleted}` (see Seal design).
+
+### Causal range-assert semantics
+
+- `upto` is inclusive. For a batch from device `D`, `RangeAssert { prefix, upto: S }` means: the greatest historical admission under `prefix` from any device other than `D` is at most `S`.
+- Earlier submissions from `D` do not invalidate the assertion. Their order and identity come from the per-space `DeviceSeq` stream and, once B14 lands, its cumulative history commitment. This lets an offline device queue arbitrarily many dependent submissions against one server cut and later push them in one request or across several requests.
+- Each prefix aggregate stores the two greatest historical `(device, admission_seq)` points from distinct devices. To compute the maximum excluding `D`, use the first point unless it belongs to `D`, then use the second. These points are monotonic history, updated by Set and Delete, and are not removed by overwrite or tombstone.
+- This is concurrency control under the honest-server model, not same-device fork proof. Until B14, a duplicated device identity remains subject to the existing replay-fence limitations; B14's canonical history chain closes that hole.
 
 ### Oplog (client-local)
 
@@ -392,7 +399,7 @@ Do this early on a fresh branch so nothing new depends on epoch.
 Rewritten semantics:
 
 1. Device seq fence: `device_seq > last_seq` (gaps OK).
-2. Per data batch: range asserts → sequential `Set` / `Delete` ops on scratch.
+2. Per data batch: range asserts compare the scratch foreign-device prefix maximum to inclusive `upto`, then apply sequential `Set` / `Delete` ops. Earlier scratch writes from the same device do not invalidate later assertions in the request.
 3. **Set and Delete** require per-key `ver` monotonicity and must not conflict with any active incompatible lease held by another device/range; no presented lease is required.
 4. Multi-batch: all-or-nothing durable apply.
 5. Return `PutBatchResponse.results` with exactly one `PutBatchResult` per input batch.
@@ -504,7 +511,7 @@ space.repair_leases() -> RepairedLeases
 ### Inside `submit`
 
 1. **`stamp_data_ops`** — assign consecutive `ver` from the space-local disk `ver_high` for each `BatchOp::Set` and `BatchOp::Delete`.
-2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require an Active local lease covering that prefix and verify the local prefix seq/watermark equals the asserted `at`. Server admission remains authoritative.
+2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require an Active local read or write lease whose prefix covers it, require the lease barrier to be satisfied, and require the effective local coverage watermark to be greater than or equal to `upto`. Parent pulls cover child assertions; child or sibling pulls do not cover parent/sibling assertions. Server admission remains authoritative.
 3. **`submit_unchecked`:** skip the local lease/range-assert gate; server admission still decides.
 4. **`reserve_batch`** → encode data ops (cipher `encode_batch_op`) → append to `MetaStore`.
 5. Return `Submission { seq }` after durable local append.
@@ -585,7 +592,7 @@ space.repair_leases() -> RepairedLeases
 
 | API | Meaning | On stall/failure |
 |-----|---------|------------------|
-| `space.submit_checked(ops, asserts)` | Local append after local lease/range-assert gate; requires Active local lease coverage and matching local prefix seq for each assert; returns `Submission { seq }` | Caller owns retry/push/rollback policy |
+| `space.submit_checked(ops, asserts)` | Local append after local lease/range-assert gate; requires Active covering lease state and local coverage watermark `>= upto` for each assert; returns `Submission { seq }` | Caller owns retry/push/rollback policy |
 | `space.submit_unchecked(ops, asserts)` | Local append without local gate; server admission still decides | Caller owns retry/push/rollback policy |
 | `space.push()` | Push this space's oplog as far as possible | Returns stream outcome |
 | `space.push_until(seq)` | Push this space until `seq` is acked/failed/stalled | Returns outcome containing disposition for relevant seqs |
@@ -702,7 +709,8 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | B7 Meta per-space state | Move oplogs/cursors and `ver_high` to per-space persisted state; all MetaStore methods take `space_id`; no in-memory cursor mirror | meta conformance for cross-space isolation, space-local versions, cursor persistence, gaps | meta docs for head/neck/tail and space-local versioning |
 | B8 Meta rollback/certify | Implement rollback marker append using `OplogRecord::Rollback`; certify `[neck, tail)` per space; keep `certify` always on | rollback validation tests, certify gap tests, reopen/certify tests | meta docs for rollback marker and fork-safety purpose |
 | B9 Client event loop scaffold | Route public client/space operations through single-owner coordination loop; offload SQLite/bulk crypto to blocking workers and network/timers to tasks | concurrency tests that state transitions only happen on loop; worker result ordering tests | client module docs for correctness chokepoint vs performance workers |
-| B10 Submit API + checked gate | Add `submit_checked`, `submit_unchecked`, `Submission { seq }`; checked mode verifies Active lease coverage and matching local prefix seq for every `RangeAssert`; stamp from space-local `ver_high` | client submit tests for checked success, missing lease rejection, seq mismatch rejection, unchecked bypass, space-local vers | space docs for submit vs push and checked range-assert semantics |
+| B10 Submit API + checked-gate scaffold | Add `submit_checked`, `submit_unchecked`, `Submission { seq }`; persist range asserts with the stamped batch; stamp from space-local `ver_high`; establish the initial exact-watermark gate that B10a replaces with final causal semantics | client submit tests for checked success, missing lease rejection, exact-watermark rejection, unchecked bypass, space-local vers | space docs for submit vs push and checked range-assert scaffold |
+| B10a Causal range assertions | Rename `RangeAssert.at` to inclusive `upto`; maintain the two greatest historical admission points from distinct devices per prefix; server checks maximum excluding the submitting device `<= upto`; local checked gate requires an Active covering read/write lease with satisfied barrier and effective coverage watermark `>= upto`; preserve same-device dependent submissions across coalesced and split pushes | core/schema roundtrips; same-device offline dependency chain in one and multiple requests; foreign write after `upto` rejects; foreign write remains visible after own overwrite/delete; parent lease+watermark covers child; sibling and child coverage reject; local watermark above `upto` accepts; document same-device fork test as completed by B14 | core/server/client docs for inclusive `upto`, top-two distinct-device history, local coverage direction, offline chains, and B14 dependency |
 | B11 Cipher integration | Implement `encode_batch_op`, Seal AAD with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
 | B12 Lease client API | Expose `ensure`, `release`, `repair_leases`; remove public acquire; implement Forgotten release intents, local deadline margin, barrier pulls | client lease tests for ensure barrier pull, non-empty oplog ensure, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant and repair algorithm |
 | B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits NoOp wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |

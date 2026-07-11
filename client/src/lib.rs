@@ -17,7 +17,7 @@
 //! - [`client`] — the device-scoped coordinator: one store, one device
 //!   identity, and persisted per-space oplogs — over many [`Space`] drivers.
 //!
-//! - [`space`] — per-space commit, pull, and lease operations, reached
+//! - [`space`] — per-space submit, pull, and lease operations, reached
 //!   through [`Client::attach`] and [`Client::space`].
 //!
 //! - [`cipher`] — the privacy boundary: `SpaceEnvelope`, space-id
@@ -33,5 +33,6 @@ pub mod space;
 pub use client::{Client, ClientError, open_offline};
 pub use server::{Offline, ServerHandle};
 pub use space::{
-    Acquired, DEFAULT_PUSH_CAP, LeaseState, PushOutcome, Space, SpaceDriverError, lease_margin,
+    Acquired, DEFAULT_PUSH_CAP, LeaseState, PushOutcome, Space, SpaceDriverError, Submission,
+    lease_margin,
 };

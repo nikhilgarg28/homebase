@@ -414,7 +414,9 @@ pub trait MetaStore {
     /// `DeviceSeq` and its entries with consecutive vers above the
     /// high-water (in entry order — duplicate keys are legal and behave
     /// like a sequence, the kernel's own within-batch rule), but does not
-    /// advance counters or append to the queue. The replica uses this
+    /// advance counters or append to the queue. `range_asserts` are already
+    /// encoded into server-visible prefix space and are carried unchanged in
+    /// the same eventual oplog record. The replica uses this
     /// window to transform values with stamped tags in AEAD associated
     /// data, then persists through [`commit`](Self::commit).
     ///
@@ -423,6 +425,7 @@ pub trait MetaStore {
         &self,
         space: SpaceId,
         entries: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
     ) -> impl Future<Output = Result<ReservedCommit, StorageError>> + Send;
 
     /// Commit a reservation: advances the counters and appends the
@@ -917,6 +920,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         &self,
         space: SpaceId,
         entries: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
     ) -> Result<ReservedCommit, StorageError> {
         let cursors = match self.store.get(&cursors_key(space)).await? {
             Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
@@ -940,7 +944,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             })
             .collect();
         let ver_high = Ver(high.0 + entries.len() as u64);
-        let record = OplogRecord::commit(entries);
+        let record = OplogRecord::commit_with_asserts(entries, range_asserts);
         Ok(ReservedCommit {
             seq: cursors.tail,
             ver_high,
@@ -1392,9 +1396,13 @@ impl HeldLease {
 
 impl OplogRecord {
     pub fn commit(entries: Vec<PutEntry>) -> Self {
+        Self::commit_with_asserts(entries, Vec::new())
+    }
+
+    pub fn commit_with_asserts(entries: Vec<PutEntry>, range_asserts: Vec<RangeAssert>) -> Self {
         Self::Commit {
             entries,
-            range_asserts: Vec::new(),
+            range_asserts,
             evidence: Vec::new(),
         }
     }
@@ -1644,7 +1652,10 @@ pub mod conformance {
         space: SpaceId,
         entries: Vec<(Key, Value)>,
     ) -> Committed {
-        let reserved = store.reserve_commit(space, entries).await.unwrap();
+        let reserved = store
+            .reserve_commit(space, entries, Vec::new())
+            .await
+            .unwrap();
         store.commit(space, reserved).await.unwrap()
     }
 
@@ -2425,6 +2436,7 @@ mod tests {
                 .reserve_commit(
                     SPACE,
                     vec![(key(&[b"db", b"a"]), Value::Present(b"one".to_vec()))],
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -2433,6 +2445,7 @@ mod tests {
                 .reserve_commit(
                     SPACE,
                     vec![(key(&[b"db", b"b"]), Value::Present(b"two".to_vec()))],
+                    Vec::new(),
                 )
                 .await
                 .unwrap();

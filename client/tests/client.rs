@@ -143,15 +143,15 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
-            .commit(vec![(row_a.clone(), val(b"alpha"))])
+            .submit_checked(vec![(row_a.clone(), val(b"alpha"))], vec![])
             .await
             .unwrap();
         space_b
-            .commit(vec![(row_b.clone(), val(b"beta"))])
+            .submit_checked(vec![(row_b.clone(), val(b"beta"))], vec![])
             .await
             .unwrap();
         space_a
-            .commit(vec![(row_a.clone(), val(b"alpha2"))])
+            .submit_checked(vec![(row_a.clone(), val(b"alpha2"))], vec![])
             .await
             .unwrap();
 
@@ -250,15 +250,15 @@ fn global_push_compatibility_drains_independent_space_streams() {
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
-            .commit(vec![(row_a1.clone(), val(b"a1"))])
+            .submit_checked(vec![(row_a1.clone(), val(b"a1"))], vec![])
             .await
             .unwrap();
         space_b
-            .commit(vec![(row_b1.clone(), val(b"b1"))])
+            .submit_checked(vec![(row_b1.clone(), val(b"b1"))], vec![])
             .await
             .unwrap();
         space_a
-            .commit(vec![(row_a2.clone(), val(b"a2"))])
+            .submit_checked(vec![(row_a2.clone(), val(b"a2"))], vec![])
             .await
             .unwrap();
 
@@ -311,7 +311,7 @@ fn offline_commit_survives_until_online_push() {
         {
             let offline_space = offline.space(space).await.unwrap();
             offline_space
-                .commit(vec![(row.clone(), val(b"offline"))])
+                .submit_checked(vec![(row.clone(), val(b"offline"))], vec![])
                 .await
                 .unwrap();
         }
@@ -371,7 +371,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
             let space = client.space(space).await.unwrap();
             space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
-                .commit(vec![(row.clone(), val(b"cached"))])
+                .submit_checked(vec![(row.clone(), val(b"cached"))], vec![])
                 .await
                 .unwrap();
             client.push().await.unwrap();
@@ -421,7 +421,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
             let writer_space = writer.space(space).await.unwrap();
             writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             writer_space
-                .commit(vec![(row.clone(), val(b"roundtrip"))])
+                .submit_checked(vec![(row.clone(), val(b"roundtrip"))], vec![])
                 .await
                 .unwrap();
         }

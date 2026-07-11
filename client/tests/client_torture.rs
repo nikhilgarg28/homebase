@@ -342,13 +342,15 @@ async fn driver(
             match err {
                 SpaceDriverError::Storage(_) => coverage.borrow_mut().storage_errors += 1,
                 SpaceDriverError::Rejected(KernelError::Contended { .. }) => {}
-                SpaceDriverError::LocalAuthority { .. } => {}
                 other => panic!("unexpected ensure failure: {other:?}"),
             }
             finish_client(&slot, guard);
             continue;
         }
-        match space.commit(vec![(pool_key(key_index), value)]).await {
+        match space
+            .submit_checked(vec![(pool_key(key_index), value)], vec![])
+            .await
+        {
             Ok(_) => {
                 state.vers.borrow_mut().insert(key_index, ver);
                 let mut cov = coverage.borrow_mut();
@@ -360,8 +362,7 @@ async fn driver(
                 }
             }
             Err(SpaceDriverError::Storage(_)) => coverage.borrow_mut().storage_errors += 1,
-            Err(SpaceDriverError::LocalAuthority { .. }) => {}
-            Err(err) => panic!("unexpected commit failure: {err:?}"),
+            Err(err) => panic!("unexpected submission failure: {err:?}"),
         }
         finish_client(&slot, guard);
     }

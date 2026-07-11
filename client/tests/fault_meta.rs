@@ -114,7 +114,7 @@ async fn run_flushed_crash_seed(seed: u64) {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
         space
-            .commit(vec![(row.clone(), val(b"survived"))])
+            .submit_checked(vec![(row.clone(), val(b"survived"))], vec![])
             .await
             .unwrap();
         sim.flush();
@@ -165,7 +165,7 @@ fn unflushed_commit_is_lost_on_crash() {
             let space = client.space(SPACE).await.unwrap();
             space.acquire(vec![wspec(&db)]).await.unwrap();
             space
-                .commit(vec![(row.clone(), val(b"volatile"))])
+                .submit_checked(vec![(row.clone(), val(b"volatile"))], vec![])
                 .await
                 .unwrap();
         }
@@ -198,11 +198,11 @@ fn flushed_rollback_survives_crash_as_one_cursor_marker_transition() {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
         space
-            .commit(vec![(key(&[b"db", b"a"]), val(b"one"))])
+            .submit_checked(vec![(key(&[b"db", b"a"]), val(b"one"))], vec![])
             .await
             .unwrap();
         space
-            .commit(vec![(key(&[b"db", b"b"]), val(b"two"))])
+            .submit_checked(vec![(key(&[b"db", b"b"]), val(b"two"))], vec![])
             .await
             .unwrap();
         client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
@@ -251,6 +251,7 @@ fn unflushed_rollback_crash_recovers_the_complete_pre_transition_state() {
                 .reserve_commit(
                     SPACE,
                     vec![(key(&[b"db", name]), Value::Present(name.to_vec()))],
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -294,11 +295,11 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&key(&[b"db"]))]).await.unwrap();
         space
-            .commit(vec![(key(&[b"db", b"a"]), val(b"one"))])
+            .submit_checked(vec![(key(&[b"db", b"a"]), val(b"one"))], vec![])
             .await
             .unwrap();
         space
-            .commit(vec![(key(&[b"db", b"b"]), val(b"two"))])
+            .submit_checked(vec![(key(&[b"db", b"b"]), val(b"two"))], vec![])
             .await
             .unwrap();
         client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
@@ -368,8 +369,14 @@ fn ack_drop_trims_after_server_admitted() {
         let space = client.space(SPACE).await.unwrap();
         let granted = space.acquire(vec![wspec(&db)]).await.unwrap();
         let lease = granted.leases[0].id;
-        space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
-        space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
+        space
+            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .await
+            .unwrap();
+        space
+            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .await
+            .unwrap();
         sim.flush();
 
         handle

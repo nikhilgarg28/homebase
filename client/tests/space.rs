@@ -127,7 +127,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
         let row = key(&[b"db", b"k"]);
         space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
-            .commit(vec![(row.clone(), val(b"secret"))])
+            .submit_checked(vec![(row.clone(), val(b"secret"))], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
@@ -175,11 +175,11 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
-            .commit(vec![(row1.clone(), val(b"one"))])
+            .submit_checked(vec![(row1.clone(), val(b"one"))], vec![])
             .await
             .unwrap();
         writer_space
-            .commit(vec![(row2.clone(), val(b"two"))])
+            .submit_checked(vec![(row2.clone(), val(b"two"))], vec![])
             .await
             .unwrap();
         writer.push().await.unwrap();
@@ -234,7 +234,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
-            .commit(vec![(row, val(b"before-link"))])
+            .submit_checked(vec![(row, val(b"before-link"))], vec![])
             .await
             .unwrap();
         writer.push().await.unwrap();

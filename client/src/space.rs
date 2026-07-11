@@ -1,6 +1,12 @@
-//! Per-space commit, pull, and lease operations for one [`SpaceId`],
+//! Per-space submit, pull, and lease operations for one [`SpaceId`],
 //! reached through [`Client::attach`](crate::client::Client::attach) and
 //! [`Client::space`](crate::client::Client::space).
+//!
+//! Data mutation has two local-only entry points. [`Space::submit_checked`]
+//! requires every supplied range assertion to be backed by a live local
+//! lease and an equal local prefix watermark; [`Space::submit_unchecked`]
+//! skips that preflight. Both durably append to this space's oplog and return
+//! a [`Submission`]. Neither method performs network admission.
 
 use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource, ValueContext};
 use crate::client::Client;
@@ -10,8 +16,8 @@ use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, Range, RangeCursor, RangeCut, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, KernelError, LeaseSpec, Range, RangeAssert, RangeCursor, RangeCut,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -29,12 +35,28 @@ pub fn lease_margin(ttl: Duration) -> Duration {
 pub enum SpaceDriverError {
     Storage(StorageError),
     Cipher(CipherError),
-    Nonce { reason: String },
-    Unavailable { reason: String },
+    Nonce {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
     Rejected(KernelError),
-    Fork { admitted: DeviceSeq },
-    LocalAuthority { key: Key },
-    ReleaseBlocked { lease: LeaseId, at: DeviceSeq },
+    Fork {
+        admitted: DeviceSeq,
+    },
+    RangeAssertAuthority {
+        prefix: Key,
+    },
+    RangeAssertMismatch {
+        prefix: Key,
+        asserted: AdmissionSeq,
+        local: AdmissionSeq,
+    },
+    ReleaseBlocked {
+        lease: LeaseId,
+        at: DeviceSeq,
+    },
 }
 
 impl From<StorageError> for SpaceDriverError {
@@ -70,7 +92,17 @@ impl fmt::Display for SpaceDriverError {
                 f,
                 "device fork: the server admitted {admitted:?}, which this store never sent"
             ),
-            Self::LocalAuthority { key } => write!(f, "no local write authority for {key:?}"),
+            Self::RangeAssertAuthority { prefix } => {
+                write!(f, "no active local lease for asserted prefix {prefix:?}")
+            }
+            Self::RangeAssertMismatch {
+                prefix,
+                asserted,
+                local,
+            } => write!(
+                f,
+                "range assertion for {prefix:?} is {asserted:?}, local prefix watermark is {local:?}"
+            ),
             Self::ReleaseBlocked { lease, at } => {
                 write!(f, "lease {lease:?} still covers queued write {at:?}")
             }
@@ -102,6 +134,15 @@ pub enum PushOutcome {
 pub struct LeaseState {
     pub held: HeldLease,
     pub live: bool,
+}
+
+/// A data batch durably appended to one space's local oplog.
+///
+/// The sequence identifies this exact local submission. Remote admission is
+/// a separate push operation; per-submission push sugar lands with B13.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub seq: DeviceSeq,
 }
 
 /// A handle to one space within a [`Client`].
@@ -146,23 +187,73 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         Ok(out)
     }
 
-    pub async fn commit(&self, entries: Vec<(Key, Value)>) -> Result<Committed, SpaceDriverError> {
+    /// Append a local data batch after substantiating every range assertion
+    /// from active local lease state and the exact local prefix watermark.
+    pub async fn submit_checked(
+        &self,
+        entries: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
+    ) -> Result<Submission, SpaceDriverError> {
         let _permit = self.enter().await?;
-        let cipher = self.cipher();
-        let name_cipher = cipher.clone();
-        let encoded = self
-            .client
-            .run_blocking(move || {
-                entries
+        let (encoded, range_asserts) = self.encode_submission(entries, range_asserts).await?;
+        self.check_range_asserts(&range_asserts).await?;
+        let committed = self.persist_submission(encoded, range_asserts).await?;
+        Ok(Submission { seq: committed.seq })
+    }
+
+    /// Append a local data batch without checking lease-backed range
+    /// assertions. The server still evaluates every assertion on push.
+    pub async fn submit_unchecked(
+        &self,
+        entries: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
+    ) -> Result<Submission, SpaceDriverError> {
+        let _permit = self.enter().await?;
+        let (encoded, range_asserts) = self.encode_submission(entries, range_asserts).await?;
+        let committed = self.persist_submission(encoded, range_asserts).await?;
+        Ok(Submission { seq: committed.seq })
+    }
+
+    async fn encode_submission(
+        &self,
+        entries: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
+    ) -> Result<(Vec<(Key, Value)>, Vec<RangeAssert>), SpaceDriverError> {
+        let name_cipher = self.cipher();
+        self.client
+            .run_blocking(move || -> Result<_, CipherError> {
+                let entries = entries
                     .into_iter()
                     .map(|(key, value)| Ok((name_cipher.encode_key(&key)?, value)))
-                    .collect::<Result<Vec<_>, CipherError>>()
+                    .collect::<Result<Vec<_>, CipherError>>()?;
+                let range_asserts = range_asserts
+                    .into_iter()
+                    .map(|assert| {
+                        Ok(RangeAssert {
+                            prefix: name_cipher.encode_key(&assert.prefix)?,
+                            at: assert.at,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CipherError>>()?;
+                Ok((entries, range_asserts))
             })
             .await
-            .map_err(coordination_unavailable)??;
-        self.check_local_write_authority(&encoded).await?;
+            .map_err(coordination_unavailable)?
+            .map_err(Into::into)
+    }
+
+    async fn persist_submission(
+        &self,
+        encoded: Vec<(Key, Value)>,
+        range_asserts: Vec<RangeAssert>,
+    ) -> Result<Committed, SpaceDriverError> {
+        let cipher = self.cipher();
         let device = self.device();
-        let reserved = self.client.store().reserve_commit(self.id, encoded).await?;
+        let reserved = self
+            .client
+            .store()
+            .reserve_commit(self.id, encoded, range_asserts)
+            .await?;
         let nonces = (0..reserved.record.entries().len())
             .map(|_| {
                 self.client
@@ -529,29 +620,50 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .expect("acquire returned a lease that is not durably held"))
     }
 
-    async fn check_local_write_authority(
+    async fn check_range_asserts(
         &self,
-        entries: &[(Key, Value)],
+        range_asserts: &[RangeAssert],
     ) -> Result<(), SpaceDriverError> {
-        if entries.is_empty() {
+        if range_asserts.is_empty() {
             return Ok(());
         }
-        let keys: Vec<Key> = entries.iter().map(|(key, _)| key.clone()).collect();
-        let held = self.client.store().leases_covering(self.id, &keys).await?;
+        let prefixes: Vec<_> = range_asserts
+            .iter()
+            .map(|assert| assert.prefix.clone())
+            .collect();
+        let held = self
+            .client
+            .store()
+            .leases_covering(self.id, &prefixes)
+            .await?;
         let now = self.client.clock().stamp();
-        for key in keys {
+        for assert in range_asserts {
             let mut covered = false;
-            for held in &held {
-                if held.lease.mode == LeaseMode::Write
-                    && key.starts_with(&held.lease.prefix)
-                    && self.lease_usable_for_held(held, &now).await?
+            for lease in &held {
+                if assert.prefix.starts_with(&lease.lease.prefix)
+                    && self.lease_usable_for_held(lease, &now).await?
                 {
                     covered = true;
                     break;
                 }
             }
             if !covered {
-                return Err(SpaceDriverError::LocalAuthority { key });
+                return Err(SpaceDriverError::RangeAssertAuthority {
+                    prefix: assert.prefix.clone(),
+                });
+            }
+            let local = self
+                .client
+                .store()
+                .watermark(self.id, &Range::Prefix(assert.prefix.clone()))
+                .await?
+                .unwrap_or(AdmissionSeq(0));
+            if local != assert.at {
+                return Err(SpaceDriverError::RangeAssertMismatch {
+                    prefix: assert.prefix.clone(),
+                    asserted: assert.at,
+                    local,
+                });
             }
         }
         Ok(())

@@ -125,10 +125,16 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
-        space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
+        space
+            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .await
+            .unwrap();
         client.push().await.unwrap();
 
-        space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
+        space
+            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .await
+            .unwrap();
         assert_eq!(
             audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
                 .oplog
@@ -207,9 +213,15 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         let space = client.space(space_id).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
-        space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
+        space
+            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .await
+            .unwrap();
         client.push().await.unwrap();
-        space.commit(vec![(k2.clone(), val(b"two"))]).await.unwrap();
+        space
+            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .await
+            .unwrap();
 
         let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
         let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
