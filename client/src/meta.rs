@@ -214,9 +214,9 @@ pub struct HeldLease {
 }
 
 /// One unshipped record in a space's queue, keyed by the `DeviceSeq` it
-/// ships under. The containing storage key identifies the space. Runtime
-/// currently emits only [`OplogRecord::Commit`];
-/// rollback markers are durable vocabulary for the rollback plan.
+/// ships under. The containing storage key identifies the space. Commit
+/// records carry data; rollback records retire an active window while
+/// preserving sequence continuity on the next push.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OplogRecord {
     /// Legacy data commit shape. `entries` will become `BatchOp` once the
@@ -246,6 +246,14 @@ pub struct SpaceState {
     pub leases: BTreeMap<LeaseId, HeldLease>,
 }
 
+impl SpaceState {
+    /// Retained records eligible for certification and push. Rows below
+    /// `neck` remain durable rollback history but are no longer active.
+    pub fn active_oplog(&self) -> impl Iterator<Item = (&DeviceSeq, &OplogRecord)> {
+        self.oplog.range(self.cursors.neck..self.cursors.tail)
+    }
+}
+
 /// Everything a [`MetaStore`] remembers — what [`MetaStore::load`] hands
 /// the engine at open, and what [`certify`] holds to the invariants.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -259,11 +267,11 @@ pub struct ClientState {
 /// The recomputation oracle — the client twin of the server-side `check`.
 /// Panics with context on any violation:
 ///
-/// 1. vers are **strictly increasing per key** within each space's queue
-///    in commit order — a regression would bounce off the server as
-///    `VerRegression`;
-/// 2. each space's cursors cover its queue and `ver_high` is at least
-///    every queued ver — a lagging durable scalar
+/// 1. vers are **strictly increasing per key** within each space's active
+///    `[neck, tail)` window — a regression would bounce off the server as
+///    `VerRegression`; retired rows below `neck` are deliberately ignored;
+/// 2. each space's cursors cover its retained queue and `ver_high` is at
+///    least every active queued ver — a lagging durable scalar
 ///    means a torn commit (the assignment and the entry are one atomic
 ///    transition).
 ///
@@ -271,9 +279,9 @@ pub struct ClientState {
 ///    (`deadline − ttl`) lies at or under it — a stamp past the
 ///    high-water is a torn transition or a tampered timeline.
 ///
-/// Queue seqs carry no density invariant: trims take a prefix and
-/// discards take a suffix, but the seq counter never rewinds, so a
-/// discard followed by new commits legally leaves a gap.
+/// Queue seqs carry no density invariant. Rollback retires an active
+/// window and appends a marker without reusing any seq, so the wire stream
+/// may legally jump over the retained dead rows.
 ///
 /// Implementation-level integrity (key shapes, record decoding, index
 /// agreement) is each implementation's `load` obligation.
@@ -307,6 +315,14 @@ pub fn certify(state: &ClientState) {
                 "oplog seq {seq:?} outside persisted cursors {:?} in {space_id:?}",
                 space.cursors
             );
+            if let OplogRecord::Rollback { marker } = record {
+                assert!(
+                    *marker < *seq,
+                    "rollback marker {marker:?} must precede its oplog seq {seq:?} in {space_id:?}"
+                );
+            }
+        }
+        for (_, record) in space.active_oplog() {
             for entry in record.entries() {
                 if let Some(previous) = last_ver.get(&entry.key) {
                     assert!(
@@ -321,8 +337,8 @@ pub fn certify(state: &ClientState) {
             }
         }
         let queued_high = space
-            .oplog
-            .values()
+            .active_oplog()
+            .map(|(_, record)| record)
             .flat_map(|r| r.entries().iter().map(|e| e.ver))
             .max();
         if let Some(queued_high) = queued_high {
@@ -422,8 +438,8 @@ pub trait MetaStore {
     /// through the admitted prefix, deletes those retained rows, and
     /// advances `head` with the trim in the same atomic transition.
     /// Deletes every queued entry with seq ≤ `through`. Prefix-only **by
-    /// construction**: pushes are FIFO, and absent seqs created by a
-    /// discarded suffix are crossed by advancing the durable cursors.
+    /// construction**: pushes are FIFO, and seqs retired by rollback are
+    /// crossed by advancing the durable cursors.
     /// Idempotent: re-acknowledging is a no-op.
     ///
     /// No staged-group record exists on purpose: the admitted set is
@@ -437,19 +453,18 @@ pub trait MetaStore {
         through: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Rollback: deletes every queued entry with seq ≥ `from` — the
-    /// suffix mirror of [`trim_oplog`](Self::trim_oplog), the resolution
-    /// for a rejected push the caller chooses not to repair. The
-    /// single-driver discipline keeps it from racing a push.
-    ///
-    /// The seq counter never rewinds (a discarded seq may have been
-    /// *sent* and rejected; re-minting it would confuse the replay
-    /// fence), so a discard followed by new commits leaves a **gap** in
-    /// the queue — legal, and [`certify`] treats it so.
-    fn discard_from(
+    /// Retire the entire active window after a definitively rejected
+    /// record `to` that the caller chooses not to repair. An ambiguous
+    /// push outcome must be reconciled by pushing again before rollback;
+    /// the local store cannot prove what the server admitted. Requires
+    /// `neck <= to < tail`.
+    /// Appends `Rollback { marker: to }` at the old `tail`, advances
+    /// `neck` to that marker and `tail` past it, and leaves `head` and all
+    /// retired rows untouched. One atomic transition; seqs never rewind.
+    fn rollback(
         &self,
         space: SpaceId,
-        from: DeviceSeq,
+        to: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// A pulled range cut records that exact range's sync point — and
@@ -1023,20 +1038,51 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         Ok(())
     }
 
-    async fn discard_from(&self, space: SpaceId, from: DeviceSeq) -> Result<(), StorageError> {
-        let queued = collect_scan(self.store.scan_prefix(&oplog_scan(space))).await?;
-        let mut batch = WriteBatch::new();
-        for (storage_key, _) in queued {
-            let components = decode_components(&storage_key).expect("undecodable storage key");
-            let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
-            if seq >= from {
-                batch.delete(storage_key);
+    async fn rollback(&self, space: SpaceId, to: DeviceSeq) -> Result<(), StorageError> {
+        let cursors = match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
+        };
+        if to < cursors.neck {
+            let exact_post_state = cursors.neck.0.checked_add(1) == Some(cursors.tail.0)
+                && self
+                    .store
+                    .get(&oplog_key(space, cursors.neck))
+                    .await?
+                    .and_then(|bytes| OplogRecord::decode(&bytes))
+                    .is_some_and(|record| record == OplogRecord::Rollback { marker: to });
+            if exact_post_state {
+                return Ok(());
             }
         }
-        if !batch.is_empty() {
-            self.store.apply(batch).await?;
+        if to < cursors.neck || to >= cursors.tail {
+            return Err(StorageError(format!(
+                "rollback target {to:?} outside active window [{:?}, {:?})",
+                cursors.neck, cursors.tail
+            )));
         }
-        Ok(())
+        let next_tail = DeviceSeq(
+            cursors
+                .tail
+                .0
+                .checked_add(1)
+                .ok_or_else(|| StorageError("oplog tail overflow during rollback".into()))?,
+        );
+        let mut batch = WriteBatch::new();
+        batch.put(
+            oplog_key(space, cursors.tail),
+            OplogRecord::Rollback { marker: to }.encode(),
+        );
+        batch.put(
+            cursors_key(space),
+            OplogCursors {
+                head: cursors.head,
+                neck: cursors.tail,
+                tail: next_tail,
+            }
+            .encode(),
+        );
+        self.store.apply(batch).await
     }
 
     async fn advance_watermark(
@@ -1865,41 +1911,63 @@ pub mod conformance {
             "later commits survive a deep trim"
         );
 
-        // Rollback: discard drops the suffix — the resolution for a
-        // rejected push the caller chooses not to repair.
+        // Rollback retires the whole active window, preserving its rows
+        // below neck and appending one active marker at the old tail.
         let doomed = commit_entries(
             store,
             space,
             vec![(key(&[b"db", b"doomed"]), Value::Present(b"x".to_vec()))],
         )
         .await;
-        store.discard_from(space, doomed.seq).await.unwrap();
+        assert!(
+            store.rollback(space, DeviceSeq(3)).await.is_err(),
+            "a target below neck is already outside the active window"
+        );
+        assert!(
+            store.rollback(space, DeviceSeq(6)).await.is_err(),
+            "tail is the next unminted seq, not a rollback target"
+        );
+        store.rollback(space, doomed.seq).await.unwrap();
         let state = audit(store).await;
+        store.rollback(space, doomed.seq).await.unwrap();
         assert_eq!(
-            state.spaces[&space]
-                .oplog
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![DeviceSeq(4)],
-            "discard takes a suffix"
+            audit(store).await,
+            state,
+            "retrying the exact completed rollback is idempotent"
+        );
+        let data = &state.spaces[&space];
+        assert_eq!(
+            data.oplog.keys().copied().collect::<Vec<_>>(),
+            vec![DeviceSeq(4), DeviceSeq(5), DeviceSeq(6)],
+            "rollback retains dead rows and appends its marker"
         );
         assert_eq!(
-            state.spaces[&space].cursors.tail,
-            DeviceSeq(6),
-            "tail never rewinds"
+            data.cursors,
+            OplogCursors {
+                head: DeviceSeq(4),
+                neck: DeviceSeq(6),
+                tail: DeviceSeq(7),
+            }
+        );
+        assert_eq!(
+            data.oplog[&DeviceSeq(6)],
+            OplogRecord::Rollback { marker: doomed.seq }
         );
 
-        // A commit after a discard leaves a gap — legal, because the seq
-        // counter never rewinds. The state still certifies and the head
-        // window shows the hole.
+        // A successor appends after the marker. The wire stream starts at
+        // neck and therefore jumps over the retired seqs without reusing
+        // them, while the retained queue remains dense for audit.
         let after_gap = commit_entries(
             store,
             space,
             vec![(key(&[b"db", b"post"]), Value::Present(b"gap".to_vec()))],
         )
         .await;
-        assert_eq!(after_gap.seq, DeviceSeq(6));
+        assert_eq!(after_gap.seq, DeviceSeq(7));
+        assert!(
+            store.rollback(space, doomed.seq).await.is_err(),
+            "an old rollback target is stale after a later append"
+        );
         let state = audit(store).await;
         assert_eq!(
             state.spaces[&space]
@@ -1907,27 +1975,40 @@ pub mod conformance {
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![DeviceSeq(4), DeviceSeq(6)],
-            "a discarded seq is never re-minted"
-        );
-        assert!(
-            store
-                .oplog(space, DeviceSeq(5), DeviceSeq(5))
-                .await
-                .unwrap()
-                .is_empty(),
-            "the hole is real"
+            vec![DeviceSeq(4), DeviceSeq(5), DeviceSeq(6), DeviceSeq(7)],
+            "retired seqs are retained and never re-minted"
         );
         assert_eq!(
             store
-                .oplog(space, DeviceSeq(1), DeviceSeq(u64::MAX))
+                .oplog(space, DeviceSeq(6), DeviceSeq(u64::MAX))
                 .await
                 .unwrap()
                 .iter()
                 .map(|(seq, _)| *seq)
                 .collect::<Vec<_>>(),
-            vec![DeviceSeq(4), DeviceSeq(6)],
-            "the range read walks straight over the gap"
+            vec![DeviceSeq(6), DeviceSeq(7)],
+            "the active range starts at the rollback marker"
+        );
+
+        // Acking the marker trims all dead history through it and moves
+        // head/neck together, leaving the later active commit intact.
+        store.trim_oplog(space, DeviceSeq(6)).await.unwrap();
+        let state = audit(store).await;
+        assert_eq!(
+            state.spaces[&space].cursors,
+            OplogCursors {
+                head: DeviceSeq(7),
+                neck: DeviceSeq(7),
+                tail: DeviceSeq(8),
+            }
+        );
+        assert_eq!(
+            state.spaces[&space]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(7)]
         );
 
         // The clock high-water is a plain overwrite — advanced at every
@@ -2278,9 +2359,9 @@ mod tests {
 
     #[test]
     fn certify_allows_queue_gaps() {
-        // A discard followed by new commits leaves a hole (the counter
-        // never rewinds) — a legal history, not corruption. Distinct
-        // keys keep the ver chains clean.
+        // Storage backends may represent retired history sparsely. A seq
+        // hole is legal because the counter never rewinds; distinct keys
+        // keep the active ver chains clean.
         let mut state = covered_state();
         let space = state.spaces.get_mut(&SPACE).unwrap();
         space.oplog.insert(
@@ -2298,6 +2379,87 @@ mod tests {
 
     #[test]
     fn certify_allows_rollback_marker_without_entries() {
+        let mut state = ClientState::default();
+        let space = state.spaces.entry(SPACE).or_default();
+        space.oplog.insert(DeviceSeq(1), sample_commit());
+        space.oplog.insert(
+            DeviceSeq(2),
+            OplogRecord::Rollback {
+                marker: DeviceSeq(1),
+            },
+        );
+        space.cursors.neck = DeviceSeq(2);
+        space.cursors.tail = DeviceSeq(3);
+        certify(&state);
+    }
+
+    #[test]
+    fn certify_ignores_retired_ver_regressions_below_neck() {
+        let mut state = covered_state();
+        let space = state.spaces.get_mut(&SPACE).unwrap();
+        space.oplog.insert(
+            DeviceSeq(2),
+            OplogRecord::commit(vec![PutEntry {
+                key: key(&[b"db", b"a"]),
+                value: Value::Present(b"rejected".to_vec()),
+                ver: Ver(2),
+            }]),
+        );
+        space.oplog.insert(
+            DeviceSeq(3),
+            OplogRecord::Rollback {
+                marker: DeviceSeq(2),
+            },
+        );
+        space.cursors.neck = DeviceSeq(3);
+        space.cursors.tail = DeviceSeq(4);
+        certify(&state);
+    }
+
+    #[test]
+    fn rollback_survives_reopen_and_certify() {
+        block_on(async {
+            let inner = MemoryStore::new();
+            let store = OrderedMetaStore::new(&inner);
+            let first = store
+                .reserve_commit(
+                    SPACE,
+                    vec![(key(&[b"db", b"a"]), Value::Present(b"one".to_vec()))],
+                )
+                .await
+                .unwrap();
+            store.commit(SPACE, first).await.unwrap();
+            let second = store
+                .reserve_commit(
+                    SPACE,
+                    vec![(key(&[b"db", b"b"]), Value::Present(b"two".to_vec()))],
+                )
+                .await
+                .unwrap();
+            let second = store.commit(SPACE, second).await.unwrap();
+            store.rollback(SPACE, second.seq).await.unwrap();
+            drop(store);
+
+            let reopened = OrderedMetaStore::new(&inner);
+            let state = audit(&reopened).await;
+            assert_eq!(
+                state.spaces[&SPACE].cursors,
+                OplogCursors {
+                    head: DeviceSeq(1),
+                    neck: DeviceSeq(3),
+                    tail: DeviceSeq(4),
+                }
+            );
+            assert_eq!(
+                state.spaces[&SPACE].oplog[&DeviceSeq(3)],
+                OplogRecord::Rollback { marker: second.seq }
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "must precede its oplog seq")]
+    fn certify_rejects_forward_rollback_marker() {
         let mut state = ClientState::default();
         let space = state.spaces.entry(SPACE).or_default();
         space.oplog.insert(

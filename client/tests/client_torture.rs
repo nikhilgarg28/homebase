@@ -404,12 +404,12 @@ async fn drain_push(
                 if matches!(error, KernelError::VerRegression { .. }) {
                     let mut guard = take_client(slot);
                     let client = guard.client.as_mut().unwrap();
-                    match client.discard_from(SPACE, at).await {
+                    match client.rollback(SPACE, at).await {
                         Ok(()) => {}
                         Err(ClientError::Store(_)) => {
                             coverage.borrow_mut().storage_errors += 1;
                         }
-                        Err(err) => panic!("discard failed during settle: {err:?}"),
+                        Err(err) => panic!("rollback failed during settle: {err:?}"),
                     }
                     finish_client(slot, guard);
                     continue;

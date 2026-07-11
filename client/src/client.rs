@@ -356,9 +356,10 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
         }
     }
 
-    /// Temporary pre-rollback API: drop one space's queued suffix.
-    pub async fn discard_from(&self, space: SpaceId, from: DeviceSeq) -> Result<(), ClientError> {
-        self.store.discard_from(space, from).await?;
+    /// Retire a space's active oplog window after a definitive rejection.
+    /// Retry an ambiguous push before calling this method.
+    pub async fn rollback(&self, space: SpaceId, to: DeviceSeq) -> Result<(), ClientError> {
+        self.store.rollback(space, to).await?;
         Ok(())
     }
 }

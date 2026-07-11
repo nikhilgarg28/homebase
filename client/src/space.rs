@@ -454,7 +454,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Space<'a
         if releasing.is_empty() {
             return Ok(());
         }
-        for (seq, record) in &space_state.oplog {
+        for (seq, record) in space_state.active_oplog() {
             for held in &releasing {
                 if record
                     .entries()

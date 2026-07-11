@@ -2,7 +2,7 @@
 //! boundary, crash/reopen, and ack-drop recovery.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{OrderedMetaStore, audit, conformance};
+use homebase::meta::{MetaStore, OrderedMetaStore, audit, conformance};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -175,6 +175,174 @@ fn unflushed_commit_is_lost_on_crash() {
         assert!(
             state.spaces.values().all(|space| space.oplog.is_empty()),
             "unflushed commit must not survive"
+        );
+    });
+}
+
+#[test]
+fn flushed_rollback_survives_crash_as_one_cursor_marker_transition() {
+    block_on(async {
+        let sim = SimStore::new(43, FaultConfig::NONE);
+        let mem = OrderedMetaStore::new(sim.clone());
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server();
+        let db = key(&[b"db"]);
+
+        let client = Client::open(mem, &handle, &clock, dev(1), SystemNonceSource)
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        space.acquire(vec![wspec(&db)]).await.unwrap();
+        space
+            .commit(vec![(key(&[b"db", b"a"]), val(b"one"))])
+            .await
+            .unwrap();
+        space
+            .commit(vec![(key(&[b"db", b"b"]), val(b"two"))])
+            .await
+            .unwrap();
+        client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
+        sim.flush();
+        drop(client);
+
+        sim.crash();
+        let state = audit(&OrderedMetaStore::new(sim.clone())).await;
+        assert_eq!(state.spaces[&SPACE].cursors.head, DeviceSeq(1));
+        assert_eq!(state.spaces[&SPACE].cursors.neck, DeviceSeq(3));
+        assert_eq!(state.spaces[&SPACE].cursors.tail, DeviceSeq(4));
+        assert_eq!(state.spaces[&SPACE].oplog.len(), 3);
+
+        let reopened = Client::open(
+            OrderedMetaStore::new(sim),
+            &handle,
+            &clock,
+            dev(1),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(3))
+            }
+        );
+    });
+}
+
+#[test]
+fn unflushed_rollback_crash_recovers_the_complete_pre_transition_state() {
+    block_on(async {
+        let sim = SimStore::new(
+            44,
+            FaultConfig {
+                error_rate: 0.0,
+                flush_rate: 0.0,
+                max_latency_yields: 0,
+            },
+        );
+        let meta = OrderedMetaStore::new(sim.clone());
+        for name in [b"a".as_slice(), b"b".as_slice()] {
+            let reserved = meta
+                .reserve_commit(
+                    SPACE,
+                    vec![(key(&[b"db", name]), Value::Present(name.to_vec()))],
+                )
+                .await
+                .unwrap();
+            meta.commit(SPACE, reserved).await.unwrap();
+        }
+        sim.flush();
+
+        meta.rollback(SPACE, DeviceSeq(2)).await.unwrap();
+        sim.crash();
+
+        let state = audit(&OrderedMetaStore::new(sim)).await;
+        assert_eq!(state.spaces[&SPACE].cursors.head, DeviceSeq(1));
+        assert_eq!(state.spaces[&SPACE].cursors.neck, DeviceSeq(1));
+        assert_eq!(state.spaces[&SPACE].cursors.tail, DeviceSeq(3));
+        assert_eq!(
+            state.spaces[&SPACE]
+                .oplog
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(1), DeviceSeq(2)],
+            "neither the volatile marker nor its cursor update survived"
+        );
+    });
+}
+
+#[test]
+fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
+    block_on(async {
+        let sim = SimStore::new(45, FaultConfig::NONE);
+        let meta = OrderedMetaStore::new(sim.clone());
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server();
+        let client = Client::open(meta, &handle, &clock, dev(1), SystemNonceSource)
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        space.acquire(vec![wspec(&key(&[b"db"]))]).await.unwrap();
+        space
+            .commit(vec![(key(&[b"db", b"a"]), val(b"one"))])
+            .await
+            .unwrap();
+        space
+            .commit(vec![(key(&[b"db", b"b"]), val(b"two"))])
+            .await
+            .unwrap();
+        client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
+        sim.flush();
+
+        // Admit only the rollback marker and drop the response before the
+        // client can trim its retained dead prefix.
+        handle
+            .put_batch(
+                &SPACE,
+                PutBatchRequest {
+                    device: client.device(),
+                    evidence: vec![],
+                    batches: vec![PutBatch {
+                        device_seq: DeviceSeq(3),
+                        range_asserts: vec![],
+                        ops: vec![],
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        drop(client);
+        sim.crash();
+
+        let reopened = Client::open(
+            OrderedMetaStore::new(sim.clone()),
+            &handle,
+            &clock,
+            dev(1),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(3))
+            }
+        );
+        assert!(
+            audit(&OrderedMetaStore::new(sim)).await.spaces[&SPACE]
+                .oplog
+                .is_empty()
         );
     });
 }

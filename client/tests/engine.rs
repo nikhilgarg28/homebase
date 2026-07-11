@@ -892,14 +892,15 @@ fn group_rejection_probes_to_the_faulty_commit() {
         }
         // The rollback: the convicted commit falls, and everything after
         // it falls too (it may have read what the fault wrote).
-        client.discard_from(SPACE, DeviceSeq(2)).await.unwrap();
-        assert_eq!(queued(&mem).await, 0);
+        client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
+        assert_eq!(queued(&mem).await, 3, "dead suffix plus rollback marker");
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
-                acked_through: None
+                acked_through: Some(DeviceSeq(4))
             }
         );
+        assert_eq!(queued(&mem).await, 0);
 
         assert_eq!(fetch(&handle, SPACE, &x).await.unwrap().value, val(b"ok"));
         let foreign = fetch(&handle, SPACE, &k).await.unwrap();
@@ -1278,6 +1279,15 @@ fn release_rejects_when_queued_writes_are_covered() {
         assert!(
             !audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].leases[&granted.leases[0].id]
                 .retiring
+        );
+
+        client.rollback(SPACE, DeviceSeq(1)).await.unwrap();
+        space.release(&[granted.leases[0].id]).await.unwrap();
+        assert!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
+                .leases
+                .is_empty(),
+            "retired writes below neck no longer block lease release"
         );
     });
 }

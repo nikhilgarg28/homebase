@@ -556,8 +556,15 @@ space.repair_leases() -> RepairedLeases
 
 ### Fork vs trim
 
-- `DeviceSeqRegression` where seq **not** in that space's local oplog → `Fork` (fatal).
-- Seq **in** that space's oplog → `trim_oplog(space, seq)` catch-up, not rollback.
+- Each `(space, device)` has a cumulative `HistoryHead { device_seq, hash: [u8; 32] }`, beginning at a domain-separated genesis hash for seq 0.
+- For each admitted batch, the server recomputes `next_hash = H(domain, previous_hash, space_id, device_id, device_seq, canonical_batch)`; canonical batch content includes ordered range asserts and data ops (keys, vers, seals, ciphertext), and excludes diagnostic lease evidence.
+- A push presents the client's persisted confirmed history head. The server admits only when it equals the server's current head, chains across every batch in the request, and atomically stores only the final head with the data apply.
+- The client atomically persists the returned final head with trimming the acknowledged oplog prefix. No per-batch fingerprint history is required on the server.
+- When the server is ahead after a lost response, the client hashes forward from its confirmed head across the retained local batches through the server's current seq. A matching final head validates every intermediate batch and permits catch-up trim; a mismatch or missing local path is a fatal fork.
+- Rollback's dead `[head, neck)` records do not enter the history chain. The admitted rollback `NoOp` extends the chain like any other wire batch.
+- The expected-head check prevents a rollback marker from skipping over a data batch that the server admitted before a client crash or lost response; before B14, callers must reconcile every ambiguous push outcome before invoking rollback.
+- This intentionally adds one correctness-bearing persisted server-history head per space; it is not derivable from `head/neck/tail` because rollback can put `neck` ahead of the server and a lost response can put the server ahead of `neck`.
+- Do not add a random `SubmissionId`: sequence number plus cumulative content commitment supplies ordering, exact batch identity, and complete-prefix validation. This remains honest-server fork/rollback detection, not protection against Byzantine server equivocation without an external witness.
 
 ### Submission push sugar / wait-through
 
@@ -699,7 +706,7 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | B11 Cipher integration | Implement `encode_batch_op`, Seal AAD with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
 | B12 Lease client API | Expose `ensure`, `release`, `repair_leases`; remove public acquire; implement Forgotten release intents, local deadline margin, barrier pulls | client lease tests for ensure barrier pull, non-empty oplog ensure, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant and repair algorithm |
 | B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits NoOp wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
-| B14 Fork/trim hardening | Distinguish fatal fork from server-ahead trim using per-space oplog membership; update engine/torture/equivalence/sim harnesses | fork vs trim tests; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for duplicate device identity and catch-up trim |
+| B14 Fork/trim + history head | Add per-space persisted confirmed `HistoryHead`; server-recompute a cumulative canonical batch hash and require the expected prior head; atomically advance client head with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; rollback `NoOp` chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative history commitment, duplicate device identity, catch-up trim, and honest-server threat boundary |
 | B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length present | server docs for why live_count remains and DeleteRange prerequisites |
 | B16 Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit wording and link this plan |
 
@@ -718,9 +725,10 @@ Suggested commit messages: `batch NN: <short description>`. Promote optional or 
 7. **Seal scheme discipline** — present vs delete vs zero-length present must stay unambiguous via explicit wire op + op-kind-bound AAD; `scheme` is only the sealing scheme; empty Set must not leak as empty ciphertext.
 8. **Caller-driven rollback** — multilite must wire stall → rollback explicitly.
 9. **No `resume_pending`** initially — crash recovery gap until backlog item lands.
-10. **Multi-batch all-or-nothing** — client retries smaller windows on failure.
-11. **Epoch removed early** — breaking encode; all test stores recreated.
-12. **Monolithic WIP discarded** — do not merge stash; re-land by phase.
+10. **History-head atomicity** — B14 must persist the client confirmed history head in the same MetaStore transition that trims its acknowledged prefix; a torn head/trim pair destroys lost-response recovery.
+11. **Multi-batch all-or-nothing** — client retries smaller windows on failure.
+12. **Epoch removed early** — breaking encode; all test stores recreated.
+13. **Monolithic WIP discarded** — do not merge stash; re-land by phase.
 
 ---
 
