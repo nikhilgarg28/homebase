@@ -362,6 +362,7 @@ pub mod conformance {
                     evidence: vec![lease],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
                         ops: vec![
                             PutEntry {
                                 key: k.clone(),
@@ -527,6 +528,7 @@ pub mod conformance {
                     evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
                         ops: vec![
                             PutEntry {
                                 key: key(&[b"x", b"k"]),
@@ -604,6 +606,7 @@ pub mod conformance {
                     evidence: vec![],
                     batches: vec![PutBatch {
                         device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
                         ops: vec![],
                     }],
                 },

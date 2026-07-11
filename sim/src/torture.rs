@@ -59,6 +59,7 @@ pub fn put_one(
         evidence: vec![lease],
         batches: vec![PutBatch {
             device_seq: DeviceSeq(seq),
+            range_asserts: vec![],
             ops: vec![
                 PutEntry {
                     key: k.clone(),

@@ -144,7 +144,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             .await
             .unwrap();
             client.attach(&envelope).await.unwrap();
-            let mut space_handle = client.space(space).await.unwrap();
+            let space_handle = client.space(space).await.unwrap();
             let granted = space_handle.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space_handle
                 .commit(vec![(row.clone(), val(b"secret"))])
@@ -171,7 +171,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
         .await
         .unwrap();
         client.attach(&envelope).await.unwrap();
-        let mut space_handle = client.space(space).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
         assert_eq!(client.device(), dev(1));
 
         space_handle
@@ -204,7 +204,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         .await
         .unwrap();
         client.attach(&envelope).await.unwrap();
-        let mut space_handle = client.space(space).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
@@ -234,6 +234,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                     batches: vec![
                         PutBatch {
                             device_seq: seq1,
+                            range_asserts: vec![],
                             ops: state.oplog[&seq1]
                                 .entries()
                                 .iter()
@@ -243,6 +244,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                         },
                         PutBatch {
                             device_seq: seq2,
+                            range_asserts: vec![],
                             ops: state.oplog[&seq2]
                                 .entries()
                                 .iter()
@@ -326,7 +328,7 @@ fn push_stall_recovers_via_ensure() {
         .await
         .unwrap();
         client.attach(&envelope).await.unwrap();
-        let mut space_handle = client.space(space).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);

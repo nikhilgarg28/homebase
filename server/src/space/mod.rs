@@ -128,7 +128,8 @@ mod tests {
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{
-        BatchOp, KernelError, LeaseSpec, PutBatch, PutEntry, Range, RangeCursor, RangeCut,
+        BatchOp, KernelError, LeaseSpec, PutBatch, PutBatchResult, PutEntry, Range, RangeAssert,
+        RangeCursor, RangeCut,
     };
     use homebase_core::seal::Seal;
     use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
@@ -192,6 +193,17 @@ mod tests {
         device_seq: u64,
         ops: Vec<BatchOp>,
     ) -> Result<PutBatchResponse, Error> {
+        put_batch_asserting(space, store, lease, device_seq, Vec::new(), ops)
+    }
+
+    fn put_batch_asserting(
+        space: &mut Space,
+        store: &MemoryStore,
+        lease: LeaseId,
+        device_seq: u64,
+        range_asserts: Vec<RangeAssert>,
+        ops: Vec<BatchOp>,
+    ) -> Result<PutBatchResponse, Error> {
         block_on(space.put_batch(
             store,
             Timestamp(1),
@@ -200,6 +212,7 @@ mod tests {
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
+                    range_asserts,
                     ops,
                 }],
             },
@@ -279,10 +292,12 @@ mod tests {
                 batches: vec![
                     PutBatch {
                         device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
                         ops: vec![put(&k1, b"v1", 1)],
                     },
                     PutBatch {
                         device_seq: DeviceSeq(2),
+                        range_asserts: vec![],
                         ops: vec![put(&k2, b"v2", 2)],
                     },
                 ],
@@ -300,6 +315,104 @@ mod tests {
         assert_eq!(first.tag.admission_seq, AdmissionSeq(1));
         assert_eq!(second.tag.device_seq, DeviceSeq(2));
         assert_eq!(second.tag.admission_seq, AdmissionSeq(2));
+    }
+
+    #[test]
+    fn range_asserts_see_scratch_state_from_earlier_coalesced_batches() {
+        let (mut space, store, lease) = setup();
+        let root = key(&[b"db"]);
+        let k1 = key(&[b"db", b"t", b"r1"]);
+        let k2 = key(&[b"db", b"t", b"r2"]);
+
+        let resp = block_on(space.put_batch(
+            &store,
+            Timestamp(1),
+            &PutBatchRequest {
+                device: dev(1),
+                evidence: vec![lease],
+                batches: vec![
+                    PutBatch {
+                        device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
+                        ops: vec![put(&k1, b"v1", 1)],
+                    },
+                    PutBatch {
+                        device_seq: DeviceSeq(2),
+                        range_asserts: vec![RangeAssert {
+                            prefix: root,
+                            at: AdmissionSeq(1),
+                        }],
+                        ops: vec![put(&k2, b"v2", 1)],
+                    },
+                ],
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(resp.applied_admission_seq(0), Some(AdmissionSeq(1)));
+        assert_eq!(resp.applied_admission_seq(1), Some(AdmissionSeq(2)));
+    }
+
+    #[test]
+    fn range_assert_failure_reports_all_batches_and_applies_nothing() {
+        let (mut space, store, lease) = setup();
+        let root = key(&[b"db"]);
+        let k1 = key(&[b"db", b"t", b"r1"]);
+        let k2 = key(&[b"db", b"t", b"r2"]);
+
+        let resp = block_on(space.put_batch(
+            &store,
+            Timestamp(1),
+            &PutBatchRequest {
+                device: dev(1),
+                evidence: vec![lease],
+                batches: vec![
+                    PutBatch {
+                        device_seq: DeviceSeq(1),
+                        range_asserts: vec![],
+                        ops: vec![put(&k1, b"v1", 1)],
+                    },
+                    PutBatch {
+                        device_seq: DeviceSeq(2),
+                        range_asserts: vec![RangeAssert {
+                            prefix: root.clone(),
+                            at: AdmissionSeq(0),
+                        }],
+                        ops: vec![put(&k2, b"v2", 1)],
+                    },
+                ],
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(resp.results.len(), 2);
+        for result in &resp.results {
+            let PutBatchResult::Failed {
+                error: KernelError::RangeAssertFailed { failures },
+            } = result
+            else {
+                panic!("expected range assert failure, got {result:?}");
+            };
+            assert_eq!(
+                failures,
+                &vec![homebase_core::messages::RangeAssertFailure {
+                    prefix: root.clone(),
+                    expected: AdmissionSeq(0),
+                    actual: AdmissionSeq(1),
+                }]
+            );
+        }
+
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![k1.clone()],
+            },
+        ))
+        .unwrap();
+        assert!(got.entries[0].is_none());
+        put_batch(&mut space, &store, lease, 1, vec![put(&k1, b"v1", 1)])
+            .expect("failed range assert did not advance device seq");
     }
 
     #[test]
@@ -383,6 +496,49 @@ mod tests {
                 live_count: 0
             })
         );
+
+        // Repeated delete advances high water but keeps live count stable.
+        put_batch(&mut space, &store, lease, 7, vec![del(&k1, 4)]).unwrap();
+        assert_eq!(
+            meta(&store, &root),
+            Some(PrefixMetaRecord {
+                max_admission_seq: 7,
+                live_count: 0
+            })
+        );
+
+        // Delete -> present and a zero-length present both count as live.
+        let k4 = key(&[b"db", b"t", b"r4"]);
+        put_batch(&mut space, &store, lease, 8, vec![put(&k1, b"back", 5)]).unwrap();
+        put_batch(&mut space, &store, lease, 9, vec![put(&k4, b"", 1)]).unwrap();
+        assert_eq!(
+            meta(&store, &root),
+            Some(PrefixMetaRecord {
+                max_admission_seq: 9,
+                live_count: 2
+            })
+        );
+    }
+
+    #[test]
+    fn noop_batch_advances_admission_without_touching_aggregates() {
+        use crate::schema::{PrefixMetaRecord, prefix_meta_key};
+        let meta = |store: &MemoryStore, prefix: &Key| -> Option<PrefixMetaRecord> {
+            block_on(store.get(&prefix_meta_key(SPACE, prefix.components())))
+                .unwrap()
+                .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
+        };
+
+        let (mut space, store, lease) = setup();
+        let root = key(&[b"db"]);
+        let k = key(&[b"db", b"t", b"r1"]);
+
+        let resp = put_batch(&mut space, &store, lease, 1, vec![BatchOp::NoOp]).unwrap();
+        assert_eq!(resp.applied_admission_seq(0), Some(AdmissionSeq(1)));
+        assert_eq!(meta(&store, &root), None);
+
+        let resp = put_batch(&mut space, &store, lease, 2, vec![put(&k, b"v", 1)]).unwrap();
+        assert_eq!(resp.applied_admission_seq(0), Some(AdmissionSeq(2)));
     }
 
     #[test]

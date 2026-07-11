@@ -183,6 +183,7 @@ mod tests {
                 evidence: vec![lease],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(1),
+                    range_asserts: vec![],
                     ops: vec![
                         PutEntry {
                             key: key(&[b"db", b"marker"]),

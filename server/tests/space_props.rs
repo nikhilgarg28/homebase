@@ -186,6 +186,7 @@ impl Harness {
                 evidence: vec![self.leases[device]],
                 batches: vec![PutBatch {
                     device_seq: DeviceSeq(device_seq),
+                    range_asserts: vec![],
                     ops,
                 }],
             },

@@ -2,7 +2,7 @@
 //! boundary, crash/reopen, and ack-drop recovery.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit, conformance};
+use homebase::meta::{OrderedMetaStore, audit, conformance};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -111,7 +111,7 @@ async fn run_flushed_crash_seed(seed: u64) {
             .attach(&SpaceEnvelope::plaintext(SPACE))
             .await
             .unwrap();
-        let mut space = client.space(SPACE).await.unwrap();
+        let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
         space
             .commit(vec![(row.clone(), val(b"survived"))])
@@ -126,7 +126,7 @@ async fn run_flushed_crash_seed(seed: u64) {
     let client = Client::open(mem, &handle, &clock, dev(1), SystemNonceSource)
         .await
         .unwrap();
-    let mut space = client.space(SPACE).await.unwrap();
+    let space = client.space(SPACE).await.unwrap();
     space.ensure(vec![wspec(&db)]).await.unwrap();
     assert_eq!(
         client.push().await.unwrap(),
@@ -162,7 +162,7 @@ fn unflushed_commit_is_lost_on_crash() {
                 .attach(&SpaceEnvelope::plaintext(SPACE))
                 .await
                 .unwrap();
-            let mut space = client.space(SPACE).await.unwrap();
+            let space = client.space(SPACE).await.unwrap();
             space.acquire(vec![wspec(&db)]).await.unwrap();
             space
                 .commit(vec![(row.clone(), val(b"volatile"))])
@@ -194,7 +194,7 @@ fn ack_drop_trims_after_server_admitted() {
             .attach(&SpaceEnvelope::plaintext(SPACE))
             .await
             .unwrap();
-        let mut space = client.space(SPACE).await.unwrap();
+        let space = client.space(SPACE).await.unwrap();
         let granted = space.acquire(vec![wspec(&db)]).await.unwrap();
         let lease = granted.leases[0].id;
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
@@ -210,6 +210,7 @@ fn ack_drop_trims_after_server_admitted() {
                     batches: vec![
                         PutBatch {
                             device_seq: DeviceSeq(1),
+                            range_asserts: vec![],
                             ops: vec![
                                 PutEntry {
                                     key: k1.clone(),
@@ -221,6 +222,7 @@ fn ack_drop_trims_after_server_admitted() {
                         },
                         PutBatch {
                             device_seq: DeviceSeq(2),
+                            range_asserts: vec![],
                             ops: vec![
                                 PutEntry {
                                     key: k2.clone(),

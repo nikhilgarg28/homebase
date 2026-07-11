@@ -1322,6 +1322,13 @@ impl OplogRecord {
         }
     }
 
+    pub fn range_asserts(&self) -> &[RangeAssert] {
+        match self {
+            Self::Commit { range_asserts, .. } => range_asserts,
+            Self::Rollback { .. } => &[],
+        }
+    }
+
     pub fn entries_mut(&mut self) -> &mut Vec<PutEntry> {
         match self {
             Self::Commit { entries, .. } => entries,

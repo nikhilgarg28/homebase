@@ -123,6 +123,7 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             evidence: vec![state.lease.borrow().unwrap()],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
+                range_asserts: vec![],
                 ops: vec![
                     PutEntry {
                         key: pool_key(key_index),

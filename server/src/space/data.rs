@@ -14,7 +14,9 @@
 //! 2. each client batch's `device_seq` strictly follows the device's stored
 //!    high water and the preceding batch in the request (replay and
 //!    out-of-order rejection);
-//! 3. every Set/Delete has a valid seal and its `ver` strictly exceeds the
+//! 3. each batch's range asserts match the scratch prefix high-water as of
+//!    that batch (including earlier coalesced batches, excluding this batch);
+//! 4. every Set/Delete has a valid seal and its `ver` strictly exceeds the
 //!    stored ver for its key (within a batch, later ops for the same key
 //!    check against earlier ones — the batch behaves like a sequence).
 //!
@@ -52,7 +54,8 @@ use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
     BatchOp, GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
-    PutBatchResponse, PutBatchResult, Range, RangeCut, ReadAtRequest, ReadAtResponse,
+    PutBatchResponse, PutBatchResult, Range, RangeAssertFailure, RangeCut, ReadAtRequest,
+    ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Epoch, Tag, Value, Ver};
@@ -109,10 +112,21 @@ pub async fn put_batch<S: OrderedStore>(
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
     let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
+    let mut scratch_prefix_high: BTreeMap<Vec<u8>, AdmissionSeq> = BTreeMap::new();
     for client_batch in &req.batches {
+        let failures =
+            range_assert_failures(space, store, &scratch_prefix_high, client_batch).await?;
+        if !failures.is_empty() {
+            return Ok(failed_response(
+                req.batches.len(),
+                KernelError::RangeAssertFailed { failures },
+            ));
+        }
+
         let seq = next_admission_seq;
         results.push(PutBatchResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
+        let mut touched_prefixes = Vec::new();
         for op in &client_batch.ops {
             let Some((key, ver, value)) = op_write(op)? else {
                 continue;
@@ -154,6 +168,13 @@ pub async fn put_batch<S: OrderedStore>(
                     value,
                 },
             );
+            touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
+        }
+        for meta_key in touched_prefixes {
+            scratch_prefix_high
+                .entry(meta_key)
+                .and_modify(|at| *at = (*at).max(seq))
+                .or_insert(seq);
         }
     }
     counters.admission_high_water = next_admission_seq.0 - 1;
@@ -211,11 +232,62 @@ pub async fn put_batch<S: OrderedStore>(
     Ok(PutBatchResponse { results })
 }
 
+async fn range_assert_failures<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    scratch_prefix_high: &BTreeMap<Vec<u8>, AdmissionSeq>,
+    batch: &homebase_core::messages::PutBatch,
+) -> Result<Vec<RangeAssertFailure>, Error> {
+    let mut failures = Vec::new();
+    for assert in &batch.range_asserts {
+        let meta_key = prefix_meta_key(space, assert.prefix.components());
+        let actual = match scratch_prefix_high.get(&meta_key) {
+            Some(at) => *at,
+            None => {
+                let max = match store.get(&meta_key).await? {
+                    Some(bytes) => {
+                        PrefixMetaRecord::decode(&bytes)
+                            .expect("corrupt prefix meta record")
+                            .max_admission_seq
+                    }
+                    None => 0,
+                };
+                AdmissionSeq(max)
+            }
+        };
+        if actual != assert.at {
+            failures.push(RangeAssertFailure {
+                prefix: assert.prefix.clone(),
+                expected: assert.at,
+                actual,
+            });
+        }
+    }
+    Ok(failures)
+}
+
+fn failed_response(count: usize, error: KernelError) -> PutBatchResponse {
+    PutBatchResponse {
+        results: (0..count)
+            .map(|_| PutBatchResult::Failed {
+                error: error.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn op_key(op: &BatchOp) -> Option<&Key> {
     match op {
         BatchOp::Set { key, .. } | BatchOp::Delete { key, .. } => Some(key),
         BatchOp::NoOp => None,
     }
+}
+
+fn prefix_meta_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
+    let components = key.components();
+    (1..=components.len())
+        .map(|depth| prefix_meta_key(space, &components[..depth]))
+        .collect()
 }
 
 fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value)>, Error> {

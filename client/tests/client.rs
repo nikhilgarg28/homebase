@@ -2,7 +2,7 @@
 //! global push ordering, and codec-cache resume.
 
 use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueContext};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit};
+use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, open_offline};
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -137,8 +137,8 @@ fn multi_space_shares_one_seq_stream_with_distinct_ciphertext() {
         let db_b = key(&[b"b", b"db"]);
         let row_b = key(&[b"b", b"db", b"k"]);
 
-        let mut space_a = client.space(id_a).await.unwrap();
-        let mut space_b = client.space(id_b).await.unwrap();
+        let space_a = client.space(id_a).await.unwrap();
+        let space_b = client.space(id_b).await.unwrap();
         space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
@@ -234,8 +234,8 @@ fn global_push_drains_interleaved_spaces_in_seq_order() {
         let row_b1 = key(&[b"b", b"db", b"k1"]);
         let row_a2 = key(&[b"a", b"db", b"k2"]);
 
-        let mut space_a = client.space(id_a).await.unwrap();
-        let mut space_b = client.space(id_b).await.unwrap();
+        let space_a = client.space(id_a).await.unwrap();
+        let space_b = client.space(id_b).await.unwrap();
         space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
@@ -286,7 +286,7 @@ fn offline_commit_survives_until_online_push() {
             .await
             .unwrap();
             client.attach(&envelope).await.unwrap();
-            let mut online_space = client.space(space).await.unwrap();
+            let online_space = client.space(space).await.unwrap();
             online_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         }
 
@@ -299,7 +299,7 @@ fn offline_commit_survives_until_online_push() {
         .await
         .unwrap();
         {
-            let mut offline_space = offline.space(space).await.unwrap();
+            let offline_space = offline.space(space).await.unwrap();
             offline_space
                 .commit(vec![(row.clone(), val(b"offline"))])
                 .await
@@ -353,7 +353,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
             client.attach(&envelope).await.unwrap();
             let db = key(&[b"db"]);
             let row = key(&[b"db", b"k"]);
-            let mut space = client.space(space).await.unwrap();
+            let space = client.space(space).await.unwrap();
             space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .commit(vec![(row.clone(), val(b"cached"))])
@@ -372,7 +372,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
         .await
         .unwrap();
         let db = key(&[b"db"]);
-        let mut space = client.space(space).await.unwrap();
+        let space = client.space(space).await.unwrap();
         let pulled = space.pull(Range::Prefix(db)).await.unwrap();
         assert!(matches!(
             &pulled.ranges[0],
@@ -403,7 +403,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         .unwrap();
         writer.attach(&envelope).await.unwrap();
         {
-            let mut writer_space = writer.space(space).await.unwrap();
+            let writer_space = writer.space(space).await.unwrap();
             writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             writer_space
                 .commit(vec![(row.clone(), val(b"roundtrip"))])
@@ -423,7 +423,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         .await
         .unwrap();
         reader.attach(&envelope).await.unwrap();
-        let mut reader_space = reader.space(space).await.unwrap();
+        let reader_space = reader.space(space).await.unwrap();
         let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
         assert!(matches!(
             &pulled.ranges[0],

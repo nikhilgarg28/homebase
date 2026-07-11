@@ -1,7 +1,7 @@
 //! pull ⊕ replay(unshipped oplog) ≡ server plaintext after push.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource, ValueContext};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit};
+use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -122,7 +122,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
             .attach(&SpaceEnvelope::plaintext(SPACE))
             .await
             .unwrap();
-        let mut space = client.space(SPACE).await.unwrap();
+        let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();
@@ -199,7 +199,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         .await
         .unwrap();
         client.attach(&envelope).await.unwrap();
-        let mut space = client.space(space_id).await.unwrap();
+        let space = client.space(space_id).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space.commit(vec![(k1.clone(), val(b"one"))]).await.unwrap();

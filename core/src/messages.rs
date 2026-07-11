@@ -127,6 +127,13 @@ pub struct RangeAssert {
     pub at: AdmissionSeq,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeAssertFailure {
+    pub prefix: Key,
+    pub expected: AdmissionSeq,
+    pub actual: AdmissionSeq,
+}
+
 /// One v2 data operation within a client batch.
 ///
 /// Set ciphertext is separate from the AEAD tag stored in [`Seal`]. To avoid
@@ -183,6 +190,9 @@ pub struct PutBatch {
     /// commit. A request may coalesce successive client commits without
     /// erasing their individual seq identity.
     pub device_seq: DeviceSeq,
+    /// Assertions evaluated against the scratch prefix state immediately
+    /// before this client batch is applied.
+    pub range_asserts: Vec<RangeAssert>,
     pub ops: Vec<BatchOp>,
 }
 
@@ -353,6 +363,9 @@ pub enum KernelError {
     NotCovered { key: Key },
     /// A Set/Delete seal is malformed for its declared scheme.
     InvalidSeal { reason: String },
+    /// One or more range watermarks did not match the server-visible prefix
+    /// high water.
+    RangeAssertFailed { failures: Vec<RangeAssertFailure> },
     /// Per-key version monotonicity violated.
     VerRegression {
         key: Key,
@@ -383,6 +396,9 @@ impl fmt::Display for KernelError {
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
             Self::InvalidSeal { reason } => write!(f, "invalid seal: {reason}"),
+            Self::RangeAssertFailed { failures } => {
+                write!(f, "{} range assert(s) failed", failures.len())
+            }
             Self::VerRegression {
                 key,
                 current,

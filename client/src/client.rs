@@ -242,6 +242,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
             let mut last = head;
             let mut batches = vec![PutBatch {
                 device_seq: head,
+                range_asserts: head_record.range_asserts().to_vec(),
                 ops: head_record
                     .entries()
                     .iter()
@@ -261,6 +262,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource> Client<M, H,
                     }
                     batches.push(PutBatch {
                         device_seq: *seq,
+                        range_asserts: record.range_asserts().to_vec(),
                         ops: record.entries().iter().cloned().map(Into::into).collect(),
                     });
                     last = *seq;

@@ -121,7 +121,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
         .await
         .unwrap();
         client.attach(&envelope).await.unwrap();
-        let mut space_handle = client.space(space).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
@@ -172,7 +172,7 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         .await
         .unwrap();
         writer.attach(&envelope).await.unwrap();
-        let mut writer_space = writer.space(space).await.unwrap();
+        let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
             .commit(vec![(row1.clone(), val(b"one"))])
@@ -195,7 +195,7 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         .await
         .unwrap();
         reader.attach(&envelope).await.unwrap();
-        let mut reader_space = reader.space(space).await.unwrap();
+        let reader_space = reader.space(space).await.unwrap();
         let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
 
         let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
@@ -231,7 +231,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         .await
         .unwrap();
         writer.attach(&local_envelope).await.unwrap();
-        let mut writer_space = writer.space(space).await.unwrap();
+        let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
             .commit(vec![(row, val(b"before-link"))])
@@ -252,7 +252,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         .await
         .unwrap();
         reader.attach(&linked_envelope).await.unwrap();
-        let mut reader_space = reader.space(space).await.unwrap();
+        let reader_space = reader.space(space).await.unwrap();
         let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
 
         assert!(matches!(

@@ -151,6 +151,7 @@ async fn client(
             evidence: vec![lease],
             batches: vec![PutBatch {
                 device_seq: DeviceSeq(seq),
+                range_asserts: vec![],
                 ops: vec![
                     PutEntry {
                         key: counter_key(),
