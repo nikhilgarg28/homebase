@@ -1,18 +1,15 @@
-//! Value tags and entries: what the kernel stores alongside every value.
+//! Device-authored and admitted entries.
 //!
-//! Every stored value is tagged `(device, device_seq, epoch, ver,
-//! admission_seq)`. The server never interprets values; tags are the only
-//! server-legible metadata, and they exist for fencing, replication cursors,
-//! and fork detection — not for querying.
+//! A [`DeviceEntry`] is the complete client-authenticated object: its seal
+//! binds the mutation to every field in [`DeviceTag`]. An [`AdmittedEntry`]
+//! wraps that object without changing it and adds only server-assigned
+//! admission metadata.
 
 use crate::key::Key;
 use crate::seal::Seal;
 use std::fmt;
 
 /// Identifies a writing device: 16 opaque bytes, UUID-shaped.
-///
-/// Assigned by the platform and carried as a token claim; the kernel never
-/// generates or interprets one.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId(pub [u8; 16]);
 
@@ -26,78 +23,103 @@ impl fmt::Debug for DeviceId {
     }
 }
 
-/// Client-assigned batch sequence number, strictly increasing per device.
-///
-/// One `put_batch` = one `DeviceSeq`. Replicas use it to detect gaps in a
-/// device's stream; the codec binds it into AEAD associated data.
+/// Client-assigned admission-batch sequence number, strictly increasing per
+/// device and space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceSeq(pub u64);
 
-/// Lease fencing token, server-assigned at acquire.
-///
-/// Epochs are correctness, timestamps are availability: any write admitted
-/// under an old epoch after a re-grant is rejected regardless of clocks.
-/// This is also the fencing token handed downstream by leader-election users.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Epoch(pub u64);
-
-/// Server-assigned admission sequence: the total order of admitted batches
-/// within a space.
-///
-/// All entries of one batch share one `AdmissionSeq` (batch = transaction).
-/// Cursors and `read_at` cuts are positions in this order; the augmented
-/// tree maintains its max under any prefix.
+/// Server-assigned total-order position of one admitted batch in a space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AdmissionSeq(pub u64);
 
 /// Client-computed per-key version.
-///
-/// The server enforces strict monotonicity per key (a put must carry a `Ver`
-/// strictly greater than the stored one) but never generates versions —
-/// clients own the chain, which keeps it meaningful under E2EE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ver(pub u64);
 
-/// The tag attached to every stored value.
+/// Selects the value-encryption key used by a sealing scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CipherEpoch(pub u64);
+
+/// Opaque encrypted bytes carried by a Set mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tag {
+pub struct Ciphertext(pub Vec<u8>);
+
+impl AsRef<[u8]> for Ciphertext {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A Set or Delete shape. Bare client mutations use plaintext `Vec<u8>`;
+/// device/server entries use [`Ciphertext`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mutation<T = Vec<u8>> {
+    Set { key: Key, value: T },
+    Delete { key: Key },
+}
+
+impl<T> Mutation<T> {
+    pub fn key(&self) -> &Key {
+        match self {
+            Self::Set { key, .. } | Self::Delete { key } => key,
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        matches!(self, Self::Set { .. })
+    }
+
+    pub fn is_delete(&self) -> bool {
+        matches!(self, Self::Delete { .. })
+    }
+}
+
+/// Every client-minted field authenticated as AEAD associated data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceTag {
     pub device: DeviceId,
     pub device_seq: DeviceSeq,
-    /// Epoch of the lease that covered this key at admission.
-    pub epoch: Epoch,
     pub ver: Ver,
+    pub cipher_epoch: CipherEpoch,
+}
+
+/// One complete device-authenticated data mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceEntry<T = Ciphertext> {
+    pub mutation: Mutation<T>,
+    pub tag: DeviceTag,
+    pub seal: Seal,
+}
+
+impl<T> DeviceEntry<T> {
+    pub fn key(&self) -> &Key {
+        self.mutation.key()
+    }
+
+    pub fn ver(&self) -> Ver {
+        self.tag.ver
+    }
+}
+
+/// Server-minted metadata deliberately excluded from value AAD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionTag {
     pub admission_seq: AdmissionSeq,
 }
 
-/// A value as written and stored. Deletes are explicit: a tombstone is a
-/// first-class `Absent` value carrying a tag, not a missing row.
+/// An unchanged device-authenticated entry plus authority metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Value {
-    /// Opaque bytes — ciphertext by the time the kernel sees them.
-    Present(Vec<u8>),
-    /// A tombstone.
-    Absent,
+pub struct AdmittedEntry<T = Ciphertext> {
+    pub device_entry: DeviceEntry<T>,
+    pub admission: AdmissionTag,
 }
 
-impl Value {
-    pub fn is_present(&self) -> bool {
-        matches!(self, Self::Present(_))
+impl<T> AdmittedEntry<T> {
+    pub fn key(&self) -> &Key {
+        self.device_entry.key()
     }
 
-    pub fn is_absent(&self) -> bool {
-        matches!(self, Self::Absent)
+    pub fn ver(&self) -> Ver {
+        self.device_entry.ver()
     }
-}
-
-/// A stored entry as returned by reads.
-///
-/// Tombstones (`Value::Absent`) appear in `read_at` deltas — replicas must
-/// observe deletes — while `get` and `list` return live entries only, so
-/// their entries are always `Present`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub key: Key,
-    pub value: Value,
-    pub seal: Seal,
-    pub tag: Tag,
 }

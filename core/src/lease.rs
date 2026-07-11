@@ -32,7 +32,7 @@ pub enum LeaseMode {
     /// Never authorizes writes, and never upgrades to `Write`.
     Read,
     /// Exclusive: overlaps nothing, read or write. Required for every key
-    /// admitted by `put_batch`.
+    /// admitted by `admit`.
     Write,
 }
 

@@ -10,10 +10,13 @@ use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceId};
-use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::{SlateOpenOptions, SlateStore, local_object_store};
 use homebase_sim::check;
@@ -48,20 +51,25 @@ async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
         .unwrap();
     let lease = granted.leases[0].id;
     handle
-        .put_batch(PutBatchRequest {
+        .admit(AdmissionRequest {
             device: dev(),
             evidence: vec![lease],
-            batches: vec![PutBatch {
+            batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(device_seq),
                 range_asserts: vec![],
-                ops: vec![
-                    PutEntry {
+                entries: vec![DeviceEntry {
+                    mutation: Mutation::Set {
                         key: key(&[b"db", b"marker"]),
-                        value: Value::Present(marker.to_vec()),
+                        value: Ciphertext(marker.to_vec()),
+                    },
+                    tag: DeviceTag {
+                        device: dev(),
+                        device_seq: DeviceSeq(device_seq),
                         ver: Ver(device_seq),
-                    }
-                    .into(),
-                ],
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                }],
             }],
         })
         .await
@@ -107,7 +115,13 @@ async fn slate_survives_flush_and_reopen() {
         .await
         .unwrap();
     let entry = got.entries[0].as_ref().unwrap();
-    assert_eq!(entry.value, Value::Present(b"after-reopen".to_vec()));
+    assert_eq!(
+        entry.device_entry.mutation,
+        Mutation::Set {
+            key: key(&[b"db", b"marker"]),
+            value: Ciphertext(b"after-reopen".to_vec()),
+        }
+    );
 
     check::audit(SPACE, store2.as_ref());
     drop(handle2);
@@ -140,20 +154,25 @@ async fn slate_seeded_writes_audit_clean() {
     for seq in 1..=rng.random_range(5..15) {
         let k = key(&[b"load", format!("k{seq}").as_bytes()]);
         handle
-            .put_batch(PutBatchRequest {
+            .admit(AdmissionRequest {
                 device: dev(),
                 evidence: vec![lease],
-                batches: vec![PutBatch {
+                batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(seq),
                     range_asserts: vec![],
-                    ops: vec![
-                        PutEntry {
+                    entries: vec![DeviceEntry {
+                        mutation: Mutation::Set {
                             key: k,
-                            value: Value::Present(format!("v{seq}").into_bytes()),
+                            value: Ciphertext(format!("v{seq}").into_bytes()),
+                        },
+                        tag: DeviceTag {
+                            device: dev(),
+                            device_seq: DeviceSeq(seq),
                             ver: Ver(1),
-                        }
-                        .into(),
-                    ],
+                            cipher_epoch: CipherEpoch(0),
+                        },
+                        seal: Seal::empty_aead_v1(),
+                    }],
                 }],
             })
             .await

@@ -11,7 +11,7 @@ use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value};
+use homebase_core::tag::{AdmittedEntry, DeviceId, DeviceSeq, Mutation};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -36,8 +36,11 @@ fn key(components: &[&[u8]]) -> Key {
     Key::from_bytes(components.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: bytes.to_vec(),
+    }
 }
 
 fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
@@ -63,7 +66,7 @@ fn spawn_server(
     move |id: &SpaceId| server.space(id)
 }
 
-async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<Entry> {
+async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<AdmittedEntry> {
     handle
         .get(
             &space,
@@ -143,15 +146,15 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
-            .submit_checked(vec![(row_a.clone(), val(b"alpha"))], vec![])
+            .submit_checked(vec![set(row_a.clone(), b"alpha")], vec![])
             .await
             .unwrap();
         space_b
-            .submit_checked(vec![(row_b.clone(), val(b"beta"))], vec![])
+            .submit_checked(vec![set(row_b.clone(), b"beta")], vec![])
             .await
             .unwrap();
         space_a
-            .submit_checked(vec![(row_a.clone(), val(b"alpha2"))], vec![])
+            .submit_checked(vec![set(row_a.clone(), b"alpha2")], vec![])
             .await
             .unwrap();
 
@@ -185,15 +188,27 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
 
         let stored_a = fetch(&handle, id_a, &encoded_a).await.unwrap();
         let stored_b = fetch(&handle, id_b, &encoded_b).await.unwrap();
-        assert_ne!(stored_a.value, val(b"beta"));
-        assert_ne!(stored_b.value, val(b"alpha2"));
-        assert_eq!(
-            cipher_a.decode_entry_value(&stored_a).unwrap(),
-            val(b"alpha2")
+        assert!(
+            matches!(&stored_a.device_entry.mutation, Mutation::Set { value, .. } if value.0 != b"beta")
+        );
+        assert!(
+            matches!(&stored_b.device_entry.mutation, Mutation::Set { value, .. } if value.0 != b"alpha2")
         );
         assert_eq!(
-            cipher_b.decode_entry_value(&stored_b).unwrap(),
-            val(b"beta")
+            cipher_a
+                .open_admitted_entry(&stored_a)
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(encoded_a, b"alpha2")
+        );
+        assert_eq!(
+            cipher_b
+                .open_admitted_entry(&stored_b)
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(encoded_b, b"beta")
         );
     });
 }
@@ -238,15 +253,15 @@ fn global_push_compatibility_drains_independent_space_streams() {
         space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
-            .submit_checked(vec![(row_a1.clone(), val(b"a1"))], vec![])
+            .submit_checked(vec![set(row_a1.clone(), b"a1")], vec![])
             .await
             .unwrap();
         space_b
-            .submit_checked(vec![(row_b1.clone(), val(b"b1"))], vec![])
+            .submit_checked(vec![set(row_b1.clone(), b"b1")], vec![])
             .await
             .unwrap();
         space_a
-            .submit_checked(vec![(row_a2.clone(), val(b"a2"))], vec![])
+            .submit_checked(vec![set(row_a2.clone(), b"a2")], vec![])
             .await
             .unwrap();
 
@@ -255,7 +270,7 @@ fn global_push_compatibility_drains_independent_space_streams() {
         let mut seqs = Vec::new();
         for (id, row) in [(id_a, row_a1), (id_b, row_b1), (id_a, row_a2)] {
             let entry = fetch(&handle, id, &row).await.unwrap();
-            seqs.push(entry.tag.device_seq);
+            seqs.push(entry.device_entry.tag.device_seq);
         }
         assert_eq!(seqs, vec![DeviceSeq(1), DeviceSeq(1), DeviceSeq(2)]);
     });
@@ -299,7 +314,7 @@ fn offline_commit_survives_until_online_push() {
         {
             let offline_space = offline.space(space).await.unwrap();
             offline_space
-                .submit_checked(vec![(row.clone(), val(b"offline"))], vec![])
+                .submit_checked(vec![set(row.clone(), b"offline")], vec![])
                 .await
                 .unwrap();
         }
@@ -324,7 +339,14 @@ fn offline_commit_survives_until_online_push() {
         let cipher = envelope.open().unwrap();
         let encoded = cipher.encode_key(&row).unwrap();
         let stored = fetch(&handle, space, &encoded).await.unwrap();
-        assert_eq!(cipher.decode_entry_value(&stored).unwrap(), val(b"offline"));
+        assert_eq!(
+            cipher
+                .open_admitted_entry(&stored)
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(encoded, b"offline")
+        );
     });
 }
 
@@ -354,7 +376,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
             let space = client.space(space).await.unwrap();
             space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
-                .submit_checked(vec![(row.clone(), val(b"cached"))], vec![])
+                .submit_checked(vec![set(row.clone(), b"cached")], vec![])
                 .await
                 .unwrap();
             client.push().await.unwrap();
@@ -374,7 +396,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
         let pulled = space.pull(Range::Prefix(db)).await.unwrap();
         assert!(matches!(
             &pulled.ranges[0],
-            RangeCut::Snapshot(entries) if entries.len() == 1 && entries[0].value == val(b"cached")
+            RangeCut::Snapshot(entries) if entries.len() == 1 && entries[0].device_entry.mutation == set(entries[0].key().clone(), b"cached")
         ));
     });
 }
@@ -404,7 +426,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
             let writer_space = writer.space(space).await.unwrap();
             writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             writer_space
-                .submit_checked(vec![(row.clone(), val(b"roundtrip"))], vec![])
+                .submit_checked(vec![set(row.clone(), b"roundtrip")], vec![])
                 .await
                 .unwrap();
         }
@@ -426,7 +448,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         assert!(matches!(
             &pulled.ranges[0],
             RangeCut::Snapshot(entries)
-                if entries.len() == 1 && entries[0].value == val(b"roundtrip")
+                if entries.len() == 1 && entries[0].device_entry.mutation == set(entries[0].key().clone(), b"roundtrip")
         ));
     });
 }

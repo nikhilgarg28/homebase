@@ -1,5 +1,5 @@
 //! Lease management: the state machine behind `acquire` / `renew` /
-//! `release` / `list_leases`, plus the reservation check `put_batch`
+//! `release` / `list_leases`, plus the reservation check `admit`
 //! admission will use.
 //!
 //! All lease state lives in the ordered store (nothing special-cased in
@@ -214,7 +214,7 @@ impl LeaseManager {
         Ok(ListLeasesResponse { leases })
     }
 
-    /// The reservation check `put_batch` admission runs. Presented ids are
+    /// The reservation check `admit` admission runs. Presented ids are
     /// diagnostic evidence only; they never authorize or reject admission. A
     /// key may be written when no live foreign lease overlaps it.
     pub async fn validate_put<S: OrderedStore>(

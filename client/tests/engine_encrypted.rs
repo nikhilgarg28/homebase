@@ -9,10 +9,12 @@ use homebase::{Client, Mutation, PushOutcome};
 use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest, Range, RangeCut};
+use homebase_core::messages::{
+    AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec, Range, RangeCut,
+};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, DeviceSeq, Entry, Value};
+use homebase_core::tag::{AdmittedEntry, DeviceId, DeviceSeq};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -56,8 +58,18 @@ fn key(parts: &[&[u8]]) -> Key {
     Key::from_bytes(parts.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: bytes.to_vec(),
+    }
+}
+
+fn value(entry: &AdmittedEntry<Vec<u8>>) -> &[u8] {
+    match &entry.device_entry.mutation {
+        Mutation::Set { value, .. } => value,
+        Mutation::Delete { .. } => panic!("expected set"),
+    }
 }
 
 fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
@@ -94,7 +106,7 @@ async fn fetch_cipher(
     space: SpaceId,
     envelope: &SpaceEnvelope,
     logical: &Key,
-) -> Entry {
+) -> AdmittedEntry<Vec<u8>> {
     let cipher = envelope.open().unwrap();
     let encoded = cipher.encode_key(logical).unwrap();
     let stored = handle
@@ -109,13 +121,7 @@ async fn fetch_cipher(
         .entries
         .remove(0)
         .unwrap();
-    let value = cipher.decode_entry_value(&stored).unwrap();
-    Entry {
-        key: logical.clone(),
-        value,
-        seal: stored.seal,
-        tag: stored.tag,
-    }
+    cipher.open_admitted_entry(&stored).unwrap()
 }
 
 async fn queued(mem: &MemoryStore) -> usize {
@@ -166,7 +172,9 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
             panic!("expected snapshot")
         };
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].value, Value::Present(Vec::new()));
+        assert!(
+            matches!(&entries[0].device_entry.mutation, Mutation::Set { value, .. } if value.is_empty())
+        );
 
         space_handle
             .submit_checked(vec![Mutation::Delete { key: row.clone() }], vec![])
@@ -179,10 +187,13 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[0].key,
-            envelope.open().unwrap().encode_key(&row).unwrap()
+            entries[0].key(),
+            &envelope.open().unwrap().encode_key(&row).unwrap()
         );
-        assert_eq!(entries[0].value, Value::Absent);
+        assert!(matches!(
+            entries[0].device_entry.mutation,
+            Mutation::Delete { .. }
+        ));
     });
 }
 
@@ -211,7 +222,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             let space_handle = client.space(space).await.unwrap();
             let granted = space_handle.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space_handle
-                .submit_checked(vec![(row.clone(), val(b"secret"))], vec![])
+                .submit_checked(vec![set(row.clone(), b"secret")], vec![])
                 .await
                 .unwrap();
             granted.leases[0].id
@@ -239,13 +250,13 @@ fn encrypted_resume_keeps_wall_clock_authority() {
         assert_eq!(client.device(), dev(1));
 
         space_handle
-            .submit_checked(vec![(row.clone(), val(b"after-resume"))], vec![])
+            .submit_checked(vec![set(row.clone(), b"after-resume")], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
 
         let entry = fetch_cipher(&handle, space, &envelope, &row).await;
-        assert_eq!(entry.value, val(b"after-resume"));
+        assert_eq!(value(&entry), b"after-resume");
     });
 }
 
@@ -275,11 +286,11 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         let granted = space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let lease = granted.leases[0].id;
         space_handle
-            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
         space_handle
-            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
 
@@ -291,21 +302,21 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         let seq2 = DeviceSeq(seq1.0 + 1);
 
         handle
-            .put_batch(
+            .admit(
                 &space,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: client.device(),
                     evidence: vec![lease],
                     batches: vec![
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: seq1,
                             range_asserts: vec![],
-                            ops: oplog[&seq1].ops().to_vec(),
+                            entries: oplog[&seq1].entries().to_vec(),
                         },
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: seq2,
                             range_asserts: vec![],
-                            ops: oplog[&seq2].ops().to_vec(),
+                            entries: oplog[&seq2].entries().to_vec(),
                         },
                     ],
                 },
@@ -322,12 +333,12 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         assert_eq!(queued(&mem).await, 0);
 
         assert_eq!(
-            fetch_cipher(&handle, space, &envelope, &k1).await.value,
-            val(b"one")
+            value(&fetch_cipher(&handle, space, &envelope, &k1).await),
+            b"one"
         );
         assert_eq!(
-            fetch_cipher(&handle, space, &envelope, &k2).await.value,
-            val(b"two")
+            value(&fetch_cipher(&handle, space, &envelope, &k2).await),
+            b"two"
         );
         assert!(
             handle
@@ -389,7 +400,7 @@ fn push_stall_recovers_via_ensure() {
         let row = key(&[b"db", b"k"]);
         space_handle.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
-            .submit_checked(vec![(row.clone(), val(b"v"))], vec![])
+            .submit_checked(vec![set(row.clone(), b"v")], vec![])
             .await
             .unwrap();
 
@@ -401,8 +412,8 @@ fn push_stall_recovers_via_ensure() {
             }
         );
         assert_eq!(
-            fetch_cipher(&handle, space, &envelope, &row).await.value,
-            val(b"v")
+            value(&fetch_cipher(&handle, space, &envelope, &row).await),
+            b"v"
         );
     });
 }

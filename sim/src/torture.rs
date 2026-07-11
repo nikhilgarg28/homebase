@@ -9,11 +9,15 @@ use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
-    RangeCursor, ReadAtRequest, ReleaseRequest,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, KernelError, LeaseSpec, Range, RangeCursor,
+    ReadAtRequest, ReleaseRequest,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
+};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
 use rand::rngs::StdRng;
@@ -53,21 +57,26 @@ pub fn put_one(
     k: &Key,
     v: &[u8],
     ver: u64,
-) -> PutBatchRequest {
-    PutBatchRequest {
+) -> AdmissionRequest {
+    AdmissionRequest {
         device: dev(device),
         evidence: vec![lease],
-        batches: vec![PutBatch {
+        batches: vec![AdmissionBatch {
             device_seq: DeviceSeq(seq),
             range_asserts: vec![],
-            ops: vec![
-                PutEntry {
+            entries: vec![DeviceEntry {
+                mutation: Mutation::Set {
                     key: k.clone(),
-                    value: Value::Present(v.to_vec()),
+                    value: Ciphertext(v.to_vec()),
+                },
+                tag: DeviceTag {
+                    device: dev(device),
+                    device_seq: DeviceSeq(seq),
                     ver: Ver(ver),
-                }
-                .into(),
-            ],
+                    cipher_epoch: CipherEpoch(0),
+                },
+                seal: Seal::empty_aead_v1(),
+            }],
         }],
     }
 }
@@ -120,21 +129,21 @@ impl Replica {
                 self.live = entries
                     .iter()
                     .filter_map(|e| {
-                        let Value::Present(v) = &e.value else {
+                        let Mutation::Set { value: v, .. } = &e.device_entry.mutation else {
                             return None;
                         };
-                        Some((e.key.clone(), v.clone()))
+                        Some((e.key().clone(), v.0.clone()))
                     })
                     .collect();
             }
             (Some(_), homebase_core::messages::RangeCut::Delta(entries)) => {
                 for e in entries {
-                    match &e.value {
-                        Value::Present(v) => {
-                            self.live.insert(e.key.clone(), v.clone());
+                    match &e.device_entry.mutation {
+                        Mutation::Set { value: v, .. } => {
+                            self.live.insert(e.key().clone(), v.0.clone());
                         }
-                        Value::Absent => {
-                            self.live.remove(&e.key);
+                        Mutation::Delete { .. } => {
+                            self.live.remove(e.key());
                         }
                     }
                 }
@@ -265,7 +274,7 @@ pub fn run_expired_evidence_write(seed: u64) {
     let out = Rc::clone(&admitted);
     exec.spawn(async move {
         *out.borrow_mut() = Some(
-            h.put_batch(put_one(1, 1, l.unwrap(), &k, b"expired-evidence", 1))
+            h.admit(put_one(1, 1, l.unwrap(), &k, b"expired-evidence", 1))
                 .await
                 .unwrap()
                 .applied_admission_seq(0)
@@ -303,7 +312,7 @@ pub fn run_replica_sync(seed: u64) {
         let k = key(&[b"d0", format!("k{seq}").as_bytes()]);
         let l = lease.unwrap();
         exec.spawn(async move {
-            h.put_batch(put_one(0, seq, l, &k, format!("v{seq}").as_bytes(), 1))
+            h.admit(put_one(0, seq, l, &k, format!("v{seq}").as_bytes(), 1))
                 .await
                 .unwrap();
         });
@@ -324,6 +333,10 @@ pub fn run_replica_sync(seed: u64) {
     let audit = audit_sim_store(&store);
     assert_eq!(
         replica.live.len(),
-        audit.data.values().filter(|r| r.value.is_present()).count()
+        audit
+            .data
+            .values()
+            .filter(|r| r.entry.device_entry.mutation.is_set())
+            .count()
     );
 }

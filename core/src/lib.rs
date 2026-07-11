@@ -3,8 +3,7 @@
 //! This crate holds the types both the server and the client speak:
 //!
 //! - [`key`] — tuple keys and their order-preserving flat encoding
-//! - [`tag`] — value tags `(device, device_seq, epoch, ver, admission_seq)`
-//!   and stored entries
+//! - [`tag`] — device-authenticated mutations and admitted entries
 //! - [`lease`] — read/write leases and TTLs
 //! - [`clock`] — [`Timestamp`] and the [`Clock`] abstraction: real time for
 //!   servers and clients, hand-cranked time for tests and the sim
@@ -37,4 +36,7 @@ pub use lease::{Lease, LeaseId, LeaseMode};
 pub use messages::KernelError;
 pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};
-pub use tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Epoch, Tag, Value, Ver};
+pub use tag::{
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId,
+    DeviceSeq, DeviceTag, Mutation, Ver,
+};

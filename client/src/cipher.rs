@@ -16,10 +16,10 @@ use chacha20poly1305::{Key as AeadKey, Tag as AeadTag, XChaCha20Poly1305, XNonce
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use homebase_core::key::{Key, KeyComponent, KeyError};
-use homebase_core::messages::{BatchOp, PutEntry, Range};
+use homebase_core::messages::Range;
 use homebase_core::seal::{Seal, SealScheme};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{DeviceId, DeviceSeq, Tag, Value, Ver};
+use homebase_core::tag::{AdmittedEntry, Ciphertext, DeviceEntry, DeviceTag, Mutation};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,23 +74,6 @@ enum CipherMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueNonce(pub [u8; VALUE_NONCE_LEN]);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ValueContext {
-    pub device: DeviceId,
-    pub device_seq: DeviceSeq,
-    pub ver: Ver,
-}
-
-impl ValueContext {
-    fn from_tag(tag: &Tag) -> Self {
-        Self {
-            device: tag.device,
-            device_seq: tag.device_seq,
-            ver: tag.ver,
-        }
-    }
-}
 
 pub trait NonceSource {
     fn next_nonce(&mut self) -> Result<ValueNonce, String>;
@@ -321,93 +304,98 @@ impl SpaceCipher {
     ///
     /// Plaintext spaces retain the same Set/Delete wire shapes but pass Set
     /// bytes through without the encrypted-value frame.
-    pub fn encode_batch_op(
+    pub fn encode_device_entry(
         &self,
-        device: DeviceId,
-        device_seq: DeviceSeq,
-        entry: &PutEntry,
+        mutation: Mutation,
+        tag: DeviceTag,
         nonce: ValueNonce,
-    ) -> Result<BatchOp, CipherError> {
-        let context = ValueContext {
-            device,
-            device_seq,
-            ver: entry.ver,
-        };
-        match &entry.value {
-            Value::Present(value) => {
+    ) -> Result<DeviceEntry, CipherError> {
+        let (mutation, seal) = match mutation {
+            Mutation::Set { key, value } => {
                 let framed = match self.mode {
-                    CipherMode::Plaintext => value.clone(),
+                    CipherMode::Plaintext => value,
                     CipherMode::Encrypted { .. } => {
                         let mut framed = Vec::with_capacity(value.len() + 1);
                         framed.push(SET_FRAME_V1);
-                        framed.extend_from_slice(value);
+                        framed.extend_from_slice(&value);
                         framed
                     }
                 };
                 let (seal, ciphertext) =
-                    self.seal_detached(&entry.key, SET_OP_KIND, framed, context, nonce)?;
-                Ok(BatchOp::Set {
-                    key: entry.key.clone(),
-                    ver: entry.ver,
+                    self.seal_detached(&key, SET_OP_KIND, framed, tag, nonce)?;
+                (
+                    Mutation::Set {
+                        key,
+                        value: Ciphertext(ciphertext),
+                    },
                     seal,
-                    ciphertext,
-                })
+                )
             }
-            Value::Absent => {
+            Mutation::Delete { key } => {
                 let (seal, ciphertext) =
-                    self.seal_detached(&entry.key, DELETE_OP_KIND, Vec::new(), context, nonce)?;
+                    self.seal_detached(&key, DELETE_OP_KIND, Vec::new(), tag, nonce)?;
                 debug_assert!(ciphertext.is_empty());
-                Ok(BatchOp::Delete {
-                    key: entry.key.clone(),
-                    ver: entry.ver,
-                    seal,
-                })
+                (Mutation::Delete { key }, seal)
             }
-        }
+        };
+        Ok(DeviceEntry {
+            mutation,
+            tag,
+            seal,
+        })
     }
 
-    /// Authenticate and decode one server entry. The key remains in its
-    /// server-visible anonymized form; only the logical value is returned.
-    pub fn decode_entry_value(
+    /// Authenticate and open one server-admitted entry.
+    pub fn open_admitted_entry(
         &self,
-        entry: &homebase_core::tag::Entry,
-    ) -> Result<Value, CipherError> {
-        if matches!(self.mode, CipherMode::Plaintext) {
-            entry
-                .seal
-                .validate_payload()
-                .map_err(|_| CipherError::MalformedSealedValue)?;
-            return Ok(entry.value.clone());
-        }
-        let context = ValueContext::from_tag(&entry.tag);
-        match &entry.value {
-            Value::Present(ciphertext) => {
+        entry: &AdmittedEntry,
+    ) -> Result<AdmittedEntry<Vec<u8>>, CipherError> {
+        let device = &entry.device_entry;
+        device
+            .seal
+            .validate_payload()
+            .map_err(|_| CipherError::MalformedSealedValue)?;
+        let mutation = match (&self.mode, &device.mutation) {
+            (CipherMode::Plaintext, Mutation::Set { key, value }) => Mutation::Set {
+                key: key.clone(),
+                value: value.0.clone(),
+            },
+            (CipherMode::Plaintext, Mutation::Delete { key }) => {
+                Mutation::Delete { key: key.clone() }
+            }
+            (CipherMode::Encrypted { .. }, Mutation::Set { key, value }) => {
                 let plaintext = self.open_detached(
-                    &entry.key,
+                    key,
                     SET_OP_KIND,
-                    ciphertext.clone(),
-                    &entry.seal,
-                    context,
+                    value.0.clone(),
+                    &device.seal,
+                    device.tag,
                 )?;
                 let Some((&SET_FRAME_V1, value)) = plaintext.split_first() else {
                     return Err(CipherError::MalformedSealedValue);
                 };
-                Ok(Value::Present(value.to_vec()))
+                Mutation::Set {
+                    key: key.clone(),
+                    value: value.to_vec(),
+                }
             }
-            Value::Absent => {
-                let plaintext = self.open_detached(
-                    &entry.key,
-                    DELETE_OP_KIND,
-                    Vec::new(),
-                    &entry.seal,
-                    context,
-                )?;
+            (CipherMode::Encrypted { .. }, Mutation::Delete { key }) => {
+                let plaintext =
+                    self.open_detached(key, DELETE_OP_KIND, Vec::new(), &device.seal, device.tag)?;
                 if !plaintext.is_empty() {
                     return Err(CipherError::MalformedSealedValue);
                 }
-                Ok(Value::Absent)
+                Mutation::Delete { key: key.clone() }
             }
-        }
+        };
+        Ok(AdmittedEntry {
+            device_entry: DeviceEntry {
+                mutation,
+                tag: device.tag,
+                seal: device.seal.clone(),
+            },
+            admission: entry.admission,
+        })
     }
 
     fn seal_detached(
@@ -415,19 +403,19 @@ impl SpaceCipher {
         encoded_key: &Key,
         op_kind: u8,
         mut plaintext: Vec<u8>,
-        context: ValueContext,
+        context: DeviceTag,
         nonce: ValueNonce,
     ) -> Result<(Seal, Vec<u8>), CipherError> {
         match &self.mode {
             CipherMode::Plaintext => Ok((Seal::empty_aead_v1(), plaintext)),
             CipherMode::Encrypted { space_keys, .. } => {
-                let key = space_keys
-                    .get(&V1_CIPHER_EPOCH)
-                    .ok_or(CipherError::MissingSpaceKey {
-                        epoch: V1_CIPHER_EPOCH,
-                    })?;
+                let key = space_keys.get(&context.cipher_epoch.0).ok_or(
+                    CipherError::MissingSpaceKey {
+                        epoch: context.cipher_epoch.0,
+                    },
+                )?;
                 let scheme = SealScheme::AeadV1;
-                let aad = seal_aad(encoded_key, scheme, op_kind, V1_CIPHER_EPOCH, context);
+                let aad = seal_aad(encoded_key, scheme, op_kind, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -457,19 +445,19 @@ impl SpaceCipher {
         op_kind: u8,
         mut ciphertext: Vec<u8>,
         seal: &Seal,
-        context: ValueContext,
+        context: DeviceTag,
     ) -> Result<Vec<u8>, CipherError> {
         seal.validate_payload()
             .map_err(|_| CipherError::MalformedSealedValue)?;
         match &self.mode {
             CipherMode::Plaintext => Ok(ciphertext),
             CipherMode::Encrypted { space_keys, .. } => {
-                let key = space_keys
-                    .get(&V1_CIPHER_EPOCH)
-                    .ok_or(CipherError::MissingSpaceKey {
-                        epoch: V1_CIPHER_EPOCH,
-                    })?;
-                let aad = seal_aad(encoded_key, seal.scheme, op_kind, V1_CIPHER_EPOCH, context);
+                let key = space_keys.get(&context.cipher_epoch.0).ok_or(
+                    CipherError::MissingSpaceKey {
+                        epoch: context.cipher_epoch.0,
+                    },
+                )?;
+                let aad = seal_aad(encoded_key, seal.scheme, op_kind, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -526,19 +514,13 @@ fn child_name_key(path_key: &[u8; KEY_LEN], component: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn seal_aad(
-    encoded_key: &Key,
-    scheme: SealScheme,
-    op_kind: u8,
-    cipher_epoch: u64,
-    context: ValueContext,
-) -> Vec<u8> {
+fn seal_aad(encoded_key: &Key, scheme: SealScheme, op_kind: u8, context: DeviceTag) -> Vec<u8> {
     let key = encoded_key.encode();
     let mut out = Vec::with_capacity(SEAL_AAD_PREFIX.len() + 2 + 8 + 16 + 8 + 8 + 4 + key.len());
     out.extend_from_slice(SEAL_AAD_PREFIX);
     out.push(scheme.to_u8());
     out.push(op_kind);
-    out.extend_from_slice(&cipher_epoch.to_be_bytes());
+    out.extend_from_slice(&context.cipher_epoch.0.to_be_bytes());
     out.extend_from_slice(&context.device.0);
     out.extend_from_slice(&context.device_seq.0.to_be_bytes());
     out.extend_from_slice(&context.ver.0.to_be_bytes());
@@ -550,7 +532,7 @@ fn seal_aad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use homebase_core::tag::{AdmissionSeq, Epoch};
+    use homebase_core::tag::{AdmissionSeq, AdmissionTag, CipherEpoch, DeviceId, DeviceSeq, Ver};
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
@@ -568,40 +550,28 @@ mod tests {
         ValueNonce([n; VALUE_NONCE_LEN])
     }
 
-    fn context(ver: u64) -> ValueContext {
-        ValueContext {
+    fn context(ver: u64) -> DeviceTag {
+        DeviceTag {
             device: DeviceId([7; 16]),
             device_seq: DeviceSeq(8),
             ver: Ver(ver),
+            cipher_epoch: CipherEpoch(0),
         }
     }
 
-    fn stored(op: &BatchOp, context: ValueContext) -> homebase_core::tag::Entry {
-        let (key, value, seal) = match op {
-            BatchOp::Set {
-                key,
-                ciphertext,
-                seal,
-                ..
-            } => (
-                key.clone(),
-                Value::Present(ciphertext.clone()),
-                seal.clone(),
-            ),
-            BatchOp::Delete { key, seal, .. } => (key.clone(), Value::Absent, seal.clone()),
-            BatchOp::NoOp => panic!("NoOp has no stored value"),
-        };
-        homebase_core::tag::Entry {
-            key,
-            value,
-            seal,
-            tag: Tag {
-                device: context.device,
-                device_seq: context.device_seq,
-                epoch: Epoch(0),
-                ver: context.ver,
+    fn admitted(device_entry: DeviceEntry) -> AdmittedEntry {
+        AdmittedEntry {
+            device_entry,
+            admission: AdmissionTag {
                 admission_seq: AdmissionSeq(0),
             },
+        }
+    }
+
+    fn set(key: Key, value: &[u8]) -> Mutation {
+        Mutation::Set {
+            key,
+            value: value.to_vec(),
         }
     }
 
@@ -627,25 +597,20 @@ mod tests {
         let raw = key(&[b"db", b"k"]);
         assert_eq!(codec.space_id(), id);
         assert_eq!(codec.encode_key(&raw).unwrap(), raw);
-        let op = codec
-            .encode_batch_op(
-                context(1).device,
-                context(1).device_seq,
-                &PutEntry {
-                    key: raw,
-                    value: Value::Present(b"v".to_vec()),
-                    ver: Ver(1),
-                },
-                nonce(3),
-            )
+        let entry = codec
+            .encode_device_entry(set(raw, b"v"), context(1), nonce(3))
             .unwrap();
-        let BatchOp::Set { ciphertext, .. } = &op else {
+        let Mutation::Set { value, .. } = &entry.mutation else {
             panic!("set changed shape")
         };
-        assert_eq!(ciphertext, b"v");
+        assert_eq!(value.0, b"v");
         assert_eq!(
-            codec.decode_entry_value(&stored(&op, context(1))).unwrap(),
-            Value::Present(b"v".to_vec())
+            codec
+                .open_admitted_entry(&admitted(entry))
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(key(&[b"db", b"k"]), b"v")
         );
     }
 
@@ -688,29 +653,21 @@ mod tests {
             .open()
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
-        let op = codec
-            .encode_batch_op(
-                context(9).device,
-                context(9).device_seq,
-                &PutEntry {
-                    key: encoded_key,
-                    value: Value::Present(Vec::new()),
-                    ver: Ver(9),
-                },
-                nonce(3),
-            )
+        let entry = codec
+            .encode_device_entry(set(encoded_key.clone(), b""), context(9), nonce(3))
             .unwrap();
-        let BatchOp::Set {
-            ciphertext, seal, ..
-        } = &op
-        else {
+        let Mutation::Set { value, .. } = &entry.mutation else {
             panic!("set changed shape")
         };
-        assert_eq!(ciphertext.len(), 1);
-        assert_eq!(seal.payload, Vec::<u8>::new());
+        assert_eq!(value.0.len(), 1);
+        assert!(entry.seal.payload.is_empty());
         assert_eq!(
-            codec.decode_entry_value(&stored(&op, context(9))).unwrap(),
-            Value::Present(Vec::new())
+            codec
+                .open_admitted_entry(&admitted(entry))
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(encoded_key, b"")
         );
     }
 
@@ -720,25 +677,26 @@ mod tests {
             .open()
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
-        let op = codec
-            .encode_batch_op(
-                context(9).device,
-                context(9).device_seq,
-                &PutEntry {
-                    key: encoded_key,
-                    value: Value::Absent,
-                    ver: Ver(9),
+        let entry = codec
+            .encode_device_entry(
+                Mutation::Delete {
+                    key: encoded_key.clone(),
                 },
+                context(9),
                 nonce(5),
             )
             .unwrap();
-        let BatchOp::Delete { seal, .. } = &op else {
+        let Mutation::Delete { .. } = &entry.mutation else {
             panic!("delete changed shape")
         };
-        assert_ne!(seal.aead, [0; 16]);
+        assert_ne!(entry.seal.aead, [0; 16]);
         assert_eq!(
-            codec.decode_entry_value(&stored(&op, context(9))).unwrap(),
-            Value::Absent
+            codec
+                .open_admitted_entry(&admitted(entry))
+                .unwrap()
+                .device_entry
+                .mutation,
+            Mutation::Delete { key: encoded_key }
         );
     }
 
@@ -748,51 +706,49 @@ mod tests {
             .open()
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
-        let op = codec
-            .encode_batch_op(
-                context(9).device,
-                context(9).device_seq,
-                &PutEntry {
-                    key: encoded_key,
-                    value: Value::Present(b"secret".to_vec()),
-                    ver: Ver(9),
-                },
-                nonce(5),
-            )
+        let entry = codec
+            .encode_device_entry(set(encoded_key, b"secret"), context(9), nonce(5))
             .unwrap();
 
-        let mut wrong_key = stored(&op, context(9));
-        wrong_key.key = codec.encode_key(&key(&[b"db", b"other"])).unwrap();
+        let mut wrong_key = admitted(entry.clone());
+        match &mut wrong_key.device_entry.mutation {
+            Mutation::Set { key: entry_key, .. } => {
+                *entry_key = codec.encode_key(&key(&[b"db", b"other"])).unwrap()
+            }
+            Mutation::Delete { .. } => unreachable!(),
+        }
         assert_eq!(
-            codec.decode_entry_value(&wrong_key),
+            codec.open_admitted_entry(&wrong_key),
             Err(CipherError::DecryptFailed)
         );
 
-        let mut wrong_kind = stored(&op, context(9));
-        wrong_kind.value = Value::Absent;
+        let mut wrong_kind = admitted(entry.clone());
+        wrong_kind.device_entry.mutation = Mutation::Delete {
+            key: wrong_kind.key().clone(),
+        };
         assert_eq!(
-            codec.decode_entry_value(&wrong_kind),
+            codec.open_admitted_entry(&wrong_kind),
             Err(CipherError::DecryptFailed)
         );
 
         for tag in [
-            Tag {
+            DeviceTag {
                 device: DeviceId([8; 16]),
-                ..stored(&op, context(9)).tag
+                ..context(9)
             },
-            Tag {
+            DeviceTag {
                 device_seq: DeviceSeq(9),
-                ..stored(&op, context(9)).tag
+                ..context(9)
             },
-            Tag {
+            DeviceTag {
                 ver: Ver(10),
-                ..stored(&op, context(9)).tag
+                ..context(9)
             },
         ] {
-            let mut entry = stored(&op, context(9));
-            entry.tag = tag;
+            let mut entry = admitted(entry.clone());
+            entry.device_entry.tag = tag;
             assert_eq!(
-                codec.decode_entry_value(&entry),
+                codec.open_admitted_entry(&entry),
                 Err(CipherError::DecryptFailed)
             );
         }
@@ -804,47 +760,38 @@ mod tests {
             .open()
             .unwrap();
         let encoded_key = codec.encode_key(&key(&[b"db", b"k"])).unwrap();
-        let op = codec
-            .encode_batch_op(
-                context(9).device,
-                context(9).device_seq,
-                &PutEntry {
-                    key: encoded_key,
-                    value: Value::Present(b"secret".to_vec()),
-                    ver: Ver(9),
-                },
-                nonce(5),
-            )
+        let entry = codec
+            .encode_device_entry(set(encoded_key, b"secret"), context(9), nonce(5))
             .unwrap();
 
-        let mut ciphertext = stored(&op, context(9));
-        let Value::Present(bytes) = &mut ciphertext.value else {
+        let mut ciphertext = admitted(entry.clone());
+        let Mutation::Set { value, .. } = &mut ciphertext.device_entry.mutation else {
             unreachable!()
         };
-        bytes[0] ^= 1;
+        value.0[0] ^= 1;
         assert_eq!(
-            codec.decode_entry_value(&ciphertext),
+            codec.open_admitted_entry(&ciphertext),
             Err(CipherError::DecryptFailed)
         );
 
-        let mut nonce = stored(&op, context(9));
-        nonce.seal.nonce[0] ^= 1;
+        let mut nonce = admitted(entry.clone());
+        nonce.device_entry.seal.nonce[0] ^= 1;
         assert_eq!(
-            codec.decode_entry_value(&nonce),
+            codec.open_admitted_entry(&nonce),
             Err(CipherError::DecryptFailed)
         );
 
-        let mut tag = stored(&op, context(9));
-        tag.seal.aead[0] ^= 1;
+        let mut tag = admitted(entry.clone());
+        tag.device_entry.seal.aead[0] ^= 1;
         assert_eq!(
-            codec.decode_entry_value(&tag),
+            codec.open_admitted_entry(&tag),
             Err(CipherError::DecryptFailed)
         );
 
-        let mut payload = stored(&op, context(9));
-        payload.seal.payload.push(1);
+        let mut payload = admitted(entry);
+        payload.device_entry.seal.payload.push(1);
         assert_eq!(
-            codec.decode_entry_value(&payload),
+            codec.open_admitted_entry(&payload),
             Err(CipherError::MalformedSealedValue)
         );
     }
@@ -854,25 +801,15 @@ mod tests {
         let codec = SpaceEnvelope::encrypted(name_key(1), space_key(2))
             .open()
             .unwrap();
-        let entry = PutEntry {
-            key: codec.encode_key(&key(&[b"db", b"k"])).unwrap(),
-            value: Value::Present(b"secret".to_vec()),
-            ver: Ver(9),
-        };
+        let mutation = set(codec.encode_key(&key(&[b"db", b"k"])).unwrap(), b"secret");
         let first = codec
-            .encode_batch_op(context(9).device, context(9).device_seq, &entry, nonce(5))
+            .encode_device_entry(mutation.clone(), context(9), nonce(5))
             .unwrap();
         let second = codec
-            .encode_batch_op(context(9).device, context(9).device_seq, &entry, nonce(6))
+            .encode_device_entry(mutation, context(9), nonce(6))
             .unwrap();
-        let (
-            BatchOp::Set {
-                ciphertext: first, ..
-            },
-            BatchOp::Set {
-                ciphertext: second, ..
-            },
-        ) = (&first, &second)
+        let (Mutation::Set { value: first, .. }, Mutation::Set { value: second, .. }) =
+            (&first.mutation, &second.mutation)
         else {
             panic!("sets changed shape")
         };

@@ -8,10 +8,13 @@ use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry};
+use homebase_core::messages::{AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec};
+use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use homebase_sim::store::{FaultConfig, SimStore};
@@ -40,8 +43,31 @@ fn key(parts: &[&[u8]]) -> Key {
     Key::from_bytes(parts.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn val(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: val(bytes),
+    }
+}
+
+fn wire_entry(device: DeviceId, seq: DeviceSeq, key: Key, value: &[u8], ver: Ver) -> DeviceEntry {
+    DeviceEntry {
+        mutation: Mutation::Set {
+            key,
+            value: Ciphertext(val(value)),
+        },
+        tag: DeviceTag {
+            device,
+            device_seq: seq,
+            ver,
+            cipher_epoch: CipherEpoch(0),
+        },
+        seal: Seal::empty_aead_v1(),
+    }
 }
 
 fn wspec(prefix: &Key) -> LeaseSpec {
@@ -62,8 +88,8 @@ fn spawn_server() -> impl Fn(&SpaceId) -> Option<SpaceHandle> + Sync {
     move |id: &SpaceId| server.space(id)
 }
 
-async fn fetch(handle: &impl ServerHandle, k: &Key) -> Value {
-    handle
+async fn fetch(handle: &impl ServerHandle, k: &Key) -> Vec<u8> {
+    let entry = handle
         .get(
             &SPACE,
             GetRequest {
@@ -74,8 +100,11 @@ async fn fetch(handle: &impl ServerHandle, k: &Key) -> Value {
         .unwrap()
         .entries
         .remove(0)
-        .unwrap()
-        .value
+        .unwrap();
+    match entry.device_entry.mutation {
+        Mutation::Set { value, .. } => value.0,
+        Mutation::Delete { .. } => panic!("expected live value"),
+    }
 }
 
 #[test]
@@ -114,7 +143,7 @@ async fn run_flushed_crash_seed(seed: u64) {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
         space
-            .submit_checked(vec![(row.clone(), val(b"survived"))], vec![])
+            .submit_checked(vec![set(row.clone(), b"survived")], vec![])
             .await
             .unwrap();
         sim.flush();
@@ -165,7 +194,7 @@ fn unflushed_commit_is_lost_on_crash() {
             let space = client.space(SPACE).await.unwrap();
             space.acquire(vec![wspec(&db)]).await.unwrap();
             space
-                .submit_checked(vec![(row.clone(), val(b"volatile"))], vec![])
+                .submit_checked(vec![set(row.clone(), b"volatile")], vec![])
                 .await
                 .unwrap();
         }
@@ -198,11 +227,11 @@ fn flushed_rollback_survives_crash_as_one_cursor_marker_transition() {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&db)]).await.unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"a"]), val(b"one"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"a"]), b"one")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"b"]), val(b"two"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"b"]), b"two")], vec![])
             .await
             .unwrap();
         client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
@@ -247,15 +276,15 @@ fn unflushed_rollback_crash_recovers_the_complete_pre_transition_state() {
         );
         let meta = OrderedMetaStore::new(sim.clone());
         for name in [b"a".as_slice(), b"b".as_slice()] {
-            let reserved = meta
-                .reserve_commit(
-                    SPACE,
-                    vec![(key(&[b"db", name]), Value::Present(name.to_vec()))],
-                    Vec::new(),
-                )
-                .await
-                .unwrap();
-            meta.commit(SPACE, reserved).await.unwrap();
+            let reserved = meta.reserve_commit(SPACE, 1, Vec::new()).await.unwrap();
+            let entry = wire_entry(
+                dev(1),
+                reserved.seq,
+                key(&[b"db", name]),
+                name,
+                reserved.versions[0],
+            );
+            meta.commit(SPACE, reserved, vec![entry]).await.unwrap();
         }
         sim.flush();
 
@@ -295,11 +324,11 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
         let space = client.space(SPACE).await.unwrap();
         space.acquire(vec![wspec(&key(&[b"db"]))]).await.unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"a"]), val(b"one"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"a"]), b"one")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"b"]), val(b"two"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"b"]), b"two")], vec![])
             .await
             .unwrap();
         client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
@@ -308,15 +337,15 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
         // Admit only the rollback marker and drop the response before the
         // client can trim its retained dead prefix.
         handle
-            .put_batch(
+            .admit(
                 &SPACE,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: client.device(),
                     evidence: vec![],
-                    batches: vec![PutBatch {
+                    batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(3),
                         range_asserts: vec![],
-                        ops: vec![],
+                        entries: vec![],
                     }],
                 },
             )
@@ -370,45 +399,43 @@ fn ack_drop_trims_after_server_admitted() {
         let granted = space.acquire(vec![wspec(&db)]).await.unwrap();
         let lease = granted.leases[0].id;
         space
-            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
         sim.flush();
 
         handle
-            .put_batch(
+            .admit(
                 &SPACE,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: client.device(),
                     evidence: vec![lease],
                     batches: vec![
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: DeviceSeq(1),
                             range_asserts: vec![],
-                            ops: vec![
-                                PutEntry {
-                                    key: k1.clone(),
-                                    value: val(b"one"),
-                                    ver: Ver(1),
-                                }
-                                .into(),
-                            ],
+                            entries: vec![wire_entry(
+                                client.device(),
+                                DeviceSeq(1),
+                                k1.clone(),
+                                b"one",
+                                Ver(1),
+                            )],
                         },
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: DeviceSeq(2),
                             range_asserts: vec![],
-                            ops: vec![
-                                PutEntry {
-                                    key: k2.clone(),
-                                    value: val(b"two"),
-                                    ver: Ver(2),
-                                }
-                                .into(),
-                            ],
+                            entries: vec![wire_entry(
+                                client.device(),
+                                DeviceSeq(2),
+                                k2.clone(),
+                                b"two",
+                                Ver(2),
+                            )],
                         },
                     ],
                 },

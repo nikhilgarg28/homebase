@@ -55,7 +55,7 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         .into_iter()
         .map(|(k, v)| {
             let key = user_key_from_data(&k).expect("undecodable data key");
-            let record = DataRecord::decode(&v).expect("undecodable data record");
+            let record = DataRecord::decode(key.clone(), &v).expect("undecodable data record");
             (key, record)
         })
         .collect();
@@ -66,7 +66,7 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
         let key = user_key_from_changelog(&storage_key).expect("undecodable changelog key");
         let components = decode_components(&storage_key).unwrap();
         let seq = u64::from_be_bytes(components[2].as_bytes().try_into().expect("seq width"));
-        let record = DataRecord::decode(&bytes).expect("undecodable changelog record");
+        let record = DataRecord::decode(key.clone(), &bytes).expect("undecodable changelog record");
 
         assert!(
             changelog_keys.insert(key.clone()),
@@ -80,7 +80,7 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
             "changelog bytes diverge from data at {key:?}"
         );
         assert_eq!(
-            seq, record.tag.admission_seq.0,
+            seq, record.entry.admission.admission_seq.0,
             "changelog position diverges from record tag at {key:?}"
         );
         max_seq = max_seq.max(seq);
@@ -138,8 +138,8 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
             let slot = expected
                 .entry(prefix_meta_key(space, &components[..depth]))
                 .or_insert((0, 0));
-            slot.0 = slot.0.max(record.tag.admission_seq.0);
-            slot.1 += record.value.is_present() as u64;
+            slot.0 = slot.0.max(record.entry.admission.admission_seq.0);
+            slot.1 += record.entry.device_entry.mutation.is_set() as u64;
         }
     }
     let stored: BTreeMap<Vec<u8>, (u64, u64)> = scan_all(store, &prefix_meta_scan_all(space))
@@ -152,7 +152,10 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
     assert_eq!(stored, expected, "aggregates diverged from recomputation");
 
     // -- device high waters ------------------------------------------------------
-    let devices: BTreeSet<DeviceId> = data.values().map(|r| r.tag.device).collect();
+    let devices: BTreeSet<DeviceId> = data
+        .values()
+        .map(|r| r.entry.device_entry.tag.device)
+        .collect();
     for device in devices {
         let record = block_on(store.get(&device_key(space, device)))
             .unwrap()
@@ -160,8 +163,8 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
             .unwrap_or_else(|| panic!("data from {device:?} but no device record"));
         let max_tag = data
             .values()
-            .filter(|r| r.tag.device == device)
-            .map(|r| r.tag.device_seq)
+            .filter(|r| r.entry.device_entry.tag.device == device)
+            .map(|r| r.entry.device_entry.tag.device_seq)
             .max()
             .unwrap();
         assert!(

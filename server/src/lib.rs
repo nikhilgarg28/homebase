@@ -111,10 +111,14 @@ mod tests {
     use homebase_core::key::Key;
     use homebase_core::lease::LeaseMode;
     use homebase_core::messages::{
-        AcquireRequest, GetRequest, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+        AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec,
     };
+    use homebase_core::seal::Seal;
     use homebase_core::space::Space as _;
-    use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+    use homebase_core::tag::{
+        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+        Mutation, Ver,
+    };
     use std::cell::Cell;
     use std::pin::Pin;
     use std::rc::Rc;
@@ -178,20 +182,25 @@ mod tests {
             .unwrap();
         let lease = granted.leases[0].id;
         handle
-            .put_batch(PutBatchRequest {
+            .admit(AdmissionRequest {
                 device: dev(1),
                 evidence: vec![lease],
-                batches: vec![PutBatch {
+                batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(1),
                     range_asserts: vec![],
-                    ops: vec![
-                        PutEntry {
+                    entries: vec![DeviceEntry {
+                        mutation: Mutation::Set {
                             key: key(&[b"db", b"marker"]),
-                            value: Value::Present(marker.to_vec()),
+                            value: Ciphertext(marker.to_vec()),
+                        },
+                        tag: DeviceTag {
+                            device: dev(1),
+                            device_seq: DeviceSeq(1),
                             ver: Ver(1),
-                        }
-                        .into(),
-                    ],
+                            cipher_epoch: CipherEpoch(0),
+                        },
+                        seal: Seal::empty_aead_v1(),
+                    }],
                 }],
             })
             .await
@@ -207,10 +216,12 @@ mod tests {
             })
             .await
             .unwrap();
-        got.entries[0].as_ref().map(|e| match &e.value {
-            Value::Present(v) => v.clone(),
-            Value::Absent => panic!("tombstone in get"),
-        })
+        got.entries[0]
+            .as_ref()
+            .map(|e| match &e.device_entry.mutation {
+                Mutation::Set { value, .. } => value.0.clone(),
+                Mutation::Delete { .. } => panic!("tombstone in get"),
+            })
     }
 
     #[test]

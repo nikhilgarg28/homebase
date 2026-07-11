@@ -6,9 +6,9 @@
 //! lives — so transport details never leak into kernel semantics or
 //! validated types like [`Key`].
 //!
-//! Value bytes are opaque throughout: by the time a [`Value::Present`]
-//! reaches these messages it is already ciphertext (the E2EE codec is a
-//! client-side layer), and the kernel could not interpret it if it wanted to.
+//! Device-entry bytes are opaque throughout: by the time they reach these
+//! messages they are ciphertext, and the kernel could not interpret them if
+//! it wanted to.
 //!
 //! The verb contract itself is [`Space`](crate::space::Space). A request
 //! executes within exactly one space, selected by the authenticated
@@ -19,8 +19,7 @@
 use crate::clock::HybridTimestamp;
 use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode};
-use crate::seal::Seal;
-use crate::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Value, Ver};
+use crate::tag::{AdmissionSeq, AdmittedEntry, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, Ver};
 use std::fmt;
 use std::time::Duration;
 
@@ -117,7 +116,7 @@ pub struct ListLeasesResponse {
 }
 
 // ---------------------------------------------------------------------------
-// put_batch
+// admission
 
 /// Inclusive upper bound on foreign-device admissions under a prefix.
 ///
@@ -138,81 +137,10 @@ pub struct RangeAssertFailure {
     pub actual: AdmissionSeq,
 }
 
-/// One v2 data operation within a client batch.
-///
-/// Set ciphertext is separate from the AEAD tag stored in [`Seal`]. To avoid
-/// leaking empty logical values as empty ciphertexts, clients should encrypt a
-/// non-empty Set plaintext frame even when the application value is empty.
+/// One device-sequenced unit within an atomic admission request. An empty
+/// `entries` vector is the wire no-op used for a local rollback marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BatchOp {
-    Set {
-        key: Key,
-        ver: Ver,
-        seal: Seal,
-        ciphertext: Vec<u8>,
-    },
-    Delete {
-        key: Key,
-        ver: Ver,
-        seal: Seal,
-    },
-    NoOp,
-}
-
-impl BatchOp {
-    pub fn key(&self) -> Option<&Key> {
-        match self {
-            Self::Set { key, .. } | Self::Delete { key, .. } => Some(key),
-            Self::NoOp => None,
-        }
-    }
-
-    pub fn ver(&self) -> Option<Ver> {
-        match self {
-            Self::Set { ver, .. } | Self::Delete { ver, .. } => Some(*ver),
-            Self::NoOp => None,
-        }
-    }
-
-    pub fn seal(&self) -> Option<&Seal> {
-        match self {
-            Self::Set { seal, .. } | Self::Delete { seal, .. } => Some(seal),
-            Self::NoOp => None,
-        }
-    }
-}
-
-/// Internal unstamped-value bridge used while the client reserves versions.
-/// Persisted oplog and server wire records use [`BatchOp`] instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PutEntry {
-    pub key: Key,
-    pub value: Value,
-    /// Must be strictly greater than the stored `Ver` for this key.
-    pub ver: Ver,
-}
-
-impl From<PutEntry> for BatchOp {
-    fn from(entry: PutEntry) -> Self {
-        match entry.value {
-            Value::Present(ciphertext) => Self::Set {
-                key: entry.key,
-                ver: entry.ver,
-                seal: Seal::empty_aead_v1(),
-                ciphertext,
-            },
-            Value::Absent => Self::Delete {
-                key: entry.key,
-                ver: entry.ver,
-                seal: Seal::empty_aead_v1(),
-            },
-        }
-    }
-}
-
-/// One client commit within an atomic put request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PutBatch {
+pub struct AdmissionBatch {
     /// Client-assigned, strictly increasing per device; one per client
     /// commit. A request may coalesce successive client commits without
     /// erasing their individual seq identity.
@@ -220,10 +148,10 @@ pub struct PutBatch {
     /// Assertions evaluated against the scratch prefix state immediately
     /// before this client batch is applied.
     pub range_asserts: Vec<RangeAssert>,
-    pub ops: Vec<BatchOp>,
+    pub entries: Vec<DeviceEntry>,
 }
 
-/// Atomic write request (request = transaction; torn requests impossible).
+/// Atomic admission request (request = transaction; torn requests impossible).
 ///
 /// Admission requires: no Set/Delete key overlaps a live foreign lease
 /// reservation, every Set/Delete has a valid [`Seal`], and every Set/Delete
@@ -231,33 +159,33 @@ pub struct PutBatch {
 /// Presented lease ids are diagnostic evidence only. Any violation rejects
 /// the whole batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PutBatchRequest {
+pub struct AdmissionRequest {
     pub device: DeviceId,
     /// Diagnostic lease evidence only; never admission authority.
     pub evidence: Vec<LeaseId>,
     /// Successive client commits to admit atomically in one server turn.
-    pub batches: Vec<PutBatch>,
+    pub batches: Vec<AdmissionBatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PutBatchResponse {
+pub struct AdmissionResponse {
     /// One result per input batch, in order. Current in-process admission is
     /// still all-or-nothing, so a successful response contains only
-    /// [`PutBatchResult::Applied`]; failed elements are the wire shape for
+    /// [`AdmissionResult::Applied`]; failed elements are the wire shape for
     /// richer per-batch reporting.
-    pub results: Vec<PutBatchResult>,
+    pub results: Vec<AdmissionResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PutBatchResult {
+pub enum AdmissionResult {
     Applied { admission_seq: AdmissionSeq },
     Failed { error: KernelError },
 }
 
-impl PutBatchResponse {
+impl AdmissionResponse {
     pub fn applied_admission_seq(&self, index: usize) -> Option<AdmissionSeq> {
         match self.results.get(index) {
-            Some(PutBatchResult::Applied { admission_seq }) => Some(*admission_seq),
+            Some(AdmissionResult::Applied { admission_seq }) => Some(*admission_seq),
             _ => None,
         }
     }
@@ -276,8 +204,8 @@ pub struct GetRequest {
 /// never-written and tombstoned are indistinguishable here (tombstones
 /// surface only in `read_at` deltas).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetResponse {
-    pub entries: Vec<Option<Entry>>,
+pub struct GetResponse<T = Ciphertext> {
+    pub entries: Vec<Option<AdmittedEntry<T>>>,
 }
 
 /// Ordered scan of live entries under a prefix.
@@ -290,9 +218,9 @@ pub struct ListRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListResponse {
+pub struct ListResponse<T = Ciphertext> {
     /// Live entries in key order (tombstones excluded).
-    pub entries: Vec<Entry>,
+    pub entries: Vec<AdmittedEntry<T>>,
     /// True when the scan stopped at `limit` with more remaining.
     pub truncated: bool,
 }
@@ -348,23 +276,23 @@ pub struct ReadAtRequest {
 
 /// Per-range result of a consistent cut: `(S, Δ)` in the design's terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RangeCut {
+pub enum RangeCut<T = Ciphertext> {
     /// Full state of the range at the cut (cursor was `None`); live entries
     /// only, key order.
-    Snapshot(Vec<Entry>),
+    Snapshot(Vec<AdmittedEntry<T>>),
     /// Changes since the caller's cursor, tombstones included, ascending
     /// `(admission_seq, key)`.
-    Delta(Vec<Entry>),
+    Delta(Vec<AdmittedEntry<T>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadAtResponse {
+pub struct ReadAtResponse<T = Ciphertext> {
     /// The single admission point at which every range was evaluated —
     /// never a torn multi-range read. Also the caller's next cursor for
     /// all requested ranges.
     pub at: AdmissionSeq,
     /// Parallel to the requested ranges.
-    pub ranges: Vec<RangeCut>,
+    pub ranges: Vec<RangeCut<T>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -456,13 +384,13 @@ mod tests {
     }
 
     #[test]
-    fn put_batch_response_reports_one_result_per_batch() {
-        let response = PutBatchResponse {
+    fn admit_response_reports_one_result_per_batch() {
+        let response = AdmissionResponse {
             results: vec![
-                PutBatchResult::Applied {
+                AdmissionResult::Applied {
                     admission_seq: AdmissionSeq(7),
                 },
-                PutBatchResult::Failed {
+                AdmissionResult::Failed {
                     error: KernelError::VerRegression {
                         key: key(&[b"db", b"row"]),
                         current: Ver(3),

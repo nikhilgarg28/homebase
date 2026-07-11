@@ -13,12 +13,16 @@ use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, T
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec, Range,
     RangeAssert, RangeAssertFailure, RangeCut, ReleaseRequest,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{MemoryStore, OrderedStore, WriteBatch, collect_scan};
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq,
+    DeviceTag, Mutation, Ver,
+};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -62,8 +66,45 @@ fn key(components: &[&[u8]]) -> Key {
     Key::from_bytes(components.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn val(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: val(bytes),
+    }
+}
+
+#[derive(Clone)]
+struct PendingEntry {
+    key: Key,
+    value: Vec<u8>,
+    ver: Ver,
+}
+
+fn wire_entry(device: DeviceId, device_seq: DeviceSeq, entry: PendingEntry) -> DeviceEntry {
+    DeviceEntry {
+        mutation: Mutation::Set {
+            key: entry.key,
+            value: Ciphertext(entry.value),
+        },
+        tag: DeviceTag {
+            device,
+            device_seq,
+            ver: entry.ver,
+            cipher_epoch: CipherEpoch(0),
+        },
+        seal: Seal::empty_aead_v1(),
+    }
+}
+
+fn entry_value(entry: &AdmittedEntry) -> &[u8] {
+    match &entry.device_entry.mutation {
+        Mutation::Set { value, .. } => &value.0,
+        Mutation::Delete { .. } => panic!("expected live value"),
+    }
 }
 
 fn wspec(prefix: &Key, secs: u64) -> LeaseSpec {
@@ -99,7 +140,7 @@ fn spawn_server(
     move |id: &SpaceId| server.space(id)
 }
 
-async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<Entry> {
+async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<AdmittedEntry> {
     handle
         .get(
             &space,
@@ -119,7 +160,7 @@ async fn foreign_put(
     space: SpaceId,
     device: DeviceId,
     prefix: &Key,
-    entries: Vec<PutEntry>,
+    entries: Vec<PendingEntry>,
     seq: DeviceSeq,
 ) {
     let granted = handle
@@ -135,15 +176,18 @@ async fn foreign_put(
         .expect("foreign acquire");
     let lease = granted.leases[0].id;
     handle
-        .put_batch(
+        .admit(
             &space,
-            PutBatchRequest {
+            AdmissionRequest {
                 device,
                 evidence: vec![lease],
-                batches: vec![PutBatch {
+                batches: vec![AdmissionBatch {
                     device_seq: seq,
                     range_asserts: vec![],
-                    ops: entries.into_iter().map(Into::into).collect(),
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| wire_entry(device, seq, entry))
+                        .collect(),
                 }],
             },
         )
@@ -225,7 +269,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: key(&[b"db", b"sibling"]),
                 value: val(b"foreign"),
                 ver: Ver(1),
@@ -254,7 +298,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
 
         let submission = space
             .submit_checked(
-                vec![(key(&[b"db", b"target", b"row"]), val(b"value"))],
+                vec![set(key(&[b"db", b"target", b"row"]), b"value")],
                 vec![RangeAssert {
                     prefix: target.clone(),
                     upto: AdmissionSeq(0),
@@ -268,7 +312,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let record = &state.spaces[&SPACE].oplog[&submission.seq];
         assert_eq!(record.range_asserts().len(), 1);
         assert_eq!(record.range_asserts()[0].prefix, target);
-        assert_eq!(record.ops()[0].ver(), Some(Ver(2)));
+        assert_eq!(record.entries()[0].ver(), Ver(2));
         assert_eq!(
             client.push().await.unwrap(),
             PushOutcome::Drained {
@@ -299,7 +343,7 @@ fn dependent_asserting_submissions_push_across_request_boundaries() {
         for name in [&b"one"[..], &b"two"[..]] {
             space
                 .submit_checked(
-                    vec![(key(&[b"db", name]), val(name))],
+                    vec![set(key(&[b"db", name]), name)],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -338,7 +382,7 @@ fn dependent_asserting_submissions_push_when_coalesced() {
         for name in [&b"one"[..], &b"two"[..]] {
             space
                 .submit_checked(
-                    vec![(key(&[b"db", name]), val(name))],
+                    vec![set(key(&[b"db", name]), name)],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -376,7 +420,7 @@ fn foreign_write_after_upto_stalls_and_keeps_submission_queued() {
         space.ensure(vec![rspec(&db, 60)]).await.unwrap();
         space
             .submit_checked(
-                vec![(key(&[b"db", b"mine"]), val(b"mine"))],
+                vec![set(key(&[b"db", b"mine"]), b"mine")],
                 vec![RangeAssert {
                     prefix: db.clone(),
                     upto: AdmissionSeq(0),
@@ -391,7 +435,7 @@ fn foreign_write_after_upto_stalls_and_keeps_submission_queued() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: key(&[b"db", b"foreign"]),
                 value: val(b"foreign"),
                 ver: Ver(1),
@@ -471,7 +515,7 @@ fn checked_submit_rejects_assert_without_active_lease() {
 
         let error = space
             .submit_checked(
-                vec![(key(&[b"db", b"row"]), val(b"value"))],
+                vec![set(key(&[b"db", b"row"]), b"value")],
                 vec![RangeAssert {
                     prefix: db.clone(),
                     upto: AdmissionSeq(0),
@@ -504,7 +548,7 @@ fn checked_submit_rejects_assert_beyond_local_watermark() {
 
         let error = space
             .submit_checked(
-                vec![(key(&[b"db", b"row"]), val(b"value"))],
+                vec![set(key(&[b"db", b"row"]), b"value")],
                 vec![RangeAssert {
                     prefix: db.clone(),
                     upto: AdmissionSeq(7),
@@ -542,7 +586,7 @@ fn unchecked_submit_bypasses_local_assert_gate() {
 
         let submission = space
             .submit_unchecked(
-                vec![(key(&[b"db", b"row"]), val(b"value"))],
+                vec![set(key(&[b"db", b"row"]), b"value")],
                 vec![RangeAssert {
                     prefix: key(&[b"db"]),
                     upto: AdmissionSeq(99),
@@ -582,15 +626,15 @@ fn submissions_stamp_versions_from_each_spaces_high_water() {
         first
             .submit_unchecked(
                 vec![
-                    (key(&[b"db", b"one"]), val(b"1")),
-                    (key(&[b"db", b"two"]), val(b"2")),
+                    set(key(&[b"db", b"one"]), b"1"),
+                    set(key(&[b"db", b"two"]), b"2"),
                 ],
                 vec![],
             )
             .await
             .unwrap();
         second
-            .submit_unchecked(vec![(key(&[b"db", b"one"]), val(b"1"))], vec![])
+            .submit_unchecked(vec![set(key(&[b"db", b"one"]), b"1")], vec![])
             .await
             .unwrap();
 
@@ -626,15 +670,15 @@ fn push_drains_and_groups_same_space_neighbors() {
             key(&[b"db", b"a3"]),
         );
         space
-            .submit_checked(vec![(a1.clone(), val(b"1"))], vec![])
+            .submit_checked(vec![set(a1.clone(), b"1")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(a2.clone(), val(b"2"))], vec![])
+            .submit_checked(vec![set(a2.clone(), b"2")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(a3.clone(), val(b"4"))], vec![])
+            .submit_checked(vec![set(a3.clone(), b"4")], vec![])
             .await
             .unwrap();
         assert_eq!(queued(&mem).await, 3);
@@ -651,15 +695,30 @@ fn push_drains_and_groups_same_space_neighbors() {
         // Same-space neighbors merge into one request while preserving each
         // client commit's seq identity in stored tags.
         assert_eq!(
-            fetch(&handle, SPACE, &a1).await.unwrap().tag.device_seq,
+            fetch(&handle, SPACE, &a1)
+                .await
+                .unwrap()
+                .device_entry
+                .tag
+                .device_seq,
             DeviceSeq(1)
         );
         assert_eq!(
-            fetch(&handle, SPACE, &a2).await.unwrap().tag.device_seq,
+            fetch(&handle, SPACE, &a2)
+                .await
+                .unwrap()
+                .device_entry
+                .tag
+                .device_seq,
             DeviceSeq(2)
         );
         assert_eq!(
-            fetch(&handle, SPACE, &a3).await.unwrap().tag.device_seq,
+            fetch(&handle, SPACE, &a3)
+                .await
+                .unwrap()
+                .device_entry
+                .tag
+                .device_seq,
             DeviceSeq(3)
         );
 
@@ -696,22 +755,32 @@ fn push_cap_splits_groups() {
         space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
         space
-            .submit_checked(vec![(k1.clone(), val(b"1"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"1")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(k2.clone(), val(b"2"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"2")], vec![])
             .await
             .unwrap();
 
         client.push().await.unwrap();
         // At cap 1 nothing merges: each commit ships under its own seq.
         assert_eq!(
-            fetch(&handle, SPACE, &k1).await.unwrap().tag.device_seq,
+            fetch(&handle, SPACE, &k1)
+                .await
+                .unwrap()
+                .device_entry
+                .tag
+                .device_seq,
             DeviceSeq(1)
         );
         assert_eq!(
-            fetch(&handle, SPACE, &k2).await.unwrap().tag.device_seq,
+            fetch(&handle, SPACE, &k2)
+                .await
+                .unwrap()
+                .device_entry
+                .tag
+                .device_seq,
             DeviceSeq(2)
         );
     });
@@ -785,7 +854,7 @@ fn acquire_satisfies_covered_specs_locally() {
 
         // And the revived lease actually backs writes again.
         space
-            .submit_checked(vec![(key(&[b"db", b"w"]), val(b"v"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"w"]), b"v")], vec![])
             .await
             .unwrap();
         assert!(matches!(
@@ -817,7 +886,7 @@ fn resume_keeps_wall_clock_authority() {
             let space = client.space(SPACE).await.unwrap();
             let granted = space.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
             space
-                .submit_checked(vec![(k.clone(), val(b"v"))], vec![])
+                .submit_checked(vec![set(k.clone(), b"v")], vec![])
                 .await
                 .unwrap();
             granted.leases[0].id
@@ -860,7 +929,7 @@ fn resume_keeps_wall_clock_authority() {
                 acked_through: Some(DeviceSeq(1))
             }
         );
-        assert_eq!(fetch(&handle, SPACE, &k).await.unwrap().value, val(b"v"));
+        assert_eq!(entry_value(&fetch(&handle, SPACE, &k).await.unwrap()), b"v");
 
         // Real expiry still ends it: past the deadline the engine
         // refuses assertion coverage, and renewal is the cure.
@@ -868,7 +937,7 @@ fn resume_keeps_wall_clock_authority() {
         assert!(matches!(
             space
                 .submit_checked(
-                    vec![(k.clone(), val(b"later"))],
+                    vec![set(k.clone(), b"later")],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -881,7 +950,7 @@ fn resume_keeps_wall_clock_authority() {
         let renewed = space.renew(std::slice::from_ref(&db)).await.unwrap();
         assert_eq!(renewed.granted.len(), 1);
         space
-            .submit_checked(vec![(k.clone(), val(b"later"))], vec![])
+            .submit_checked(vec![set(k.clone(), b"later")], vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -914,7 +983,7 @@ fn margin_applies_only_across_incarnations() {
             let space = client.space(SPACE).await.unwrap();
             space.acquire(vec![wspec(&db, 60)]).await.unwrap();
             space
-                .submit_checked(vec![(key(&[b"db", b"k"]), val(b"v"))], vec![])
+                .submit_checked(vec![set(key(&[b"db", b"k"]), b"v")], vec![])
                 .await
                 .unwrap();
 
@@ -955,7 +1024,7 @@ fn margin_applies_only_across_incarnations() {
         assert!(matches!(
             space
                 .submit_checked(
-                    vec![(key(&[b"db", b"k2"]), val(b"v2"))],
+                    vec![set(key(&[b"db", b"k2"]), b"v2")],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -968,7 +1037,7 @@ fn margin_applies_only_across_incarnations() {
 
         space.renew(std::slice::from_ref(&db)).await.unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"k2"]), val(b"v2"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"k2"]), b"v2")], vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -1000,7 +1069,7 @@ fn suspend_expires_leases_within_a_lineage() {
         let db = key(&[b"db"]);
         space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space
-            .submit_checked(vec![(key(&[b"db", b"k"]), val(b"v"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"k"]), b"v")], vec![])
             .await
             .unwrap();
 
@@ -1041,7 +1110,7 @@ fn backward_clock_step_poisons_stored_stamps() {
             let space = client.space(SPACE).await.unwrap();
             space.acquire(vec![wspec(&db, 60)]).await.unwrap();
             space
-                .submit_checked(vec![(k.clone(), val(b"v"))], vec![])
+                .submit_checked(vec![set(k.clone(), b"v")], vec![])
                 .await
                 .unwrap();
         }
@@ -1134,7 +1203,7 @@ fn expired_local_lease_does_not_block_unasserted_submission() {
         let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space
-            .submit_checked(vec![(k.clone(), val(b"v"))], vec![])
+            .submit_checked(vec![set(k.clone(), b"v")], vec![])
             .await
             .unwrap();
 
@@ -1177,46 +1246,48 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
         let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let lease = granted.leases[0].id;
         space
-            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
 
         // The dead incarnation's send: the same group, coalesced as two
         // client batches, admitted — and then the crash ate the trim.
         handle
-            .put_batch(
+            .admit(
                 &SPACE,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: client.device(),
                     evidence: vec![lease],
                     batches: vec![
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: DeviceSeq(1),
                             range_asserts: vec![],
-                            ops: vec![
-                                PutEntry {
+                            entries: vec![wire_entry(
+                                client.device(),
+                                DeviceSeq(1),
+                                PendingEntry {
                                     key: k1.clone(),
                                     value: val(b"one"),
                                     ver: Ver(1),
-                                }
-                                .into(),
-                            ],
+                                },
+                            )],
                         },
-                        PutBatch {
+                        AdmissionBatch {
                             device_seq: DeviceSeq(2),
                             range_asserts: vec![],
-                            ops: vec![
-                                PutEntry {
+                            entries: vec![wire_entry(
+                                client.device(),
+                                DeviceSeq(2),
+                                PendingEntry {
                                     key: k2.clone(),
                                     value: val(b"two"),
                                     ver: Ver(2),
-                                }
-                                .into(),
-                            ],
+                                },
+                            )],
                         },
                     ],
                 },
@@ -1234,8 +1305,12 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
         );
         assert_eq!(queued(&mem).await, 0);
         let entry = fetch(&handle, SPACE, &k1).await.unwrap();
-        assert_eq!(entry.value, val(b"one"));
-        assert_eq!(entry.tag.ver, Ver(1), "admitted exactly once, no replay");
+        assert_eq!(entry_value(&entry), b"one");
+        assert_eq!(
+            entry.device_entry.tag.ver,
+            Ver(1),
+            "admitted exactly once, no replay"
+        );
         assert!(
             audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
                 .oplog
@@ -1263,7 +1338,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: k.clone(),
                 value: val(b"foreign"),
                 ver: Ver(100),
@@ -1293,15 +1368,15 @@ fn group_rejection_probes_to_the_faulty_commit() {
             .await
             .unwrap();
         space
-            .submit_checked(vec![(x.clone(), val(b"ok"))], vec![])
+            .submit_checked(vec![set(x.clone(), b"ok")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(k.clone(), val(b"stale"))], vec![])
+            .submit_checked(vec![set(k.clone(), b"stale")], vec![])
             .await
             .unwrap();
         space
-            .submit_checked(vec![(y.clone(), val(b"after"))], vec![])
+            .submit_checked(vec![set(y.clone(), b"after")], vec![])
             .await
             .unwrap();
 
@@ -1335,10 +1410,17 @@ fn group_rejection_probes_to_the_faulty_commit() {
         );
         assert_eq!(queued(&mem).await, 0);
 
-        assert_eq!(fetch(&handle, SPACE, &x).await.unwrap().value, val(b"ok"));
+        assert_eq!(
+            entry_value(&fetch(&handle, SPACE, &x).await.unwrap()),
+            b"ok"
+        );
         let foreign = fetch(&handle, SPACE, &k).await.unwrap();
-        assert_eq!(foreign.value, val(b"foreign"));
-        assert_eq!(foreign.tag.ver, Ver(100), "the stale write never landed");
+        assert_eq!(entry_value(&foreign), b"foreign");
+        assert_eq!(
+            foreign.device_entry.tag.ver,
+            Ver(100),
+            "the stale write never landed"
+        );
         assert!(
             fetch(&handle, SPACE, &y).await.is_none(),
             "the suffix rolled back"
@@ -1373,7 +1455,7 @@ fn a_forked_store_is_fatal() {
         let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space
-            .submit_checked(vec![(k1.clone(), val(b"a"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"a")], vec![])
             .await
             .unwrap();
 
@@ -1397,7 +1479,7 @@ fn a_forked_store_is_fatal() {
             "the copy carries the identity"
         );
         twin_space
-            .submit_checked(vec![(k2.clone(), val(b"twin"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"twin")], vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -1434,7 +1516,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: k.clone(),
                 value: val(b"foreign"),
                 ver: Ver(7),
@@ -1457,7 +1539,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         assert!(matches!(
             space
                 .submit_checked(
-                    vec![(k.clone(), val(b"too-soon"))],
+                    vec![set(k.clone(), b"too-soon")],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -1484,7 +1566,7 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
         // the pulled ver, so the server's chain accepts it.
         space
             .submit_checked(
-                vec![(k.clone(), val(b"mine"))],
+                vec![set(k.clone(), b"mine")],
                 vec![RangeAssert {
                     prefix: db.clone(),
                     upto: AdmissionSeq(1),
@@ -1499,8 +1581,12 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
             }
         );
         let entry = fetch(&handle, SPACE, &k).await.unwrap();
-        assert_eq!(entry.value, val(b"mine"));
-        assert_eq!(entry.tag.ver, Ver(8), "stamped past the foreign chain");
+        assert_eq!(entry_value(&entry), b"mine");
+        assert_eq!(
+            entry.device_entry.tag.ver,
+            Ver(8),
+            "stamped past the foreign chain"
+        );
 
         // The next pull is a delta from the stored cursor and carries
         // exactly our own admitted write.
@@ -1531,7 +1617,7 @@ fn ensure_acquires_pulls_and_makes_assertions_locally_authorized() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: k.clone(),
                 value: val(b"foreign"),
                 ver: Ver(7),
@@ -1560,7 +1646,7 @@ fn ensure_acquires_pulls_and_makes_assertions_locally_authorized() {
         );
 
         space
-            .submit_checked(vec![(k.clone(), val(b"mine"))], vec![])
+            .submit_checked(vec![set(k.clone(), b"mine")], vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -1570,8 +1656,8 @@ fn ensure_acquires_pulls_and_makes_assertions_locally_authorized() {
             }
         );
         let entry = fetch(&handle, SPACE, &k).await.unwrap();
-        assert_eq!(entry.value, val(b"mine"));
-        assert_eq!(entry.tag.ver, Ver(8));
+        assert_eq!(entry_value(&entry), b"mine");
+        assert_eq!(entry.device_entry.tag.ver, Ver(8));
     });
 }
 
@@ -1589,7 +1675,7 @@ fn ensure_satisfies_read_lease_barriers_too() {
             SPACE,
             dev(2),
             &db,
-            vec![PutEntry {
+            vec![PendingEntry {
                 key: k,
                 value: val(b"foreign"),
                 ver: Ver(7),
@@ -1662,7 +1748,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
         assert!(matches!(
             space
                 .submit_checked(
-                    vec![(key(&[b"db", b"k"]), val(b"v"))],
+                    vec![set(key(&[b"db", b"k"]), b"v")],
                     vec![RangeAssert {
                         prefix: db.clone(),
                         upto: AdmissionSeq(0),
@@ -1728,7 +1814,7 @@ fn release_rejects_when_queued_writes_are_covered() {
         let space = client.space(SPACE).await.unwrap();
         let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
         space
-            .submit_checked(vec![(k, val(b"queued"))], vec![])
+            .submit_checked(vec![set(k, b"queued")], vec![])
             .await
             .unwrap();
 
@@ -1788,7 +1874,7 @@ fn unavailable_leaves_the_queue_intact() {
         let space = client.space(SPACE).await.unwrap();
 
         space
-            .submit_checked(vec![(key(&[b"db", b"k"]), val(b"v"))], vec![])
+            .submit_checked(vec![set(key(&[b"db", b"k"]), b"v")], vec![])
             .await
             .unwrap();
         assert!(matches!(

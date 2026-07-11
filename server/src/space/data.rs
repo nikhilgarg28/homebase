@@ -1,10 +1,10 @@
-//! The data plane: `put_batch` admission and the three read verbs.
+//! The data plane: `admit` admission and the three read verbs.
 //!
 //! Free functions over `(space, store)` — the data plane keeps no in-memory
 //! state of its own; everything lives in the ordered store. [`super::Space`]
 //! is the only caller.
 //!
-//! # Admission (`put_batch`)
+//! # Admission (`admit`)
 //!
 //! A batch admits if and only if, in this order:
 //!
@@ -54,27 +54,25 @@ use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_su
 use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
-    BatchOp, GetRequest, GetResponse, KernelError, ListRequest, ListResponse, PutBatchRequest,
-    PutBatchResponse, PutBatchResult, Range, RangeAssertFailure, RangeCut, ReadAtRequest,
-    ReadAtResponse,
+    AdmissionRequest, AdmissionResponse, AdmissionResult, GetRequest, GetResponse, KernelError,
+    ListRequest, ListResponse, Range, RangeAssertFailure, RangeCut, ReadAtRequest, ReadAtResponse,
 };
-use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId, Entry, Epoch, Tag, Value, Ver};
+use homebase_core::tag::{AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceId};
 use std::collections::BTreeMap;
 
-pub async fn put_batch<S: OrderedStore>(
+pub async fn admit<S: OrderedStore>(
     space: SpaceId,
     leases: &LeaseManager,
     store: &S,
     now: Timestamp,
-    req: &PutBatchRequest,
-) -> Result<PutBatchResponse, Error> {
-    // 1. Reservation conflicts over mutating ops; NoOp carries no key.
+    req: &AdmissionRequest,
+) -> Result<AdmissionResponse, Error> {
+    // 1. Reservation conflicts over data entries; an empty batch is a no-op.
     let keys: Vec<Key> = req
         .batches
         .iter()
-        .flat_map(|batch| batch.ops.iter().filter_map(op_key).cloned())
+        .flat_map(|batch| batch.entries.iter().map(|entry| entry.key().clone()))
         .collect();
     leases
         .validate_put(store, now, req.device, &req.evidence, &keys)
@@ -125,25 +123,38 @@ pub async fn put_batch<S: OrderedStore>(
         }
 
         let seq = next_admission_seq;
-        results.push(PutBatchResult::Applied { admission_seq: seq });
+        results.push(AdmissionResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
         let mut touched_prefixes = Vec::new();
-        for op in &client_batch.ops {
-            let Some((key, ver, value, seal)) = op_write(op)? else {
-                continue;
-            };
+        for entry in &client_batch.entries {
+            if entry.tag.device != req.device || entry.tag.device_seq != client_batch.device_seq {
+                return Err(KernelError::InvalidSeal {
+                    reason: "device entry tag does not match its admission batch".into(),
+                }
+                .into());
+            }
+            entry
+                .seal
+                .validate_payload()
+                .map_err(|err| KernelError::InvalidSeal {
+                    reason: err.to_string(),
+                })?;
+            let key = entry.key();
+            let ver = entry.ver();
             let current_ver = match staged.get(key) {
-                Some(rec) => Some(rec.tag.ver),
+                Some(rec) => Some(rec.entry.ver()),
                 None => {
                     let stored = data(space, store, key).await?;
                     if let Some(rec) = &stored {
-                        old_seqs.insert(key.clone(), rec.tag.admission_seq);
+                        old_seqs.insert(key.clone(), rec.entry.admission.admission_seq);
                     }
                     was_live.insert(
                         key.clone(),
-                        stored.as_ref().is_some_and(|rec| rec.value.is_present()),
+                        stored
+                            .as_ref()
+                            .is_some_and(|rec| rec.entry.device_entry.mutation.is_set()),
                     );
-                    stored.map(|rec| rec.tag.ver)
+                    stored.map(|rec| rec.entry.ver())
                 }
             };
             if let Some(current) = current_ver {
@@ -159,15 +170,10 @@ pub async fn put_batch<S: OrderedStore>(
             staged.insert(
                 key.clone(),
                 DataRecord {
-                    tag: Tag {
-                        device: req.device,
-                        device_seq: client_batch.device_seq,
-                        epoch: Epoch(0),
-                        ver,
-                        admission_seq: seq,
+                    entry: AdmittedEntry {
+                        device_entry: entry.clone(),
+                        admission: AdmissionTag { admission_seq: seq },
                     },
-                    value,
-                    seal,
                 },
             );
             touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
@@ -191,12 +197,15 @@ pub async fn put_batch<S: OrderedStore>(
         if let Some(old) = old_seqs.get(key) {
             batch.delete(changelog_key(space, *old, key));
         }
-        batch.put(changelog_key(space, record.tag.admission_seq, key), bytes);
+        batch.put(
+            changelog_key(space, record.entry.admission.admission_seq, key),
+            bytes,
+        );
 
         // Aggregate updates along the key's prefix path: every ancestor sees
         // the new max seq; live counts move by the key's net transition
         // across the whole batch (absent→present +1, present→absent −1).
-        let delta = (record.value.is_present() as i64) - (was_live[key] as i64);
+        let delta = (record.entry.device_entry.mutation.is_set() as i64) - (was_live[key] as i64);
         let components = key.components();
         for depth in 1..=components.len() {
             *live_deltas
@@ -226,14 +235,14 @@ pub async fn put_batch<S: OrderedStore>(
     batch.put(counters_key(space), counters.encode());
     store.apply(batch).await?;
 
-    Ok(PutBatchResponse { results })
+    Ok(AdmissionResponse { results })
 }
 
 async fn range_assert_failures<S: OrderedStore>(
     space: SpaceId,
     store: &S,
     device: DeviceId,
-    batch: &homebase_core::messages::PutBatch,
+    batch: &homebase_core::messages::AdmissionBatch,
 ) -> Result<Vec<RangeAssertFailure>, Error> {
     let mut failures = Vec::new();
     for assert in &batch.range_asserts {
@@ -255,20 +264,13 @@ async fn range_assert_failures<S: OrderedStore>(
     Ok(failures)
 }
 
-fn failed_response(count: usize, error: KernelError) -> PutBatchResponse {
-    PutBatchResponse {
+fn failed_response(count: usize, error: KernelError) -> AdmissionResponse {
+    AdmissionResponse {
         results: (0..count)
-            .map(|_| PutBatchResult::Failed {
+            .map(|_| AdmissionResult::Failed {
                 error: error.clone(),
             })
             .collect(),
-    }
-}
-
-fn op_key(op: &BatchOp) -> Option<&Key> {
-    match op {
-        BatchOp::Set { key, .. } | BatchOp::Delete { key, .. } => Some(key),
-        BatchOp::NoOp => None,
     }
 }
 
@@ -279,36 +281,6 @@ fn prefix_meta_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn op_write(op: &BatchOp) -> Result<Option<(&Key, Ver, Value, Seal)>, Error> {
-    match op {
-        BatchOp::Set {
-            key,
-            ver,
-            seal,
-            ciphertext,
-        } => {
-            seal.validate_payload()
-                .map_err(|err| KernelError::InvalidSeal {
-                    reason: err.to_string(),
-                })?;
-            Ok(Some((
-                key,
-                *ver,
-                Value::Present(ciphertext.clone()),
-                seal.clone(),
-            )))
-        }
-        BatchOp::Delete { key, ver, seal } => {
-            seal.validate_payload()
-                .map_err(|err| KernelError::InvalidSeal {
-                    reason: err.to_string(),
-                })?;
-            Ok(Some((key, *ver, Value::Absent, seal.clone())))
-        }
-        BatchOp::NoOp => Ok(None),
-    }
-}
-
 pub async fn get<S: OrderedStore>(
     space: SpaceId,
     store: &S,
@@ -317,12 +289,11 @@ pub async fn get<S: OrderedStore>(
     let mut entries = Vec::with_capacity(req.keys.len());
     for key in &req.keys {
         let entry = data(space, store, key).await?.and_then(|rec| {
-            rec.value.is_present().then(|| Entry {
-                key: key.clone(),
-                value: rec.value,
-                seal: rec.seal,
-                tag: rec.tag,
-            })
+            rec.entry
+                .device_entry
+                .mutation
+                .is_set()
+                .then_some(rec.entry)
         });
         entries.push(entry);
     }
@@ -350,21 +321,16 @@ pub async fn list<S: OrderedStore>(
     let mut truncated = false;
     let mut iter = store.scan(start, prefix_successor(&base));
     while let Some((storage_key, bytes)) = iter.next().await? {
-        let rec = DataRecord::decode(&bytes).expect("corrupt data record");
-        if rec.value.is_absent() {
+        let key = user_key_from_data(&storage_key).expect("corrupt data key");
+        let rec = DataRecord::decode(key, &bytes).expect("corrupt data record");
+        if rec.entry.device_entry.mutation.is_delete() {
             continue;
         }
         if req.limit.is_some_and(|limit| entries.len() >= limit) {
             truncated = true;
             break;
         }
-        let key = user_key_from_data(&storage_key).expect("corrupt data key");
-        entries.push(Entry {
-            key,
-            value: rec.value,
-            seal: rec.seal,
-            tag: rec.tag,
-        });
+        entries.push(rec.entry);
     }
     Ok(ListResponse { entries, truncated })
 }
@@ -391,23 +357,18 @@ async fn snapshot<S: OrderedStore>(
     space: SpaceId,
     store: &S,
     range: &Range,
-) -> Result<Vec<Entry>, StorageError> {
+) -> Result<Vec<AdmittedEntry>, StorageError> {
     let Range::Prefix(prefix) = range else {
         let base = data_scan_all(space);
         let mut entries = Vec::new();
         let mut iter = store.scan_prefix(&base);
         while let Some((storage_key, bytes)) = iter.next().await? {
-            let rec = DataRecord::decode(&bytes).expect("corrupt data record");
-            if rec.value.is_absent() {
+            let key = user_key_from_data(&storage_key).expect("corrupt data key");
+            let rec = DataRecord::decode(key, &bytes).expect("corrupt data record");
+            if rec.entry.device_entry.mutation.is_delete() {
                 continue;
             }
-            let key = user_key_from_data(&storage_key).expect("corrupt data key");
-            entries.push(Entry {
-                key,
-                value: rec.value,
-                seal: rec.seal,
-                tag: rec.tag,
-            });
+            entries.push(rec.entry);
         }
         return Ok(entries);
     };
@@ -421,17 +382,12 @@ async fn snapshot<S: OrderedStore>(
     let mut entries = Vec::new();
     let mut iter = store.scan_prefix(&base);
     while let Some((storage_key, bytes)) = iter.next().await? {
-        let rec = DataRecord::decode(&bytes).expect("corrupt data record");
-        if rec.value.is_absent() {
+        let key = user_key_from_data(&storage_key).expect("corrupt data key");
+        let rec = DataRecord::decode(key, &bytes).expect("corrupt data record");
+        if rec.entry.device_entry.mutation.is_delete() {
             continue;
         }
-        let key = user_key_from_data(&storage_key).expect("corrupt data key");
-        entries.push(Entry {
-            key,
-            value: rec.value,
-            seal: rec.seal,
-            tag: rec.tag,
-        });
+        entries.push(rec.entry);
     }
     Ok(entries)
 }
@@ -444,7 +400,7 @@ async fn delta<S: OrderedStore>(
     store: &S,
     range: &Range,
     since: AdmissionSeq,
-) -> Result<Vec<Entry>, StorageError> {
+) -> Result<Vec<AdmittedEntry>, StorageError> {
     if let Range::Prefix(prefix) = range {
         // Aggregate short-circuit: nothing under this prefix since the cursor.
         match prefix_meta(space, store, prefix).await? {
@@ -462,13 +418,8 @@ async fn delta<S: OrderedStore>(
         if !range.covers_key(&key) {
             continue;
         }
-        let rec = DataRecord::decode(&bytes).expect("corrupt data record");
-        entries.push(Entry {
-            key,
-            value: rec.value,
-            seal: rec.seal,
-            tag: rec.tag,
-        });
+        let rec = DataRecord::decode(key, &bytes).expect("corrupt data record");
+        entries.push(rec.entry);
     }
     Ok(entries)
 }
@@ -494,7 +445,7 @@ async fn data<S: OrderedStore>(
     Ok(store
         .get(&data_key(space, key))
         .await?
-        .map(|bytes| DataRecord::decode(&bytes).expect("corrupt data record")))
+        .map(|bytes| DataRecord::decode(key.clone(), &bytes).expect("corrupt data record")))
 }
 
 async fn device<S: OrderedStore>(

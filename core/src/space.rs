@@ -6,9 +6,9 @@
 //! is why request bodies never carry a `SpaceId`.
 
 use crate::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, KernelError, ListLeasesRequest,
-    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
+    KernelError, ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
+    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use std::fmt;
 use std::future::Future;
@@ -41,7 +41,7 @@ impl fmt::Debug for SpaceId {
 /// - [`Unavailable`](SpaceError::Unavailable): the space could not serve
 ///   the request at all — storage fault, shutdown mid-request, dead
 ///   mailbox. Says nothing about the request's validity. Reads may be
-///   retried blindly; a retried `put_batch` that was actually admitted
+///   retried blindly; a retried `admit` that was actually admitted
 ///   before the failure is caught by the `device_seq` replay fence, so
 ///   clients treat that rejection as "already applied".
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,10 +109,10 @@ pub trait Space {
         req: ListLeasesRequest,
     ) -> impl Future<Output = Result<ListLeasesResponse, SpaceError>> + Send;
 
-    fn put_batch(
+    fn admit(
         &self,
-        req: PutBatchRequest,
-    ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send;
+        req: AdmissionRequest,
+    ) -> impl Future<Output = Result<AdmissionResponse, SpaceError>> + Send;
 
     fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send;
 

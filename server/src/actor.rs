@@ -29,9 +29,9 @@ use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 use homebase_core::clock::Clock;
 use homebase_core::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListLeasesRequest,
-    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
+    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space as SpaceApi, SpaceError, SpaceId};
 use std::pin::Pin;
@@ -57,7 +57,7 @@ enum Command {
     Renew(RenewRequest, Reply<RenewResponse>),
     Release(ReleaseRequest, Reply<ReleaseResponse>),
     ListLeases(ListLeasesRequest, Reply<ListLeasesResponse>),
-    PutBatch(PutBatchRequest, Reply<PutBatchResponse>),
+    Admit(AdmissionRequest, Reply<AdmissionResponse>),
     Get(GetRequest, Reply<GetResponse>),
     List(ListRequest, Reply<ListResponse>),
     ReadAt(ReadAtRequest, Reply<ReadAtResponse>),
@@ -111,8 +111,8 @@ impl<S: OrderedStore, C: Clock> SpaceActor<S, C> {
                     let result = self.machine.list_leases(&*store, now, &req).await;
                     let _ = reply.send(result.map_err(Into::into));
                 }
-                Command::PutBatch(req, reply) => {
-                    let result = self.machine.put_batch(&*store, now, &req).await;
+                Command::Admit(req, reply) => {
+                    let result = self.machine.admit(&*store, now, &req).await;
                     let _ = reply.send(result.map_err(Into::into));
                 }
                 Command::Get(req, reply) => {
@@ -187,11 +187,11 @@ impl SpaceApi for SpaceHandle {
         self.call(move |reply| Command::ListLeases(req, reply))
     }
 
-    fn put_batch(
+    fn admit(
         &self,
-        req: PutBatchRequest,
-    ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send {
-        self.call(move |reply| Command::PutBatch(req, reply))
+        req: AdmissionRequest,
+    ) -> impl Future<Output = Result<AdmissionResponse, SpaceError>> + Send {
+        self.call(move |reply| Command::Admit(req, reply))
     }
 
     fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
@@ -222,8 +222,12 @@ mod tests {
     use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseId, LeaseMode};
-    use homebase_core::messages::{KernelError, LeaseSpec, PutBatch, PutEntry};
-    use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+    use homebase_core::messages::{AdmissionBatch, KernelError, LeaseSpec};
+    use homebase_core::seal::Seal;
+    use homebase_core::tag::{
+        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+        Mutation, Ver,
+    };
     use std::time::Duration;
 
     const SPACE: SpaceId = SpaceId([9; 16]);
@@ -255,21 +259,26 @@ mod tests {
         k: &Key,
         v: &[u8],
         ver: u64,
-    ) -> PutBatchRequest {
-        PutBatchRequest {
+    ) -> AdmissionRequest {
+        AdmissionRequest {
             device: dev(device),
             evidence: vec![lease],
-            batches: vec![PutBatch {
+            batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
                 range_asserts: vec![],
-                ops: vec![
-                    PutEntry {
+                entries: vec![DeviceEntry {
+                    mutation: Mutation::Set {
                         key: k.clone(),
-                        value: Value::Present(v.to_vec()),
+                        value: Ciphertext(v.to_vec()),
+                    },
+                    tag: DeviceTag {
+                        device: dev(device),
+                        device_seq: DeviceSeq(seq),
                         ver: Ver(ver),
-                    }
-                    .into(),
-                ],
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                }],
             }],
         }
     }
@@ -294,7 +303,7 @@ mod tests {
 
             let k = key(&[b"db", b"row"]);
             let put = handle
-                .put_batch(put_req(1, 1, lease, &k, b"v", 1))
+                .admit(put_req(1, 1, lease, &k, b"v", 1))
                 .await
                 .unwrap();
             assert_eq!(put.applied_admission_seq(0), Some(AdmissionSeq(1)));
@@ -306,7 +315,10 @@ mod tests {
                 .await
                 .unwrap();
             let entry = got.entries[0].as_ref().unwrap();
-            assert_eq!(entry.value, Value::Present(b"v".to_vec()));
+            assert!(matches!(
+                &entry.device_entry.mutation,
+                Mutation::Set { value, .. } if value.0 == b"v"
+            ));
 
             let listed = handle
                 .list(ListRequest {
@@ -362,7 +374,7 @@ mod tests {
             for i in 1..=5u64 {
                 let k = key(&[format!("d{device}").as_bytes(), format!("k{i}").as_bytes()]);
                 let resp = handle
-                    .put_batch(put_req(device, i, lease, &k, b"v", 1))
+                    .admit(put_req(device, i, lease, &k, b"v", 1))
                     .await
                     .unwrap();
                 seqs.push(resp.applied_admission_seq(0).unwrap().0);

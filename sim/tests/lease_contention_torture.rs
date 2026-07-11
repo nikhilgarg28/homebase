@@ -19,11 +19,14 @@ use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, GetRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec,
     ReleaseRequest,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
-use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
 use homebase_sim::exec::SimExecutor;
@@ -136,9 +139,9 @@ async fn client(
         {
             Ok(resp) => resp.entries[0]
                 .as_ref()
-                .map(|e| match &e.value {
-                    Value::Present(v) => (decode(v), e.tag.ver.0),
-                    Value::Absent => panic!("tombstone leaked out of get"),
+                .map(|e| match &e.device_entry.mutation {
+                    Mutation::Set { value, .. } => (decode(&value.0), e.device_entry.tag.ver.0),
+                    Mutation::Delete { .. } => panic!("tombstone leaked out of get"),
                 })
                 .unwrap_or((0, 0)),
             Err(SpaceError::Unavailable { .. }) => return,
@@ -146,23 +149,28 @@ async fn client(
         };
 
         let seq = state.next_seq.get();
-        let req = PutBatchRequest {
+        let req = AdmissionRequest {
             device: dev(d),
             evidence: vec![lease],
-            batches: vec![PutBatch {
+            batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
                 range_asserts: vec![],
-                ops: vec![
-                    PutEntry {
+                entries: vec![DeviceEntry {
+                    mutation: Mutation::Set {
                         key: counter_key(),
-                        value: Value::Present(encode(current.0 + 1)),
+                        value: Ciphertext(encode(current.0 + 1)),
+                    },
+                    tag: DeviceTag {
+                        device: dev(d),
+                        device_seq: DeviceSeq(seq),
                         ver: Ver(current.1 + 1),
-                    }
-                    .into(),
-                ],
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                }],
             }],
         };
-        match handle.put_batch(req).await {
+        match handle.admit(req).await {
             Ok(resp) => {
                 acks.borrow_mut().push(Ack {
                     device: d,
@@ -278,13 +286,16 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
                 .get(&counter_key())
                 .unwrap_or_else(|| panic!("acked counter vanished (seed {seed})"));
             assert!(
-                record.tag.admission_seq.0 >= best.admission_seq,
+                record.entry.admission.admission_seq.0 >= best.admission_seq,
                 "counter record older than a surviving ack (seed {seed})"
             );
-            if record.tag.admission_seq.0 == best.admission_seq {
+            if record.entry.admission.admission_seq.0 == best.admission_seq {
                 assert_eq!(
-                    record.value,
-                    Value::Present(encode(best.value)),
+                    record.entry.device_entry.mutation,
+                    Mutation::Set {
+                        key: counter_key(),
+                        value: Ciphertext(encode(best.value)),
+                    },
                     "acked counter value corrupted (seed {seed})"
                 );
             }

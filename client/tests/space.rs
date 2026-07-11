@@ -10,7 +10,7 @@ use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, Entry, Value};
+use homebase_core::tag::{AdmittedEntry, DeviceId, Mutation};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -35,8 +35,11 @@ fn key(components: &[&[u8]]) -> Key {
     Key::from_bytes(components.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: bytes.to_vec(),
+    }
 }
 
 fn nonce(n: u8) -> ValueNonce {
@@ -89,7 +92,7 @@ fn spawn_server(
     move |id: &SpaceId| server.space(id)
 }
 
-async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<Entry> {
+async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<AdmittedEntry> {
     handle
         .get(
             &space,
@@ -127,7 +130,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
         let row = key(&[b"db", b"k"]);
         space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
-            .submit_checked(vec![(row.clone(), val(b"secret"))], vec![])
+            .submit_checked(vec![set(row.clone(), b"secret")], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
@@ -136,8 +139,17 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
         let encoded_row = cipher.encode_key(&row).unwrap();
         assert!(fetch(&handle, space, &row).await.is_none());
         let stored = fetch(&handle, space, &encoded_row).await.unwrap();
-        assert_ne!(stored.value, val(b"secret"));
-        assert_eq!(cipher.decode_entry_value(&stored).unwrap(), val(b"secret"));
+        assert!(
+            matches!(&stored.device_entry.mutation, Mutation::Set { value, .. } if value.0 != b"secret")
+        );
+        assert_eq!(
+            cipher
+                .open_admitted_entry(&stored)
+                .unwrap()
+                .device_entry
+                .mutation,
+            set(encoded_row, b"secret")
+        );
     });
 }
 
@@ -166,11 +178,11 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
-            .submit_checked(vec![(row1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(row1.clone(), b"one")], vec![])
             .await
             .unwrap();
         writer_space
-            .submit_checked(vec![(row2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(row2.clone(), b"two")], vec![])
             .await
             .unwrap();
         writer.push().await.unwrap();
@@ -193,9 +205,12 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
             panic!("initial pull should snapshot")
         };
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.value == val(b"one")));
-        assert!(entries.iter().any(|entry| entry.value == val(b"two")));
-        let mut device_seqs: Vec<_> = entries.iter().map(|entry| entry.tag.device_seq.0).collect();
+        assert!(entries.iter().any(|entry| matches!(&entry.device_entry.mutation, Mutation::Set { value, .. } if value == b"one")));
+        assert!(entries.iter().any(|entry| matches!(&entry.device_entry.mutation, Mutation::Set { value, .. } if value == b"two")));
+        let mut device_seqs: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.device_entry.tag.device_seq.0)
+            .collect();
         device_seqs.sort_unstable();
         assert_eq!(device_seqs, vec![1, 2]);
     });
@@ -225,7 +240,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         let writer_space = writer.space(space).await.unwrap();
         writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         writer_space
-            .submit_checked(vec![(row, val(b"before-link"))], vec![])
+            .submit_checked(vec![set(row, b"before-link")], vec![])
             .await
             .unwrap();
         writer.push().await.unwrap();
@@ -249,7 +264,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         assert!(matches!(
             &pulled.ranges[0],
             RangeCut::Snapshot(entries)
-                if entries.len() == 1 && entries[0].value == val(b"before-link")
+                if entries.len() == 1 && matches!(&entries[0].device_entry.mutation, Mutation::Set { value, .. } if value == b"before-link")
         ));
     });
 }

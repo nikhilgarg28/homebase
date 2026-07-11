@@ -9,12 +9,12 @@ use homebase_core::clock::{HybridClock, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AcquireRequest, BatchOp, GetRequest, KernelError, LeaseSpec, PutBatchRequest, PutBatchResponse,
-    Range, RangeCut,
+    AcquireRequest, AdmissionRequest, AdmissionResponse, GetRequest, KernelError, LeaseSpec, Range,
+    RangeCut,
 };
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceId, Value};
+use homebase_core::tag::{DeviceEntry, DeviceId, Mutation};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::seeds;
 use homebase_sim::store::{FaultConfig, SimStore};
@@ -49,10 +49,16 @@ const FAULTS: FaultConfig = FaultConfig {
     max_latency_yields: 3,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelValue {
+    Present(Vec<u8>),
+    Absent,
+}
+
 #[derive(Clone, Debug)]
 struct Ack {
     key_index: u64,
-    value: Value,
+    value: ModelValue,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,23 +141,21 @@ impl ServerHandle for ClientTestServer {
         self.handle.list_leases(req).await
     }
 
-    async fn put_batch(
+    async fn admit(
         &self,
         space: &SpaceId,
-        req: PutBatchRequest,
-    ) -> Result<PutBatchResponse, homebase_core::space::SpaceError> {
+        req: AdmissionRequest,
+    ) -> Result<AdmissionResponse, homebase_core::space::SpaceError> {
         if *space != self.space {
             return Err(homebase_core::space::SpaceError::unavailable(
                 "space not served",
             ));
         }
-        let resp = self.handle.put_batch(req.clone()).await?;
+        let resp = self.handle.admit(req.clone()).await?;
         let mut acks = self.acks.lock().unwrap();
         for batch in &req.batches {
-            for op in &batch.ops {
-                let Some((key, value)) = op_ack(op) else {
-                    continue;
-                };
+            for op in &batch.entries {
+                let (key, value) = op_ack(op);
                 let key_index = pool_index(key);
                 acks.retain(|ack| ack.key_index != key_index);
                 acks.push(Ack { key_index, value });
@@ -200,13 +204,10 @@ impl ServerHandle for ClientTestServer {
     }
 }
 
-fn op_ack(op: &BatchOp) -> Option<(&Key, Value)> {
-    match op {
-        BatchOp::Set {
-            key, ciphertext, ..
-        } => Some((key, Value::Present(ciphertext.clone()))),
-        BatchOp::Delete { key, .. } => Some((key, Value::Absent)),
-        BatchOp::NoOp => None,
+fn op_ack(entry: &DeviceEntry) -> (&Key, ModelValue) {
+    match &entry.mutation {
+        Mutation::Set { key, value } => (key, ModelValue::Present(value.0.clone())),
+        Mutation::Delete { key } => (key, ModelValue::Absent),
     }
 }
 
@@ -324,9 +325,9 @@ async fn driver(
         let ver = state.vers.borrow().get(&key_index).copied().unwrap_or(0) + 1;
         let stamp = rng.random::<u32>();
         let value = if tombstone {
-            Value::Absent
+            ModelValue::Absent
         } else {
-            Value::Present(format!("s{stamp}").into_bytes())
+            ModelValue::Present(format!("s{stamp}").into_bytes())
         };
 
         let space = match client.space(SPACE).await {
@@ -347,10 +348,16 @@ async fn driver(
             finish_client(&slot, guard);
             continue;
         }
-        match space
-            .submit_checked(vec![(pool_key(key_index), value)], vec![])
-            .await
-        {
+        let mutation = match value {
+            ModelValue::Present(value) => Mutation::Set {
+                key: pool_key(key_index),
+                value,
+            },
+            ModelValue::Absent => Mutation::Delete {
+                key: pool_key(key_index),
+            },
+        };
+        match space.submit_checked(vec![mutation], vec![]).await {
             Ok(_) => {
                 state.vers.borrow_mut().insert(key_index, ver);
                 let mut cov = coverage.borrow_mut();
@@ -447,24 +454,21 @@ async fn drain_push(
 }
 
 fn replay_oplog(
-    mut view: BTreeMap<Key, Value>,
+    mut view: BTreeMap<Key, ModelValue>,
     state: &homebase::meta::ClientState,
-) -> BTreeMap<Key, Value> {
+) -> BTreeMap<Key, ModelValue> {
     let Some(space) = state.spaces.get(&SPACE) else {
         return view;
     };
     for record in space.oplog.values() {
-        for op in record.ops() {
-            match op {
-                BatchOp::Set {
-                    key, ciphertext, ..
-                } => {
-                    view.insert(key.clone(), Value::Present(ciphertext.clone()));
+        for entry in record.entries() {
+            match &entry.mutation {
+                Mutation::Set { key, value } => {
+                    view.insert(key.clone(), ModelValue::Present(value.0.clone()));
                 }
-                BatchOp::Delete { key, .. } => {
-                    view.insert(key.clone(), Value::Absent);
+                Mutation::Delete { key } => {
+                    view.insert(key.clone(), ModelValue::Absent);
                 }
-                BatchOp::NoOp => {}
             }
         }
     }
@@ -488,14 +492,17 @@ async fn read_equivalence(
     let entries = match &pulled.ranges[0] {
         RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
     };
-    let mut expected: BTreeMap<Key, Value> = entries
+    let mut expected: BTreeMap<Key, ModelValue> = entries
         .iter()
-        .map(|e| (e.key.clone(), e.value.clone()))
+        .map(|e| match &e.device_entry.mutation {
+            Mutation::Set { key, value } => (key.clone(), ModelValue::Present(value.clone())),
+            Mutation::Delete { key } => (key.clone(), ModelValue::Absent),
+        })
         .collect();
     expected = replay_oplog(expected, &state);
     let expected: BTreeMap<_, _> = expected
         .into_iter()
-        .filter(|(_, v)| !matches!(v, Value::Absent))
+        .filter(|(_, v)| !matches!(v, ModelValue::Absent))
         .collect();
 
     for (key, expected_value) in &expected {
@@ -511,8 +518,12 @@ async fn read_equivalence(
             .entries
             .remove(0)
             .unwrap();
+        let got = match got.device_entry.mutation {
+            Mutation::Set { value, .. } => ModelValue::Present(value.0),
+            Mutation::Delete { .. } => ModelValue::Absent,
+        };
         assert_eq!(
-            got.value, *expected_value,
+            got, *expected_value,
             "pull ⊕ oplog diverged at {key:?} (seed {seed}, phase {phase})"
         );
     }
@@ -540,8 +551,12 @@ fn phase_oracle(
         .entries
         .remove(0);
         match (&ack.value, entry) {
-            (Value::Absent, None) => {}
-            (_, Some(entry)) if entry.value == ack.value => {}
+            (ModelValue::Absent, None) => {}
+            (_, Some(entry))
+                if match &entry.device_entry.mutation {
+                    Mutation::Set { value, .. } => ModelValue::Present(value.0.clone()),
+                    Mutation::Delete { .. } => ModelValue::Absent,
+                } == ack.value => {}
             (_, got) => {
                 panic!("acked value corrupted: {ack:?} got {got:?} (seed {seed}, phase {phase})")
             }

@@ -50,7 +50,10 @@ use homebase_core::key::{Key, KeyComponent, decode_components, encode_components
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Epoch, Tag, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId,
+    DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use std::time::Duration;
 
 /// Record kind: the second component of every space-scoped storage key.
@@ -314,7 +317,7 @@ impl LeaseRecord {
 pub struct CountersRecord {
     pub next_lease_id: u64,
     /// Last admitted batch's admission seq (0 = nothing admitted yet).
-    /// Incremented by `put_batch`; read by `acquire` as the barrier.
+    /// Incremented by `admit`; read by `acquire` as the barrier.
     pub admission_high_water: u64,
 }
 
@@ -344,57 +347,70 @@ impl CountersRecord {
 /// delta scan never needs a second lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataRecord {
-    pub tag: Tag,
-    pub value: Value,
-    pub seal: Seal,
+    pub entry: AdmittedEntry,
 }
 
 impl DataRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let value_len = match &self.value {
-            Value::Present(bytes) => bytes.len(),
-            Value::Absent => 0,
+        let value_len = match &self.entry.device_entry.mutation {
+            Mutation::Set { value, .. } => value.0.len(),
+            Mutation::Delete { .. } => 0,
         };
-        let seal = self.seal.encode();
+        let tag = self.entry.device_entry.tag;
+        let seal = self.entry.device_entry.seal.encode();
         let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 + seal.len() + 1 + value_len);
         out.push(DATA_RECORD_VERSION);
-        out.extend_from_slice(&self.tag.device.0);
-        out.extend_from_slice(&self.tag.device_seq.0.to_be_bytes());
-        out.extend_from_slice(&self.tag.epoch.0.to_be_bytes());
-        out.extend_from_slice(&self.tag.ver.0.to_be_bytes());
-        out.extend_from_slice(&self.tag.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&tag.device.0);
+        out.extend_from_slice(&tag.device_seq.0.to_be_bytes());
+        out.extend_from_slice(&tag.ver.0.to_be_bytes());
+        out.extend_from_slice(&tag.cipher_epoch.0.to_be_bytes());
+        out.extend_from_slice(&self.entry.admission.admission_seq.0.to_be_bytes());
         out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
         out.extend_from_slice(&seal);
-        match &self.value {
-            Value::Absent => out.push(0),
-            Value::Present(bytes) => {
+        match &self.entry.device_entry.mutation {
+            Mutation::Delete { .. } => out.push(0),
+            Mutation::Set { value, .. } => {
                 out.push(1);
-                out.extend_from_slice(bytes);
+                out.extend_from_slice(&value.0);
             }
         }
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
+    pub fn decode(key: Key, bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
         if r.u8()? != DATA_RECORD_VERSION {
             return None;
         }
-        let tag = Tag {
+        let tag = DeviceTag {
             device: DeviceId(r.bytes16()?),
             device_seq: DeviceSeq(r.u64()?),
-            epoch: Epoch(r.u64()?),
             ver: Ver(r.u64()?),
+            cipher_epoch: CipherEpoch(r.u64()?),
+        };
+        let admission = AdmissionTag {
             admission_seq: AdmissionSeq(r.u64()?),
         };
         let seal_len = r.u32()? as usize;
         let seal = Seal::decode(r.take(seal_len)?).ok()?;
-        let value = match r.u8()? {
-            0 => Value::Absent,
-            1 => Value::Present(r.rest().to_vec()),
+        let mutation = match r.u8()? {
+            0 => Mutation::Delete { key },
+            1 => Mutation::Set {
+                key,
+                value: Ciphertext(r.rest().to_vec()),
+            },
             _ => return None,
         };
-        Some(Self { tag, value, seal })
+        Some(Self {
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation,
+                    tag,
+                    seal,
+                },
+                admission,
+            },
+        })
     }
 }
 
@@ -646,25 +662,48 @@ mod tests {
 
     #[test]
     fn data_record_roundtrips() {
-        let tag = Tag {
+        let key = Key::from_bytes([&b"db"[..], &b"row"[..]]).unwrap();
+        let tag = DeviceTag {
             device: DeviceId([3; 16]),
             device_seq: DeviceSeq(7),
-            epoch: Epoch(2),
             ver: Ver(11),
-            admission_seq: AdmissionSeq(99),
+            cipher_epoch: CipherEpoch(2),
         };
         let present = DataRecord {
-            tag: tag.clone(),
-            value: Value::Present(b"ct".to_vec()),
-            seal: Seal::empty_aead_v1(),
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation: Mutation::Set {
+                        key: key.clone(),
+                        value: Ciphertext(b"ct".to_vec()),
+                    },
+                    tag,
+                    seal: Seal::empty_aead_v1(),
+                },
+                admission: AdmissionTag {
+                    admission_seq: AdmissionSeq(99),
+                },
+            },
         };
-        assert_eq!(DataRecord::decode(&present.encode()), Some(present));
+        assert_eq!(
+            DataRecord::decode(key.clone(), &present.encode()),
+            Some(present)
+        );
         let tombstone = DataRecord {
-            tag,
-            value: Value::Absent,
-            seal: Seal::empty_aead_v1(),
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation: Mutation::Delete { key: key.clone() },
+                    tag,
+                    seal: Seal::empty_aead_v1(),
+                },
+                admission: AdmissionTag {
+                    admission_seq: AdmissionSeq(99),
+                },
+            },
         };
-        assert_eq!(DataRecord::decode(&tombstone.encode()), Some(tombstone));
+        assert_eq!(
+            DataRecord::decode(key, &tombstone.encode()),
+            Some(tombstone)
+        );
     }
 
     #[test]

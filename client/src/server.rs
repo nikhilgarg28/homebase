@@ -29,9 +29,9 @@
 //! lie, and the contract only promises what every implementation can keep.
 
 use homebase_core::messages::{
-    AcquireRequest, AcquireResponse, GetRequest, GetResponse, ListLeasesRequest,
-    ListLeasesResponse, ListRequest, ListResponse, PutBatchRequest, PutBatchResponse,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
+    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space, SpaceError, SpaceId};
 use std::future::Future;
@@ -65,11 +65,11 @@ pub trait ServerHandle {
         req: ListLeasesRequest,
     ) -> impl Future<Output = Result<ListLeasesResponse, SpaceError>> + Send;
 
-    fn put_batch(
+    fn admit(
         &self,
         space: &SpaceId,
-        req: PutBatchRequest,
-    ) -> impl Future<Output = Result<PutBatchResponse, SpaceError>> + Send;
+        req: AdmissionRequest,
+    ) -> impl Future<Output = Result<AdmissionResponse, SpaceError>> + Send;
 
     fn get(
         &self,
@@ -138,13 +138,13 @@ where
         }
     }
 
-    async fn put_batch(
+    async fn admit(
         &self,
         space: &SpaceId,
-        req: PutBatchRequest,
-    ) -> Result<PutBatchResponse, SpaceError> {
+        req: AdmissionRequest,
+    ) -> Result<AdmissionResponse, SpaceError> {
         match self(space) {
-            Some(s) => s.put_batch(req).await,
+            Some(s) => s.admit(req).await,
             None => Err(SpaceError::unavailable("space not served by this endpoint")),
         }
     }
@@ -200,7 +200,7 @@ impl Space for UnreachableSpace {
         match *self {}
     }
 
-    async fn put_batch(&self, _: PutBatchRequest) -> Result<PutBatchResponse, SpaceError> {
+    async fn admit(&self, _: AdmissionRequest) -> Result<AdmissionResponse, SpaceError> {
         match *self {}
     }
 
@@ -255,11 +255,11 @@ impl ServerHandle for Offline {
         match *self {}
     }
 
-    async fn put_batch(
+    async fn admit(
         &self,
         _space: &SpaceId,
-        _req: PutBatchRequest,
-    ) -> Result<PutBatchResponse, SpaceError> {
+        _req: AdmissionRequest,
+    ) -> Result<AdmissionResponse, SpaceError> {
         match *self {}
     }
 
@@ -292,11 +292,15 @@ pub mod conformance {
     use homebase_core::key::Key;
     use homebase_core::lease::LeaseMode;
     use homebase_core::messages::{
-        AcquireRequest, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch, PutBatchRequest,
-        PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
+        AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec,
+        ListRequest, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
     };
+    use homebase_core::seal::Seal;
     use homebase_core::space::{SpaceError, SpaceId};
-    use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+    use homebase_core::tag::{
+        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+        Mutation, Ver,
+    };
     use std::time::Duration;
 
     fn dev(n: u8) -> DeviceId {
@@ -312,6 +316,22 @@ pub mod conformance {
             prefix: prefix.clone(),
             mode: LeaseMode::Write,
             ttl: Duration::from_secs(60),
+        }
+    }
+
+    fn set_entry(device: DeviceId, seq: u64, key: Key, value: &[u8], ver: u64) -> DeviceEntry {
+        DeviceEntry {
+            mutation: Mutation::Set {
+                key,
+                value: Ciphertext(value.to_vec()),
+            },
+            tag: DeviceTag {
+                device,
+                device_seq: DeviceSeq(seq),
+                ver: Ver(ver),
+                cipher_epoch: CipherEpoch(0),
+            },
+            seal: Seal::empty_aead_v1(),
         }
     }
 
@@ -355,22 +375,15 @@ pub mod conformance {
         let lease = granted.leases[0].id;
 
         let put = handle
-            .put_batch(
+            .admit(
                 &space,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: dev(1),
                     evidence: vec![lease],
-                    batches: vec![PutBatch {
+                    batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),
                         range_asserts: vec![],
-                        ops: vec![
-                            PutEntry {
-                                key: k.clone(),
-                                value: Value::Present(marker.to_vec()),
-                                ver: Ver(1),
-                            }
-                            .into(),
-                        ],
+                        entries: vec![set_entry(dev(1), 1, k.clone(), marker, 1)],
                     }],
                 },
             )
@@ -392,8 +405,11 @@ pub mod conformance {
             .await
             .unwrap();
         assert_eq!(
-            got.entries[0].as_ref().map(|e| &e.value),
-            Some(&Value::Present(marker.to_vec()))
+            got.entries[0].as_ref().map(|e| &e.device_entry.mutation),
+            Some(&Mutation::Set {
+                key: k.clone(),
+                value: Ciphertext(marker.to_vec())
+            })
         );
 
         let listed = handle
@@ -477,8 +493,11 @@ pub mod conformance {
                 .await
                 .unwrap();
             assert_eq!(
-                got.entries[0].as_ref().map(|e| &e.value),
-                Some(&Value::Present(marker.to_vec())),
+                got.entries[0].as_ref().map(|e| &e.device_entry.mutation),
+                Some(&Mutation::Set {
+                    key: k.clone(),
+                    value: Ciphertext(marker.to_vec()),
+                }),
                 "space {space:?} must see only its own write"
             );
         }
@@ -521,22 +540,15 @@ pub mod conformance {
         );
 
         let uncovered = handle
-            .put_batch(
+            .admit(
                 &space,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: dev(2),
                     evidence: vec![],
-                    batches: vec![PutBatch {
+                    batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),
                         range_asserts: vec![],
-                        ops: vec![
-                            PutEntry {
-                                key: key(&[b"x", b"k"]),
-                                value: Value::Present(b"v".to_vec()),
-                                ver: Ver(1),
-                            }
-                            .into(),
-                        ],
+                        entries: vec![set_entry(dev(2), 1, key(&[b"x", b"k"]), b"v", 1)],
                     }],
                 },
             )
@@ -599,21 +611,21 @@ pub mod conformance {
             .unwrap_err();
         assert!(is_transport(&err), "release: {err:?}");
         let err = handle
-            .put_batch(
+            .admit(
                 &unknown,
-                PutBatchRequest {
+                AdmissionRequest {
                     device: dev(1),
                     evidence: vec![],
-                    batches: vec![PutBatch {
+                    batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),
                         range_asserts: vec![],
-                        ops: vec![],
+                        entries: vec![],
                     }],
                 },
             )
             .await
             .unwrap_err();
-        assert!(is_transport(&err), "put_batch: {err:?}");
+        assert!(is_transport(&err), "admit: {err:?}");
         let err = handle
             .get(&unknown, GetRequest { keys: vec![] })
             .await

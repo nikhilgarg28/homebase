@@ -7,10 +7,12 @@ use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{BatchOp, GetRequest, LeaseSpec, Range, RangeCut};
+use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Entry, Epoch, Tag, Value};
+use homebase_core::tag::{
+    AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceId, DeviceSeq, Mutation,
+};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -38,8 +40,11 @@ fn key(parts: &[&[u8]]) -> Key {
     Key::from_bytes(parts.iter().copied()).unwrap()
 }
 
-fn val(bytes: &[u8]) -> Value {
-    Value::Present(bytes.to_vec())
+fn set(key: Key, bytes: &[u8]) -> Mutation {
+    Mutation::Set {
+        key,
+        value: bytes.to_vec(),
+    }
 }
 
 fn wspec(prefix: &Key) -> LeaseSpec {
@@ -60,7 +65,7 @@ fn spawn_server() -> impl Fn(&SpaceId) -> Option<SpaceHandle> + Sync {
     move |id: &SpaceId| server.space(id)
 }
 
-async fn fetch(handle: &impl ServerHandle, k: &Key) -> Option<Entry> {
+async fn fetch(handle: &impl ServerHandle, k: &Key) -> Option<AdmittedEntry> {
     handle
         .get(
             &SPACE,
@@ -74,34 +79,34 @@ async fn fetch(handle: &impl ServerHandle, k: &Key) -> Option<Entry> {
         .remove(0)
 }
 
-fn snapshot_from_pull(entries: &[homebase_core::tag::Entry]) -> BTreeMap<Key, Value> {
+fn snapshot_from_pull(entries: &[AdmittedEntry<Vec<u8>>]) -> BTreeMap<Key, Option<Vec<u8>>> {
     entries
         .iter()
-        .map(|e| (e.key.clone(), e.value.clone()))
+        .map(|e| match &e.device_entry.mutation {
+            Mutation::Set { key, value } => (key.clone(), Some(value.clone())),
+            Mutation::Delete { key } => (key.clone(), None),
+        })
         .collect()
 }
 
 fn replay_oplog_plaintext(
-    mut view: BTreeMap<Key, Value>,
+    mut view: BTreeMap<Key, Option<Vec<u8>>>,
     state: &homebase::meta::ClientState,
     space: SpaceId,
     device: DeviceId,
-) -> BTreeMap<Key, Value> {
+) -> BTreeMap<Key, Option<Vec<u8>>> {
     let Some(space_state) = state.spaces.get(&space) else {
         return view;
     };
     for (seq, record) in &space_state.oplog {
-        for op in record.ops() {
-            match op {
-                BatchOp::Set {
-                    key, ciphertext, ..
-                } => {
-                    view.insert(key.clone(), Value::Present(ciphertext.clone()));
+        for entry in record.entries() {
+            match &entry.mutation {
+                Mutation::Set { key, value } => {
+                    view.insert(key.clone(), Some(value.0.clone()));
                 }
-                BatchOp::Delete { key, .. } => {
-                    view.insert(key.clone(), Value::Absent);
+                Mutation::Delete { key } => {
+                    view.insert(key.clone(), None);
                 }
-                BatchOp::NoOp => {}
             }
             let _ = (seq, device);
         }
@@ -136,13 +141,13 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space
-            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
 
         space
-            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -172,7 +177,15 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
         );
 
         for (k, v) in &expected {
-            assert_eq!(fetch(&handle, k).await.unwrap().value, *v);
+            let fetched = fetch(&handle, k).await;
+            match (v, fetched) {
+                (None, None) => {}
+                (Some(expected), Some(entry)) => match entry.device_entry.mutation {
+                    Mutation::Set { value, .. } => assert_eq!(value.0, *expected),
+                    Mutation::Delete { .. } => panic!("get returned tombstone"),
+                },
+                other => panic!("server state mismatch: {other:?}"),
+            }
         }
     });
 }
@@ -224,12 +237,12 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         space.acquire(vec![wspec(&db)]).await.unwrap();
 
         space
-            .submit_checked(vec![(k1.clone(), val(b"one"))], vec![])
+            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
         client.push().await.unwrap();
         space
-            .submit_checked(vec![(k2.clone(), val(b"two"))], vec![])
+            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
 
@@ -237,37 +250,29 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
             panic!("expected snapshot")
         };
-        let mut expected: BTreeMap<Key, Value> = entries
-            .iter()
-            .map(|e| (e.key.clone(), e.value.clone()))
-            .collect();
+        let mut expected = snapshot_from_pull(entries);
 
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         let cipher = envelope.open().unwrap();
         let encoded_k2 = cipher.encode_key(&k2).unwrap();
         for (seq, record) in &state.spaces[&space_id].oplog {
-            for op in record.ops() {
-                if op.key() != Some(&encoded_k2) {
+            for device_entry in record.entries() {
+                if device_entry.key() != &encoded_k2 {
                     continue;
                 }
-                let entry = Entry {
-                    key: encoded_k2.clone(),
-                    value: match op {
-                        BatchOp::Set { ciphertext, .. } => Value::Present(ciphertext.clone()),
-                        BatchOp::Delete { .. } => Value::Absent,
-                        BatchOp::NoOp => continue,
-                    },
-                    seal: op.seal().unwrap().clone(),
-                    tag: Tag {
-                        device: client.device(),
-                        device_seq: *seq,
-                        epoch: Epoch(0),
-                        ver: op.ver().unwrap(),
+                let entry = AdmittedEntry {
+                    device_entry: device_entry.clone(),
+                    admission: AdmissionTag {
                         admission_seq: AdmissionSeq(0),
                     },
                 };
-                let plain = cipher.decode_entry_value(&entry).unwrap();
-                expected.insert(encoded_k2.clone(), plain);
+                let plain = cipher.open_admitted_entry(&entry).unwrap();
+                let value = match plain.device_entry.mutation {
+                    Mutation::Set { value, .. } => Some(value),
+                    Mutation::Delete { .. } => None,
+                };
+                expected.insert(encoded_k2.clone(), value);
+                let _ = seq;
             }
         }
 
@@ -286,8 +291,12 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
                 .entries
                 .remove(0)
                 .unwrap();
-            let decoded = cipher.decode_entry_value(&stored).unwrap();
-            assert_eq!(decoded, *plain);
+            let decoded = cipher.open_admitted_entry(&stored).unwrap();
+            match (&decoded.device_entry.mutation, plain) {
+                (Mutation::Set { value, .. }, Some(expected)) => assert_eq!(value, expected),
+                (Mutation::Delete { .. }, None) => {}
+                other => panic!("decoded state mismatch: {other:?}"),
+            }
         }
     });
 }

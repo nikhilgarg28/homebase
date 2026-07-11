@@ -10,10 +10,13 @@ use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, KernelError, LeaseSpec,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
-use homebase_core::tag::{DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
 use rand::rngs::StdRng;
@@ -124,23 +127,28 @@ pub async fn client(
 
         let seq = state.next_seq.load(Ordering::SeqCst);
         let lease = state.lease.lock().unwrap().unwrap();
-        let req = PutBatchRequest {
+        let req = AdmissionRequest {
             device: dev(d),
             evidence: vec![lease],
-            batches: vec![PutBatch {
+            batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
                 range_asserts: vec![],
-                ops: vec![
-                    PutEntry {
+                entries: vec![DeviceEntry {
+                    mutation: Mutation::Set {
                         key: user_key(d, seq),
-                        value: Value::Present(value(d, seq)),
+                        value: Ciphertext(value(d, seq)),
+                    },
+                    tag: DeviceTag {
+                        device: dev(d),
+                        device_seq: DeviceSeq(seq),
                         ver: Ver(1),
-                    }
-                    .into(),
-                ],
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                }],
             }],
         };
-        match handle.put_batch(req).await {
+        match handle.admit(req).await {
             Ok(resp) => {
                 acks.lock().unwrap().push(Ack {
                     device: d,
@@ -182,8 +190,11 @@ pub fn phase_oracle<S: OrderedStore>(
                 panic!("acked batch below high water lost: {ack:?} (seed {seed})")
             });
             assert_eq!(
-                record.value,
-                Value::Present(value(ack.device, ack.device_seq)),
+                record.entry.device_entry.mutation,
+                Mutation::Set {
+                    key: user_key(ack.device, ack.device_seq),
+                    value: Ciphertext(value(ack.device, ack.device_seq)),
+                },
                 "acked value corrupted: {ack:?} (seed {seed})"
             );
             true

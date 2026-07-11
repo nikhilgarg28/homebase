@@ -22,7 +22,9 @@ use homebase_core::messages::{
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, CipherEpoch, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+};
 use std::fmt;
 use std::time::Duration;
 
@@ -146,23 +148,6 @@ pub struct Submission {
     pub seq: DeviceSeq,
 }
 
-/// One logical client mutation. Version, nonce, seal, and ciphertext are
-/// assigned internally when the mutation is appended to the oplog.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Mutation {
-    Set { key: Key, value: Vec<u8> },
-    Delete { key: Key },
-}
-
-impl From<(Key, Value)> for Mutation {
-    fn from((key, value): (Key, Value)) -> Self {
-        match value {
-            Value::Present(value) => Self::Set { key, value },
-            Value::Absent => Self::Delete { key },
-        }
-    }
-}
-
 /// A handle to one space within a [`Client`].
 pub struct Space<'a, M, H, C, N = SystemNonceSource> {
     client: &'a Client<M, H, C, N>,
@@ -246,19 +231,20 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         &self,
         mutations: Vec<Mutation>,
         range_asserts: Vec<RangeAssert>,
-    ) -> Result<(Vec<(Key, Value)>, Vec<RangeAssert>), SpaceDriverError> {
+    ) -> Result<(Vec<Mutation>, Vec<RangeAssert>), SpaceDriverError> {
         let name_cipher = self.cipher();
         self.client
             .run_blocking(move || -> Result<_, CipherError> {
-                let entries = mutations
+                let mutations = mutations
                     .into_iter()
                     .map(|mutation| match mutation {
-                        Mutation::Set { key, value } => {
-                            Ok((name_cipher.encode_key(&key)?, Value::Present(value)))
-                        }
-                        Mutation::Delete { key } => {
-                            Ok((name_cipher.encode_key(&key)?, Value::Absent))
-                        }
+                        Mutation::Set { key, value } => Ok(Mutation::Set {
+                            key: name_cipher.encode_key(&key)?,
+                            value,
+                        }),
+                        Mutation::Delete { key } => Ok(Mutation::Delete {
+                            key: name_cipher.encode_key(&key)?,
+                        }),
                     })
                     .collect::<Result<Vec<_>, CipherError>>()?;
                 let range_asserts = range_asserts
@@ -270,7 +256,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                         })
                     })
                     .collect::<Result<Vec<_>, CipherError>>()?;
-                Ok((entries, range_asserts))
+                Ok((mutations, range_asserts))
             })
             .await
             .map_err(coordination_unavailable)?
@@ -279,7 +265,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
 
     async fn persist_submission(
         &self,
-        encoded: Vec<(Key, Value)>,
+        encoded: Vec<Mutation>,
         range_asserts: Vec<RangeAssert>,
     ) -> Result<Committed, SpaceDriverError> {
         let cipher = self.cipher();
@@ -287,47 +273,45 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let reserved = self
             .client
             .store()
-            .reserve_commit(self.id, encoded, range_asserts)
+            .reserve_commit(self.id, encoded.len(), range_asserts)
             .await?;
-        let nonces = (0..reserved.record.ops().len())
+        let nonces = (0..encoded.len())
             .map(|_| {
                 self.client
                     .next_nonce()
                     .map_err(|reason| SpaceDriverError::Nonce { reason })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let reserved = self
+        let seq = reserved.seq;
+        let versions = reserved.versions.clone();
+        let entries = self
             .client
             .run_blocking(move || {
-                let mut reserved = reserved;
-                for (op, nonce) in reserved.record.ops_mut().iter_mut().zip(nonces) {
-                    let entry = match op {
-                        homebase_core::messages::BatchOp::Set {
-                            key,
-                            ver,
-                            ciphertext,
-                            ..
-                        } => homebase_core::messages::PutEntry {
-                            key: key.clone(),
-                            value: Value::Present(ciphertext.clone()),
-                            ver: *ver,
-                        },
-                        homebase_core::messages::BatchOp::Delete { key, ver, .. } => {
-                            homebase_core::messages::PutEntry {
-                                key: key.clone(),
-                                value: Value::Absent,
-                                ver: *ver,
-                            }
-                        }
-                        homebase_core::messages::BatchOp::NoOp => continue,
-                    };
-                    *op = cipher.encode_batch_op(device, reserved.seq, &entry, nonce)?;
-                }
-                Ok::<_, CipherError>(reserved)
+                encoded
+                    .into_iter()
+                    .zip(versions)
+                    .zip(nonces)
+                    .map(|((mutation, ver), nonce)| {
+                        cipher.encode_device_entry(
+                            mutation,
+                            DeviceTag {
+                                device,
+                                device_seq: seq,
+                                ver,
+                                cipher_epoch: CipherEpoch(crate::cipher::V1_CIPHER_EPOCH),
+                            },
+                            nonce,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, CipherError>>()
             })
             .await
             .map_err(coordination_unavailable)??;
-        let committed = self.client.store().commit(self.id, reserved).await?;
+        let committed = self
+            .client
+            .store()
+            .commit(self.id, reserved, entries)
+            .await?;
         Ok(committed)
     }
 
@@ -504,7 +488,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         Ok(())
     }
 
-    pub async fn pull(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
+    pub async fn pull(&self, range: Range) -> Result<ReadAtResponse<Vec<u8>>, SpaceDriverError> {
         let _permit = self.enter().await?;
         let range = self.cipher().encode_range(&range)?;
         self.pull_encoded(range).await
@@ -522,11 +506,14 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             })
     }
 
-    async fn pull_encoded(&self, range: Range) -> Result<ReadAtResponse, SpaceDriverError> {
+    async fn pull_encoded(
+        &self,
+        range: Range,
+    ) -> Result<ReadAtResponse<Vec<u8>>, SpaceDriverError> {
         let space = self.id;
         let cipher = self.cipher();
         let since = self.client.store().watermark(space, &range).await?;
-        let mut response = self
+        let response = self
             .client
             .server()
             .read_at(
@@ -544,7 +531,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .iter()
             .flat_map(|range| {
                 let (RangeCut::Snapshot(entries) | RangeCut::Delta(entries)) = range;
-                entries.iter().map(|entry| entry.tag.ver)
+                entries.iter().map(|entry| entry.ver())
             })
             .max()
             .unwrap_or(Ver(0));
@@ -554,15 +541,26 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .await?;
         self.client
             .run_blocking(move || {
-                for cut in &mut response.ranges {
-                    let entries = match cut {
-                        RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
-                    };
-                    for entry in entries {
-                        entry.value = cipher.decode_entry_value(entry)?;
-                    }
-                }
-                Ok::<_, CipherError>(response)
+                let ranges = response
+                    .ranges
+                    .into_iter()
+                    .map(|cut| match cut {
+                        RangeCut::Snapshot(entries) => entries
+                            .iter()
+                            .map(|entry| cipher.open_admitted_entry(entry))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(RangeCut::Snapshot),
+                        RangeCut::Delta(entries) => entries
+                            .iter()
+                            .map(|entry| cipher.open_admitted_entry(entry))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(RangeCut::Delta),
+                    })
+                    .collect::<Result<Vec<_>, CipherError>>()?;
+                Ok::<_, CipherError>(ReadAtResponse {
+                    at: response.at,
+                    ranges,
+                })
             })
             .await
             .map_err(coordination_unavailable)?
@@ -641,10 +639,11 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         }
         for (seq, record) in space_state.active_oplog() {
             for held in &releasing {
-                if record.ops().iter().any(|op| {
-                    op.key()
-                        .is_some_and(|key| key.starts_with(&held.lease.prefix))
-                }) {
+                if record
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.key().starts_with(&held.lease.prefix))
+                {
                     return Err(SpaceDriverError::ReleaseBlocked {
                         lease: held.lease.id,
                         at: *seq,

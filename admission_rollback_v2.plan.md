@@ -6,10 +6,10 @@ todos:
     content: "Phase 0: Confirm baseline — 2 committed test commits on main; stash WIP; workspace green"
     status: pending
   - id: p1-core-types
-    content: "Phase 1: Core wire + oplog types — Seal, BatchOp Set/Delete, RangeAssert, data-only PutBatch, LeaseKind, ListLeases, OplogRecord/Cursors; lease verbs stay separate"
+    content: "Phase 1: Core wire + oplog types — Seal, Mutation Set/Delete, DeviceEntry/AdmittedEntry, RangeAssert, data-only AdmissionBatch, LeaseKind, ListLeases, DeviceOp/Cursors; lease verbs stay separate"
     status: pending
   - id: p2-drop-epoch
-    content: "Phase 2: Remove lease Epoch — Tag/Lease/Fenced; keep LeaseId evidence diagnostic-only; record encode v2; sim audit"
+    content: "Phase 2: Remove lease Epoch — split DeviceTag from AdmissionTag; keep LeaseId evidence diagnostic-only; record encode v2; sim audit"
     status: pending
   - id: p3-server-admission
     content: "Phase 3: Server admission rewrite — multi-batch all-or-nothing, asserts, sequential data ops, writes allowed unless conflicting active lease"
@@ -18,7 +18,7 @@ todos:
     content: "Phase 4: Client meta — per-space oplogs/ver_high, rollback(to), head/neck/tail persisted, forgotten lease release intents, certify [neck,tail), reserve_batch only, drop discard_from"
     status: pending
   - id: p5-data-submit
-    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, encode_batch_op; expose ensure()+release(), no public acquire()"
+    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose ensure()+release(), no public acquire()"
     status: pending
   - id: p6-push-ack
     content: "Phase 6: Push + ack — PushOptions, disk head/neck/tail only, push_until wait-through, Submission::push sugar, data-only ack, Fork trim vs rollback"
@@ -83,8 +83,8 @@ isProject: false
 - Leases are **reservations**, not required write capabilities: writes without a held lease are admitted when no active incompatible lease conflicts with their keys.
 - Client lease state is always a **subset of authority**: local active leases may lag server grants, but must never outlive local release intent.
 - Client coordination state is owned by a **single-owner event loop**. The loop serializes all correctness-state transitions and performs no slow work itself: blocking work (SQLite, bulk crypto) runs on worker threads, concurrent work (network, timers) runs in tasks, and both communicate with the loop via channels. The loop is the correctness chokepoint, never the performance chokepoint.
-- Data batches evaluate sequentially on server scratch; no lease acquire/release ops appear in the oplog or `PutBatch`.
-- Multi-batch `PutBatchRequest`: simulate sequentially, commit **all-or-nothing**.
+- Data batches evaluate sequentially on server scratch; no lease acquire/release ops appear in the oplog or `AdmissionBatch`.
+- Multi-batch `AdmissionRequest`: simulate sequentially, commit **all-or-nothing**.
 - **Fork** (duplicate device identity) is fatal; server-ahead catch-up uses **trim**, not rollback.
 - **`certify` at `Client::open`** — production safety net (not sim-only). Do **not** feature-gate.
 
@@ -97,8 +97,8 @@ isProject: false
 | Lease stealing | Stealable leases + `steal=true` preemption | **Removed:** no pre-deadline lease stealing; takeover is a later explicit/admin flow |
 | Client release state | Drop after server release | **Forgotten first:** local release intent removes authority before remote release; retained for retry until ack |
 | Lease deadline margin | 0.1% of TTL | **max(0.1% of TTL, 10ms)** floor for local authority expiry |
-| `BatchOp::Delete` | Separate delete op | **Explicit `Delete { key, ver, seal }`** — server-aware; no `Value::Absent` tombstone-on-Set |
-| Value binding | Opaque ciphertext + server `Tag` | **`Seal`** (scheme + nonce + AEAD tag) on all data ops; key-bound AAD at client |
+| `Mutation::Delete` | Separate delete mutation | **Explicit `Delete { key }` inside a sealed `DeviceEntry`** — server-aware; no sentinel value |
+| Value binding | Opaque ciphertext + combined metadata | **`DeviceEntry { mutation, tag, seal }`** is the complete client-authenticated object; server wraps it unchanged in `AdmittedEntry` |
 | Awaited data writes | Special `Sync` mode | **Sugar, not mechanism:** `Submission::push()` calls `space.push_until(seq).await` and extracts that seq's disposition |
 | Client session state | (implicit in-memory cursors) | **Disk-only:** `Client` holds device + session attach map; per-space oplog cursors load from `MetaStore` each push; `PushOptions` per push call |
 | Oplog scope | One client-level oplog | **Per-space oplog:** cross-space/client-level oplog deferred for future two-phase commits |
@@ -122,7 +122,7 @@ sequenceDiagram
     App->>Space: submit_checked(Set ops, asserts)
     Space->>Meta: reserve_batch + append at tail
     App->>Push: Space::push() or Submission::push()
-    Push->>Server: PutBatchRequest
+    Push->>Server: AdmissionRequest
     Server-->>Push: per-batch results
     Push->>Meta: trim data oplog
 
@@ -143,7 +143,7 @@ sequenceDiagram
     Note over App,Server: Abandon path (caller-driven)
     Push-->>App: Stalled / Rejected
     App->>Meta: rollback(to)
-    App->>Push: push rollback NoOp batch
+    App->>Push: push rollback as an empty AdmissionBatch
 ```
 
 ---
@@ -172,14 +172,14 @@ impl From<SealScheme> for u8 {
 pub struct Seal {
     pub scheme: SealScheme,  // wire-encoded as u8; AeadV1 = 0
     pub nonce: [u8; 24],     // AEAD nonce
-    pub aead: [u8; 16],       // Poly1305 authentication tag (not server admission Tag)
+    pub aead: [u8; 16],       // Poly1305 authentication tag (not AdmissionTag)
     pub payload: Vec<u8>,     // opaque scheme extension; empty for AeadV1
 }
 ```
 
 - **`scheme`** identifies the sealing/encryption scheme, not the op kind. Initial enum has one variant, `AeadV1 = 0`, with explicit checked conversion to/from the wire `u8`.
-- **Present (`Set`):** `BatchOp::Set { key, ver, seal, ciphertext }` — ciphertext follows the fixed seal header.
-- **Delete:** `BatchOp::Delete { key, ver, seal }` — seal only; AEAD plaintext is `b""`.
+- **Present (`Set`):** `DeviceEntry { mutation: Mutation::Set { key, value: Ciphertext }, tag, seal }`.
+- **Delete:** `DeviceEntry { mutation: Mutation::Delete { key }, tag, seal }`; AEAD plaintext is `b""`.
 - **Future `DeleteRange`:** same seal machinery over range metadata + prefix (backlog until specified).
 - **Scheme payload:** `Seal.payload` is opaque extension data for future schemes. For `SealScheme::AeadV1`, it must be empty and decoders should reject non-empty payloads.
 - **Empty Set privacy:** because the AEAD tag lives in `Seal.aead`, encrypting raw `b""` for a Set would produce empty ciphertext and leak "empty logical value" to the server. Do not use key material as a deterministic IV/nonce; the same key would repeat across writes. Key components are non-empty, but that does not make them safe nonces. Instead, the value cipher must encrypt a non-empty Set plaintext frame (for example a versioned length/value frame, with optional padding buckets later) so even an empty logical value has non-empty ciphertext.
@@ -196,18 +196,22 @@ Clients decrypt/verify on `read_at` / local replay; the kernel never interprets 
 
 ### Kernel storage model
 
-Replace `Value::Absent` with an explicit delete representation the server can recognize:
+The canonical entry model is:
 
 ```rust
-pub enum Value {
-    Present { seal: Seal, ciphertext: Vec<u8> },
-    Deleted { seal: Seal },
+pub enum Mutation<T = Vec<u8>> {
+    Set { key: Key, value: T },
+    Delete { key: Key },
 }
+pub struct DeviceTag { device: DeviceId, device_seq: DeviceSeq, ver: Ver, cipher_epoch: CipherEpoch }
+pub struct DeviceEntry<T = Ciphertext> { mutation: Mutation<T>, tag: DeviceTag, seal: Seal }
+pub struct AdmissionTag { admission_seq: AdmissionSeq }
+pub struct AdmittedEntry<T = Ciphertext> { device_entry: DeviceEntry<T>, admission: AdmissionTag }
 ```
 
-- **`read_at` deltas** emit `Deleted { seal }` rows — replicas observe deletes.
+- **`read_at` deltas** emit admitted Delete mutations — replicas observe deletes.
 - **`get` / `list`** skip deleted rows (live entries only), same contract as today.
-- Server **`Tag`** (device, device_seq, ver, admission_seq) unchanged — admission metadata stays separate from AEAD seal and carries no lease id.
+- `DeviceTag` contains every client-minted AAD field. `AdmissionTag` is server-minted and deliberately outside AAD. Neither carries a lease id.
 
 ### Why not tombstone-on-Set?
 
@@ -305,39 +309,39 @@ pub struct ListLeasesResponse {
 - Each lease's `barrier` is the prefix-scoped `effective_prefix_max(prefix)` when that lease was granted/refreshed. Repaired leases are not local authority until their prefixes are pulled through their own barriers.
 - Client reconciliation records listed leases as Active/pending-barrier, drops local Active leases absent from the server response, and clears Forgotten release intents absent from the server response. Forgotten leases still present on the server remain Forgotten for retry.
 
-### Put batch shape
+### Admission shape
 
 ```rust
 pub struct RangeAssert { pub prefix: Key, pub upto: AdmissionSeq }
 
-pub enum BatchOp {
-    Set { key: Key, ver: Ver, seal: Seal, ciphertext: Vec<u8> },
-    Delete { key: Key, ver: Ver, seal: Seal },
-    NoOp,
-}
-
-pub struct PutBatch {
+pub struct AdmissionBatch {
     pub device_seq: DeviceSeq,
-    pub ops: Vec<BatchOp>,
     pub range_asserts: Vec<RangeAssert>,
+    pub entries: Vec<DeviceEntry>,
+}
+
+pub struct AdmissionRequest {
+    pub device: DeviceId,
     pub evidence: Vec<LeaseId>,  // diagnostic only; never admission authority
+    pub batches: Vec<AdmissionBatch>,
 }
 
-pub struct PutBatchResponse {
-    pub results: Vec<PutBatchResult>, // exactly one result per input batch
+pub struct AdmissionResponse {
+    pub results: Vec<AdmissionResult>, // exactly one result per input batch
 }
 
-pub enum PutBatchResult {
+pub enum AdmissionResult {
     Applied { admission_seq: AdmissionSeq },
     Failed { error: BatchError },
 }
 ```
 
-- Remove authoritative `PutBatchRequest.leases` and `LeaseRef`; keep `Vec<LeaseId>` evidence on data batches for diagnostics / richer errors only.
-- Keep lease verbs (`acquire` / `release` / `list_leases`) outside `PutBatch`; no `BatchOp::Acquire` or `BatchOp::Release`.
+- Remove authoritative `AdmissionRequest.leases` and `LeaseRef`; keep `Vec<LeaseId>` evidence on data batches for diagnostics / richer errors only.
+- Keep lease verbs (`acquire` / `release` / `list_leases`) outside `AdmissionBatch`.
 - Acquire refreshes same-device compatible held leases in place where possible; no data push is required before lease calls.
 - Remove lease stealing entirely: no `stealable` field, no `steal` argument, and no pre-deadline preemption.
-- Replace `PutEntry` / `Value::Absent` tombstone path with `BatchOp` + `Value::{Present, Deleted}` (see Seal design).
+- `Mutation::Delete` is the only tombstone representation; no `PutEntry`, `Value`, `BatchOp`, or explicit NoOp type remains.
+- A rollback is represented on the wire by an `AdmissionBatch` with empty `entries`; sequence and range-assert fields retain their normal meaning.
 
 ### Causal range-assert semantics
 
@@ -351,9 +355,9 @@ pub enum PutBatchResult {
 ```rust
 pub struct OplogCursors { pub head, pub neck, pub tail: DeviceSeq }
 
-pub enum OplogRecord {
+pub enum DeviceOp {
     Commit {
-        ops: Vec<BatchOp>,
+        entries: Vec<DeviceEntry>,
         range_asserts: Vec<RangeAssert>,
         evidence: Vec<LeaseId>,
     },
@@ -364,7 +368,7 @@ pub enum OplogRecord {
 ```
 
 - Oplog storage is keyed by `(space_id, device_seq)` and each space has its own `OplogCursors`.
-- Checked vs unchecked is a client-side pre-append policy selected by the `submit_checked` / `submit_unchecked` API; it does not need to be stored in `OplogRecord` after local qualification succeeds.
+- Checked vs unchecked is a client-side pre-append policy selected by the `submit_checked` / `submit_unchecked` API; it does not need to be stored in `DeviceOp` after local qualification succeeds.
 - `Submission::push()` is API sugar, not oplog state. The durable fact is still only the appended record at `device_seq`.
 - MetaStore methods that read/write oplog state take `space_id` explicitly: reservation, append, scan, trim, rollback, cursor load/certify.
 - `DeviceSeq` remains part of server tags and replay fences, but monotonicity is per `(space, device)`, matching server admission.
@@ -402,7 +406,7 @@ Rewritten semantics:
 2. Per data batch: range asserts compare the scratch foreign-device prefix maximum to inclusive `upto`, then apply sequential `Set` / `Delete` ops. Earlier scratch writes from the same device do not invalidate later assertions in the request.
 3. **Set and Delete** require per-key `ver` monotonicity and must not conflict with any active incompatible lease held by another device/range; no presented lease is required.
 4. Multi-batch: all-or-nothing durable apply.
-5. Return `PutBatchResponse.results` with exactly one `PutBatchResult` per input batch.
+5. Return `AdmissionResponse.results` with exactly one `AdmissionResult` per input batch.
 6. `evidence: Vec<LeaseId>` may be consulted only to improve rejection details; it never authorizes a write.
 7. Prefix aggregates: update on **data writes only** (`Set` and `Delete`); real deletes keep `live_count` accurate because the server can distinguish present vs deleted values.
 
@@ -434,7 +438,7 @@ Lease verbs remain separate sync operations:
 ### Per-space oplogs
 
 - `ClientState` keeps device identity globally, but queue/cursor state under each `SpaceState`.
-- `OplogCursors { head, neck, tail }` and `OplogRecord::{Commit, Rollback}` records are keyed by `SpaceId` and persisted in `MetaStore`.
+- `OplogCursors { head, neck, tail }` and `DeviceOp::{Commit, Rollback}` records are keyed by `SpaceId` and persisted in `MetaStore`.
 - `MetaStore::reserve_batch`, `commit`, `oplog`, `trim_oplog`, `rollback`, and cursor/certify helpers take `space_id` and operate only on that space's queue.
 - `next_seq` is replaced by the space's `tail`; the "collapse `next_seq` vs tail" backlog item is part of this phase.
 - There is no separate in-memory scan pointer or second cursor set; every push iteration reloads or transactionally updates disk `head/neck/tail`.
@@ -443,7 +447,7 @@ Lease verbs remain separate sync operations:
 ### `rollback(to: DeviceSeq)`
 
 - Validate against that space's cursors: `neck <= to < tail`.
-- Append `OplogRecord::Rollback { marker }` at that space's `tail`; `neck = tail`; `tail += 1`; `head` unchanged.
+- Append `DeviceOp::Rollback { marker }` at that space's `tail`; `neck = tail`; `tail += 1`; `head` unchanged.
 - Remove `discard_from`.
 
 ### `reserve_batch` only
@@ -483,8 +487,8 @@ Lease verbs remain separate sync operations:
 
 ```rust
 // Data mutation surface on Space.
-space.submit_checked(ops: Vec<BatchOp>, range_asserts: Vec<RangeAssert>) -> Submission
-space.submit_unchecked(ops: Vec<BatchOp>, range_asserts: Vec<RangeAssert>) -> Submission
+space.submit_checked(mutations: Vec<Mutation>, range_asserts: Vec<RangeAssert>) -> Submission
+space.submit_unchecked(mutations: Vec<Mutation>, range_asserts: Vec<RangeAssert>) -> Submission
 
 pub struct Submission {
     pub seq: DeviceSeq,
@@ -510,10 +514,10 @@ space.repair_leases() -> RepairedLeases
 
 ### Inside `submit`
 
-1. **`stamp_data_ops`** — assign consecutive `ver` from the space-local disk `ver_high` for each `BatchOp::Set` and `BatchOp::Delete`.
+1. Reserve a `DeviceSeq` and consecutive `ver` values from the space-local disk `ver_high` for each mutation.
 2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require an Active local read or write lease whose prefix covers it, require the lease barrier to be satisfied, and require the effective local coverage watermark to be greater than or equal to `upto`. Parent pulls cover child assertions; child or sibling pulls do not cover parent/sibling assertions. Server admission remains authoritative.
 3. **`submit_unchecked`:** skip the local lease/range-assert gate; server admission still decides.
-4. **`reserve_batch`** → encode data ops (cipher `encode_batch_op`) → append to `MetaStore`.
+4. **`reserve_commit`** → build sealed `DeviceEntry` values with `encode_device_entry` → atomically append the finished `DeviceOp::Commit` to `MetaStore`.
 5. Return `Submission { seq }` after durable local append.
 6. `Submission::push()` is convenience only: it calls `space.push_until(seq).await` and extracts the disposition for this exact seq. It does not add a second admission/await mechanism.
 7. There is no empty-oplog precondition for `Submission::push()`. Semantics match "submit locally, then push through my seq"; earlier queued ops in the same space may be pushed first as part of reaching the target seq.
@@ -528,10 +532,10 @@ space.repair_leases() -> RepairedLeases
 
 ### Cipher
 
-- `encode_batch_op(device, seq, op, nonce)` for Set and Delete only.
+- `encode_device_entry(mutation, DeviceTag, nonce)` for Set and Delete.
 - **`encode_seal` / `verify_seal`** — AEAD with key-bound AAD (scheme + op kind + anonymized key/range descriptor + write context + `cipher_epoch`).
 - **Delete:** encrypt empty plaintext → `Seal` only; **Set:** encrypt payload → `Seal` + ciphertext.
-- **`decode_entry`** on read: verify seal binds to key; map `Value::Deleted` / `Present` for app layer.
+- **`open_admitted_entry`** on read: verify the seal and return `AdmittedEntry<Vec<u8>>` with the same mutation shape.
 
 **Exit:** space driver tests for data submit API, `ensure()` barrier pull, release, release retry after unavailable server, lease repair after local state loss/staleness, and acquire/release/list_leases working while local data oplogs are non-empty.
 
@@ -554,7 +558,7 @@ space.repair_leases() -> RepairedLeases
 
 - Public push is space-scoped (`space.push()` and `space.push_until(seq)`); there is no public global `client.push()` that silently iterates spaces.
 - Push scans that space's disk `[neck, tail)`; coalesce up to `cap`; honor optional `wait_through`.
-- Rollback record → wire `NoOp` batch preserving sequence/fork semantics.
+- Rollback record → wire batch with empty `entries`, preserving sequence/fork semantics without a NoOp mutation.
 
 ### Ack (`through`)
 
@@ -568,7 +572,7 @@ space.repair_leases() -> RepairedLeases
 - A push presents the client's persisted confirmed history head. The server admits only when it equals the server's current head, chains across every batch in the request, and atomically stores only the final head with the data apply.
 - The client atomically persists the returned final head with trimming the acknowledged oplog prefix. No per-batch fingerprint history is required on the server.
 - When the server is ahead after a lost response, the client hashes forward from its confirmed head across the retained local batches through the server's current seq. A matching final head validates every intermediate batch and permits catch-up trim; a mismatch or missing local path is a fatal fork.
-- Rollback's dead `[head, neck)` records do not enter the history chain. The admitted rollback `NoOp` extends the chain like any other wire batch.
+- Rollback's dead `[head, neck)` records do not enter the history chain. The admitted empty rollback batch extends the chain like any other wire batch.
 - The expected-head check prevents a rollback marker from skipping over a data batch that the server admitted before a client crash or lost response; before B14, callers must reconcile every ambiguous push outcome before invoking rollback.
 - This intentionally adds one correctness-bearing persisted server-history head per space; it is not derivable from `head/neck/tail` because rollback can put `neck` ahead of the server and a lost response can put the server ahead of `neck`.
 - Do not add a random `SubmissionId`: sequence number plus cumulative content commitment supplies ordering, exact batch identity, and complete-prefix validation. This remains honest-server fork/rollback detection, not protection against Byzantine server equivocation without an external witness.
@@ -618,7 +622,7 @@ space.push().await?;
 |------|--------|
 | `client/tests/rollback.rs` | New — `submit_checked` / `submit_unchecked`, `push_until`, `Submission::push`, stall, rollback marker, cursors |
 | `client/tests/common/mod.rs` | Test helpers only (`set_op`, `blocking_ensure`, `blocking_release`, …) — **not** exported from crate |
-| `engine.rs` / torture / equivalence / sim | Update for PutBatch shape, data-only submit/push, Fork trim |
+| `engine.rs` / torture / equivalence / sim | Update for AdmissionBatch shape, data-only submit/push, Fork trim |
 | meta conformance | per-space head/neck/tail; space-local `ver_high`; certify `[neck,tail)` per space |
 | lease release | Forgotten lease is not authority, survives failed release, retries until remote ack deletes it |
 | lease deadlines | local usability margin is `max(ttl / 1000, 10ms)` |
@@ -638,13 +642,13 @@ Seal + explicit `Delete` land in Phases 1/3/5. Phase 9 is follow-on kernel clean
 
 ### Stage A — Keep `live_count` correct
 
-- Do **not** drop `live_count`. Real `BatchOp::Delete` gives the kernel enough information to maintain it correctly.
+- Do **not** drop `live_count`. Real `Mutation::Delete` entries give the kernel enough information to maintain it correctly.
 - Update prefix aggregate tests for present → delete, delete → present, repeated delete, and zero-length present values.
 - Snapshot may keep the `live_count == 0` fast-path because deleted rows are server-visible and counted out of liveness.
 
 ### Stage B — `DeleteRange` (when specified)
 
-- New `BatchOp::DeleteRange { prefix, ver, seal, ... }` — seal uses the same `{ scheme, nonce, aead }` shape with AEAD plaintext `b""` or specified range metadata, and AAD bound to op kind plus anonymized prefix/range descriptor.
+- New `Mutation::DeleteRange { prefix, ... }` shape carried by a sealed `DeviceEntry` — the seal uses the same `{ scheme, nonce, aead, payload }` shape with AEAD plaintext `b""` or specified range metadata, and AAD bound to op kind plus anonymized prefix/range descriptor.
 - Admission: range delete is rejected only when an active incompatible lease conflicts with the target prefix/range; single ver bump or per-key vers TBD at design time.
 - Prefix aggregate maintenance must remain exact under `DeleteRange`; define and test the `live_count` update strategy before landing the op.
 
@@ -700,22 +704,23 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | Batch | Scope | Tests | Docs |
 |-------|-------|-------|------|
 | B0 Baseline | Stash current WIP, confirm committed main, copy this plan into the repo | `cargo test --workspace` | Note baseline commit hashes and WIP exclusions in this plan |
-| B1 Seal primitives | Add `SealScheme::{AeadV1}`, checked `u8` conversions, `Seal { scheme, nonce, aead, payload }`, `RangeAssert`, explicit `BatchOp::{Set, Delete, NoOp}` scaffolding, and non-empty key components | core roundtrips/shape tests; unknown scheme rejects; `AeadV1` rejects non-empty payload; empty key components reject | core message/seal/key module docs for scheme vs op kind, payload, and non-empty Set plaintext framing |
+| B1 Seal primitives | Add `SealScheme::{AeadV1}`, checked `u8` conversions, `Seal { scheme, nonce, aead, payload }`, `RangeAssert`, initial Set/Delete scaffolding, and non-empty key components | core roundtrips/shape tests; unknown scheme rejects; `AeadV1` rejects non-empty payload; empty key components reject | core message/seal/key module docs for scheme vs op kind, payload, and non-empty Set plaintext framing |
 | B2 Lease wire model | Remove lease epochs/fencing/stealing types; add `Lease { requested_at, granted_at, ttl, barrier }`; add acquire/list/release request-response shapes | core encode/decode; no `Epoch`/`Fenced`/`LeaseRef` grep except unrelated crypto epoch | lease module docs for client/server clock domains and prefix-scoped barrier |
-| B3 PutBatch response + oplog shapes | Add per-batch `PutBatchResult`; change local oplog to `OplogRecord::{Commit {..}, Rollback {..}}`; keep evidence diagnostic-only | core serialization tests for result vectors and oplog enum variants | messages/oplog docs for all-or-nothing response semantics and evidence |
+| B3 AdmissionBatch response + oplog shapes | Add per-batch `AdmissionResult`; change local oplog to `DeviceOp::{Commit {..}, Rollback {..}}`; keep evidence diagnostic-only | core serialization tests for result vectors and oplog enum variants | messages/oplog docs for all-or-nothing response semantics and evidence |
 | B4 Server lease verbs | Implement no-steal acquire/refresh, idempotent release, `list_leases(device)`, prefix-scoped barriers, `requested_at` storage | server lease unit/prop tests for refresh, expiry, list repair, no stealing, prefix barrier not global high-water | server lease docs for reservation semantics and deadline math |
-| B5 Server data admission | Replace legacy `PutEntry` / `Value::Absent` path with `BatchOp` + `Value::{Present, Deleted}`; admit Set/Delete without requiring a lease when no incompatible active lease conflicts; use evidence only for errors | server tests for write-without-lease, conflict rejection, same-device held lease, delete admission | server data docs for explicit deletes and leases as reservations, not capabilities |
+| B5 Server data admission | Admit explicit Set/Delete mutations without requiring a lease when no incompatible active lease conflicts; use evidence only for errors | server tests for write-without-lease, conflict rejection, same-device held lease, delete admission | server data docs for explicit deletes and leases as reservations, not capabilities |
 | B6 Server batch apply + aggregates | Multi-batch scratch apply, per-batch success/failure vector, aggregate all failed asserts in failed batch, maintain `live_count` for real deletes | server props for sequential ops, all-or-nothing, result length, assert aggregation, live_count Set/Delete transitions | server aggregate docs for Present/Deleted and live_count contract |
 | B7 Meta per-space state | Move oplogs/cursors and `ver_high` to per-space persisted state; all MetaStore methods take `space_id`; no in-memory cursor mirror | meta conformance for cross-space isolation, space-local versions, cursor persistence, gaps | meta docs for head/neck/tail and space-local versioning |
-| B8 Meta rollback/certify | Implement rollback marker append using `OplogRecord::Rollback`; certify `[neck, tail)` per space; keep `certify` always on | rollback validation tests, certify gap tests, reopen/certify tests | meta docs for rollback marker and fork-safety purpose |
+| B8 Meta rollback/certify | Implement rollback marker append using `DeviceOp::Rollback`; certify `[neck, tail)` per space; keep `certify` always on | rollback validation tests, certify gap tests, reopen/certify tests | meta docs for rollback marker and fork-safety purpose |
 | B9 Client event loop scaffold | Route public client/space operations through single-owner coordination loop; offload SQLite/bulk crypto to blocking workers and network/timers to tasks | concurrency tests that state transitions only happen on loop; worker result ordering tests | client module docs for correctness chokepoint vs performance workers |
 | B10 Submit API + checked-gate scaffold | Add `submit_checked`, `submit_unchecked`, `Submission { seq }`; persist range asserts with the stamped batch; stamp from space-local `ver_high`; establish the initial exact-watermark gate that B10a replaces with final causal semantics | client submit tests for checked success, missing lease rejection, exact-watermark rejection, unchecked bypass, space-local vers | space docs for submit vs push and checked range-assert scaffold |
 | B10a Causal range assertions | Rename `RangeAssert.at` to inclusive `upto`; maintain the two greatest historical admission points from distinct devices per prefix; server checks maximum excluding the submitting device `<= upto`; local checked gate requires an Active covering read/write lease with satisfied barrier and effective coverage watermark `>= upto`; preserve same-device dependent submissions across coalesced and split pushes | core/schema roundtrips; same-device offline dependency chain in one and multiple requests; foreign write after `upto` rejects; foreign write remains visible after own overwrite/delete; parent lease+watermark covers child; sibling and child coverage reject; local watermark above `upto` accepts; document same-device fork test as completed by B14 | core/server/client docs for inclusive `upto`, top-two distinct-device history, local coverage direction, offline chains, and B14 dependency |
-| B11 Cipher integration | Implement `encode_batch_op`, Seal AAD with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
+| B11 Cipher integration | Implement sealing with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
+| B11a Canonical entry model | Replace intermediate `BatchOp`/`PutEntry`/`Value`/combined `Tag` shapes with `Mutation`, `DeviceTag`, `DeviceEntry`, `AdmissionTag`, and `AdmittedEntry`; rename `PutBatch` family to `AdmissionBatch`/`AdmissionRequest`/`AdmissionResponse`; rename local oplog record to `DeviceOp`; represent rollback on wire as empty `entries` | full core/server/client/sim target checks; cipher tamper tests; engine, crash, equivalence, and torture suites migrated to the canonical object boundaries | core tag/messages docs plus this plan and DESIGN terminology |
 | B12 Lease client API | Expose `ensure`, `release`, `repair_leases`; remove public acquire; implement Forgotten release intents, local deadline margin, barrier pulls | client lease tests for ensure barrier pull, non-empty oplog ensure, forgotten release retry, repair drops stale Active and clears acked Forgotten | lease/client docs for subset invariant and repair algorithm |
-| B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits NoOp wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
-| B14 Fork/trim + history head | Add per-space persisted confirmed `HistoryHead`; server-recompute a cumulative canonical batch hash and require the expected prior head; atomically advance client head with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; rollback `NoOp` chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative history commitment, duplicate device identity, catch-up trim, and honest-server threat boundary |
-| B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length present | server docs for why live_count remains and DeleteRange prerequisites |
+| B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits an empty-entry wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
+| B14 Fork/trim + history head | Add per-space persisted confirmed `HistoryHead`; server-recompute a cumulative canonical batch hash and require the expected prior head; atomically advance client head with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; empty rollback-batch chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative history commitment, duplicate device identity, catch-up trim, and honest-server threat boundary |
+| B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length Set | server docs for why live_count remains and DeleteRange prerequisites |
 | B16 Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit wording and link this plan |
 
 Suggested commit messages: `batch NN: <short description>`. Promote optional or backlog work only by adding a new batch with its own tests/docs row.

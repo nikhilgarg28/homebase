@@ -27,8 +27,7 @@ use crate::meta::{CodecRecord, MetaStore, certify};
 use crate::server::{ServerHandle, offline_router};
 use crate::space::{DEFAULT_PUSH_CAP, PushOutcome, Space, SpaceDriverError, live_write_leases};
 use homebase_core::clock::HybridClock;
-use homebase_core::key::Key;
-use homebase_core::messages::{BatchOp, KernelError, PutBatch, PutBatchRequest, PutBatchResult};
+use homebase_core::messages::{AdmissionBatch, AdmissionRequest, AdmissionResult, KernelError};
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
 use homebase_core::tag::{DeviceId, DeviceSeq};
@@ -301,44 +300,47 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             };
             let head = *head;
             let mut last = head;
-            let mut batches = vec![PutBatch {
+            let mut batches = vec![AdmissionBatch {
                 device_seq: head,
                 range_asserts: head_record.range_asserts().to_vec(),
-                ops: head_record.ops().to_vec(),
+                entries: head_record.entries().to_vec(),
             }];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
-                        || batches.iter().map(|batch| batch.ops.len()).sum::<usize>()
-                            + record.ops().len()
+                        || batches
+                            .iter()
+                            .map(|batch| batch.entries.len())
+                            .sum::<usize>()
+                            + record.entries().len()
                             > push_cap
                     {
                         break;
                     }
-                    batches.push(PutBatch {
+                    batches.push(AdmissionBatch {
                         device_seq: *seq,
                         range_asserts: record.range_asserts().to_vec(),
-                        ops: record.ops().to_vec(),
+                        entries: record.entries().to_vec(),
                     });
                     last = *seq;
                 }
             }
             let keys: Vec<_> = batches
                 .iter()
-                .flat_map(|batch| batch.ops.iter().filter_map(op_key).cloned())
+                .flat_map(|batch| batch.entries.iter().map(|entry| entry.key().clone()))
                 .collect();
             let batch_count = batches.len();
-            let request = PutBatchRequest {
+            let request = AdmissionRequest {
                 device,
                 evidence: live_write_leases(self.store(), self.clock(), space, &keys).await?,
                 batches,
             };
-            match self.server.put_batch(&space, request).await {
+            match self.server.admit(&space, request).await {
                 Ok(response) => {
                     if response.results.len() != batch_count {
                         return Err(ClientError::Space(SpaceDriverError::Unavailable {
                             reason: format!(
-                                "malformed put_batch response: {} results for {} batches",
+                                "malformed admit response: {} results for {} batches",
                                 response.results.len(),
                                 batch_count
                             ),
@@ -350,8 +352,8 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                             .iter()
                             .enumerate()
                             .find_map(|(i, result)| match result {
-                                PutBatchResult::Applied { .. } => None,
-                                PutBatchResult::Failed { error } => Some((i, error.clone())),
+                                AdmissionResult::Applied { .. } => None,
+                                AdmissionResult::Failed { error } => Some((i, error.clone())),
                             })
                     {
                         let at = DeviceSeq(head.0 + failed as u64);
@@ -477,13 +479,6 @@ impl fmt::Display for ClientError {
             }
             Self::Coordination { reason } => write!(f, "{reason}"),
         }
-    }
-}
-
-fn op_key(op: &BatchOp) -> Option<&Key> {
-    match op {
-        BatchOp::Set { key, .. } | BatchOp::Delete { key, .. } => Some(key),
-        BatchOp::NoOp => None,
     }
 }
 

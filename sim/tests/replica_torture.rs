@@ -22,11 +22,15 @@ use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, PutBatch, PutBatchRequest, PutEntry, Range,
-    RangeCursor, RangeCut, ReadAtRequest,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, KernelError, LeaseSpec, Range, RangeCursor,
+    RangeCut, ReadAtRequest,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
+};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
 use homebase_sim::exec::SimExecutor;
@@ -111,30 +115,37 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
         let tombstone = rng.random_bool(0.3);
         let ver = state.vers.borrow().get(&key_index).copied().unwrap_or(0) + 1;
         let seq = state.next_seq.get();
-        let value = if tombstone {
-            Value::Absent
+        let mutation = if tombstone {
+            Mutation::Delete {
+                key: pool_key(key_index),
+            }
         } else {
             state.stamp.set(state.stamp.get() + 1);
-            Value::Present(format!("s{}", state.stamp.get()).into_bytes())
+            Mutation::Set {
+                key: pool_key(key_index),
+                value: Ciphertext(format!("s{}", state.stamp.get()).into_bytes()),
+            }
         };
 
-        let req = PutBatchRequest {
+        let req = AdmissionRequest {
             device: WRITER,
             evidence: vec![state.lease.borrow().unwrap()],
-            batches: vec![PutBatch {
+            batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
                 range_asserts: vec![],
-                ops: vec![
-                    PutEntry {
-                        key: pool_key(key_index),
-                        value: value.clone(),
+                entries: vec![DeviceEntry {
+                    mutation,
+                    tag: DeviceTag {
+                        device: WRITER,
+                        device_seq: DeviceSeq(seq),
                         ver: Ver(ver),
-                    }
-                    .into(),
-                ],
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                }],
             }],
         };
-        match handle.put_batch(req).await {
+        match handle.admit(req).await {
             Ok(_) => {
                 state.next_seq.set(seq + 1);
                 state.vers.borrow_mut().insert(key_index, ver);
@@ -207,9 +218,9 @@ async fn sync_once(
             coverage.borrow_mut().snapshots += 1;
             *replica.state.borrow_mut() = entries
                 .iter()
-                .map(|e| match &e.value {
-                    Value::Present(v) => (e.key.clone(), v.clone()),
-                    Value::Absent => panic!("tombstone in snapshot"),
+                .map(|e| match &e.device_entry.mutation {
+                    Mutation::Set { key, value } => (key.clone(), value.0.clone()),
+                    Mutation::Delete { .. } => panic!("tombstone in snapshot"),
                 })
                 .collect();
         }
@@ -217,24 +228,24 @@ async fn sync_once(
             coverage.borrow_mut().deltas += 1;
             let positions: Vec<(u64, &Key)> = entries
                 .iter()
-                .map(|e| (e.tag.admission_seq.0, &e.key))
+                .map(|e| (e.admission.admission_seq.0, e.key()))
                 .collect();
             assert!(
                 positions.windows(2).all(|w| w[0] < w[1]),
                 "delta order broken"
             );
             assert!(
-                entries.iter().all(|e| e.tag.admission_seq > *since),
+                entries.iter().all(|e| e.admission.admission_seq > *since),
                 "delta leaked entries at or before the cursor"
             );
             let mut state = replica.state.borrow_mut();
             for e in entries {
-                match &e.value {
-                    Value::Present(v) => {
-                        state.insert(e.key.clone(), v.clone());
+                match &e.device_entry.mutation {
+                    Mutation::Set { key, value } => {
+                        state.insert(key.clone(), value.0.clone());
                     }
-                    Value::Absent => {
-                        state.remove(&e.key);
+                    Mutation::Delete { key } => {
+                        state.remove(key);
                     }
                 }
             }
@@ -322,9 +333,9 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
         let expected: BTreeMap<Key, Vec<u8>> = audit
             .data
             .iter()
-            .filter_map(|(k, rec)| match &rec.value {
-                Value::Present(v) => Some((k.clone(), v.clone())),
-                Value::Absent => None,
+            .filter_map(|(k, rec)| match &rec.entry.device_entry.mutation {
+                Mutation::Set { value, .. } => Some((k.clone(), value.0.clone())),
+                Mutation::Delete { .. } => None,
             })
             .collect();
         assert_eq!(

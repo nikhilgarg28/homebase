@@ -22,11 +22,15 @@ use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, BatchOp, GetRequest, KernelError, LeaseSpec, ListRequest, PutBatch,
-    PutBatchRequest, PutEntry, Range, RangeCursor, RangeCut, ReadAtRequest,
+    AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec,
+    ListRequest, Range, RangeCursor, RangeCut, ReadAtRequest,
 };
+use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq, Value, Ver};
+use homebase_core::tag::{
+    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
+};
 use homebase_server::error::Error;
 use homebase_server::schema::{
     DataRecord, PrefixMetaRecord, data_scan_all, prefix_meta_key, prefix_meta_scan_all,
@@ -176,18 +180,30 @@ impl Harness {
         &mut self,
         device: usize,
         device_seq: u64,
-        ops: Vec<BatchOp>,
+        mutations: Vec<(Mutation<Ciphertext>, Ver)>,
     ) -> Result<AdmissionSeq, Error> {
-        block_on(self.space.put_batch(
+        block_on(self.space.admit(
             &self.store,
             Timestamp(1),
-            &PutBatchRequest {
+            &AdmissionRequest {
                 device: dev(device),
                 evidence: vec![self.leases[device]],
-                batches: vec![PutBatch {
+                batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(device_seq),
                     range_asserts: vec![],
-                    ops,
+                    entries: mutations
+                        .into_iter()
+                        .map(|(mutation, ver)| DeviceEntry {
+                            mutation,
+                            tag: DeviceTag {
+                                device: dev(device),
+                                device_seq: DeviceSeq(device_seq),
+                                ver,
+                                cipher_epoch: CipherEpoch(0),
+                            },
+                            seal: Seal::empty_aead_v1(),
+                        })
+                        .collect(),
                 }],
             },
         ))
@@ -205,8 +221,17 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
         match live.get(&s) {
             Some(value) => {
                 let entry = entry.as_ref().expect("live key must be present in get");
-                prop_assert_eq!(&entry.value, &Value::Present(value.clone()));
-                prop_assert_eq!(entry.tag.ver, Ver(model.data[&(device, s)].ver));
+                prop_assert_eq!(
+                    &entry.device_entry.mutation,
+                    &Mutation::Set {
+                        key: keys[s].clone(),
+                        value: Ciphertext(value.clone()),
+                    }
+                );
+                prop_assert_eq!(
+                    entry.device_entry.tag.ver,
+                    Ver(model.data[&(device, s)].ver)
+                );
             }
             None => prop_assert!(entry.is_none(), "tombstoned/unwritten key surfaced in get"),
         }
@@ -227,10 +252,10 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
         .entries
         .iter()
         .map(|e| {
-            let Value::Present(v) = &e.value else {
+            let Mutation::Set { value: v, .. } = &e.device_entry.mutation else {
                 panic!("tombstone in list")
             };
-            (e.key.clone(), v.clone())
+            (e.key().clone(), v.0.clone())
         })
         .collect();
     let expected: Vec<(Key, Vec<u8>)> = live
@@ -255,11 +280,11 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
         prop_assert!(page.entries.len() <= 1);
         match page.entries.into_iter().next() {
             Some(e) => {
-                cursor = Some(e.key.clone());
-                let Value::Present(v) = e.value else {
+                cursor = Some(e.key().clone());
+                let Mutation::Set { key, value: v } = e.device_entry.mutation else {
                     panic!("tombstone in list")
                 };
-                paged.push((e.key, v));
+                paged.push((key, v.0));
             }
             None => {
                 prop_assert!(!page.truncated);
@@ -280,14 +305,14 @@ fn check_aggregates(store: &MemoryStore) -> Result<(), TestCaseError> {
     let mut expected: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
     for (k, v) in block_on(collect_scan(store.scan_prefix(&data_scan_all(SPACE)))).unwrap() {
         let key = user_key_from_data(&k).unwrap();
-        let rec = DataRecord::decode(&v).unwrap();
+        let rec = DataRecord::decode(key.clone(), &v).unwrap();
         let components = key.components();
         for depth in 1..=components.len() {
             let slot = expected
                 .entry(prefix_meta_key(SPACE, &components[..depth]))
                 .or_insert((0, 0));
-            slot.0 = slot.0.max(rec.tag.admission_seq.0);
-            slot.1 += rec.value.is_present() as u64;
+            slot.0 = slot.0.max(rec.entry.admission.admission_seq.0);
+            slot.1 += rec.entry.device_entry.mutation.is_set() as u64;
         }
     }
 
@@ -332,10 +357,10 @@ fn sync_replica(
             replica.state = entries
                 .iter()
                 .map(|e| {
-                    let Value::Present(v) = &e.value else {
+                    let Mutation::Set { value: v, .. } = &e.device_entry.mutation else {
                         panic!("tombstone in snapshot")
                     };
-                    (e.key.clone(), v.clone())
+                    (e.key().clone(), v.0.clone())
                 })
                 .collect();
         }
@@ -344,22 +369,22 @@ fn sync_replica(
             // strictly after the cursor.
             let positions: Vec<(u64, &Key)> = entries
                 .iter()
-                .map(|e| (e.tag.admission_seq.0, &e.key))
+                .map(|e| (e.admission.admission_seq.0, e.key()))
                 .collect();
             prop_assert!(positions.windows(2).all(|w| w[0] < w[1]), "delta order");
-            prop_assert!(entries.iter().all(|e| e.tag.admission_seq > *since));
-            let mut keys: Vec<&Key> = entries.iter().map(|e| &e.key).collect();
+            prop_assert!(entries.iter().all(|e| e.admission.admission_seq > *since));
+            let mut keys: Vec<&Key> = entries.iter().map(|e| e.key()).collect();
             keys.sort();
             keys.dedup();
             prop_assert_eq!(keys.len(), entries.len(), "each key at most once");
 
             for e in entries {
-                match &e.value {
-                    Value::Present(v) => {
-                        replica.state.insert(e.key.clone(), v.clone());
+                match &e.device_entry.mutation {
+                    Mutation::Set { value: v, .. } => {
+                        replica.state.insert(e.key().clone(), v.0.clone());
                     }
-                    Value::Absent => {
-                        replica.state.remove(&e.key);
+                    Mutation::Delete { .. } => {
+                        replica.state.remove(e.key());
                     }
                 }
             }
@@ -404,17 +429,16 @@ proptest! {
                         let ver = current + 1;
                         vers.insert(suffix, ver);
                         let value = if tombstone { None } else { Some(model.fresh_value()) };
-                        entries.push(
-                            PutEntry {
-                            key: user_key(device, suffix),
-                            value: match &value {
-                                Some(v) => Value::Present(v.clone()),
-                                None => Value::Absent,
+                        let mutation = match &value {
+                            Some(v) => Mutation::Set {
+                                key: user_key(device, suffix),
+                                value: Ciphertext(v.clone()),
                             },
-                            ver: Ver(ver),
-                            }
-                            .into(),
-                        );
+                            None => Mutation::Delete {
+                                key: user_key(device, suffix),
+                            },
+                        };
+                        entries.push((mutation, Ver(ver)));
                         staged.push((suffix, value, ver));
                     }
 
@@ -434,12 +458,13 @@ proptest! {
                     let Some(current) = model.data.get(&(device, suffix)).map(|e| e.ver) else {
                         continue;
                     };
-                    let entries = vec![PutEntry {
-                        key: user_key(device, suffix),
-                        value: Value::Present(b"never-lands".to_vec()),
-                        ver: Ver(current), // equal, not greater → regression
-                    }
-                    .into()];
+                    let entries = vec![(
+                        Mutation::Set {
+                            key: user_key(device, suffix),
+                            value: Ciphertext(b"never-lands".to_vec()),
+                        },
+                        Ver(current), // equal, not greater → regression
+                    )];
                     let err = h.put(device, model.device_seq[device] + 1, entries).unwrap_err();
                     prop_assert!(
                         matches!(err, Error::Kernel(KernelError::VerRegression { .. })),
@@ -453,12 +478,13 @@ proptest! {
                         continue;
                     }
                     let ver = model.data.get(&(device, suffix)).map_or(0, |e| e.ver) + 1;
-                    let entries = vec![PutEntry {
-                        key: user_key(device, suffix),
-                        value: Value::Present(b"never-lands".to_vec()),
-                        ver: Ver(ver),
-                    }
-                    .into()];
+                    let entries = vec![(
+                        Mutation::Set {
+                            key: user_key(device, suffix),
+                            value: Ciphertext(b"never-lands".to_vec()),
+                        },
+                        Ver(ver),
+                    )];
                     let err = h.put(device, model.device_seq[device], entries).unwrap_err();
                     prop_assert!(
                         matches!(err, Error::Kernel(KernelError::DeviceSeqRegression { .. })),
