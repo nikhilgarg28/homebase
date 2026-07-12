@@ -133,7 +133,7 @@ fn encrypted_space_writes_ciphertext_under_encoded_keys() {
             .submit_checked(vec![set(row.clone(), b"secret")], vec![])
             .await
             .unwrap();
-        client.push().await.unwrap();
+        client.space(space).await.unwrap().push().await.unwrap();
 
         let cipher = envelope.open().unwrap();
         let encoded_row = cipher.encode_key(&row).unwrap();
@@ -185,7 +185,7 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
             .submit_checked(vec![set(row2.clone(), b"two")], vec![])
             .await
             .unwrap();
-        writer.push().await.unwrap();
+        writer.space(space).await.unwrap().push().await.unwrap();
 
         let reader_clock = ManualClock::new(Timestamp(0));
         let reader = Client::open(
@@ -243,7 +243,7 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
             .submit_checked(vec![set(row, b"before-link")], vec![])
             .await
             .unwrap();
-        writer.push().await.unwrap();
+        writer.space(space).await.unwrap().push().await.unwrap();
 
         let linked_envelope = local_envelope.clone();
         assert_eq!(linked_envelope.space_id(), space);

@@ -166,7 +166,7 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
             )
             .await
             .unwrap();
-        client.push().await.unwrap();
+        space_handle.push().await.unwrap();
         let first = space_handle.pull(Range::Prefix(db.clone())).await.unwrap();
         let RangeCut::Snapshot(entries) = &first.ranges[0] else {
             panic!("expected snapshot")
@@ -180,7 +180,7 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
             .submit_checked(vec![Mutation::Delete { key: row.clone() }], vec![])
             .await
             .unwrap();
-        client.push().await.unwrap();
+        space_handle.push().await.unwrap();
         let second = space_handle.pull(Range::Prefix(db)).await.unwrap();
         let RangeCut::Delta(entries) = &second.ranges[0] else {
             panic!("expected delta")
@@ -253,7 +253,7 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             .submit_checked(vec![set(row.clone(), b"after-resume")], vec![])
             .await
             .unwrap();
-        client.push().await.unwrap();
+        space_handle.push().await.unwrap();
 
         let entry = fetch_cipher(&handle, space, &envelope, &row).await;
         assert_eq!(value(&entry), b"after-resume");
@@ -325,7 +325,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
             .expect("dead incarnation admitted ciphertext");
 
         assert_eq!(
-            client.push().await.unwrap(),
+            space_handle.push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(seq2)
             }
@@ -406,7 +406,7 @@ fn push_stall_recovers_via_ensure() {
 
         clock.skew_wall(Duration::from_secs(3_600));
         assert_eq!(
-            client.push().await.unwrap(),
+            space_handle.push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }

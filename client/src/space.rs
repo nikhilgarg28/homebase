@@ -10,7 +10,9 @@
 //! a [`Submission`]. Neither method performs network admission. The persisted
 //! submit mode also lets [`Space::release_checked`] preserve reservation
 //! coverage for checked assertions; [`Space::release_unchecked`] deliberately
-//! skips that potentially expensive local scan.
+//! skips that potentially expensive local scan. [`Space::push`] drains only
+//! this space, [`Space::push_until`] stops at a chosen local sequence, and
+//! [`Submission::push`] is attribution sugar for the latter.
 
 use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
 use crate::client::Client;
@@ -64,6 +66,9 @@ pub enum SpaceDriverError {
         lease: LeaseId,
         at: DeviceSeq,
     },
+    SubmissionNotPending {
+        seq: DeviceSeq,
+    },
 }
 
 impl From<StorageError> for SpaceDriverError {
@@ -116,6 +121,9 @@ impl fmt::Display for SpaceDriverError {
                     "releasing lease {lease:?} would leave checked submission {at:?} unreserved"
                 )
             }
+            Self::SubmissionNotPending { seq } => {
+                write!(f, "submission {seq:?} is no longer pending")
+            }
         }
     }
 }
@@ -146,6 +154,26 @@ pub enum PushOutcome {
     },
 }
 
+/// The disposition of the exact submission passed to [`Submission::push`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushReceipt {
+    Applied {
+        seq: DeviceSeq,
+        /// Absent when a retry discovers that the server had already applied
+        /// the submission but its original response was lost.
+        admission_seq: Option<AdmissionSeq>,
+    },
+    Failed {
+        seq: DeviceSeq,
+        error: KernelError,
+    },
+    Blocked {
+        seq: DeviceSeq,
+        at: DeviceSeq,
+        error: KernelError,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseState {
     pub held: HeldLease,
@@ -155,10 +183,53 @@ pub struct LeaseState {
 /// A data batch durably appended to one space's local oplog.
 ///
 /// The sequence identifies this exact local submission. Remote admission is
-/// a separate push operation; per-submission push sugar lands with B13.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Submission {
+/// a separate push operation. Retaining this handle permits retrying an
+/// ambiguous [`Submission::push`] without another durable state machine.
+pub struct Submission<'a, M, H, C, N = SystemNonceSource> {
     pub seq: DeviceSeq,
+    client: &'a Client<M, H, C, N>,
+    space: SpaceId,
+}
+
+impl<M, H, C, N> fmt::Debug for Submission<'_, M, H, C, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Submission")
+            .field("seq", &self.seq)
+            .field("space", &self.space)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'static>
+    Submission<'a, M, H, C, N>
+{
+    /// Push this space through this submission and return its exact outcome.
+    pub async fn push(&self) -> Result<PushReceipt, crate::client::ClientError> {
+        let run = self.client.push_space(self.space, Some(self.seq)).await?;
+        match run.outcome {
+            PushOutcome::Drained { .. } => Ok(PushReceipt::Applied {
+                seq: self.seq,
+                admission_seq: run.target_admission,
+            }),
+            PushOutcome::Stalled {
+                at,
+                error,
+                acked_through: _,
+            } if at == self.seq => Ok(PushReceipt::Failed {
+                seq: self.seq,
+                error,
+            }),
+            PushOutcome::Stalled {
+                at,
+                error,
+                acked_through: _,
+            } => Ok(PushReceipt::Blocked {
+                seq: self.seq,
+                at,
+                error,
+            }),
+        }
+    }
 }
 
 /// A handle to one space within a [`Client`].
@@ -209,7 +280,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         &self,
         mutations: I,
         range_asserts: Vec<RangeAssert>,
-    ) -> Result<Submission, SpaceDriverError>
+    ) -> Result<Submission<'_, M, H, C, N>, SpaceDriverError>
     where
         I: IntoIterator<Item = T>,
         T: Into<Mutation>,
@@ -221,7 +292,11 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let committed = self
             .persist_submission(encoded, range_asserts, SubmitMode::Checked)
             .await?;
-        Ok(Submission { seq: committed.seq })
+        Ok(Submission {
+            seq: committed.seq,
+            client: self.client,
+            space: self.id,
+        })
     }
 
     /// Append a local data batch without checking lease-backed range
@@ -230,7 +305,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         &self,
         mutations: I,
         range_asserts: Vec<RangeAssert>,
-    ) -> Result<Submission, SpaceDriverError>
+    ) -> Result<Submission<'_, M, H, C, N>, SpaceDriverError>
     where
         I: IntoIterator<Item = T>,
         T: Into<Mutation>,
@@ -241,7 +316,24 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let committed = self
             .persist_submission(encoded, range_asserts, SubmitMode::Unchecked)
             .await?;
-        Ok(Submission { seq: committed.seq })
+        Ok(Submission {
+            seq: committed.seq,
+            client: self.client,
+            space: self.id,
+        })
+    }
+
+    /// Push this space's active oplog as far as possible.
+    pub async fn push(&self) -> Result<PushOutcome, crate::client::ClientError> {
+        Ok(self.client.push_space(self.id, None).await?.outcome)
+    }
+
+    /// Push this space only through `seq`; later submissions are not sent.
+    pub async fn push_until(
+        &self,
+        seq: DeviceSeq,
+    ) -> Result<PushOutcome, crate::client::ClientError> {
+        Ok(self.client.push_space(self.id, Some(seq)).await?.outcome)
     }
 
     async fn encode_submission(

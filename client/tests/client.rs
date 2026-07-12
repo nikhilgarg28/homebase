@@ -178,7 +178,8 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
             vec![DeviceSeq(1)]
         );
 
-        client.push().await.unwrap();
+        space_a.push().await.unwrap();
+        space_b.push().await.unwrap();
 
         let cipher_a = envelope_a.open().unwrap();
         let cipher_b = envelope_b.open().unwrap();
@@ -214,7 +215,7 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
 }
 
 #[test]
-fn global_push_compatibility_drains_independent_space_streams() {
+fn space_push_does_not_drain_another_space() {
     block_on(async {
         let id_a = SpaceId([10; 16]);
         let id_b = SpaceId([11; 16]);
@@ -265,7 +266,18 @@ fn global_push_compatibility_drains_independent_space_streams() {
             .await
             .unwrap();
 
-        client.push().await.unwrap();
+        space_a.push().await.unwrap();
+        assert!(fetch(&handle, id_a, &row_a1).await.is_some());
+        assert!(fetch(&handle, id_a, &row_a2).await.is_some());
+        assert!(fetch(&handle, id_b, &row_b1).await.is_none());
+        assert_eq!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&id_b]
+                .oplog
+                .len(),
+            1
+        );
+
+        space_b.push().await.unwrap();
 
         let mut seqs = Vec::new();
         for (id, row) in [(id_a, row_a1), (id_b, row_b1), (id_a, row_a2)] {
@@ -334,7 +346,7 @@ fn offline_commit_survives_until_online_push() {
         )
         .await
         .unwrap();
-        online.push().await.unwrap();
+        online.space(space).await.unwrap().push().await.unwrap();
 
         let cipher = envelope.open().unwrap();
         let encoded = cipher.encode_key(&row).unwrap();
@@ -379,7 +391,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
                 .submit_checked(vec![set(row.clone(), b"cached")], vec![])
                 .await
                 .unwrap();
-            client.push().await.unwrap();
+            space.push().await.unwrap();
         }
 
         let client = Client::open(
@@ -430,7 +442,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
                 .await
                 .unwrap();
         }
-        writer.push().await.unwrap();
+        writer.space(space).await.unwrap().push().await.unwrap();
 
         let reader_clock = ManualClock::new(Timestamp(0));
         let reader = Client::open(

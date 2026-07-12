@@ -294,7 +294,7 @@ async fn driver(
         let client = guard.client.as_mut().expect("client slot empty");
 
         if rng.random_bool(0.4) {
-            match client.push().await {
+            match client.space(SPACE).await.unwrap().push().await {
                 Ok(PushOutcome::Stalled { .. }) => coverage.borrow_mut().push_stalls += 1,
                 Ok(PushOutcome::Drained { .. }) => {}
                 Err(ClientError::Store(_))
@@ -402,7 +402,7 @@ async fn drain_push(
     for attempt in 0..500 {
         let mut guard = take_client(slot);
         let client = guard.client.as_mut().expect("client slot empty");
-        let outcome = client.push().await;
+        let outcome = client.space(SPACE).await.unwrap().push().await;
         finish_client(slot, guard);
 
         match outcome {

@@ -144,7 +144,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
-        client.push().await.unwrap();
+        space.push().await.unwrap();
 
         space
             .submit_checked(vec![set(k2.clone(), b"two")], vec![])
@@ -170,7 +170,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
         );
 
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -240,7 +240,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
-        client.push().await.unwrap();
+        space.push().await.unwrap();
         space
             .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
@@ -276,7 +276,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
             }
         }
 
-        client.push().await.unwrap();
+        space.push().await.unwrap();
 
         for (encoded, plain) in &expected {
             let stored = handle

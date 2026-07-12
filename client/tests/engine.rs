@@ -8,7 +8,7 @@
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase::meta::{HeldLease, MetaStore, OrderedMetaStore, SubmitMode, audit};
 use homebase::server::ServerHandle;
-use homebase::{Client, ClientError, PushOutcome, SpaceDriverError, lease_margin};
+use homebase::{Client, ClientError, PushOutcome, PushReceipt, SpaceDriverError, lease_margin};
 use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -315,7 +315,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
         assert_eq!(record.range_asserts()[0].prefix, target);
         assert_eq!(record.entries()[0].ver(), Ver(2));
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -355,7 +355,7 @@ fn dependent_asserting_submissions_push_across_request_boundaries() {
         }
 
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -394,7 +394,7 @@ fn dependent_asserting_submissions_push_when_coalesced() {
         }
 
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -446,7 +446,7 @@ fn foreign_write_after_upto_stalls_and_keeps_submission_queued() {
         .await;
 
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Stalled {
                 at: DeviceSeq(1),
                 error: KernelError::RangeAssertFailed {
@@ -684,7 +684,7 @@ fn push_drains_and_groups_same_space_neighbors() {
             .unwrap();
         assert_eq!(queued(&mem).await, 3);
 
-        let outcome = client.push().await.unwrap();
+        let outcome = client.space(SPACE).await.unwrap().push().await.unwrap();
         assert_eq!(
             outcome,
             PushOutcome::Drained {
@@ -728,7 +728,7 @@ fn push_drains_and_groups_same_space_neighbors() {
         assert!(state.spaces[&SPACE].oplog.is_empty());
         assert_eq!(state.spaces[&SPACE].cursors.tail, DeviceSeq(4));
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: None
             }
@@ -764,7 +764,7 @@ fn push_cap_splits_groups() {
             .await
             .unwrap();
 
-        client.push().await.unwrap();
+        client.space(SPACE).await.unwrap().push().await.unwrap();
         // At cap 1 nothing merges: each commit ships under its own seq.
         assert_eq!(
             fetch(&handle, SPACE, &k1)
@@ -859,7 +859,7 @@ fn ensure_satisfies_covered_specs_locally() {
             .await
             .unwrap();
         assert!(matches!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained { .. }
         ));
     });
@@ -957,7 +957,7 @@ fn resume_keeps_wall_clock_authority() {
         assert_eq!(leases.len(), 1);
         assert!(leases[0].live, "the wall fallback outlives the process");
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -987,7 +987,7 @@ fn resume_keeps_wall_clock_authority() {
             .await
             .unwrap();
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -1025,7 +1025,7 @@ fn margin_applies_only_across_incarnations() {
             // no margin shaves it — the full window is usable.
             clock.set(Timestamp(60_000 - 2));
             assert_eq!(
-                client.push().await.unwrap(),
+                client.space(SPACE).await.unwrap().push().await.unwrap(),
                 PushOutcome::Drained {
                     acked_through: Some(DeviceSeq(1))
                 }
@@ -1074,7 +1074,7 @@ fn margin_applies_only_across_incarnations() {
             .await
             .unwrap();
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -1391,7 +1391,7 @@ fn suspend_expires_leases_within_a_lineage() {
         clock.skew_wall(Duration::from_secs(3_600));
         assert!(!space.leases(std::slice::from_ref(&db)).await.unwrap()[0].live);
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -1459,7 +1459,7 @@ fn backward_clock_step_poisons_stored_stamps() {
         // Zero-stamped means no lease authority, but an unreserved write may
         // still admit without lease evidence.
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -1522,7 +1522,7 @@ fn expired_local_lease_does_not_block_unasserted_submission() {
         // not authority, but the unreserved write may still be admitted.
         clock.advance(Duration::from_secs(60));
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -1560,7 +1560,7 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
             .unwrap();
-        space
+        let target = space
             .submit_checked(vec![set(k2.clone(), b"two")], vec![])
             .await
             .unwrap();
@@ -1609,9 +1609,10 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
         // The resend collides, the collision names the admitted extent,
         // the trim happens, and nothing is applied twice.
         assert_eq!(
-            client.push().await.unwrap(),
-            PushOutcome::Drained {
-                acked_through: Some(DeviceSeq(2))
+            target.push().await.unwrap(),
+            PushReceipt::Applied {
+                seq: DeviceSeq(2),
+                admission_seq: None,
             }
         );
         assert_eq!(queued(&mem).await, 0);
@@ -1714,7 +1715,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
 
         // The merged group bounces; solo probes admit the healthy head
         // and convict exactly the faulty seq.
-        let outcome = client.push().await.unwrap();
+        let outcome = client.space(SPACE).await.unwrap().push().await.unwrap();
         match &outcome {
             PushOutcome::Stalled {
                 at,
@@ -1735,7 +1736,7 @@ fn group_rejection_probes_to_the_faulty_commit() {
         client.rollback(SPACE, DeviceSeq(2)).await.unwrap();
         assert_eq!(queued(&mem).await, 3, "dead suffix plus rollback marker");
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(4))
             }
@@ -1761,6 +1762,154 @@ fn group_rejection_probes_to_the_faulty_commit() {
             audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
                 .oplog
                 .is_empty()
+        );
+    });
+}
+
+#[test]
+fn submission_push_stops_at_target_and_attributes_later_failure() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let (first, stale, last) = (
+            key(&[b"db", b"first"]),
+            key(&[b"db", b"stale"]),
+            key(&[b"db", b"last"]),
+        );
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PendingEntry {
+                key: stale.clone(),
+                value: val(b"foreign"),
+                ver: Ver(100),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let target = space
+            .submit_unchecked(vec![set(first.clone(), b"first")], vec![])
+            .await
+            .unwrap();
+        let faulty = space
+            .submit_unchecked(vec![set(stale.clone(), b"stale")], vec![])
+            .await
+            .unwrap();
+        let dependent = space
+            .submit_unchecked(vec![set(last.clone(), b"last")], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target.push().await.unwrap(),
+            PushReceipt::Applied {
+                seq: DeviceSeq(1),
+                admission_seq: Some(AdmissionSeq(2)),
+            }
+        );
+        assert_eq!(queued(&mem).await, 2, "later submissions stay local");
+        assert_eq!(
+            entry_value(&fetch(&handle, SPACE, &first).await.unwrap()),
+            b"first"
+        );
+        assert!(fetch(&handle, SPACE, &last).await.is_none());
+
+        assert!(matches!(
+            dependent.push().await.unwrap(),
+            PushReceipt::Blocked {
+                seq: DeviceSeq(3),
+                at: DeviceSeq(2),
+                error: KernelError::VerRegression { .. },
+            }
+        ));
+        assert!(matches!(
+            faulty.push().await.unwrap(),
+            PushReceipt::Failed {
+                seq: DeviceSeq(2),
+                error: KernelError::VerRegression { .. },
+            }
+        ));
+        assert_eq!(queued(&mem).await, 2, "a stall never trims the suffix");
+    });
+}
+
+#[test]
+fn push_until_rejects_a_sequence_outside_the_active_oplog() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+
+        assert_eq!(
+            space.push_until(DeviceSeq(1)).await.unwrap_err(),
+            ClientError::Space(SpaceDriverError::SubmissionNotPending { seq: DeviceSeq(1) })
+        );
+    });
+}
+
+#[test]
+fn push_until_leaves_later_submission_pending() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let keys = [
+            key(&[b"db", b"one"]),
+            key(&[b"db", b"two"]),
+            key(&[b"db", b"three"]),
+        ];
+        for (index, key) in keys.iter().enumerate() {
+            space
+                .submit_unchecked(vec![set(key.clone(), &[index as u8])], vec![])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            space.push_until(DeviceSeq(2)).await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(2))
+            }
+        );
+        assert!(fetch(&handle, SPACE, &keys[0]).await.is_some());
+        assert!(fetch(&handle, SPACE, &keys[1]).await.is_some());
+        assert!(fetch(&handle, SPACE, &keys[2]).await.is_none());
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(
+            state.spaces[&SPACE]
+                .active_oplog()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![DeviceSeq(3)]
         );
     });
 }
@@ -1815,7 +1964,13 @@ fn a_forked_store_is_fatal() {
             .await
             .unwrap();
         assert_eq!(
-            twin_client.push().await.unwrap(),
+            twin_client
+                .space(SPACE)
+                .await
+                .unwrap()
+                .push()
+                .await
+                .unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }
@@ -1825,7 +1980,7 @@ fn a_forked_store_is_fatal() {
         // counter — proof it isn't looking at its own past. Fatal, and
         // nothing is destroyed.
         assert_eq!(
-            client.push().await.unwrap_err(),
+            client.space(SPACE).await.unwrap().push().await.unwrap_err(),
             ClientError::Space(SpaceDriverError::Fork {
                 admitted: DeviceSeq(2)
             })
@@ -1890,7 +2045,7 @@ fn ensure_advances_the_watermark_and_dominates_foreign_vers() {
             .await
             .unwrap();
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -1965,7 +2120,7 @@ fn ensure_acquires_pulls_and_makes_assertions_locally_authorized() {
             .await
             .unwrap();
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(1))
             }
@@ -2284,7 +2439,7 @@ fn unavailable_leaves_the_queue_intact() {
             .await
             .unwrap();
         assert!(matches!(
-            client.push().await.unwrap_err(),
+            client.space(SPACE).await.unwrap().push().await.unwrap_err(),
             ClientError::Space(SpaceDriverError::Unavailable { .. })
         ));
         assert_eq!(queued(&mem).await, 1, "transport failure judges nothing");

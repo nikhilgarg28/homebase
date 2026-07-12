@@ -158,7 +158,7 @@ async fn run_flushed_crash_seed(seed: u64) {
     let space = client.space(SPACE).await.unwrap();
     space.ensure(vec![wspec(&db)]).await.unwrap();
     assert_eq!(
-        client.push().await.unwrap(),
+        client.space(SPACE).await.unwrap().push().await.unwrap(),
         PushOutcome::Drained {
             acked_through: Some(DeviceSeq(1))
         }
@@ -255,7 +255,7 @@ fn flushed_rollback_survives_crash_as_one_cursor_marker_transition() {
         .await
         .unwrap();
         assert_eq!(
-            reopened.push().await.unwrap(),
+            reopened.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(3))
             }
@@ -367,7 +367,7 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
         .await
         .unwrap();
         assert_eq!(
-            reopened.push().await.unwrap(),
+            reopened.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(3))
             }
@@ -447,7 +447,7 @@ fn ack_drop_trims_after_server_admitted() {
             .unwrap();
 
         assert_eq!(
-            client.push().await.unwrap(),
+            client.space(SPACE).await.unwrap().push().await.unwrap(),
             PushOutcome::Drained {
                 acked_through: Some(DeviceSeq(2))
             }

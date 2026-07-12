@@ -12,19 +12,25 @@ implement as stated) · `unsupported-v1` (rejected at adoption/DDL time with a c
 
 ---
 
-## Architecture sketch (current thinking)
+## Architecture sketch (current thinking — revised for hook-authoritative capture, C6)
 
 1. **Real tables keep their user names in `main`** — reads run unmodified at native speed
    against real b-trees and indexes.
-2. **Per-table shadow vtables live in `temp`** under mangled names (e.g. `temp._w_orders`),
-   created per connection at open from the catalog. Temp schema never persists — the file
-   stays pristine for detach.
-3. **A wrapper-level rewriter** retargets only *write statements* (`INSERT`/`UPDATE`/
-   `DELETE`) at the shadow; reads inside those statements still hit real tables.
-4. **`xBestIndex`/`xFilter`** forward the write statement's row scan to the real table and
-   capture WHERE constraints in structured form → range asserts / lease derivation.
-5. **`xUpdate`** forwards each write to the real table eagerly (read-your-writes) and
-   appends the logical op to an in-memory per-transaction buffer.
+2. **Write statements also run natively** against the real tables — no write rewriting,
+   so UPSERT, DEFAULTs, conflict modes, RETURNING, triggers, and cascades are all
+   engine-native behavior.
+3. **The preupdate hook is the authoritative write capture** (C6-b): every write that
+   lands in the b-trees — including cascade and trigger effects — enters the
+   per-transaction op buffer with old + new row values.
+4. **Read-shadow vtables live in `temp`** under mangled names, created per connection at
+   open. The rewriter retargets *reads inside write transactions* at them;
+   `xBestIndex`/`xFilter` forward the scan to the real table and record structured WHERE
+   constraints → range asserts. FK/constraint read dependencies (parent existence,
+   uniqueness witnesses) are schema-derived from the captured write set — no capture
+   layer sees them, in any architecture.
+5. **Optional eager-lease mode** (N6): when the open mode says so, the assert-recording
+   layer acquires leases at scan time instead of deferring everything to commit —
+   pessimistic concurrency for apps that prefer blocking to aborting.
 6. **At COMMIT** the wrapper runs the lease fixpoint over the buffer (validate coverage,
    acquire missing, barrier); on success the buffer materializes into `hb_oplog` rows in
    the same SQLite transaction (single fsync domain); on failure the whole transaction
@@ -32,6 +38,10 @@ implement as stated) · `unsupported-v1` (rejected at adoption/DDL time with a c
 7. **Metadata** (`hb_*` system tables in `main`): oplog, leases, cursors, device identity,
    codec caches, adoption record — the `MetaStore` trait implemented natively over SQLite,
    gated by the existing conformance suite in `client/src/meta.rs`.
+8. **Fallback preserved:** the earlier write-vtable design (writes rewritten to shadows,
+   `xUpdate` forwarding) remains the fallback if the C6 spike verifications fail
+   (WITHOUT ROWID hook coverage, truncate-DELETE behavior). Group G's dialect gaps apply
+   only in that fallback.
 
 ---
 
@@ -173,6 +183,29 @@ writes — errors surface through `xUpdate`'s return. Uniqueness additionally ne
 only; cross-device uniqueness is the kernel's ver/witness machinery.
 `Status: decided — engine enforces locally; witness keys carry the distributed claim.`
 
+**C6. Dual capture: preupdate hook alongside the vtable layer.** A preupdate hook on the
+real tables sees *every* write that lands in the b-trees — forwarded writes, FK cascades,
+trigger bodies, `OR REPLACE` implied deletes. Spectrum of roles:
+- **(a) Verifier:** diff hook-observed writes against the vtable buffer at commit;
+  mismatch = unanticipated bypass → hard error. Lifts no restrictions but converts
+  capture completeness from faith into an invariant. Cheap; always-on in debug/CI.
+- **(b) Authoritative write capture:** the oplog write set comes from the hook; the
+  vtable layer is scoped to scan capture (E1-c/E2) and veto timing. **C1–C3 restrictions
+  dissolve** — cascades and triggers enter the buffer as ordinary row ops and the commit
+  fixpoint derives their leases like any other write. Bonus: the hook provides old column
+  values (unlike xUpdate) — before-images nearly free (see L4).
+- FK *read* dependencies (parent-existence lookups) are invisible to both layers and are
+  schema-derived by the compiler in every architecture — capture never provides them.
+Costs: `SQLITE_ENABLE_PREUPDATE_HOOK` compile flag (we vendor anyway); hook fires for our
+own sync applies on the same connection → J2's re-entrancy guard becomes a hook-suppress
+flag. Spike verifications: hook coverage of WITHOUT ROWID tables in the pinned SQLite;
+hook presence disabling the truncate-optimized DELETE (which skips per-row callbacks).
+`Status: decided (direction) — (b): hook-authoritative writes + vtable scoped to
+read/scan capture and optional eager lease acquisition (N6), with the (a) diff kept as a
+permanent debug/CI invariant. Conditional on the two spike verifications above; the
+write-vtable design is the fallback if they fail. C1–C3 flip to supported under this
+model (cascades/triggers are captured writes).`
+
 ---
 
 ## Group D — Data encoding and collation
@@ -220,6 +253,30 @@ storage keys of rows *and* index entries. Not v1-critical but the key codec must
 the layout so adding partitions later isn't a key migration.
 `Status: open — layout reservation decision only.`
 
+**D8. Interception-layer type system.** The value representation shuttled between
+`sqlite3_value` (engine boundary), forwarded statements, the op buffer, and the codecs.
+Rule: mirror SQLite's five storage classes exactly — `Null | Int(i64) | Real(f64) |
+Text | Blob` — and nothing richer; affinity is a *column* property the engine applies,
+and the layer stays affinity-transparent. Load-bearing invariants:
+- **Post-affinity capture:** buffer what the engine *stored*, not what the statement
+  said. The preupdate hook guarantees this; the vtable path only if shadow column
+  declarations match the real table exactly. Pre-affinity capture ⇒ replica divergence.
+- **Fidelity:** capture → oplog → apply is bit-identical on every replica (the
+  conformance matrix's byte-identical claim depends on it). Floats never round-trip
+  through text.
+- **Pinned edge cases, each a conformance test:** NaN stores as NULL (frame never
+  carries NaN); `1` vs `1.0` equal in index comparisons ⇒ witness/key encoding needs
+  numeric normalization across the int/real boundary (concretizes D3); `-0.0` vs `0.0`;
+  i64 range vs f64 precision; TEXT ≠ BLOB (`'a'` ≠ `x'61'`) — storage class preserved,
+  never coerced; UTF-8 pinned (reject/convert UTF-16 dbs at adoption).
+- **Two codecs, separate:** value codec = versioned serial-type-tagged frame (fidelity);
+  key codec = order-preserving tuple encoding with numeric normalization + collation
+  transforms applied first (comparison semantics live here only).
+- **FFI discipline:** copy `sqlite3_value`s into owned values at the capture boundary;
+  no protected/unprotected lifetime cleverness.
+`Status: leaning — as stated; the numeric-normalization rule for keys is the remaining
+design detail (shared with D3).`
+
 ---
 
 ## Group E — Read capture and range asserts
@@ -235,8 +292,9 @@ capture via `xBestIndex`, with vtable-forwarding overhead confined to write tran
 or (d) document reads as unasserted in v1. Note this item is identical under a
 preupdate-hook architecture — hooks capture writes only; read capture is a separate
 channel in every design.
-`Status: leaning — (a) table-level asserts for v1; (c) is the precision upgrade path,
-preferred over (b) because it reuses the assert mapping (E2) instead of plan scraping.`
+`Status: decided — (c) per C6: reads inside write transactions route through
+read-shadows for structured capture; (a) authorizer table-level asserts remain the
+escalation for anything the rewriter can't classify.`
 
 **E2. xBestIndex → range assert mapping.** The write statement's own scan hands us
 structured constraints `(column, op, value)` at `xFilter` time (bindings resolved). Pin
@@ -260,6 +318,18 @@ cross-barrier stability.`
 statement *scanned*; the assert must pin the admission point the local replica was at —
 tie-in with per-prefix cursors and `effective_prefix_max` equality semantics from v2.
 `Status: open — needs a worked example against the v2 assert definition.`
+
+**E6. Write-predicate capture under native writes (phantom protection).** The honest
+cost of C6-b: `UPDATE`/`DELETE` statements run natively, so their WHERE scans no longer
+pass through a vtable — the predicate *range* is uncaptured even though the touched rows
+are (via the hook). Serializability against phantoms needs the range, not just the rows
+(`UPDATE … WHERE status='pending'` depends on which rows were pending, including ones
+that weren't). Options: (a) authorizer table-level assert on the written table — coarse,
+correct, the v1 default; (b) companion probe-SELECT through the read-shadow reproducing
+the write's WHERE clause — precise, costs a second scan and risks semantic drift from
+the real statement; (c) opt-in write-vtable mode for hot tables that need precision.
+`Status: leaning — (a) for v1 (single-writer default makes coarseness cheap); (b)
+evaluated with E2's mapping table when multi-writer contention demands it.`
 
 ---
 
@@ -291,6 +361,10 @@ table if demand appears.`
 ---
 
 ## Group G — Vtable machinery gaps (dialect fidelity)
+
+*Under the revised sketch (C6-b: native writes), G1–G4 are moot — statements run
+engine-native. They re-activate only if the write-vtable fallback is needed. G5–G7 apply
+regardless (the op buffer exists in both models).*
 
 **G1. UPSERT.** `ON CONFLICT DO UPDATE/NOTHING` does not work on virtual tables. The
 rewriter must translate upserts into engine-equivalent statement sequences (semantics are
@@ -502,13 +576,176 @@ before-images for offline-capable undo (reopens D4). Also decide the app-visible
 which error, on which call, and what "your last N transactions were undone" looks like.
 `Status: open — leaning re-pull repair keyed off the rollback marker; D4 stays
 after-image-only. The app-visible contract needs design (ties to the durability
-watermark API, J5).`
+watermark API, J5). Note: if C6 lands hook-authoritative, the preupdate hook provides
+old column values — local before-images become nearly free, reopening offline-capable
+undo as a real alternative to re-pull.`
 
 **L5. Read-transaction stability under applies.** A long-running local read transaction
 must keep a stable snapshot while sync applies remote ops. WAL mode gives readers
 snapshot isolation natively, and applies queue behind write transactions (J3) — read
 snapshots come free as long as applies run as ordinary write transactions.
 `Status: decided — WAL reader snapshots (J4) + apply queuing (J3); no new machinery.`
+
+---
+
+## Group M — Local corruption and self-consistency
+
+Distinct from Group B (foreign writes are *well-formed* SQLite commits by someone else;
+this group is about the file or our own bookkeeping going bad).
+
+**M1. SQLite-level file corruption.** Torn pages, bad checksums, filesystem damage.
+Detection: `PRAGMA quick_check` at open (cheap) vs full `integrity_check` (O(db), behind
+the deep-verify flag alongside B1's CRC). Response: corrupted file → refuse sync; local
+reads at the app's own risk; recovery = re-bootstrap from server snapshot + tail (the
+replica-restore path from LAUNCH_CHECKLIST), which multilite gets for free once bootstrap
+exists.
+`Status: leaning — quick_check at open, integrity_check in deep-verify mode; recovery =
+re-bootstrap, never in-place repair.`
+
+**M2. hb_* metadata vs data divergence.** The single-transaction invariant (user rows +
+oplog entry commit together) can still be violated by bugs: buffer/savepoint shear errors
+(G6), apply-path mistakes, rollback-repair (L4) partial application. Needs a
+recomputation oracle for the SQL layer — the `certify` discipline extended: cursors
+within bounds, oplog vers consistent with `ver_high`, spot-check that oplog entries
+re-encode from current rows where they should (sampled, not exhaustive). Run at open;
+full mode in CI/torture.
+`Status: open — design certify_sql alongside the existing meta::certify; decide the
+sampled vs exhaustive split.`
+
+**M3. Local vs server divergence.** Local materialized state disagrees with what the
+server holds under our own acked seqs (bug, M1 damage that slipped through, bad rollback
+repair). TODO.md's per-space/per-client CRC idea is the detection primitive: server
+maintains cheap rolling checksums per space (or per prefix), client compares at sync
+checkpoints; also catches the re-pushed-older-seq case. Costs a kernel feature — decide
+whether it's a multilite requirement or deferred hardening.
+`Status: open — leaning deferred to post-v1 hardening; until then divergence is caught
+only by ver-monotonicity rejections and the sim/torture rigs.`
+
+**M4. Response policy and observability.** One coherent story across B (foreign writes),
+M1–M3: a health state on the connection (`ok / suspect / invalid`), surfaced via an API
+and connection-string policy for what `suspect` does (warn-and-continue vs read-only vs
+refuse-open). Every detector above feeds the same state machine rather than each
+inventing its own error.
+`Status: leaning — single health state machine in hb_meta + open-time report; exact
+policy knobs open.`
+
+---
+
+## Group N — Deployment and policy option space
+
+The knobs an app (or connection string) can set. Each needs a default that matches the
+"drop-in SQLite" claim: working defaults, escalations opt-in.
+
+**N1. Local file: plaintext vs encrypted at rest.** E2EE (DESIGN) covers the wire and
+server; the local file is a separate decision. Options: plaintext file (default —
+detach-with-stock-sqlite works, C-ABI claim intact); OS-level disk encryption (free,
+recommended posture); SQLCipher-style page encryption (breaks detach with stock
+libsqlite3, complicates the C-ABI tier, third-party dependency); store-level wrapper
+(TODO.md's revisit item). At-rest encryption also interacts with B/M detection (header
+counters move differently under page encryption).
+`Status: leaning — plaintext file + documented OS-encryption posture for v1; page-level
+at-rest encryption explicitly out of scope until after launch, revisited as a wrapper.`
+
+**N2. Space key delivery at open.** `multilite.open(url, key)` — what is `key`? Options:
+raw space key material; a serialized `SpaceEnvelope` (name key + space keys — the
+DESIGN-committed shape); a keystore/enclave callback (key never in argv); nothing
+(plaintext spaces via `SpaceEnvelope::Plaintext`). Interacts with the identity-spec
+reconciliation (TODO.md): `Client::open`'s enclave param becomes the envelope/keystore
+source. Also decide: key in the connection string is forbidden (logs) or allowed for dev.
+`Status: open — leaning SpaceEnvelope-or-callback as the two blessed forms; raw-key-in-
+URL dev-only behind an explicit unsafe flag.`
+
+**N3. Pull cadence and staleness bounds.** How does the local replica advance, and how
+stale may it get before reads are affected? Dimensions: pull trigger (live subscription /
+interval poll / on-demand only); staleness enforcement (none — always readable, staleness
+observable; warn; refuse reads beyond bound T); scope (per connection vs per table).
+Refusing stale reads trades away offline availability — the whatsapp-lifecycle default
+must stay always-readable, with strict staleness an opt-in pragma for apps that prefer
+unavailability to stale answers. Note the interplay: an enforced staleness bound is a
+*freshness lease on reads* and needs a clock story offline.
+`Status: leaning — default: continuous pull while connected, always-readable offline,
+staleness observable via API (N5); optional max-staleness pragma refusing reads with
+SQLITE_BUSY-offline semantics. Bound semantics (wall clock vs admission-seq lag) open.`
+
+**N4. Freshness-on-demand APIs.** Can a read be *made* fresh? Surfaces: the strong-read
+pragma (route through the consistent tier — a real read_at cut, L1); an explicit
+`refresh()` / sync-barrier call (pull until local cursor ≥ server head as of the call,
+return the achieved seq); per-query escalation (attach freshness to one statement rather
+than the connection). All three are policy over the same pull machinery — decide which
+ship v1 and their blocking/timeout semantics offline.
+`Status: leaning — refresh() barrier + connection-level strong-read pragma for v1;
+per-statement escalation later. Offline: both fail fast with the offline error, never
+block indefinitely by default.`
+
+**N5. Staleness observability.** The read-side counterpart of the durability watermark
+(J5): expose last-synced admission seq and wall-clock age (`hb_status()`: local cursor,
+server head if known, lag, health state from M4). Cheap, ships v1, and is what makes
+N3's "always readable" default honest.
+`Status: decided — status API alongside the watermark API.`
+
+**N6. Lease acquisition mode.** When does the fixpoint acquire? **Optimistic (default):**
+everything deferred to COMMIT — validate the buffer, acquire missing, abort + retry on
+conflict; zero network inside the transaction. **Eager (opt-in, open-mode or per-
+transaction via `BEGIN IMMEDIATE`):** the assert-recording layer acquires leases at scan
+time — blocking beats aborting, at the cost of network RTTs mid-transaction (holding the
+SQLite write lock across them) and longer lease hold times. Interacts with L1 (this *is*
+the pessimistic escalation) and J1 (eager mode shrinks the commit fixpoint to
+validation). Barrier handling in eager mode needs care: an acquire's barrier may demand
+applying remote ops while the user transaction is open — likely: eager mode acquires
+but defers barrier catch-up rows to the retry path, same as optimistic.
+`Status: open — leaning optimistic default + eager as connection-string option mapped
+onto BEGIN IMMEDIATE; the eager-mode barrier question is the design detail to resolve.`
+
+---
+
+## Group O — Conformance-first testing (build against the real SQLite suite)
+
+Strategy: stand up the test harness *before* the engine, and let the suite drive
+development as a fidelity ratchet. One refinement over "start failing, make tests pass":
+start **passthrough-green**, not red — a pure passthrough build should pass nearly
+everything on day one, and every interception layer added must *keep* it green. Green→
+green catches regressions the moment a layer breaks dialect fidelity; red→green can't
+distinguish "not built yet" from "built wrong".
+
+**O1. Walking skeleton + SLT harness first.** Build the minimal public API — `open(path)`
+returning a connection, `execute`/`query` — as a *pure passthrough* to vendored SQLite
+(no adoption, no capture, no vtables). Implement the `sqllogictest` crate's driver trait
+over it and run the vendored, pinned SQL Logic Test corpus. Deliverables: the harness in
+CI, the day-one pass/fail baseline, and the first draft of the exclusion manifest
+(families that fail even on passthrough — build/flag artifacts, not our physics).
+`Status: decided — this is the first implementation artifact of multilite, before any
+interception code.`
+
+**O2. Layer-by-layer ratchet.** Insert layers one at a time, each behind a build/open
+flag, re-running the full corpus after each: (1) adoption (A) — hb_* tables exist, suite
+must stay green; (2) preupdate capture + op buffer (C6/G6) — capture-only, no sync,
+green + the C6-a hook-vs-buffer diff and M2 certify_sql run after every script; (3)
+read-shadow rewriting (E1-c) — the layer most likely to break fidelity, watched by the
+same green bar; (4) fixpoint + local-only lease stub; (5) real sync against an
+in-process homebase server. A family that goes red names its layer immediately.
+`Status: decided — flag-gated layers; corpus green is the merge bar per layer.`
+
+**O3. Exclusion manifest as a living deliverable.** Every excluded family carries a
+one-line reason tagged **physics** (documented behavior: dense-rowid asserts under F2,
+`hb_*` visible in schema dumps, journal-mode pragmas we own, forced WAL under J4) or
+**debt** (should pass, doesn't yet — must trend to zero). The manifest starts at O1 and
+ships with the launch claims (DESIGN.md already commits to publishing it).
+`Status: decided — manifest format: family, tag, reason, owner item in this doc.`
+
+**O4. The matrix comes later.** The full conformance matrix (topology × encryption ×
+durability, byte-identical across cells, mid-suite adoption of a vanilla file, detach
+fidelity job, testfixture build) is the launch gate, not the development loop. v1 CI
+runs three cells: passthrough, adopted+capturing (no server), synced (in-process
+server). Cross-cell byte-identity checks start when cell 3 exists.
+`Status: decided — three cells during development; full matrix per LAUNCH_CHECKLIST.`
+
+**O5. What SLT does not cover.** The corpus is read-heavy single-connection SQL — it
+exercises dialect fidelity, not sync. It will not catch: rollback repair (L4), foreign-
+write detection (B), staleness policy (N3), crash recovery (M), multi-writer contention
+(L2). Those get the kernel's own disciplines: the differential harness (script ± LEASE
+lines), crash-injection torture reusing the DST rigs, and dedicated integration tests.
+Do not let a green SLT bar masquerade as sync correctness.
+`Status: decided — SLT = dialect fidelity only; sync correctness has its own rigs.`
 
 ---
 
@@ -519,5 +756,7 @@ snapshots come free as long as applies run as ordinary write transactions.
    adoption/DDL-time rejection specified).
 3. Spike deliverables referenced above (E2 op table, G1/G3/G4 probes, H2 parser fork)
    are the first implementation artifacts — they inform decisions, not follow them.
-4. Implementation begins when no group has an `open` item that blocks the wedge:
-   adoption (A) → foreign-write guard (B) → single-table write path (G/H) → fixpoint (J).
+4. Implementation begins with the O1 walking skeleton (passthrough + SLT harness), then
+   proceeds when no group has an `open` item that blocks the wedge: adoption (A) →
+   foreign-write guard (B) → hook capture + buffer (C6/G6) → read-shadow asserts (E) →
+   fixpoint (J), each layer ratcheted per O2.

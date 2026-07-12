@@ -30,7 +30,7 @@ use homebase_core::clock::HybridClock;
 use homebase_core::messages::{AdmissionBatch, AdmissionRequest, AdmissionResult, KernelError};
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
-use homebase_core::tag::{DeviceId, DeviceSeq};
+use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -241,55 +241,39 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
         self.workers.run(work).await
     }
 
-    /// Drain every persisted per-space oplog. This compatibility entry point
-    /// becomes space-scoped when the push API batch lands.
-    pub async fn push(&self) -> Result<PushOutcome, ClientError> {
-        let state = self.store.load().await?;
-        let mut acked = None;
-        for (space, space_state) in state.spaces {
-            if space_state.cursors.neck >= space_state.cursors.tail {
-                continue;
-            }
-            match self.push_space(space).await? {
-                PushOutcome::Drained {
-                    acked_through: space_acked,
-                } => {
-                    if space_acked.is_some() {
-                        acked = space_acked;
-                    }
-                }
-                stalled @ PushOutcome::Stalled { .. } => return Ok(stalled),
-            }
-        }
-        Ok(PushOutcome::Drained {
-            acked_through: acked,
-        })
-    }
-
-    async fn push_space(&self, space: SpaceId) -> Result<PushOutcome, ClientError> {
+    pub(crate) async fn push_space(
+        &self,
+        space: SpaceId,
+        through: Option<DeviceSeq>,
+    ) -> Result<PushRun, ClientError> {
         let _permit = self.enter_space(space).await?;
         let mut acked = None;
+        let mut target_admission = None;
         let mut probe = false;
         loop {
             let state = self.store.load().await?;
             let Some(space_state) = state.spaces.get(&space) else {
-                return Ok(PushOutcome::Drained {
-                    acked_through: acked,
-                });
+                return target_missing(through);
             };
             let cursors = space_state.cursors;
+            if let Some(target) = through
+                && (target < cursors.neck || target >= cursors.tail)
+            {
+                return target_missing(Some(target));
+            }
             if cursors.neck >= cursors.tail {
-                return Ok(PushOutcome::Drained {
-                    acked_through: acked,
-                });
+                return Ok(PushRun::drained(acked, target_admission));
             }
             let push_cap = self.coordinator.call(|session| session.push_cap);
+            let stream_end = through
+                .map(|target| target.min(DeviceSeq(cursors.tail.0 - 1)))
+                .unwrap_or(DeviceSeq(cursors.tail.0 - 1));
             let until = DeviceSeq(
                 cursors
                     .neck
                     .0
                     .saturating_add(push_cap as u64 - 1)
-                    .min(cursors.tail.0 - 1),
+                    .min(stream_end.0),
             );
             let device = self.device();
 
@@ -361,14 +345,20 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                             probe = true;
                             continue;
                         }
-                        return Ok(PushOutcome::Stalled {
-                            at,
-                            error,
-                            acked_through: acked,
-                        });
+                        return Ok(PushRun::stalled(at, error, acked, target_admission));
+                    }
+                    if let Some(target) = through
+                        && target >= head
+                        && target <= last
+                    {
+                        target_admission =
+                            response.applied_admission_seq((target.0 - head.0) as usize);
                     }
                     self.store.trim_oplog(space, last).await?;
                     acked = Some(last);
+                    if through.is_some_and(|target| last >= target) {
+                        return Ok(PushRun::drained(acked, target_admission));
+                    }
                     probe = false;
                 }
                 Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
@@ -381,6 +371,9 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                     }
                     self.store.trim_oplog(space, current).await?;
                     acked = Some(current);
+                    if through.is_some_and(|target| current >= target) {
+                        return Ok(PushRun::drained(acked, target_admission));
+                    }
                     probe = false;
                 }
                 Err(SpaceError::Kernel(error)) => {
@@ -388,11 +381,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                         probe = true;
                         continue;
                     }
-                    return Ok(PushOutcome::Stalled {
-                        at: head,
-                        error,
-                        acked_through: acked,
-                    });
+                    return Ok(PushRun::stalled(head, error, acked, target_admission));
                 }
                 Err(SpaceError::Unavailable { reason }) => {
                     return Err(ClientError::Space(SpaceDriverError::Unavailable { reason }));
@@ -407,6 +396,45 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
         let _permit = self.enter_space(space).await?;
         self.store.rollback(space, to).await?;
         Ok(())
+    }
+}
+
+pub(crate) struct PushRun {
+    pub(crate) outcome: PushOutcome,
+    pub(crate) target_admission: Option<AdmissionSeq>,
+}
+
+impl PushRun {
+    fn drained(acked_through: Option<DeviceSeq>, target_admission: Option<AdmissionSeq>) -> Self {
+        Self {
+            outcome: PushOutcome::Drained { acked_through },
+            target_admission,
+        }
+    }
+
+    fn stalled(
+        at: DeviceSeq,
+        error: KernelError,
+        acked_through: Option<DeviceSeq>,
+        target_admission: Option<AdmissionSeq>,
+    ) -> Self {
+        Self {
+            outcome: PushOutcome::Stalled {
+                at,
+                error,
+                acked_through,
+            },
+            target_admission,
+        }
+    }
+}
+
+fn target_missing(through: Option<DeviceSeq>) -> Result<PushRun, ClientError> {
+    match through {
+        Some(seq) => Err(ClientError::Space(SpaceDriverError::SubmissionNotPending {
+            seq,
+        })),
+        None => Ok(PushRun::drained(None, None)),
     }
 }
 
