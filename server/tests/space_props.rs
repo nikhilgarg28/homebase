@@ -15,7 +15,8 @@
 //!    deltas equals current live state, with every operation retained in
 //!    `AdmissionOrder`;
 //! 5. **aggregate coherence** — after every admitted batch, the stored
-//!    per-prefix aggregates (max admission seq, live count) equal a
+//!    per-prefix aggregates (history, max version, live count, count epoch)
+//!    and the Full root equal a
 //!    brute-force recomputation from the data records.
 
 use homebase_core::clock::{HybridTimestamp, Timestamp};
@@ -28,13 +29,13 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue,
-    Ver,
+    AdmissionOrder, AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+    Mutation, OpaqueValue, Ver,
 };
 use homebase_server::error::Error;
 use homebase_server::schema::{
     DataRecord, PrefixMetaRecord, data_scan_all, prefix_meta_key, prefix_meta_scan_all,
-    user_key_from_data,
+    root_meta_key, user_key_from_data,
 };
 use homebase_server::space::Space;
 use homebase_server::storage::{MemoryStore, OrderedStore, collect_scan};
@@ -306,31 +307,68 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
 /// "written prefixes keep their record forever" shape: the two maps must
 /// have identical key sets.
 fn check_aggregates(store: &MemoryStore) -> Result<(), TestCaseError> {
-    let mut expected: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+    let zero_order = AdmissionOrder {
+        admission_seq: AdmissionSeq(0),
+        op_index: 0,
+    };
+    let mut expected: BTreeMap<Vec<u8>, (u64, u64, u64, AdmissionOrder)> = BTreeMap::new();
+    let mut root = (0, 0, 0, zero_order);
     for (k, v) in block_on(collect_scan(store.scan_prefix(&data_scan_all(SPACE)))).unwrap() {
         let key = user_key_from_data(&k).unwrap();
         let rec = DataRecord::decode(key.clone(), &v).unwrap();
+        let order = rec.entry.admission.order();
+        root.0 = root.0.max(order.admission_seq.0);
+        root.1 = root.1.max(rec.entry.ver().0);
+        root.2 += rec.entry.device_entry.mutation.is_set() as u64;
+        root.3 = root.3.max(order);
         let components = key.components();
         for depth in 1..=components.len() {
             let slot = expected
                 .entry(prefix_meta_key(SPACE, &components[..depth]))
-                .or_insert((0, 0));
-            slot.0 = slot.0.max(rec.entry.admission.admission_seq.0);
-            slot.1 += rec.entry.device_entry.mutation.is_set() as u64;
+                .or_insert((0, 0, 0, zero_order));
+            slot.0 = slot.0.max(order.admission_seq.0);
+            slot.1 = slot.1.max(rec.entry.ver().0);
+            slot.2 += rec.entry.device_entry.mutation.is_set() as u64;
+            slot.3 = slot.3.max(order);
         }
     }
 
-    let stored: BTreeMap<Vec<u8>, (u64, u64)> = block_on(collect_scan(
+    let stored: BTreeMap<Vec<u8>, (u64, u64, u64, AdmissionOrder)> = block_on(collect_scan(
         store.scan_prefix(&prefix_meta_scan_all(SPACE)),
     ))
     .unwrap()
     .into_iter()
     .map(|(k, v)| {
         let rec = PrefixMetaRecord::decode(&v).unwrap();
-        (k, (rec.max_admission_seq().0, rec.live_count))
+        (
+            k,
+            (
+                rec.max_admission_seq().0,
+                rec.max_ver.0,
+                rec.live_count,
+                rec.count_epoch,
+            ),
+        )
     })
     .collect();
     prop_assert_eq!(&stored, &expected, "aggregates diverged from data records");
+    let stored_root = block_on(store.get(&root_meta_key(SPACE)))
+        .unwrap()
+        .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap());
+    if expected.is_empty() {
+        prop_assert_eq!(stored_root, None);
+    } else {
+        let stored_root = stored_root.unwrap();
+        prop_assert_eq!(
+            (
+                stored_root.max_admission_seq().0,
+                stored_root.max_ver.0,
+                stored_root.live_count,
+                stored_root.count_epoch,
+            ),
+            root
+        );
+    }
     Ok(())
 }
 

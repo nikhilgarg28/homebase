@@ -16,7 +16,7 @@
 //!    counter strictly exceeds every surviving lease record's id;
 //! 3. lease indexes: by-id and by-prefix hold identical record sets, ids
 //!    unique;
-//! 4. per-prefix aggregates equal recomputation from the data records;
+//! 4. per-prefix and Full-root aggregates equal recomputation from data;
 //! 5. per-device high waters and checksums equal the latest admitted header.
 
 use homebase_core::key::Key;
@@ -26,7 +26,7 @@ use homebase_server::schema::{
     AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, LeaseRecord, PrefixMetaRecord,
     admission_header_key, admission_log_scan_all, admission_op_parts, admission_op_scan,
     counters_key, data_scan_all, device_key, lease_by_id_scan, lease_by_prefix_scan_all,
-    prefix_meta_key, prefix_meta_scan_all, user_key_from_data,
+    prefix_meta_key, prefix_meta_scan_all, root_meta_key, user_key_from_data,
 };
 use homebase_server::storage::{OrderedStore, collect_scan};
 use pollster::block_on;
@@ -146,25 +146,79 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
     }
 
     // -- per-prefix aggregates ------------------------------------------------
-    let mut expected: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, (u64, u64, u64, AdmissionOrder)> = BTreeMap::new();
+    let mut root = (
+        0,
+        0,
+        0,
+        AdmissionOrder {
+            admission_seq: AdmissionSeq(0),
+            op_index: 0,
+        },
+    );
     for (key, record) in &data {
+        let order = record.entry.admission.order();
+        root.0 = root.0.max(order.admission_seq.0);
+        root.1 = root.1.max(record.entry.ver().0);
+        root.2 += record.entry.device_entry.mutation.is_set() as u64;
+        root.3 = root.3.max(order);
         let components = key.components();
         for depth in 1..=components.len() {
             let slot = expected
                 .entry(prefix_meta_key(space, &components[..depth]))
-                .or_insert((0, 0));
-            slot.0 = slot.0.max(record.entry.admission.admission_seq.0);
-            slot.1 += record.entry.device_entry.mutation.is_set() as u64;
+                .or_insert((
+                    0,
+                    0,
+                    0,
+                    AdmissionOrder {
+                        admission_seq: AdmissionSeq(0),
+                        op_index: 0,
+                    },
+                ));
+            slot.0 = slot.0.max(order.admission_seq.0);
+            slot.1 = slot.1.max(record.entry.ver().0);
+            slot.2 += record.entry.device_entry.mutation.is_set() as u64;
+            slot.3 = slot.3.max(order);
         }
     }
-    let stored: BTreeMap<Vec<u8>, (u64, u64)> = scan_all(store, &prefix_meta_scan_all(space))
-        .into_iter()
-        .map(|(k, v)| {
-            let rec = PrefixMetaRecord::decode(&v).expect("undecodable prefix meta");
-            (k, (rec.max_admission_seq().0, rec.live_count))
-        })
-        .collect();
+    let stored: BTreeMap<Vec<u8>, (u64, u64, u64, AdmissionOrder)> =
+        scan_all(store, &prefix_meta_scan_all(space))
+            .into_iter()
+            .map(|(k, v)| {
+                let rec = PrefixMetaRecord::decode(&v).expect("undecodable prefix meta");
+                (
+                    k,
+                    (
+                        rec.max_admission_seq().0,
+                        rec.max_ver.0,
+                        rec.live_count,
+                        rec.count_epoch,
+                    ),
+                )
+            })
+            .collect();
     assert_eq!(stored, expected, "aggregates diverged from recomputation");
+    let stored_root = block_on(store.get(&root_meta_key(space)))
+        .unwrap()
+        .map(|bytes| PrefixMetaRecord::decode(&bytes).expect("undecodable root aggregate"));
+    if data.is_empty() {
+        assert_eq!(
+            stored_root, None,
+            "empty space unexpectedly has root metadata"
+        );
+    } else {
+        let stored_root = stored_root.expect("data exists without root metadata");
+        assert_eq!(
+            (
+                stored_root.max_admission_seq().0,
+                stored_root.max_ver.0,
+                stored_root.live_count,
+                stored_root.count_epoch,
+            ),
+            root,
+            "root aggregate diverged from recomputation"
+        );
+    }
 
     // -- device high waters ------------------------------------------------------
     for (device, (device_seq, checksum)) in device_heads {

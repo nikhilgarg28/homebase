@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use crate::schema::{
         DeviceRecord, PrefixMetaRecord, RangeDeleteRecord, device_key, prefix_meta_key,
-        range_delete_key,
+        range_delete_key, root_meta_key,
     };
     use crate::storage::{MemoryStore, OrderedStore, ScanIter, StorageError, WriteBatch};
     use homebase_core::clock::HybridTimestamp;
@@ -224,9 +224,23 @@ mod tests {
         }
     }
 
-    fn prefix_meta(device: DeviceId, seq: u64, live_count: u64) -> PrefixMetaRecord {
+    fn prefix_meta(
+        device: DeviceId,
+        seq: u64,
+        max_ver: u64,
+        live_count: u64,
+        op_index: u32,
+    ) -> PrefixMetaRecord {
         let mut record = PrefixMetaRecord::empty();
-        record.observe(device, AdmissionSeq(seq));
+        record.observe(
+            device,
+            AdmissionSeq(seq),
+            Ver(max_ver),
+            homebase_core::tag::AdmissionOrder {
+                admission_seq: AdmissionSeq(seq),
+                op_index,
+            },
+        );
         record.live_count = live_count;
         record
     }
@@ -445,8 +459,8 @@ mod tests {
     fn covering_range_delete_lookup_chooses_newest_order_not_deepest_prefix() {
         let store = MemoryStore::new();
         let target = Range::Prefix(key(&[b"db", b"row", b"child"]));
-        let record = |range: Range, seq: u64, op_index: u32| RangeDeleteRecord {
-            entry: AdmittedEntry {
+        let record = |range: Range, seq: u64, op_index: u32| {
+            RangeDeleteRecord::new(AdmittedEntry {
                 device_entry: DeviceEntry {
                     mutation: Mutation::DeleteRange { range },
                     tag: DeviceTag {
@@ -461,7 +475,7 @@ mod tests {
                     admission_seq: AdmissionSeq(seq),
                     op_index,
                 },
-            },
+            })
         };
         let full = record(Range::Full, 5, 0);
         let parent_range = Range::Prefix(key(&[b"db"]));
@@ -503,6 +517,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found, full, "only Full covers an unrelated prefix");
+    }
+
+    #[test]
+    fn effective_history_merges_descendants_and_covering_range_events() {
+        let store = MemoryStore::new();
+        let query_prefix = key(&[b"db", b"row"]);
+        let query = Range::Prefix(query_prefix.clone());
+        let mut aggregate = PrefixMetaRecord::empty();
+        aggregate.observe(
+            dev(1),
+            AdmissionSeq(7),
+            Ver(70),
+            homebase_core::tag::AdmissionOrder {
+                admission_seq: AdmissionSeq(7),
+                op_index: 0,
+            },
+        );
+
+        let range_entry = |range: Range, device: DeviceId, seq: u64, ver: u64| AdmittedEntry {
+            device_entry: DeviceEntry {
+                mutation: Mutation::DeleteRange { range },
+                tag: DeviceTag {
+                    device,
+                    device_seq: DeviceSeq(seq),
+                    ver: Ver(ver),
+                    cipher_epoch: CipherEpoch(0),
+                },
+                seal: Seal::empty_aead_v1(),
+            },
+            admission: homebase_core::tag::AdmissionTag {
+                admission_seq: AdmissionSeq(seq),
+                op_index: 0,
+            },
+        };
+        let parent_range = Range::Prefix(key(&[b"db"]));
+        let mut parent = RangeDeleteRecord::new(range_entry(parent_range.clone(), dev(1), 8, 80));
+        parent.observe(range_entry(parent_range.clone(), dev(2), 9, 90));
+        let full = RangeDeleteRecord::new(range_entry(Range::Full, dev(3), 6, 60));
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            prefix_meta_key(SPACE, query_prefix.components()),
+            aggregate.encode(),
+        );
+        batch.put(range_delete_key(SPACE, &parent_range), parent.encode());
+        batch.put(range_delete_key(SPACE, &Range::Full), full.encode());
+        block_on(store.apply(batch)).unwrap();
+
+        let effective = block_on(data::effective_history(SPACE, &store, &query)).unwrap();
+        assert_eq!(effective.history.max_admission_seq(), AdmissionSeq(9));
+        assert_eq!(effective.max_excluding(dev(2)), AdmissionSeq(8));
+        assert_eq!(effective.max_ver, Ver(90));
     }
 
     #[test]
@@ -725,10 +791,10 @@ mod tests {
             .unwrap()
             .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
             .unwrap();
-        assert_eq!(meta.first.device, dev(1));
-        assert_eq!(meta.first.admission_seq, AdmissionSeq(3));
-        assert_eq!(meta.second.device, dev(2));
-        assert_eq!(meta.second.admission_seq, AdmissionSeq(2));
+        assert_eq!(meta.history.first.device, dev(1));
+        assert_eq!(meta.history.first.admission_seq, AdmissionSeq(3));
+        assert_eq!(meta.history.second.device, dev(2));
+        assert_eq!(meta.history.second.admission_seq, AdmissionSeq(2));
 
         let response = admit_as(
             &mut space,
@@ -761,6 +827,11 @@ mod tests {
                 .unwrap()
                 .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
         };
+        let root_meta = |store: &MemoryStore| -> Option<PrefixMetaRecord> {
+            block_on(store.get(&root_meta_key(SPACE)))
+                .unwrap()
+                .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
+        };
 
         let (mut space, store, lease) = setup();
         let k1 = key(&[b"db", b"t", b"r1"]);
@@ -770,28 +841,30 @@ mod tests {
 
         // Never-written prefix: no record at all.
         assert_eq!(meta(&store, &root), None);
+        assert_eq!(root_meta(&store), None);
 
         // Two live keys: every ancestor counts both, at seq 2.
         admit(&mut space, &store, lease, 1, vec![put(&k1, b"v", 1)]).unwrap();
         admit(&mut space, &store, lease, 2, vec![put(&k2, b"v", 1)]).unwrap();
-        let expect = prefix_meta(dev(1), 2, 2);
+        let expect = prefix_meta(dev(1), 2, 1, 2, 0);
         assert_eq!(meta(&store, &root), Some(expect));
+        assert_eq!(root_meta(&store), Some(expect));
         assert_eq!(meta(&store, &table), Some(expect));
         assert_eq!(
             meta(&store, &k1),
-            Some(prefix_meta(dev(1), 1, 1)),
+            Some(prefix_meta(dev(1), 1, 1, 1, 0)),
             "leaf prefix untouched by the sibling's write"
         );
 
         // Overwrite: max seq advances, live count doesn't.
         admit(&mut space, &store, lease, 3, vec![put(&k1, b"v2", 2)]).unwrap();
-        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 3, 2)));
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 3, 2, 2, 0)));
 
         // Tombstone: count drops; the record persists at live_count 0.
         admit(&mut space, &store, lease, 4, vec![del(&k1, 3)]).unwrap();
         admit(&mut space, &store, lease, 5, vec![del(&k2, 2)]).unwrap();
-        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 5, 0)));
-        assert_eq!(meta(&store, &k1), Some(prefix_meta(dev(1), 4, 0)));
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 5, 3, 0, 0)));
+        assert_eq!(meta(&store, &k1), Some(prefix_meta(dev(1), 4, 3, 0, 0)));
 
         // Intra-batch create+tombstone of a fresh key nets zero.
         let k3 = key(&[b"db", b"t", b"r3"]);
@@ -803,17 +876,18 @@ mod tests {
             vec![put(&k3, b"blip", 1), del(&k3, 2)],
         )
         .unwrap();
-        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 6, 0)));
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 6, 3, 0, 1)));
 
         // Repeated delete advances high water but keeps live count stable.
         admit(&mut space, &store, lease, 7, vec![del(&k1, 4)]).unwrap();
-        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 7, 0)));
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 7, 4, 0, 0)));
 
         // Delete -> present and a zero-length present both count as live.
         let k4 = key(&[b"db", b"t", b"r4"]);
         admit(&mut space, &store, lease, 8, vec![put(&k1, b"back", 5)]).unwrap();
         admit(&mut space, &store, lease, 9, vec![put(&k4, b"", 1)]).unwrap();
-        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 9, 2)));
+        assert_eq!(meta(&store, &root), Some(prefix_meta(dev(1), 9, 5, 2, 0)));
+        assert_eq!(root_meta(&store), meta(&store, &root));
     }
 
     #[test]

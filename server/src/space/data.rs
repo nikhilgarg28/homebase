@@ -24,8 +24,9 @@
 //! On admission each client batch takes the next admission seq and the request
 //! writes, atomically:
 //! immutable admission headers and operations, data records for Set/Delete
-//! ops, per-prefix aggregates along every written key's prefix path (two
-//! distinct-device historical heads + live-key delta; see
+//! ops, the Full root plus per-prefix aggregates along every written key's
+//! path (two distinct-device historical heads, monotonic max version, count
+//! epoch, and live-key delta; see
 //! [`PrefixMetaRecord`]), the device high water, and the counters.
 //!
 //! # Reads
@@ -43,10 +44,11 @@
 use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
-    AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord,
-    RangeDeleteRecord, admission_header_key, admission_op_key, admission_op_parts,
-    admission_op_scan, counters_key, covering_range_delete_keys, data_key, data_scan_all,
-    device_key, prefix_meta_key, range_delete_parts, user_key_from_data,
+    AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, HistoricalHeads,
+    PrefixMetaRecord, RangeDeleteRecord, admission_header_key, admission_op_key,
+    admission_op_parts, admission_op_scan, counters_key, covering_range_delete_keys, data_key,
+    data_scan_all, device_key, prefix_meta_key, range_delete_parts, root_meta_key,
+    user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homebase_core::clock::Timestamp;
@@ -133,7 +135,7 @@ pub async fn admit<S: OrderedStore>(
 
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
-    let mut touched_prefix_high: BTreeMap<Vec<u8>, AdmissionSeq> = BTreeMap::new();
+    let mut touched_aggregates: BTreeMap<Vec<u8>, AggregateTouch> = BTreeMap::new();
     for client_batch in &req.batches {
         let failures = range_assert_failures(space, store, req.device, client_batch).await?;
         if !failures.is_empty() {
@@ -153,7 +155,6 @@ pub async fn admit<S: OrderedStore>(
         let seq = next_admission_seq;
         results.push(AdmissionResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
-        let mut touched_prefixes = Vec::new();
         for (op_index, entry) in client_batch.entries.iter().enumerate() {
             let op_index = u32::try_from(op_index).map_err(|_| KernelError::InvalidSeal {
                 reason: "admission batch has too many entries".into(),
@@ -212,13 +213,16 @@ pub async fn admit<S: OrderedStore>(
                 admission_op_key(space, seq, op_index, key),
                 DataRecord { entry: admitted }.encode(),
             );
-            touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
-        }
-        for meta_key in touched_prefixes {
-            touched_prefix_high
-                .entry(meta_key)
-                .and_modify(|at| *at = (*at).max(seq))
-                .or_insert(seq);
+            let order = AdmissionOrder {
+                admission_seq: seq,
+                op_index,
+            };
+            for meta_key in aggregate_keys_for_key(space, key) {
+                touched_aggregates
+                    .entry(meta_key)
+                    .or_insert_with(AggregateTouch::empty)
+                    .observe(seq, ver, order);
+            }
         }
         batch.put(
             admission_header_key(space, seq),
@@ -243,11 +247,8 @@ pub async fn admit<S: OrderedStore>(
         // the new max seq; live counts move by the key's net transition
         // across the whole batch (absent→present +1, present→absent −1).
         let delta = (record.entry.device_entry.mutation.is_set() as i64) - (was_live[key] as i64);
-        let components = key.components();
-        for depth in 1..=components.len() {
-            *live_deltas
-                .entry(prefix_meta_key(space, &components[..depth]))
-                .or_insert(0) += delta;
+        for meta_key in aggregate_keys_for_key(space, key) {
+            *live_deltas.entry(meta_key).or_insert(0) += delta;
         }
     }
     for (meta_key, delta) in live_deltas {
@@ -255,7 +256,13 @@ pub async fn admit<S: OrderedStore>(
             Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record"),
             None => PrefixMetaRecord::empty(),
         };
-        updated.observe(req.device, touched_prefix_high[&meta_key]);
+        let touch = touched_aggregates[&meta_key];
+        updated.observe(
+            req.device,
+            touch.admission_seq,
+            touch.max_ver,
+            touch.count_epoch,
+        );
         updated.live_count = updated
             .live_count
             .checked_add_signed(delta)
@@ -287,13 +294,9 @@ async fn range_assert_failures<S: OrderedStore>(
 ) -> Result<Vec<RangeAssertFailure>, Error> {
     let mut failures = Vec::new();
     for assert in &batch.range_asserts {
-        let meta_key = prefix_meta_key(space, assert.prefix.components());
-        let actual = match store.get(&meta_key).await? {
-            Some(bytes) => PrefixMetaRecord::decode(&bytes)
-                .expect("corrupt prefix meta record")
-                .max_excluding(device),
-            None => AdmissionSeq(0),
-        };
+        let actual = effective_history(space, store, &Range::Prefix(assert.prefix.clone()))
+            .await?
+            .max_excluding(device);
         if actual > assert.upto {
             failures.push(RangeAssertFailure {
                 prefix: assert.prefix.clone(),
@@ -320,11 +323,43 @@ fn failed_response(
     }
 }
 
-fn prefix_meta_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
+#[derive(Clone, Copy)]
+struct AggregateTouch {
+    admission_seq: AdmissionSeq,
+    max_ver: homebase_core::tag::Ver,
+    count_epoch: AdmissionOrder,
+}
+
+impl AggregateTouch {
+    fn empty() -> Self {
+        Self {
+            admission_seq: AdmissionSeq(0),
+            max_ver: homebase_core::tag::Ver(0),
+            count_epoch: AdmissionOrder {
+                admission_seq: AdmissionSeq(0),
+                op_index: 0,
+            },
+        }
+    }
+
+    fn observe(
+        &mut self,
+        admission_seq: AdmissionSeq,
+        ver: homebase_core::tag::Ver,
+        order: AdmissionOrder,
+    ) {
+        self.admission_seq = self.admission_seq.max(admission_seq);
+        self.max_ver = self.max_ver.max(ver);
+        self.count_epoch = self.count_epoch.max(order);
+    }
+}
+
+fn aggregate_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
     let components = key.components();
-    (1..=components.len())
-        .map(|depth| prefix_meta_key(space, &components[..depth]))
-        .collect()
+    let mut keys = Vec::with_capacity(components.len() + 1);
+    keys.push(root_meta_key(space));
+    keys.extend((1..=components.len()).map(|depth| prefix_meta_key(space, &components[..depth])));
+    keys
 }
 
 pub async fn get<S: OrderedStore>(
@@ -596,6 +631,49 @@ pub(crate) async fn covering_range_delete<S: OrderedStore>(
         }
     }
     Ok(newest)
+}
+
+/// Historical facts relevant to one range: all events below it from the
+/// aggregate plus exact ancestor tombstones that cover it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EffectiveHistory {
+    pub history: HistoricalHeads,
+    pub max_ver: homebase_core::tag::Ver,
+}
+
+impl EffectiveHistory {
+    pub fn max_excluding(self, device: DeviceId) -> AdmissionSeq {
+        self.history.max_excluding(device)
+    }
+}
+
+pub(crate) async fn effective_history<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    target: &Range,
+) -> Result<EffectiveHistory, StorageError> {
+    let aggregate_key = match target {
+        Range::Full => root_meta_key(space),
+        Range::Prefix(prefix) => prefix_meta_key(space, prefix.components()),
+    };
+    let aggregate = match store.get(&aggregate_key).await? {
+        Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt aggregate record"),
+        None => PrefixMetaRecord::empty(),
+    };
+    let mut effective = EffectiveHistory {
+        history: aggregate.history,
+        max_ver: aggregate.max_ver,
+    };
+    for storage_key in covering_range_delete_keys(space, target) {
+        let Some(bytes) = store.get(&storage_key).await? else {
+            continue;
+        };
+        let (_, range) = range_delete_parts(&storage_key).expect("corrupt range-delete key");
+        let record = RangeDeleteRecord::decode(range, &bytes).expect("corrupt range-delete record");
+        effective.history.merge(record.history);
+        effective.max_ver = effective.max_ver.max(record.max_ver);
+    }
+    Ok(effective)
 }
 
 async fn data<S: OrderedStore>(

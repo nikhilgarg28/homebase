@@ -254,6 +254,14 @@ PrefixMeta {
 }
 ```
 
+The persisted DR4 shape factors the historical heads into a reusable
+`HistoricalHeads { first, second }`. Prefix and Full-root aggregates store
+those heads together with monotonic `max_ver`, current `live_count`, and the
+`AdmissionOrder` through which that count is materialized. Each exact range
+tombstone record stores its current authenticated event plus its own
+`HistoricalHeads` and monotonic exact-target `max_ver`, so replacing a newest
+tombstone never erases the foreign head needed by range assertions.
+
 The exact storage split may differ, but these facts must be recoverable.
 
 ### Effective count

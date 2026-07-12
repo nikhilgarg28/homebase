@@ -25,12 +25,13 @@
 //! Data and PrefixMeta records may be replaced; AdmissionLog records are never
 //! moved or replaced.
 //!
-//! **PrefixMeta is the durable augmented tree**: per `(depth, prefix)`, the
-//! two greatest historical admission points from distinct devices plus the
-//! live-key count, updated along every written key's full prefix path in the
-//! same atomic batch as the write. Two heads preserve the global maximum for
-//! reads and the maximum excluding one submitting device for causal range
-//! assertions, even after overwrite or delete.
+//! **PrefixMeta plus Meta/root form the durable augmented tree**: each stores
+//! the two greatest historical admission points from distinct devices, a
+//! monotonic version floor, the current live-key count, and the exact
+//! `AdmissionOrder` through which that count is materialized. Point writes
+//! update the Full root and every component-wise prefix atomically. Two heads
+//! preserve both the global maximum and the maximum excluding one submitting
+//! device, even after overwrite or delete.
 //!
 //! The by-prefix index carries an explicit **depth** component (number of
 //! prefix components). That makes both conflict-check queries ordinary
@@ -53,8 +54,8 @@ use homebase_core::range::Range;
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId,
-    DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
+    AdmissionOrder, AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum,
+    DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
 use std::time::Duration;
 
@@ -567,9 +568,47 @@ impl DataRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeDeleteRecord {
     pub entry: AdmittedEntry,
+    /// Greatest exact-target range events from two distinct devices.
+    pub history: HistoricalHeads,
+    /// Greatest range-event version ever admitted at this exact target.
+    pub max_ver: Ver,
 }
 
 impl RangeDeleteRecord {
+    pub fn new(entry: AdmittedEntry) -> Self {
+        assert!(
+            entry.device_entry.mutation.is_delete_range(),
+            "range tombstone record requires DeleteRange"
+        );
+        let mut history = HistoricalHeads::empty();
+        history.observe(entry.device_entry.tag.device, entry.admission.admission_seq);
+        let max_ver = entry.ver();
+        Self {
+            entry,
+            history,
+            max_ver,
+        }
+    }
+
+    /// Fold another event at the same exact target into materialized state.
+    pub fn observe(&mut self, entry: AdmittedEntry) {
+        assert_eq!(
+            self.entry.device_entry.mutation.range(),
+            entry.device_entry.mutation.range(),
+            "range history target changed"
+        );
+        self.history
+            .observe(entry.device_entry.tag.device, entry.admission.admission_seq);
+        self.max_ver = self.max_ver.max(entry.ver());
+        if entry.admission.order() > self.entry.admission.order() {
+            self.entry = entry;
+        }
+    }
+
+    pub fn max_excluding(&self, device: DeviceId) -> AdmissionSeq {
+        self.history.max_excluding(device)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         assert!(
             self.entry.device_entry.mutation.is_delete_range(),
@@ -577,7 +616,7 @@ impl RangeDeleteRecord {
         );
         let tag = self.entry.device_entry.tag;
         let seal = self.entry.device_entry.seal.encode();
-        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 * 2 + seal.len());
+        let mut out = Vec::with_capacity(1 + 16 + 8 * 5 + 4 * 2 + 48 + seal.len());
         out.push(RANGE_DELETE_RECORD_VERSION);
         out.extend_from_slice(&tag.device.0);
         out.extend_from_slice(&tag.device_seq.0.to_be_bytes());
@@ -585,6 +624,8 @@ impl RangeDeleteRecord {
         out.extend_from_slice(&tag.cipher_epoch.0.to_be_bytes());
         out.extend_from_slice(&self.entry.admission.admission_seq.0.to_be_bytes());
         out.extend_from_slice(&self.entry.admission.op_index.to_be_bytes());
+        self.history.encode_into(&mut out);
+        out.extend_from_slice(&self.max_ver.0.to_be_bytes());
         out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
         out.extend_from_slice(&seal);
         out
@@ -605,9 +646,20 @@ impl RangeDeleteRecord {
             admission_seq: AdmissionSeq(r.u64()?),
             op_index: r.u32()?,
         };
+        let history = HistoricalHeads::decode_from(&mut r)?;
+        let max_ver = Ver(r.u64()?);
         let seal_len = r.u32()? as usize;
         let seal = Seal::decode(r.take(seal_len)?).ok()?;
         if !r.rest().is_empty() {
+            return None;
+        }
+        let current_in_history = [history.first, history.second]
+            .into_iter()
+            .any(|head| head.device == tag.device && head.admission_seq == admission.admission_seq);
+        if !current_in_history
+            || history.max_admission_seq() != admission.admission_seq
+            || max_ver < tag.ver
+        {
             return None;
         }
         Some(Self {
@@ -619,6 +671,8 @@ impl RangeDeleteRecord {
                 },
                 admission,
             },
+            history,
+            max_ver,
         })
     }
 }
@@ -637,24 +691,18 @@ impl DeviceAdmission {
     };
 }
 
-/// Write-time aggregates for one `(depth, prefix)`: the durable form of the
-/// augmented range-max tree. `first` and `second` are the greatest historical
-/// admissions from distinct devices. They never regress or disappear after
-/// overwrite/delete, while `live_count` may return to zero.
+/// Greatest historical admission points from two distinct devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PrefixMetaRecord {
+pub struct HistoricalHeads {
     pub first: DeviceAdmission,
     pub second: DeviceAdmission,
-    /// Number of live (non-tombstoned) keys under this prefix.
-    pub live_count: u64,
 }
 
-impl PrefixMetaRecord {
+impl HistoricalHeads {
     pub const fn empty() -> Self {
         Self {
             first: DeviceAdmission::EMPTY,
             second: DeviceAdmission::EMPTY,
-            live_count: 0,
         }
     }
 
@@ -691,23 +739,23 @@ impl PrefixMetaRecord {
         }
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + (16 + 8) * 2 + 8);
-        out.push(PREFIX_META_RECORD_VERSION);
+    pub fn merge(&mut self, other: Self) {
+        for head in [other.first, other.second] {
+            if head.admission_seq.0 != 0 {
+                self.observe(head.device, head.admission_seq);
+            }
+        }
+    }
+
+    fn encode_into(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.first.device.0);
         out.extend_from_slice(&self.first.admission_seq.0.to_be_bytes());
         out.extend_from_slice(&self.second.device.0);
         out.extend_from_slice(&self.second.admission_seq.0.to_be_bytes());
-        out.extend_from_slice(&self.live_count.to_be_bytes());
-        out
     }
 
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = Reader::new(bytes);
-        if r.u8()? != PREFIX_META_RECORD_VERSION {
-            return None;
-        }
-        Some(Self {
+    fn decode_from(r: &mut Reader<'_>) -> Option<Self> {
+        let heads = Self {
             first: DeviceAdmission {
                 device: DeviceId(r.bytes16()?),
                 admission_seq: AdmissionSeq(r.u64()?),
@@ -716,8 +764,90 @@ impl PrefixMetaRecord {
                 device: DeviceId(r.bytes16()?),
                 admission_seq: AdmissionSeq(r.u64()?),
             },
+        };
+        let ordered = heads.first.admission_seq >= heads.second.admission_seq;
+        let distinct =
+            heads.second.admission_seq.0 == 0 || heads.first.device != heads.second.device;
+        let no_second_without_first =
+            heads.first.admission_seq.0 != 0 || heads.second.admission_seq.0 == 0;
+        (ordered && distinct && no_second_without_first).then_some(heads)
+    }
+}
+
+/// Write-time aggregates for one `(depth, prefix)`: the durable form of the
+/// augmented range-max tree. `first` and `second` are the greatest historical
+/// admissions from distinct devices. They never regress or disappear after
+/// overwrite/delete, while `live_count` may return to zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixMetaRecord {
+    pub history: HistoricalHeads,
+    /// Greatest point or range-event version ever observed below this node.
+    pub max_ver: Ver,
+    /// Number of live (non-tombstoned) keys under this prefix.
+    pub live_count: u64,
+    /// Admission order through which `live_count` has been materialized.
+    pub count_epoch: AdmissionOrder,
+}
+
+impl PrefixMetaRecord {
+    pub const fn empty() -> Self {
+        Self {
+            history: HistoricalHeads::empty(),
+            max_ver: Ver(0),
+            live_count: 0,
+            count_epoch: AdmissionOrder {
+                admission_seq: AdmissionSeq(0),
+                op_index: 0,
+            },
+        }
+    }
+
+    pub fn max_admission_seq(self) -> AdmissionSeq {
+        self.history.max_admission_seq()
+    }
+
+    pub fn max_excluding(self, device: DeviceId) -> AdmissionSeq {
+        self.history.max_excluding(device)
+    }
+
+    pub fn observe(
+        &mut self,
+        device: DeviceId,
+        admission_seq: AdmissionSeq,
+        ver: Ver,
+        count_epoch: AdmissionOrder,
+    ) {
+        self.history.observe(device, admission_seq);
+        self.max_ver = self.max_ver.max(ver);
+        self.count_epoch = self.count_epoch.max(count_epoch);
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 48 + 8 * 3 + 4);
+        out.push(PREFIX_META_RECORD_VERSION);
+        self.history.encode_into(&mut out);
+        out.extend_from_slice(&self.max_ver.0.to_be_bytes());
+        out.extend_from_slice(&self.live_count.to_be_bytes());
+        out.extend_from_slice(&self.count_epoch.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.count_epoch.op_index.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != PREFIX_META_RECORD_VERSION {
+            return None;
+        }
+        let record = Self {
+            history: HistoricalHeads::decode_from(&mut r)?,
+            max_ver: Ver(r.u64()?),
             live_count: r.u64()?,
-        })
+            count_epoch: AdmissionOrder {
+                admission_seq: AdmissionSeq(r.u64()?),
+                op_index: r.u32()?,
+            },
+        };
+        r.rest().is_empty().then_some(record)
     }
 }
 
@@ -799,6 +929,13 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    fn order(seq: u64, op_index: u32) -> AdmissionOrder {
+        AdmissionOrder {
+            admission_seq: AdmissionSeq(seq),
+            op_index,
+        }
+    }
+
     fn sample_lease() -> LeaseRecord {
         LeaseRecord {
             id: LeaseId(42),
@@ -822,8 +959,8 @@ mod tests {
     #[test]
     fn prefix_meta_record_roundtrips() {
         let mut rec = PrefixMetaRecord::empty();
-        rec.observe(DeviceId([1; 16]), AdmissionSeq(17));
-        rec.observe(DeviceId([2; 16]), AdmissionSeq(11));
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(17), Ver(21), order(17, 2));
+        rec.observe(DeviceId([2; 16]), AdmissionSeq(11), Ver(13), order(11, 1));
         rec.live_count = 4;
         assert_eq!(PrefixMetaRecord::decode(&rec.encode()), Some(rec));
         assert_eq!(rec.max_excluding(DeviceId([1; 16])), AdmissionSeq(11));
@@ -833,20 +970,22 @@ mod tests {
     #[test]
     fn prefix_meta_keeps_two_distinct_device_heads() {
         let mut rec = PrefixMetaRecord::empty();
-        rec.observe(DeviceId([1; 16]), AdmissionSeq(1));
-        rec.observe(DeviceId([2; 16]), AdmissionSeq(2));
-        rec.observe(DeviceId([3; 16]), AdmissionSeq(3));
-        assert_eq!(rec.first.device, DeviceId([3; 16]));
-        assert_eq!(rec.second.device, DeviceId([2; 16]));
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(1), Ver(1), order(1, 0));
+        rec.observe(DeviceId([2; 16]), AdmissionSeq(2), Ver(2), order(2, 0));
+        rec.observe(DeviceId([3; 16]), AdmissionSeq(3), Ver(3), order(3, 0));
+        assert_eq!(rec.history.first.device, DeviceId([3; 16]));
+        assert_eq!(rec.history.second.device, DeviceId([2; 16]));
 
-        rec.observe(DeviceId([1; 16]), AdmissionSeq(4));
-        assert_eq!(rec.first.device, DeviceId([1; 16]));
-        assert_eq!(rec.second.device, DeviceId([3; 16]));
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(4), Ver(4), order(4, 0));
+        assert_eq!(rec.history.first.device, DeviceId([1; 16]));
+        assert_eq!(rec.history.second.device, DeviceId([3; 16]));
         assert_eq!(rec.max_excluding(DeviceId([1; 16])), AdmissionSeq(3));
         assert_eq!(rec.max_excluding(DeviceId([3; 16])), AdmissionSeq(4));
 
-        rec.observe(DeviceId([1; 16]), AdmissionSeq(2));
-        assert_eq!(rec.first.admission_seq, AdmissionSeq(4));
+        rec.observe(DeviceId([1; 16]), AdmissionSeq(2), Ver(2), order(2, 0));
+        assert_eq!(rec.history.first.admission_seq, AdmissionSeq(4));
+        assert_eq!(rec.max_ver, Ver(4));
+        assert_eq!(rec.count_epoch, order(4, 0));
     }
 
     #[test]
@@ -930,7 +1069,7 @@ mod tests {
         assert_eq!(components[2].as_bytes(), b"root");
 
         let mut aggregate = PrefixMetaRecord::empty();
-        aggregate.observe(DeviceId([3; 16]), AdmissionSeq(4));
+        aggregate.observe(DeviceId([3; 16]), AdmissionSeq(4), Ver(5), order(4, 1));
         aggregate.live_count = 9;
         assert_eq!(
             PrefixMetaRecord::decode(&aggregate.encode()),
@@ -943,26 +1082,24 @@ mod tests {
         use homebase_core::range::Range;
 
         let range = Range::Prefix(Key::from_bytes([&b"db"[..]]).unwrap());
-        let record = RangeDeleteRecord {
-            entry: AdmittedEntry {
-                device_entry: DeviceEntry {
-                    mutation: Mutation::DeleteRange {
-                        range: range.clone(),
-                    },
-                    tag: DeviceTag {
-                        device: DeviceId([5; 16]),
-                        device_seq: DeviceSeq(6),
-                        ver: Ver(7),
-                        cipher_epoch: CipherEpoch(8),
-                    },
-                    seal: Seal::empty_aead_v1(),
+        let record = RangeDeleteRecord::new(AdmittedEntry {
+            device_entry: DeviceEntry {
+                mutation: Mutation::DeleteRange {
+                    range: range.clone(),
                 },
-                admission: AdmissionTag {
-                    admission_seq: AdmissionSeq(9),
-                    op_index: 10,
+                tag: DeviceTag {
+                    device: DeviceId([5; 16]),
+                    device_seq: DeviceSeq(6),
+                    ver: Ver(7),
+                    cipher_epoch: CipherEpoch(8),
                 },
+                seal: Seal::empty_aead_v1(),
             },
-        };
+            admission: AdmissionTag {
+                admission_seq: AdmissionSeq(9),
+                op_index: 10,
+            },
+        });
         let encoded = record.encode();
         assert_eq!(
             RangeDeleteRecord::decode(range.clone(), &encoded),
@@ -975,9 +1112,50 @@ mod tests {
             RangeDeleteRecord::decode(range.clone(), &encoded[..20]),
             None
         );
+        let mut inconsistent_history = encoded.clone();
+        const FIRST_HISTORY_SEQ: std::ops::Range<usize> = 69..77;
+        inconsistent_history[FIRST_HISTORY_SEQ].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            RangeDeleteRecord::decode(range.clone(), &inconsistent_history),
+            None
+        );
         let mut wrong_version = encoded;
         wrong_version[0] = 2;
         assert_eq!(RangeDeleteRecord::decode(range, &wrong_version), None);
+    }
+
+    #[test]
+    fn range_delete_record_preserves_two_device_heads_and_max_ver() {
+        let range = Range::Prefix(Key::from_bytes([&b"db"[..]]).unwrap());
+        let entry = |device: u8, seq: u64, ver: u64| AdmittedEntry {
+            device_entry: DeviceEntry {
+                mutation: Mutation::DeleteRange {
+                    range: range.clone(),
+                },
+                tag: DeviceTag {
+                    device: DeviceId([device; 16]),
+                    device_seq: DeviceSeq(seq),
+                    ver: Ver(ver),
+                    cipher_epoch: CipherEpoch(0),
+                },
+                seal: Seal::empty_aead_v1(),
+            },
+            admission: AdmissionTag {
+                admission_seq: AdmissionSeq(seq),
+                op_index: 0,
+            },
+        };
+        let mut record = RangeDeleteRecord::new(entry(1, 1, 10));
+        record.observe(entry(2, 2, 20));
+        record.observe(entry(1, 3, 30));
+
+        assert_eq!(record.entry.admission.admission_seq, AdmissionSeq(3));
+        assert_eq!(record.max_excluding(DeviceId([1; 16])), AdmissionSeq(2));
+        assert_eq!(record.max_ver, Ver(30));
+        assert_eq!(
+            RangeDeleteRecord::decode(range, &record.encode()),
+            Some(record)
+        );
     }
 
     #[test]
