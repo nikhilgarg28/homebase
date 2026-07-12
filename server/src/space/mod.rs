@@ -123,8 +123,8 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{PrefixMetaRecord, prefix_meta_key};
-    use crate::storage::MemoryStore;
+    use crate::schema::{DeviceRecord, PrefixMetaRecord, device_key, prefix_meta_key};
+    use crate::storage::{MemoryStore, OrderedStore, WriteBatch};
     use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseId, LeaseMode};
@@ -277,11 +277,16 @@ mod tests {
         range_asserts: Vec<RangeAssert>,
         entries: Vec<DeviceEntry>,
     ) -> Result<AdmissionResponse, Error> {
+        let expected_checksum = block_on(store.get(&device_key(SPACE, dev(1))))
+            .unwrap()
+            .map(|bytes| DeviceRecord::decode(&bytes).unwrap().checksum)
+            .unwrap_or_default();
         block_on(space.admit(
             store,
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(1),
+                expected_checksum,
                 evidence: vec![lease],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(device_seq),
@@ -300,11 +305,16 @@ mod tests {
         range_asserts: Vec<RangeAssert>,
         mutations: Vec<(Mutation<Ciphertext>, u64)>,
     ) -> AdmissionResponse {
+        let expected_checksum = block_on(store.get(&device_key(SPACE, device)))
+            .unwrap()
+            .map(|bytes| DeviceRecord::decode(&bytes).unwrap().checksum)
+            .unwrap_or_default();
         block_on(space.admit(
             store,
             Timestamp(1),
             &AdmissionRequest {
                 device,
+                expected_checksum,
                 evidence: vec![],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(device_seq),
@@ -396,6 +406,7 @@ mod tests {
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![lease],
                 batches: vec![
                     AdmissionBatch {
@@ -437,6 +448,7 @@ mod tests {
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![lease],
                 batches: vec![
                     AdmissionBatch {
@@ -474,6 +486,7 @@ mod tests {
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(1),
@@ -489,6 +502,7 @@ mod tests {
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(2),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![],
                 batches: vec![
                     AdmissionBatch {
@@ -740,6 +754,87 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn checksum_mismatch_rejects_before_applying_or_advancing() {
+        let (mut space, store, lease) = setup();
+        let first = key(&[b"db", b"first"]);
+        let second = key(&[b"db", b"second"]);
+        let applied = admit(&mut space, &store, lease, 1, vec![put(&first, b"one", 1)]).unwrap();
+        assert_ne!(applied.checksum, homebase_core::DeviceChecksum::EMPTY);
+
+        let err = block_on(space.admit(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+                evidence: vec![lease],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(2),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(dev(1), 2, vec![put(&second, b"two", 2)]),
+                }],
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Kernel(KernelError::DeviceChecksumMismatch {
+                current_seq: DeviceSeq(1),
+                current,
+            }) if current == applied.checksum
+        ));
+        assert!(
+            block_on(space.get(
+                &store,
+                &GetRequest {
+                    keys: vec![second.clone()]
+                }
+            ))
+            .unwrap()
+            .entries[0]
+                .is_none()
+        );
+
+        admit(&mut space, &store, lease, 2, vec![put(&second, b"two", 2)])
+            .expect("mismatch must not consume device_seq 2");
+    }
+
+    #[test]
+    fn rolled_back_server_device_checksum_is_detected() {
+        let (mut space, store, lease) = setup();
+        let first = key(&[b"db", b"first"]);
+        let second = key(&[b"db", b"second"]);
+        let applied = admit(&mut space, &store, lease, 1, vec![put(&first, b"one", 1)]).unwrap();
+
+        let mut rollback = WriteBatch::new();
+        rollback.delete(device_key(SPACE, dev(1)));
+        block_on(store.apply(rollback)).unwrap();
+
+        let err = block_on(space.admit(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: applied.checksum,
+                evidence: vec![lease],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(2),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(dev(1), 2, vec![put(&second, b"two", 2)]),
+                }],
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Kernel(KernelError::DeviceChecksumMismatch {
+                current_seq: DeviceSeq(0),
+                current: homebase_core::DeviceChecksum::EMPTY,
+            })
+        ));
     }
 
     #[test]

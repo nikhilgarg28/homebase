@@ -13,7 +13,8 @@ use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
 };
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
@@ -114,6 +115,67 @@ fn simstore_meta_passes_conformance() {
         store.flush();
         let meta = OrderedMetaStore::new(store);
         conformance::run_all(&meta).await;
+    });
+}
+
+#[test]
+fn trim_and_confirmed_checksum_are_one_atomic_transition() {
+    block_on(async {
+        let sim = SimStore::new(99, FaultConfig::NONE);
+        let meta = OrderedMetaStore::new(sim.clone());
+        let reserved = meta
+            .reserve_commit(SPACE, 1, vec![], SubmitMode::Unchecked)
+            .await
+            .unwrap();
+        meta.commit(
+            SPACE,
+            reserved.clone(),
+            vec![wire_entry(
+                dev(1),
+                reserved.seq,
+                key(&[b"db", b"row"]),
+                b"value",
+                Ver(1),
+            )],
+        )
+        .await
+        .unwrap();
+        sim.flush();
+
+        sim.set_config(FaultConfig {
+            error_rate: 1.0,
+            flush_rate: 1.0,
+            max_latency_yields: 0,
+        });
+        let confirmed = DeviceChecksum([7; 32]);
+        assert!(
+            meta.trim_oplog(SPACE, reserved.seq, confirmed)
+                .await
+                .is_err()
+        );
+        sim.set_config(FaultConfig::NONE);
+        let unchanged = audit(&meta).await;
+        assert_eq!(unchanged.spaces[&SPACE].checksum, DeviceChecksum::EMPTY);
+        assert_eq!(unchanged.spaces[&SPACE].cursors.neck, DeviceSeq(1));
+        assert!(unchanged.spaces[&SPACE].oplog.contains_key(&reserved.seq));
+
+        meta.trim_oplog(SPACE, reserved.seq, confirmed)
+            .await
+            .unwrap();
+        sim.flush();
+        sim.crash();
+        let advanced = audit(&meta).await;
+        assert_eq!(advanced.spaces[&SPACE].checksum, confirmed);
+        assert_eq!(advanced.spaces[&SPACE].cursors.neck, DeviceSeq(2));
+        assert!(advanced.spaces[&SPACE].oplog.is_empty());
+
+        assert!(
+            meta.trim_oplog(SPACE, reserved.seq, DeviceChecksum([8; 32]))
+                .await
+                .is_err(),
+            "an idempotent re-ack cannot rewrite confirmed history"
+        );
+        assert_eq!(audit(&meta).await.spaces[&SPACE].checksum, confirmed);
     });
 }
 
@@ -344,6 +406,7 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
                 &SPACE,
                 AdmissionRequest {
                     device: client.device(),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![],
                     batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(3),
@@ -416,6 +479,7 @@ fn ack_drop_trims_after_server_admitted() {
                 &SPACE,
                 AdmissionRequest {
                     device: client.device(),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![lease],
                     batches: vec![
                         AdmissionBatch {

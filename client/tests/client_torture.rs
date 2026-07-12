@@ -304,7 +304,7 @@ async fn driver(
                 Err(ClientError::Space(SpaceDriverError::Fork { admitted })) => {
                     guard.client.take();
                     OrderedMetaStore::new(sim.clone())
-                        .trim_oplog(SPACE, admitted)
+                        .trim_oplog(SPACE, admitted, homebase_core::DeviceChecksum::EMPTY)
                         .await
                         .expect("trim after fork");
                     *slot.borrow_mut() =
@@ -435,7 +435,7 @@ async fn drain_push(
             }
             Err(ClientError::Space(SpaceDriverError::Fork { admitted })) => {
                 OrderedMetaStore::new(sim.clone())
-                    .trim_oplog(SPACE, admitted)
+                    .trim_oplog(SPACE, admitted, homebase_core::DeviceChecksum::EMPTY)
                     .await
                     .expect("trim after fork");
                 *slot.borrow_mut() =

@@ -28,8 +28,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    Ver,
+    AdmissionSeq, CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
+    DeviceTag, Mutation, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
@@ -80,6 +80,7 @@ struct Coverage {
 #[derive(Clone)]
 struct WriterState {
     next_seq: Rc<Cell<u64>>,
+    checksum: Rc<Cell<DeviceChecksum>>,
     /// Last ver this client believes each pool key has. Refreshed from
     /// `VerRegression` when an unacked write survived a crash.
     vers: Rc<RefCell<BTreeMap<u64, u64>>>,
@@ -129,6 +130,7 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
 
         let req = AdmissionRequest {
             device: WRITER,
+            expected_checksum: state.checksum.get(),
             evidence: vec![state.lease.borrow().unwrap()],
             batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
@@ -146,8 +148,9 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             }],
         };
         match handle.admit(req).await {
-            Ok(_) => {
+            Ok(response) => {
                 state.next_seq.set(seq + 1);
+                state.checksum.set(response.checksum);
                 state.vers.borrow_mut().insert(key_index, ver);
                 let mut cov = coverage.borrow_mut();
                 if tombstone {
@@ -162,6 +165,7 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
                 state.next_seq.set(current.0 + 1);
             }
+            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch { .. })) => return,
             // An unacked write to this key survived a crash; the rejection
             // itself tells us the authoritative ver.
             Err(SpaceError::Kernel(KernelError::VerRegression { current, .. })) => {
@@ -271,6 +275,7 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
     let coverage = Rc::new(RefCell::new(Coverage::default()));
     let writer_state = WriterState {
         next_seq: Rc::new(Cell::new(1)),
+        checksum: Rc::new(Cell::new(DeviceChecksum::EMPTY)),
         vers: Rc::new(RefCell::new(BTreeMap::new())),
         lease: Rc::new(RefCell::new(None)),
         stamp: Rc::new(Cell::new(0)),

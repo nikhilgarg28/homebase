@@ -115,7 +115,7 @@ use homebase_core::messages::{Range, RangeAssert};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{
-    AdmissionSeq, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, Mutation, Ver,
+    AdmissionSeq, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation, Ver,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -247,6 +247,8 @@ pub enum SubmitMode {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SpaceState {
     pub cursors: OplogCursors,
+    /// DeviceChecksum confirmed by the server for this space's device stream.
+    pub checksum: DeviceChecksum,
     pub ver_high: Option<Ver>,
     pub oplog: BTreeMap<DeviceSeq, DeviceOp>,
     pub watermarks: BTreeMap<Range, AdmissionSeq>,
@@ -466,6 +468,7 @@ pub trait MetaStore {
         &self,
         space: SpaceId,
         through: DeviceSeq,
+        checksum: DeviceChecksum,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Retire the entire active window after a definitively rejected
@@ -599,6 +602,7 @@ pub enum StoreNamespace {
 /// (Meta, Client, Device)               → DeviceRecord
 /// (Meta, Client, Clock)                → ClockRecord
 /// (Meta, Space, id, Cursors)           → OplogCursors
+/// (Meta, Space, id, DeviceChecksum)          → ChecksumRecord
 /// (Meta, Space, id, Ver)               → VerHighRecord
 /// (Meta, Space, id, Oplog, seq_be)     → DeviceOp
 /// (Meta, Space, id, Watermark, range)  → WatermarkRecord (exact range cursor)
@@ -641,6 +645,7 @@ enum SpaceKind {
     Cursors = 3,
     Ver = 4,
     Oplog = 5,
+    DeviceChecksum = 6,
 }
 
 fn byte_component(b: u8) -> KeyComponent {
@@ -691,6 +696,10 @@ fn cursors_key(space: SpaceId) -> Vec<u8> {
 
 fn ver_key(space: SpaceId) -> Vec<u8> {
     encode_components(&space_kind(space, SpaceKind::Ver))
+}
+
+fn checksum_key(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::DeviceChecksum))
 }
 
 fn oplog_scan(space: SpaceId) -> Vec<u8> {
@@ -850,6 +859,12 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                             let record =
                                 VerHighRecord::decode(&bytes).expect("undecodable ver record");
                             space.ver_high = Some(record.high);
+                        }
+                        k if k == SpaceKind::DeviceChecksum as u8 => {
+                            assert_eq!(components.len(), 4, "checksum key has no suffix");
+                            space.checksum = ChecksumRecord::decode(&bytes)
+                                .expect("undecodable checksum")
+                                .value;
                         }
                         k if k == SpaceKind::Oplog as u8 => {
                             let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
@@ -1033,13 +1048,35 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         })
     }
 
-    async fn trim_oplog(&self, space: SpaceId, through: DeviceSeq) -> Result<(), StorageError> {
+    async fn trim_oplog(
+        &self,
+        space: SpaceId,
+        through: DeviceSeq,
+        checksum: DeviceChecksum,
+    ) -> Result<(), StorageError> {
         let cursors = match self.store.get(&cursors_key(space)).await? {
             Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
             None => OplogCursors::default(),
         };
+        let confirmed = match self.store.get(&checksum_key(space)).await? {
+            Some(bytes) => {
+                ChecksumRecord::decode(&bytes)
+                    .expect("undecodable checksum")
+                    .value
+            }
+            None => DeviceChecksum::EMPTY,
+        };
+        if through < cursors.neck && checksum != confirmed {
+            return Err(StorageError(
+                "re-acknowledgement attempted to change the confirmed checksum".into(),
+            ));
+        }
         let queued = collect_scan(self.store.scan_prefix(&oplog_scan(space))).await?;
         let mut batch = WriteBatch::new();
+        batch.put(
+            checksum_key(space),
+            ChecksumRecord { value: checksum }.encode(),
+        );
         for (storage_key, _) in queued {
             let components = decode_components(&storage_key).expect("undecodable storage key");
             let seq = DeviceSeq(u64_at(&components, 4, "commit seq"));
@@ -1233,6 +1270,31 @@ const CLOCK_RECORD_VERSION: u8 = 1;
 const CODEC_RECORD_VERSION: u8 = 1;
 const LEASE_RECORD_VERSION: u8 = 3;
 const OPLOG_RECORD_VERSION: u8 = 4;
+const CHECKSUM_RECORD_VERSION: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChecksumRecord {
+    value: DeviceChecksum,
+}
+
+impl ChecksumRecord {
+    fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 32);
+        out.push(CHECKSUM_RECORD_VERSION);
+        out.extend_from_slice(&self.value.0);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+        if reader.u8()? != CHECKSUM_RECORD_VERSION {
+            return None;
+        }
+        let value = DeviceChecksum(reader.take(32)?.try_into().ok()?);
+        reader.end()?;
+        Some(Self { value })
+    }
+}
 
 impl DeviceRecord {
     pub fn encode(&self) -> Vec<u8> {
@@ -1890,7 +1952,10 @@ pub mod conformance {
 
         // A push ack advances this space's neck and physically trims its
         // retained prefix, advancing head in the same transition.
-        store.trim_oplog(space, DeviceSeq(1)).await.unwrap();
+        store
+            .trim_oplog(space, DeviceSeq(1), DeviceChecksum::EMPTY)
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert_eq!(
             state.spaces[&space]
@@ -1914,7 +1979,10 @@ pub mod conformance {
             1,
             "other space is isolated"
         );
-        store.trim_oplog(space, DeviceSeq(1)).await.unwrap();
+        store
+            .trim_oplog(space, DeviceSeq(1), DeviceChecksum::EMPTY)
+            .await
+            .unwrap();
         assert_eq!(
             audit(store).await.spaces[&space].oplog.len(),
             1,
@@ -2008,7 +2076,10 @@ pub mod conformance {
         // A merged wire batch acks under its last seq; the group ack
         // drops everything through it and nothing after — prefix-only by
         // construction, no gap is even expressible.
-        store.trim_oplog(space, DeviceSeq(3)).await.unwrap();
+        store
+            .trim_oplog(space, DeviceSeq(3), DeviceChecksum::EMPTY)
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert_eq!(
             state.spaces[&space]
@@ -2092,7 +2163,10 @@ pub mod conformance {
 
         // Acking the marker trims all dead history through it and moves
         // head/neck together, leaving the later active commit intact.
-        store.trim_oplog(space, DeviceSeq(6)).await.unwrap();
+        store
+            .trim_oplog(space, DeviceSeq(6), DeviceChecksum::EMPTY)
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert_eq!(
             state.spaces[&space].cursors,

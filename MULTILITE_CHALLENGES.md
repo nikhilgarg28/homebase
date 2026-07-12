@@ -54,11 +54,18 @@ atomic transaction so a crash mid-adoption leaves either a vanilla file or a ful
 one — never half.
 `Status: decided — single-transaction adoption; snapshot ship is a separate resumable saga.`
 
-**A2. System-table naming.** `_multilite_metadata` vs the `hb_*` / `_hb_*` family.
-DESIGN.md already commits to `hb_*` (`hb_oplog`, `hb_leases`) and the SLT exclusion
-manifest mentions `_hb_*`. One prefix, everywhere, decided before first byte is written —
-it is part of the detach contract and the conformance exclusion manifest.
-`Status: leaning — hb_* per DESIGN.md; reconcile the _hb_ vs hb_ inconsistency there.`
+**A2. System-table naming and schema placement.** Naming: `_multilite_metadata` vs the
+`hb_*` / `_hb_*` family — DESIGN.md already commits to `hb_*` (`hb_oplog`, `hb_leases`);
+one prefix, everywhere, decided before first byte is written (part of the detach
+contract and the exclusion manifest). **Placement: `main`, forced** — a "separate
+multilite schema" means an ATTACHed database file, and **multi-database transactions
+are not atomic under WAL** (the super-journal mechanism is rollback-journal-only; a
+power loss mid-COMMIT can land one file's changes without the other's). J4 forces WAL
+and the single-file doctrine requires rows + oplog in one atomic commit, so metadata in
+an attached file would reintroduce exactly the torn state the architecture prevents.
+In-file prefix namespacing is the only namespacing SQLite offers.
+`Status: decided — hb_* prefix in main (reconcile _hb_ vs hb_ in DESIGN.md); attached-
+file metadata rejected on WAL atomicity grounds.`
 
 **A3. Snapshot-into-oplog vs virtual snapshot cursor.** Two ways to make pre-adoption data
 shippable:
@@ -114,18 +121,35 @@ opt-in policy.
 
 **B1. Offline detection (between sessions).** Every multilite commit already writes
 `hb_*` rows in the same transaction, so multilite state is always consistent with data at
-our commits; a foreign commit changes data without touching `hb_*`. Candidate mechanisms:
-- **Header change counter** (file header offset 24): store its value in `hb_meta` at every
-  multilite commit (cheap: it's our own transaction); on open, compare header vs stored.
-  Foreign rollback-journal commits bump the header but not our stored copy → mismatch.
-  **WAL caveat:** in WAL mode the header counter moves on checkpoint, not per commit —
-  detection must also inspect `-wal` file state (salts, frame count) and we must checkpoint
-  + record on clean close.
-- **Schema cookie** (`PRAGMA schema_version`): same trick, catches foreign DDL specifically.
-- **Content CRC** (per-table or per-space, already in TODO.md): definitive but O(data);
-  optional deep check behind a flag or on suspicion.
-`Status: leaning — change counter + schema cookie snapshot in hb_meta as the always-on
-check; CRC as an explicit deep-verify mode. Exact WAL-mode story open.`
+our commits; a foreign commit changes data without touching `hb_*`. **No single SQLite
+property covers every write across journal modes persistently** — `data_version` is
+live-only and volatile; the header change counter (offset 24) bumps per commit only in
+rollback-journal mode (WAL: on checkpoint only); WAL salts/frame-count reflect every
+WAL write but are transient (reset on clean close); schema cookie is DDL-only. The
+composite that works:
+
+- **Clean-close ritual (counter fixpoint).** The circularity — recording the counter is
+  itself a write that changes it — resolves by making the final write deterministic:
+  checkpoint (TRUNCATE) → switch journal mode to DELETE for the ritual → raw-read
+  header counter `C` (plain file IO) → commit one final transaction writing
+  `hb_meta.expected = C + 1` (rollback-mode commits bump exactly once — the file
+  satisfies its own prediction; WAL file gone).
+- **Open-time assertion:** raw-read counter; require `counter == hb_meta.expected` AND
+  no/empty `-wal` file. Any interim foreign write either bumped the counter (rollback
+  mode, or their checkpoint) or left WAL frames — both trip it.
+- **Unclean close (crash):** the fixpoint never ran — fall back to WAL-consistency
+  evidence + M2's `certify_sql` (oplog tail vs materialized rows) instead of a counter
+  compare; "our crash" vs "our crash + foreign write" is not cheaply distinguishable
+  here — the deep-verify CRC exists for when it matters.
+- **Schema cookie** snapshot: cheap additional tripwire for foreign DDL specifically.
+- **Content CRC** (per-table or per-space, TODO.md): definitive but O(data); explicit
+  deep-verify mode.
+
+Threat model note: this defends against *accidental* foreign writes (someone opens the
+file with the sqlite3 CLI) — not an adversary who restores counters after tampering;
+adversarial file tampering is the sync layer's domain (E2EE, ver chains, anchors).
+`Status: leaning — clean-close ritual + open assertion + certify fallback as designed;
+verify the exact counter-increment semantics of the ritual commit in the spike.`
 
 **B2. Live detection (concurrent foreign connection).** `PRAGMA data_version` changes when
 *another* connection commits — poll it per statement or per transaction on the multilite
@@ -328,8 +352,9 @@ that weren't). Options: (a) authorizer table-level assert on the written table �
 correct, the v1 default; (b) companion probe-SELECT through the read-shadow reproducing
 the write's WHERE clause — precise, costs a second scan and risks semantic drift from
 the real statement; (c) opt-in write-vtable mode for hot tables that need precision.
-`Status: leaning — (a) for v1 (single-writer default makes coarseness cheap); (b)
-evaluated with E2's mapping table when multi-writer contention demands it.`
+`Status: decided (v1) — (a): write statements forward natively with a table-level
+assert on the written table; finer predicate capture ((b)/(c), with E2's mapping table)
+is a post-v1 refinement triggered by multi-writer contention, not a wedge requirement.`
 
 ---
 
@@ -412,10 +437,18 @@ transaction).`
 
 ## Group H — Interception and rewriting
 
-**H1. Shadow naming and resolution.** Temp schema wins unqualified resolution — shadows
-must NOT share user table names (that would capture reads). Mangled temp names + rewriter
-retargeting write statements only.
-`Status: decided — per architecture sketch.`
+**H1. Shadow naming and resolution.** Shadows live in an **attached in-memory schema**
+(`ATTACH ':memory:' AS hb` at open — per-connection, never touches the file) under
+**identity names**: `hb.orders` shadows `main.orders`. Safe because unqualified name
+resolution runs **temp → main → attached**: attached-last means identity names never
+capture reads accidentally (temp-schema-same-name would — temp wins resolution — which
+is why that variant stays rejected). Rewriting becomes schema *qualification*
+(`FROM orders` → `FROM hb.orders`): locating the target reference is the same parser
+work as renaming, but the bookkeeping disappears — no mangled-name map, no collision
+risk with user names, sane error messages and introspection. Shadows cannot live in
+`main` (their CREATE VIRTUAL TABLE entries would persist in sqlite_master as
+unknown-module junk — K1 violation). The `hb` schema name is reserved (H3).
+`Status: decided — attached-memory schema + identity names + qualification rewriting.`
 
 **H2. Rewriter scope.** Target-table renaming is shallow; G1 (upsert translation) and G2
 (default expansion) are not. Decide the parsing substrate once: hand-rolled tokenizer vs a
@@ -425,7 +458,8 @@ using SQLite's own analysis to locate the target.
 
 **H3. Statements that bypass the rewriter.** `ATTACH`ed databases, `PRAGMA`s with side
 effects (`journal_mode`, `wal_checkpoint`, `writable_schema`!), `VACUUM`, `REINDEX`,
-`ANALYZE`. Each needs a stance: passthrough / intercepted / forbidden.
+`ANALYZE`. Each needs a stance: passthrough / intercepted / forbidden. User `ATTACH …
+AS hb` is rejected — the shadow schema name is reserved (H1).
 `Status: open — inventory pass needed; writable_schema and VACUUM INTO at minimum are
 dangerous.`
 
@@ -469,6 +503,55 @@ resync.
 `hb_*` tables are visible by contract (exclusion manifest). Nothing else may leak.
 `Status: decided — CI-enforced by the detach fidelity job (DESIGN.md).`
 
+**I6. DDL and the rollback window.** Surgical DDL undo is real machinery (see I7 — it
+is *tractable*, not free), so v1 avoids needing it at all. Two regimes:
+
+- **Forever db-level W lease held (single-writer default): DDL allowed offline**, enters
+  the oplog like any write. Justification: under forever-W whole-db coverage, no
+  surgical rollback scenario exists *for anything* — no assert can fail, no contention,
+  no ver regression; the only push rejections are **fence** (takeover) and **fork**,
+  both wholesale events where the entire unacked tail is forfeit and recovery is
+  re-bootstrap, never `rollback(to)`-and-continue. Offline DDL therefore carries no
+  incremental risk over offline data writes, which the lifecycle already accepts. The
+  discarded-tail export covers the human side — DDL exports as literal SQL text.
+- **Anything less** (bounded lease — offline expiry makes rejection *routine*, not
+  exceptional; partial-prefix coverage; future multi-writer): **sync-barrier DDL** —
+  empty unacked oplog (push first) + synchronous push before returning; the v2 kernel's
+  Sync-mode `PendingOps` discipline applied one level up. Offline DDL errors.
+
+Either way v1's `hb_undo` (L4) never needs schema pre-images, and authorization is lease
+coverage, not asserts — a held db-level W lease is strictly stronger than any assert.
+Escape hatch for pathological cases: re-bootstrap from server snapshot (M1 path).
+I7's invertible DDL, when built, relaxes the sync-barrier regime (offline DDL for
+bounded/partial-lease tiers too).
+`Status: leaning — two-regime policy as stated for v1; the regime check is a
+lease-coverage inspection at DDL time. Error surface for the sync-barrier regime still
+to design.`
+
+**I7. Invertible DDL (post-wedge upgrade).** Every DDL kind has a practical inverse
+under **reverse-order undo** (each statement undone against the schema state it
+created):
+- `CREATE TABLE` → drop (its row inserts are undone first). `CREATE INDEX`/`DROP INDEX`,
+  views, trigger DDL → SQL text both ways (index data derivable; rebuild on undo).
+- `ADD COLUMN` → `DROP COLUMN` (3.35+); later DDLs that would block the drop are undone
+  first by reverse order. `RENAME` → rename back.
+- `DROP COLUMN` → `ADD COLUMN` + restore from a `(rowid, value)` snapshot captured at
+  drop time into `hb_undo` — O(table), same order as the drop itself.
+- `DROP TABLE` → **rename-defer**: rename to an `hb_trash_*` name at drop time (O(1)),
+  rename back on undo, real drop on ack.
+Known complications, all bounded: **(1) index/trigger names are schema-global** — a
+trashed table's indexes/triggers keep their names and would collide with a same-name
+recreate, breaking *forward* behavior; fix: drop them at rename time, record their SQL,
+rebuild on undo. **(2) FK fidelity** — a real DROP TABLE on a parent with live child
+rows errors; a rename instead rewrites children's FK clauses and succeeds; multilite
+must pre-check and raise the drop's error. **(3) Trash GC** — real drop on ack; crash
+between ack and drop needs an idempotent `hb_trash_*` sweep at open; trash lives in the
+`hb_` namespace so K1 detach fidelity and sync exclusion hold by contract.
+Payoff: relaxes I6's sync-barrier — offline DDL for bounded/partial-lease tiers, not
+just forever-W holders. Staging: sync-barrier everywhere first; rename-defer DROP TABLE
+next (biggest win, O(1)); remaining kinds after.
+`Status: leaning — design as stated, sequenced post-wedge; not a v1 requirement.`
+
 ---
 
 ## Group J — Transactions, sync, and the apply path
@@ -505,6 +588,36 @@ detach (WAL mode survives detach fine — vanilla SQLite reads WAL files).`
 `hb_*` cursors; the remote-sync-commit pragma (DESIGN) turns the commit fixpoint into
 1-RTT. Both ride this layer — no new machinery, but the fixpoint must expose hooks.
 `Status: decided — design the fixpoint API with both consumers in mind.`
+
+**J6. MetaStore-on-SQLite: connection and transaction discipline.** The oplog append
+must join the *user's open transaction* (single-file doctrine: rows + oplog entry = one
+commit), while engine transitions (trim on ack, watermark, lease churn) run standalone.
+Resolution: the store holds the shared connection and **every trait method wraps its
+work in a SAVEPOINT** — context-adaptive: outside a transaction it is its own atomic
+transaction (RELEASE commits); inside one it nests. The kernel client never manages
+transactions — joining the ambient user transaction is multilite's commit choreography,
+invisible through the trait. Consequences: engine transitions queue behind open user
+transactions (same discipline as J3 applies) on the single write connection (H4); a
+second hb_*-only connection is the later concurrency upgrade (B2 whitelist cost). The
+impl must pass the existing MetaStore conformance suite + fault-injection tests.
+`Status: decided — savepoint-per-method; single connection with queued transitions for
+v1.`
+
+**J7. Durability policy: WAL + synchronous=NORMAL + fsync-barrier-before-push.** Never
+fsync manually — SQLite owns durability via `PRAGMA synchronous`. Defaults: rollback
+journal + FULL ≈ 2 fsyncs/commit; WAL + FULL = 1; **WAL + NORMAL (production standard)
+fsyncs only at checkpoints** — app crash loses nothing; power loss loses recent commits
+but never corrupts. Why NORMAL is correct here: **losing unpushed tail commits is safe
+by construction** — user rows and oplog entries vanish *together* (one transaction), the
+file stays consistent, and the server never saw those seqs (reuse harmless; it is the
+documented 0-RTT local durability contract). **Losing a pushed seq is fatal**: oplog
+tail regression → device seq reuse → server `DeviceSeqRegression` → false **fork**. The
+one hard rule: **the push loop fsyncs the WAL through the batch before sending it** —
+one fsync amortized per push, write-ahead-of-push not write-ahead-of-return. Per-commit
+FULL is the opt-in durability tier (N-group connection-string option), not a correctness
+requirement.
+`Status: decided — as stated; implement the pre-push barrier as a store-level primitive
+(sync_through(seq)) so the push loop cannot forget it.`
 
 ---
 
@@ -551,6 +664,24 @@ trigger (E1-c precise read capture) when it does.
 multi-writer workloads land. Document the asymmetry: row-precise writes, table-coarse
 reads.`
 
+**L2a. The v1 isolation claim, precisely.** With table-level asserts on both the read
+set (E1-a authorizer) and write set (E6-a) of every write transaction, validated in
+admission order, v1 multi-writer is **serializable via backward-validation OCC at table
+granularity** — *stronger than snapshot isolation*: read-set validation kills write
+skew (SI admits it; our second txn's read-table assert fails), and table coarseness
+subsumes phantoms (a whole-table assert covers every predicate). The price is spurious
+aborts (L2), never anomalies. Qualifications: (1) read-only / local-tier transactions
+are **serializable-but-stale** — they order at their snapshot's admission cut; strict
+serializability (recency) is the consistent tier's job (1-RTT read_at, N4); (2) the
+claim attaches to the **admitted global history** — locally-committed-but-unacked
+transactions are visible locally and may later roll back (L4); per-device views stay
+self-consistent. Single-writer default is trivially serializable (one writer + replay).
+Note the inversion: DESIGN.md's documented write-skew hole belongs to the finer-grained
+witness-compiler model with incomplete read capture; v1's assert-everything coarseness
+*closes* it — the precision roadmap (E1-c/E6-b) must reduce aborts without reopening it.
+`Status: decided — this is the claim the physics doc states for v1; conformance/torture
+tests should encode write-skew and phantom kill cases explicitly.`
+
 **L3. Replica completeness model.** Does the local db hold a **complete prefix of the
 space's admission history** (full replica, one cursor: every table fully formed as of
 admission seq N), or a **patchwork of prefix-granular pulls** (shape/partition cursors at
@@ -566,19 +697,31 @@ stated as an invariant in hb_meta so shapes can't be half-adopted later.`
 
 **L4. Read-your-writes vs rejected batches (local rollback repair).** Local reads see
 committed-but-unacked writes — they live in the real tables. If the server rejects a
-pushed batch (assert failure, lease loss), the v2 kernel answer is caller-driven
-`rollback(to)` on the oplog; but multilite must also repair the **materialized SQLite
-state** — un-apply the rejected writes from real tables. With an after-image-only value
-codec (D4) there is nothing local to restore from: repair = re-pull authoritative state
-for the affected keys (or ranges) from the server. Decide: re-pull repair (needs
-connectivity — acceptable, rejection already implies connectivity) vs keeping local
-before-images for offline-capable undo (reopens D4). Also decide the app-visible surface:
-which error, on which call, and what "your last N transactions were undone" looks like.
-`Status: open — leaning re-pull repair keyed off the rollback marker; D4 stays
-after-image-only. The app-visible contract needs design (ties to the durability
-watermark API, J5). Note: if C6 lands hook-authoritative, the preupdate hook provides
-old column values — local before-images become nearly free, reopening offline-capable
-undo as a real alternative to re-pull.`
+pushed batch (assert failure, lease loss, fenced takeover), the v2 kernel answer is
+caller-driven `rollback(to)` on the oplog; multilite must also repair the
+**materialized SQLite state** — un-apply the rejected writes from real tables.
+
+**Design: logical undo log (`hb_undo`).** The post-image already exists (the oplog
+entry); only the pre-image is new, and the preupdate hook provides old column values for
+free (C6). `hb_undo` rows — pre-images keyed by `(device_seq, key)` — are written in the
+same transaction as user rows + oplog entry (one fsync domain) and pruned on ack: the
+undo window is exactly the unacked window, since `rollback(to)` only targets
+`[neck, tail)` and acked batches never roll back. Restore-to-`to` walks the rolled-back
+suffix; per key, the pre-image from the *earliest* rolled-back batch wins. Repair writes
+bypass capture via the apply-path suppression flag (J2). Works offline (no re-pull
+dependency) and directly enables LAUNCH_CHECKLIST's "optional export of discarded tail"
+in the fenced-takeover flow. D4 stays after-image-only on the wire — pre-images are
+local-only rows, never shipped.
+
+Fallbacks: re-pull affected ranges (needs connectivity) or full re-bootstrap (M1 path).
+Note: under the single-writer forever-W default, **surgical rollback never fires at
+all** — the only rejections (fence, fork) forfeit the whole unacked tail via
+re-bootstrap (see I6). `hb_undo` therefore activates with bounded/partial leases, not
+the wedge: a clean fast-follow. DDL undo is avoided in v1 by regime (I6) and becomes
+available later via invertible DDL (I7).
+`Status: leaning — hb_undo as designed; sequencing (wedge vs fast-follow) open. The
+app-visible contract ("your last N transactions were undone": which error, on which
+call) still needs design (ties to J5/N5).`
 
 **L5. Read-transaction stability under applies.** A long-running local read transaction
 must keep a stable snapshot while sync applies remote ops. WAL mode gives readers
@@ -696,6 +839,24 @@ but defers barrier catch-up rows to the retry path, same as optimistic.
 `Status: open — leaning optimistic default + eager as connection-string option mapped
 onto BEGIN IMMEDIATE; the eager-mode barrier question is the design detail to resolve.`
 
+**N7. Two-method query API: `query_read` vs `query`.** `query_read` **fails on any write
+statement** and in exchange forwards everything immediately to the real tables — zero
+interception cost, no rewriter, no buffer, a declared-intent contract. `query` (default)
+handles the general case. Mechanism: `sqlite3_stmt_readonly()` after prepare — no SQL
+parsing. The same primitive is the default path's rewriter-engagement rule: readonly
+statements outside a write transaction pass through untouched, so interception cost is
+paid only by writes and by reads inside open write transactions. Edge cases to pin:
+`stmt_readonly` returns true for BEGIN/COMMIT/SAVEPOINT (accept in query_read, or reject
+for strictness); write-flavored PRAGMAs; temp-table writes. **Connection semantics
+decision:** query_read on the writer's connection sees uncommitted local transaction
+state (read-your-writes); on a dedicated read-only WAL connection it gets snapshot
+isolation and never blocks behind the writer, but must be whitelisted by B2's
+data_version detector and reopens H4. Ties to L1 (query_read = the local tier surface)
+and N3/N4 (freshness options naturally attach to query_read).
+`Status: leaning — ship both methods v1; stmt_readonly as the gate; same-connection
+semantics for v1 (least surprise, no H4 complications); dedicated read connection as a
+later concurrency upgrade.`
+
 ---
 
 ## Group O — Conformance-first testing (build against the real SQLite suite)
@@ -746,6 +907,56 @@ write detection (B), staleness policy (N3), crash recovery (M), multi-writer con
 lines), crash-injection torture reusing the DST rigs, and dedicated integration tests.
 Do not let a green SLT bar masquerade as sync correctness.
 `Status: decided — SLT = dialect fidelity only; sync correctness has its own rigs.`
+
+---
+
+## Appendix — v1 flows (table-level asserts) and build list
+
+Two lease postures, same flows except where marked:
+- **Variant A (DESIGN default):** forever-W db lease auto-acquired at open; asserts never
+  fail in steady state; rejection = fence/fork = re-bootstrap (I6/L4).
+- **Variant B (pure OCC, no lease):** asserts carry all correctness. Requires a **kernel
+  assert-only admission mode** (today admission demands write-lease coverage — kernel
+  change to design), and assert failure is *routine* → `hb_undo`, rollback repair, and
+  the app retry surface move **into the wedge**.
+
+**Open:** connection (WAL+NORMAL, busy_timeout) → `ATTACH ':memory:' AS hb` → register
+authorizer + preupdate hook + commit interception → adoption (A1) or B1 assertion + M4
+health → `SqliteMetaStore` → kernel `Client::open` (certify) → push/pull loops.
+
+**Read:** prepare → `stmt_readonly` → execute natively. No capture, no asserts; local
+tier, serializable-but-stale (L2a). Overhead ≈ one readonly check.
+
+**Write:** (statement time) authorizer records read-set tables at prepare; preupdate
+hook appends `(table, op, rowid, old, new)` to the op buffer; savepoint shear (G6/G7).
+(COMMIT, wrapper-intercepted, fully local) fixpoint: encode rows (D8/D4, keys D1–D3),
+stamp vers from meta high-water, build table-level `RangeAssert`s for read∪write tables
+at the replica cursor → `MetaStore::commit` joins the txn (J6) (+ `hb_undo` pre-images
+in variant B) → real COMMIT: rows + oplog one fsync domain (J7). 0-RTT return.
+(push loop) `sync_through(seq)` barrier → unacked oplog coalesced as one multi-batch
+`PutBatchRequest` → server: seq fence, asserts (`effective_prefix_max == at`), vers
+(+ lease in A), all-or-nothing apply → ack: trim/watermark/cursors (queued behind user
+txns). Rejection: A = fence/fork → export tail, re-bootstrap; B = routine → hb_undo
+repair + app retry surface (L4).
+
+**Pull/apply:** `read_at` deltas → decode → apply txn queued behind user txns (J3) with
+hook suppression (J2), cursor in same txn; B2 whitelists own applies.
+
+**DDL:** first-token intercept (I1); regime per I6 (A: offline OK; B: sync-barrier).
+
+**Build order:** (1) wrapper: classification, query/query_read, txn state machine +
+COMMIT intercept; (2) hooks + buffer + savepoint shear; (3) codecs; (4) SqliteMetaStore
+passing the existing conformance suite; (5) adoption + B1 ritual; (6) fixpoint wired to
+kernel push/ack (v2 machinery); (7) apply path; (8) hb_status. Variant B adds (9)
+hb_undo + repair + retry, plus the kernel admission-mode decision.
+**Not in v1:** rewriter, vtables/read-shadows, eager leases, LEASE statements, witness
+compiler, partitions, invertible DDL, shapes.
+
+**Subtleties:** (i) **own-pipeline asserts** — commit 2's assert at cursor N
+self-collides with own unacked commit 1 on the same table; coalesce unacked commits
+into one multi-batch request (server evaluates asserts sequentially on scratch) and
+allow only one outstanding push. (ii) **Variant B couples abort rate to pull
+freshness** — N3's cadence becomes the OCC abort-rate dial, not a UX knob.
 
 ---
 

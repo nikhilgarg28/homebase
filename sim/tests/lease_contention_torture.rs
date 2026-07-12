@@ -25,7 +25,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
@@ -91,6 +92,7 @@ struct Coverage {
 struct DeviceState {
     lease: Rc<RefCell<Option<LeaseId>>>,
     next_seq: Rc<Cell<u64>>,
+    checksum: Rc<Cell<DeviceChecksum>>,
     rng_seed: u64,
 }
 
@@ -151,6 +153,7 @@ async fn client(
         let seq = state.next_seq.get();
         let req = AdmissionRequest {
             device: dev(d),
+            expected_checksum: state.checksum.get(),
             evidence: vec![lease],
             batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
@@ -178,6 +181,7 @@ async fn client(
                     admission_seq: resp.applied_admission_seq(0).unwrap().0,
                 });
                 state.next_seq.set(seq + 1);
+                state.checksum.set(resp.checksum);
 
                 // Sometimes hand the lease off cleanly.
                 if rng.random_bool(0.25) {
@@ -210,6 +214,7 @@ async fn client(
             Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
                 state.next_seq.set(current.0 + 1);
             }
+            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch { .. })) => return,
             Err(SpaceError::Unavailable { .. }) => return,
             Err(SpaceError::Kernel(err)) => {
                 panic!("mutual exclusion breached: {err:?} at device {d}")
@@ -228,6 +233,7 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
         .map(|_| DeviceState {
             lease: Rc::new(RefCell::new(None)),
             next_seq: Rc::new(Cell::new(1)),
+            checksum: Rc::new(Cell::new(DeviceChecksum::EMPTY)),
             rng_seed: master.random(),
         })
         .collect();

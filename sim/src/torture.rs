@@ -15,8 +15,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    Ver,
+    AdmissionSeq, CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
+    DeviceTag, Mutation, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
@@ -53,6 +53,7 @@ pub fn write_lease_req(device: u8, prefix: &Key, ttl_ms: u64) -> AcquireRequest 
 pub fn put_one(
     device: u8,
     seq: u64,
+    expected_checksum: DeviceChecksum,
     lease: LeaseId,
     k: &Key,
     v: &[u8],
@@ -60,6 +61,7 @@ pub fn put_one(
 ) -> AdmissionRequest {
     AdmissionRequest {
         device: dev(device),
+        expected_checksum,
         evidence: vec![lease],
         batches: vec![AdmissionBatch {
             device_seq: DeviceSeq(seq),
@@ -274,11 +276,19 @@ pub fn run_expired_evidence_write(seed: u64) {
     let out = Rc::clone(&admitted);
     exec.spawn(async move {
         *out.borrow_mut() = Some(
-            h.admit(put_one(1, 1, l.unwrap(), &k, b"expired-evidence", 1))
-                .await
-                .unwrap()
-                .applied_admission_seq(0)
-                .unwrap(),
+            h.admit(put_one(
+                1,
+                1,
+                DeviceChecksum::EMPTY,
+                l.unwrap(),
+                &k,
+                b"expired-evidence",
+                1,
+            ))
+            .await
+            .unwrap()
+            .applied_admission_seq(0)
+            .unwrap(),
         );
     });
     exec.run_until_stalled();
@@ -307,16 +317,31 @@ pub fn run_replica_sync(seed: u64) {
     exec.run_until_stalled();
     let lease = *granted.borrow();
 
+    let mut checksum = DeviceChecksum::EMPTY;
     for seq in 1..=5u64 {
         let h = handle.clone();
         let k = key(&[b"d0", format!("k{seq}").as_bytes()]);
         let l = lease.unwrap();
+        let out = Rc::new(RefCell::new(None));
+        let sent = Rc::clone(&out);
         exec.spawn(async move {
-            h.admit(put_one(0, seq, l, &k, format!("v{seq}").as_bytes(), 1))
+            *sent.borrow_mut() = Some(
+                h.admit(put_one(
+                    0,
+                    seq,
+                    checksum,
+                    l,
+                    &k,
+                    format!("v{seq}").as_bytes(),
+                    1,
+                ))
                 .await
-                .unwrap();
+                .unwrap()
+                .checksum,
+            );
         });
         exec.run_until_stalled();
+        checksum = out.borrow().unwrap();
 
         let hw = audit_sim_store(&store).max_admission_seq;
         let r = Rc::clone(&replica);

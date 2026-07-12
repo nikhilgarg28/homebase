@@ -58,7 +58,9 @@ use homebase_core::messages::{
     ListRequest, ListResponse, Range, RangeAssertFailure, RangeCut, ReadAtRequest, ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceId};
+use homebase_core::tag::{
+    AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceChecksum, DeviceId, DeviceSeq,
+};
 use std::collections::BTreeMap;
 
 pub async fn admit<S: OrderedStore>(
@@ -68,20 +70,20 @@ pub async fn admit<S: OrderedStore>(
     now: Timestamp,
     req: &AdmissionRequest,
 ) -> Result<AdmissionResponse, Error> {
-    // 1. Reservation conflicts over data entries; an empty batch is a no-op.
-    let keys: Vec<Key> = req
-        .batches
-        .iter()
-        .flat_map(|batch| batch.entries.iter().map(|entry| entry.key().clone()))
-        .collect();
-    leases
-        .validate_put(store, now, req.device, &req.evidence, &keys)
-        .await?;
-
-    // 2. Device replay fence.
-    let mut last_device_seq = device(space, store, req.device)
-        .await?
-        .map_or(homebase_core::tag::DeviceSeq(0), |rec| rec.last_seq);
+    // 1. Confirm the exact device history before validating a new suffix.
+    // A lost acknowledgement must remain reconcilable even if leases or
+    // reservation conflicts changed after the already-admitted write.
+    let device_record = device(space, store, req.device).await?;
+    let mut last_device_seq = device_record.map_or(DeviceSeq(0), |record| record.last_seq);
+    let current_checksum = device_record.map_or(DeviceChecksum::EMPTY, |record| record.checksum);
+    if req.expected_checksum != current_checksum {
+        return Err(KernelError::DeviceChecksumMismatch {
+            current_seq: last_device_seq,
+            current: current_checksum,
+        }
+        .into());
+    }
+    let mut next_checksum = current_checksum;
     let mut first = true;
     for client_batch in &req.batches {
         if client_batch.device_seq <= last_device_seq {
@@ -102,6 +104,16 @@ pub async fn admit<S: OrderedStore>(
         last_device_seq = client_batch.device_seq;
     }
 
+    // 2. Reservation conflicts over data entries; an empty batch is a no-op.
+    let keys: Vec<Key> = req
+        .batches
+        .iter()
+        .flat_map(|batch| batch.entries.iter().map(|entry| entry.key().clone()))
+        .collect();
+    leases
+        .validate_put(store, now, req.device, &req.evidence, &keys)
+        .await?;
+
     // 3. Ver monotonicity + changelog moves. `staged` folds the batch in
     // order so a later entry for the same key checks against the earlier
     // one; `old_seqs` remembers each stored key's current changelog slot.
@@ -119,8 +131,11 @@ pub async fn admit<S: OrderedStore>(
             return Ok(failed_response(
                 req.batches.len(),
                 KernelError::RangeAssertFailed { failures },
+                current_checksum,
             ));
         }
+
+        next_checksum = client_batch.checksum(next_checksum, space, req.device);
 
         let seq = next_admission_seq;
         results.push(AdmissionResult::Applied { admission_seq: seq });
@@ -229,13 +244,17 @@ pub async fn admit<S: OrderedStore>(
         device_key(space, req.device),
         DeviceRecord {
             last_seq: last_device_seq,
+            checksum: next_checksum,
         }
         .encode(),
     );
     batch.put(counters_key(space), counters.encode());
     store.apply(batch).await?;
 
-    Ok(AdmissionResponse { results })
+    Ok(AdmissionResponse {
+        checksum: next_checksum,
+        results,
+    })
 }
 
 async fn range_assert_failures<S: OrderedStore>(
@@ -264,8 +283,13 @@ async fn range_assert_failures<S: OrderedStore>(
     Ok(failures)
 }
 
-fn failed_response(count: usize, error: KernelError) -> AdmissionResponse {
+fn failed_response(
+    count: usize,
+    error: KernelError,
+    checksum: DeviceChecksum,
+) -> AdmissionResponse {
     AdmissionResponse {
+        checksum,
         results: (0..count)
             .map(|_| AdmissionResult::Failed {
                 error: error.clone(),

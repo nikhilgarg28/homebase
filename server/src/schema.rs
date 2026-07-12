@@ -51,8 +51,8 @@ use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId,
-    DeviceSeq, DeviceTag, Mutation, Ver,
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceChecksum,
+    DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
 };
 use std::time::Duration;
 
@@ -517,13 +517,15 @@ impl PrefixMetaRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceRecord {
     pub last_seq: DeviceSeq,
+    pub checksum: DeviceChecksum,
 }
 
 impl DeviceRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8);
+        let mut out = Vec::with_capacity(1 + 8 + 32);
         out.push(DEVICE_RECORD_VERSION);
         out.extend_from_slice(&self.last_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.checksum.0);
         out
     }
 
@@ -534,6 +536,7 @@ impl DeviceRecord {
         }
         Some(Self {
             last_seq: DeviceSeq(r.u64()?),
+            checksum: DeviceChecksum(r.take(32)?.try_into().ok()?),
         })
     }
 }
@@ -710,6 +713,7 @@ mod tests {
     fn device_record_roundtrips() {
         let rec = DeviceRecord {
             last_seq: DeviceSeq(41),
+            checksum: DeviceChecksum([7; 32]),
         };
         assert_eq!(DeviceRecord::decode(&rec.encode()), Some(rec));
     }

@@ -7,6 +7,7 @@
 
 use crate::key::Key;
 use crate::seal::Seal;
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// Identifies a writing device: 16 opaque bytes, UUID-shaped.
@@ -31,6 +32,32 @@ pub struct DeviceSeq(pub u64);
 /// Server-assigned total-order position of one admitted batch in a space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AdmissionSeq(pub u64);
+
+/// Cumulative cryptographic checksum of one device's admitted batch stream
+/// within a space. The all-zero value is the empty stream.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct DeviceChecksum(pub [u8; 32]);
+
+impl DeviceChecksum {
+    pub const EMPTY: Self = Self([0; 32]);
+
+    pub(crate) fn hasher(&self) -> Sha256 {
+        let mut hash = Sha256::new();
+        hash.update(b"homebase.device-checksum.v1\0");
+        hash.update(self.0);
+        hash
+    }
+}
+
+impl fmt::Debug for DeviceChecksum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "checksum:")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Client-computed per-key version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

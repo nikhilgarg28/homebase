@@ -256,6 +256,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                 return target_missing(through);
             };
             let cursors = space_state.cursors;
+            let confirmed_checksum = space_state.checksum;
             if let Some(target) = through
                 && (target < cursors.neck || target >= cursors.tail)
             {
@@ -279,16 +280,14 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
 
             let window = self.store.oplog(space, cursors.neck, until).await?;
             let Some((head, head_record)) = window.first() else {
-                self.store.trim_oplog(space, until).await?;
+                self.store
+                    .trim_oplog(space, until, confirmed_checksum)
+                    .await?;
                 continue;
             };
             let head = *head;
             let mut last = head;
-            let mut batches = vec![AdmissionBatch {
-                device_seq: head,
-                range_asserts: head_record.range_asserts().to_vec(),
-                entries: head_record.entries().to_vec(),
-            }];
+            let mut batches = vec![admission_batch(head, head_record)];
             if !probe {
                 for (seq, record) in &window[1..] {
                     if seq.0 != last.0 + 1
@@ -301,11 +300,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                     {
                         break;
                     }
-                    batches.push(AdmissionBatch {
-                        device_seq: *seq,
-                        range_asserts: record.range_asserts().to_vec(),
-                        entries: record.entries().to_vec(),
-                    });
+                    batches.push(admission_batch(*seq, record));
                     last = *seq;
                 }
             }
@@ -316,6 +311,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             let batch_count = batches.len();
             let request = AdmissionRequest {
                 device,
+                expected_checksum: confirmed_checksum,
                 evidence: live_write_leases(self.store(), self.clock(), space, &keys).await?,
                 batches,
             };
@@ -354,27 +350,46 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                         target_admission =
                             response.applied_admission_seq((target.0 - head.0) as usize);
                     }
-                    self.store.trim_oplog(space, last).await?;
+                    self.store
+                        .trim_oplog(space, last, response.checksum)
+                        .await?;
                     acked = Some(last);
                     if through.is_some_and(|target| last >= target) {
                         return Ok(PushRun::drained(acked, target_admission));
                     }
                     probe = false;
                 }
-                Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
-                    let ours = current < cursors.tail
-                        && !self.store.oplog(space, current, current).await?.is_empty();
-                    if !ours {
+                Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch {
+                    current_seq,
+                    current,
+                })) => {
+                    let retained = if current_seq >= cursors.neck && current_seq < cursors.tail {
+                        self.store.oplog(space, cursors.neck, current_seq).await?
+                    } else {
+                        Vec::new()
+                    };
+                    let mut rebuilt = confirmed_checksum;
+                    for (seq, record) in &retained {
+                        rebuilt = admission_batch(*seq, record).checksum(rebuilt, space, device);
+                    }
+                    let reaches_current =
+                        retained.last().is_some_and(|(seq, _)| *seq == current_seq);
+                    if !reaches_current || rebuilt != current {
                         return Err(ClientError::Space(SpaceDriverError::Fork {
-                            admitted: current,
+                            admitted: current_seq,
                         }));
                     }
-                    self.store.trim_oplog(space, current).await?;
-                    acked = Some(current);
-                    if through.is_some_and(|target| current >= target) {
+                    self.store.trim_oplog(space, current_seq, current).await?;
+                    acked = Some(current_seq);
+                    if through.is_some_and(|target| current_seq >= target) {
                         return Ok(PushRun::drained(acked, target_admission));
                     }
                     probe = false;
+                }
+                Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
+                    return Err(ClientError::Space(SpaceDriverError::Fork {
+                        admitted: current,
+                    }));
                 }
                 Err(SpaceError::Kernel(error)) => {
                     if last > head {
@@ -396,6 +411,14 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
         let _permit = self.enter_space(space).await?;
         self.store.rollback(space, to).await?;
         Ok(())
+    }
+}
+
+fn admission_batch(seq: DeviceSeq, record: &crate::meta::DeviceOp) -> AdmissionBatch {
+    AdmissionBatch {
+        device_seq: seq,
+        range_asserts: record.range_asserts().to_vec(),
+        entries: record.entries().to_vec(),
     }
 }
 

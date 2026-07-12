@@ -145,6 +145,7 @@ struct Harness {
     space: Space,
     store: MemoryStore,
     leases: Vec<LeaseId>,
+    checksums: Vec<homebase_core::DeviceChecksum>,
 }
 
 impl Harness {
@@ -173,6 +174,7 @@ impl Harness {
             space,
             store,
             leases,
+            checksums: vec![homebase_core::DeviceChecksum::EMPTY; DEVICES],
         }
     }
 
@@ -182,11 +184,12 @@ impl Harness {
         device_seq: u64,
         mutations: Vec<(Mutation<Ciphertext>, Ver)>,
     ) -> Result<AdmissionSeq, Error> {
-        block_on(self.space.admit(
+        let response = block_on(self.space.admit(
             &self.store,
             Timestamp(1),
             &AdmissionRequest {
                 device: dev(device),
+                expected_checksum: self.checksums[device],
                 evidence: vec![self.leases[device]],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(device_seq),
@@ -206,8 +209,9 @@ impl Harness {
                         .collect(),
                 }],
             },
-        ))
-        .map(|resp| resp.applied_admission_seq(0).unwrap())
+        ))?;
+        self.checksums[device] = response.checksum;
+        Ok(response.applied_admission_seq(0).unwrap())
     }
 }
 

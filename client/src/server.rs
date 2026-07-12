@@ -379,6 +379,7 @@ pub mod conformance {
                 &space,
                 AdmissionRequest {
                     device: dev(1),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![lease],
                     batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),
@@ -545,6 +546,7 @@ pub mod conformance {
                 &space,
                 AdmissionRequest {
                     device: dev(2),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![],
                     batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),
@@ -617,6 +619,7 @@ pub mod conformance {
                 &unknown,
                 AdmissionRequest {
                     device: dev(1),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![],
                     batches: vec![AdmissionBatch {
                         device_seq: DeviceSeq(1),

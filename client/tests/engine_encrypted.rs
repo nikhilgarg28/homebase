@@ -306,6 +306,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                 &space,
                 AdmissionRequest {
                     device: client.device(),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![lease],
                     batches: vec![
                         AdmissionBatch {

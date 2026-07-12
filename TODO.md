@@ -9,6 +9,7 @@
 - Device identity vs file copies (direction set in DESIGN.md — random-in-file id + unexpected-DeviceSeqRegression-as-fork-proof → re-mint & resync; ratify with the engine batch): remaining bits — whether to add early-warning heuristics (inode/host, per-device incarnation lease), and whether device-scoped ledger prefixes under a retired id migrate or just coexist.
 - Client push/lease recovery cleanup: make push stalls distinguish lease-plane recoverable failures (`NotCovered`, `LeaseInvalid`, `Fenced`) from semantic write failures (`VerRegression`); add helper or retry path using `ensure` for queued head keys, while keeping rollback manual for bad commits.
 - Make `release_checked` cheaper. It currently scans the active oplog and re-evaluates live lease coverage for every checked range assertion. Maintain local metadata indexing checked assertions by covering lease/prefix so release cost is proportional to affected guards rather than the full queue; preserve correctness across lease refresh, repair, rollback, and crash recovery.
+- Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 
 multilite
 - maintain versions of keys as of last sync point for rollback
@@ -32,7 +33,3 @@ Ensure that prefix can be empty but keys can not be
 many responses should return global seqnum or return ops when range assert fails
 
 Add bucketing/padding to key components & values before encrypting
-
-Store crc for each client as well as global space? Use that to identify 
-divergences + optinally identify when older seqnum is pushed and see if it's 
-identical or different

@@ -36,7 +36,12 @@ fn key(parts: &[&[u8]]) -> Key {
     Key::from_bytes(parts.iter().copied()).unwrap()
 }
 
-async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
+async fn write_marker(
+    handle: &SpaceHandle,
+    device_seq: u64,
+    expected_checksum: homebase_core::DeviceChecksum,
+    marker: &[u8],
+) -> homebase_core::DeviceChecksum {
     let granted = handle
         .acquire(AcquireRequest {
             device: dev(),
@@ -53,6 +58,7 @@ async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
     handle
         .admit(AdmissionRequest {
             device: dev(),
+            expected_checksum,
             evidence: vec![lease],
             batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(device_seq),
@@ -73,7 +79,8 @@ async fn write_marker(handle: &SpaceHandle, device_seq: u64, marker: &[u8]) {
             }],
         })
         .await
-        .unwrap();
+        .unwrap()
+        .checksum
 }
 
 async fn open_shard(root: &std::path::Path) -> Arc<SlateStore> {
@@ -94,7 +101,13 @@ async fn slate_survives_flush_and_reopen() {
     let store = open_shard(root).await;
     let (actor, handle) = SpaceActor::new(SPACE, Arc::clone(&store), Arc::clone(&clock));
     let task = tokio::spawn(actor.run());
-    write_marker(&handle, 1, b"before-crash").await;
+    let checksum = write_marker(
+        &handle,
+        1,
+        homebase_core::DeviceChecksum::EMPTY,
+        b"before-crash",
+    )
+    .await;
     store.flush().await.unwrap();
     drop(handle);
     task.abort();
@@ -105,7 +118,7 @@ async fn slate_survives_flush_and_reopen() {
     let store2 = open_shard(root).await;
     let (actor2, handle2) = SpaceActor::new(SPACE, Arc::clone(&store2), clock);
     let task2 = tokio::spawn(actor2.run());
-    write_marker(&handle2, 2, b"after-reopen").await;
+    write_marker(&handle2, 2, checksum, b"after-reopen").await;
     store2.flush().await.unwrap();
 
     let got = handle2
@@ -151,11 +164,13 @@ async fn slate_seeded_writes_audit_clean() {
         .unwrap();
     let lease = granted.leases[0].id;
 
+    let mut checksum = homebase_core::DeviceChecksum::EMPTY;
     for seq in 1..=rng.random_range(5..15) {
         let k = key(&[b"load", format!("k{seq}").as_bytes()]);
-        handle
+        checksum = handle
             .admit(AdmissionRequest {
                 device: dev(),
+                expected_checksum: checksum,
                 evidence: vec![lease],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(seq),
@@ -176,7 +191,8 @@ async fn slate_seeded_writes_audit_clean() {
                 }],
             })
             .await
-            .unwrap();
+            .unwrap()
+            .checksum;
     }
     store.flush().await.unwrap();
     check::audit(SPACE, store.as_ref());

@@ -37,6 +37,6 @@ pub use messages::KernelError;
 pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};
 pub use tag::{
-    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId,
-    DeviceSeq, DeviceTag, Mutation, Ver,
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceChecksum,
+    DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
 };

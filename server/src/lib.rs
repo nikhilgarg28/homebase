@@ -184,6 +184,7 @@ mod tests {
         handle
             .admit(AdmissionRequest {
                 device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![lease],
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(1),

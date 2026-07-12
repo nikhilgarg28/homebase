@@ -255,6 +255,7 @@ mod tests {
     fn put_req(
         device: u8,
         seq: u64,
+        expected_checksum: homebase_core::DeviceChecksum,
         lease: LeaseId,
         k: &Key,
         v: &[u8],
@@ -262,6 +263,7 @@ mod tests {
     ) -> AdmissionRequest {
         AdmissionRequest {
             device: dev(device),
+            expected_checksum,
             evidence: vec![lease],
             batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
@@ -303,7 +305,15 @@ mod tests {
 
             let k = key(&[b"db", b"row"]);
             let put = handle
-                .admit(put_req(1, 1, lease, &k, b"v", 1))
+                .admit(put_req(
+                    1,
+                    1,
+                    homebase_core::DeviceChecksum::EMPTY,
+                    lease,
+                    &k,
+                    b"v",
+                    1,
+                ))
                 .await
                 .unwrap();
             assert_eq!(put.applied_admission_seq(0), Some(AdmissionSeq(1)));
@@ -371,12 +381,14 @@ mod tests {
                 .unwrap();
             let lease = granted.leases[0].id;
             let mut seqs = Vec::new();
+            let mut checksum = homebase_core::DeviceChecksum::EMPTY;
             for i in 1..=5u64 {
                 let k = key(&[format!("d{device}").as_bytes(), format!("k{i}").as_bytes()]);
                 let resp = handle
-                    .admit(put_req(device, i, lease, &k, b"v", 1))
+                    .admit(put_req(device, i, checksum, lease, &k, b"v", 1))
                     .await
                     .unwrap();
+                checksum = resp.checksum;
                 seqs.push(resp.applied_admission_seq(0).unwrap().0);
             }
             seqs

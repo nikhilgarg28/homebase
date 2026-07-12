@@ -180,6 +180,7 @@ async fn foreign_put(
             &space,
             AdmissionRequest {
                 device,
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                 evidence: vec![lease],
                 batches: vec![AdmissionBatch {
                     device_seq: seq,
@@ -1572,6 +1573,7 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
                 &SPACE,
                 AdmissionRequest {
                     device: client.device(),
+                    expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![lease],
                     batches: vec![
                         AdmissionBatch {
@@ -1606,8 +1608,33 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
             .await
             .expect("the dead incarnation's send was admitted");
 
-        // The resend collides, the collision names the admitted extent,
-        // the trim happens, and nothing is applied twice.
+        // Admission history is checked before current reservation state.
+        // Even though a foreign device reserves the range after the lost
+        // response, retry still validates and trims the already-applied send.
+        handle
+            .release(
+                &SPACE,
+                ReleaseRequest {
+                    device: client.device(),
+                    leases: vec![lease],
+                },
+            )
+            .await
+            .unwrap();
+        handle
+            .acquire(
+                &SPACE,
+                AcquireRequest {
+                    device: dev(2),
+                    requested_at: clock.stamp(),
+                    specs: vec![wspec(&db, 60)],
+                },
+            )
+            .await
+            .unwrap();
+
+        // The checksum mismatch names and commits to the admitted extent;
+        // matching the retained chain trims it without applying twice.
         assert_eq!(
             target.push().await.unwrap(),
             PushReceipt::Applied {
@@ -1986,6 +2013,47 @@ fn a_forked_store_is_fatal() {
             })
         );
         assert_eq!(queued(&mem).await, 1, "a fork verdict destroys nothing");
+    });
+}
+
+#[test]
+fn divergent_content_at_the_same_device_seq_is_a_fork() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+
+        let twin_mem = clone_store(&mem).await;
+        let original = client.space(SPACE).await.unwrap();
+        original
+            .submit_unchecked(vec![set(key(&[b"db", b"row"]), b"original")], vec![])
+            .await
+            .unwrap();
+
+        let twin = open_client(OrderedMetaStore::new(&twin_mem), &handle, &clock, dev(9))
+            .await
+            .unwrap();
+        let twin_space = twin.space(SPACE).await.unwrap();
+        twin_space
+            .submit_unchecked(vec![set(key(&[b"db", b"row"]), b"twin")], vec![])
+            .await
+            .unwrap();
+        twin_space.push().await.unwrap();
+
+        assert_eq!(
+            original.push().await.unwrap_err(),
+            ClientError::Space(SpaceDriverError::Fork {
+                admitted: DeviceSeq(1)
+            })
+        );
+        assert_eq!(queued(&mem).await, 1, "fork detection must not trim");
     });
 }
 

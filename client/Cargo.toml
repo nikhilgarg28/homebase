@@ -13,7 +13,7 @@ hkdf = "0.13.0"
 hmac = "0.13.0"
 homebase-core.workspace = true
 futures-channel.workspace = true
-sha2 = "0.11.0"
+sha2.workspace = true
 
 [dev-dependencies]
 homebase-server = { workspace = true, default-features = false }

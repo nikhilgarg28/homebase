@@ -15,7 +15,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
@@ -86,6 +87,7 @@ pub struct Coverage {
 pub struct DeviceState {
     pub lease: Arc<Mutex<Option<LeaseId>>>,
     pub next_seq: Arc<AtomicU64>,
+    pub checksum: Arc<Mutex<DeviceChecksum>>,
 }
 
 pub async fn client(
@@ -127,8 +129,10 @@ pub async fn client(
 
         let seq = state.next_seq.load(Ordering::SeqCst);
         let lease = state.lease.lock().unwrap().unwrap();
+        let confirmed_checksum = *state.checksum.lock().unwrap();
         let req = AdmissionRequest {
             device: dev(d),
+            expected_checksum: confirmed_checksum,
             evidence: vec![lease],
             batches: vec![AdmissionBatch {
                 device_seq: DeviceSeq(seq),
@@ -148,6 +152,7 @@ pub async fn client(
                 }],
             }],
         };
+        let sent_checksum = req.batches[0].checksum(confirmed_checksum, SPACE, dev(d));
         match handle.admit(req).await {
             Ok(resp) => {
                 acks.lock().unwrap().push(Ack {
@@ -156,15 +161,35 @@ pub async fn client(
                     admission_seq: resp.applied_admission_seq(0).unwrap().0,
                 });
                 state.next_seq.store(seq + 1, Ordering::SeqCst);
+                *state.checksum.lock().unwrap() = resp.checksum;
                 completed += 1;
             }
             Err(SpaceError::Kernel(KernelError::LeaseInvalid { .. })) => {
                 coverage.lock().unwrap().lease_invalid += 1;
                 *state.lease.lock().unwrap() = None;
             }
-            Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
+            Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { .. })) => {
                 coverage.lock().unwrap().seq_regression += 1;
-                state.next_seq.store(current.0 + 1, Ordering::SeqCst);
+                // This direct-kernel torture client has no re-mint/resync
+                // layer; end this attempt and let the next phase recover.
+                return;
+            }
+            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch {
+                current_seq,
+                current,
+            })) => {
+                coverage.lock().unwrap().seq_regression += 1;
+                if current_seq != DeviceSeq(seq) || current != sent_checksum {
+                    // The harness records the rollback/fork detection, then
+                    // rebases so later phases can continue exercising the
+                    // kernel. The real client returns a fatal Fork instead.
+                    state.next_seq.store(current_seq.0 + 1, Ordering::SeqCst);
+                    *state.checksum.lock().unwrap() = current;
+                    continue;
+                }
+                state.next_seq.store(seq + 1, Ordering::SeqCst);
+                *state.checksum.lock().unwrap() = sent_checksum;
+                completed += 1;
             }
             Err(SpaceError::Unavailable { .. }) => {
                 coverage.lock().unwrap().unavailable += 1;
@@ -214,6 +239,7 @@ fn device_states(_master: &mut StdRng) -> Vec<DeviceState> {
         .map(|_| DeviceState {
             lease: Arc::new(Mutex::new(None)),
             next_seq: Arc::new(AtomicU64::new(1)),
+            checksum: Arc::new(Mutex::new(DeviceChecksum::EMPTY)),
         })
         .collect()
 }

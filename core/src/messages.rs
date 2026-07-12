@@ -19,7 +19,12 @@
 use crate::clock::{HybridTimestamp, Timestamp};
 use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode};
-use crate::tag::{AdmissionSeq, AdmittedEntry, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, Ver};
+use crate::space::SpaceId;
+use crate::tag::{
+    AdmissionSeq, AdmittedEntry, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
+    Mutation, Ver,
+};
+use sha2::Digest;
 use std::fmt;
 use std::time::Duration;
 
@@ -156,6 +161,51 @@ pub struct AdmissionBatch {
     pub entries: Vec<DeviceEntry>,
 }
 
+impl AdmissionBatch {
+    /// Extend a device's cumulative checksum with this exact canonical batch.
+    pub fn checksum(
+        &self,
+        previous: DeviceChecksum,
+        space: SpaceId,
+        device: DeviceId,
+    ) -> DeviceChecksum {
+        let mut hash = previous.hasher();
+        hash.update(space.0);
+        hash.update(device.0);
+        hash.update(self.device_seq.0.to_be_bytes());
+        hash.update((self.range_asserts.len() as u64).to_be_bytes());
+        for assertion in &self.range_asserts {
+            hash_bytes(&mut hash, &assertion.prefix.encode());
+            hash.update(assertion.upto.0.to_be_bytes());
+        }
+        hash.update((self.entries.len() as u64).to_be_bytes());
+        for entry in &self.entries {
+            match &entry.mutation {
+                Mutation::Set { key, value } => {
+                    hash.update([0]);
+                    hash_bytes(&mut hash, &key.encode());
+                    hash_bytes(&mut hash, &value.0);
+                }
+                Mutation::Delete { key } => {
+                    hash.update([1]);
+                    hash_bytes(&mut hash, &key.encode());
+                }
+            }
+            hash.update(entry.tag.device.0);
+            hash.update(entry.tag.device_seq.0.to_be_bytes());
+            hash.update(entry.tag.ver.0.to_be_bytes());
+            hash.update(entry.tag.cipher_epoch.0.to_be_bytes());
+            hash_bytes(&mut hash, &entry.seal.encode());
+        }
+        DeviceChecksum(hash.finalize().into())
+    }
+}
+
+fn hash_bytes(hash: &mut sha2::Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
 /// Atomic admission request (request = transaction; torn requests impossible).
 ///
 /// Admission requires: no Set/Delete key overlaps a live foreign lease
@@ -166,6 +216,8 @@ pub struct AdmissionBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionRequest {
     pub device: DeviceId,
+    /// The checksum the client last confirmed for this device in this space.
+    pub expected_checksum: DeviceChecksum,
     /// Diagnostic lease evidence only; never admission authority.
     pub evidence: Vec<LeaseId>,
     /// Successive client commits to admit atomically in one server turn.
@@ -174,6 +226,9 @@ pub struct AdmissionRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionResponse {
+    /// Final checksum after all applied batches, or the unchanged checksum
+    /// when this response reports failed batches.
+    pub checksum: DeviceChecksum,
     /// One result per input batch, in order. Current in-process admission is
     /// still all-or-nothing, so a successful response contains only
     /// [`AdmissionResult::Applied`]; failed elements are the wire shape for
@@ -338,6 +393,11 @@ pub enum KernelError {
         current: DeviceSeq,
         attempted: DeviceSeq,
     },
+    /// The request was based on a different device-stream history.
+    DeviceChecksumMismatch {
+        current_seq: DeviceSeq,
+        current: DeviceChecksum,
+    },
     /// Outside the token's prefix scope (enforced on reads AND writes).
     /// Reserved for the wire layer; the in-process kernel never emits it.
     Unauthorized { prefix: Key },
@@ -371,6 +431,13 @@ impl fmt::Display for KernelError {
                 f,
                 "device_seq regression: attempted {attempted:?} ≤ current {current:?}"
             ),
+            Self::DeviceChecksumMismatch {
+                current_seq,
+                current,
+            } => write!(
+                f,
+                "device checksum mismatch at {current_seq:?}: server has {current:?}"
+            ),
             Self::Unauthorized { prefix } => {
                 write!(f, "token does not cover prefix {prefix:?}")
             }
@@ -383,6 +450,8 @@ impl std::error::Error for KernelError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seal::Seal;
+    use crate::tag::{CipherEpoch, DeviceTag};
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
@@ -391,6 +460,7 @@ mod tests {
     #[test]
     fn admit_response_reports_one_result_per_batch() {
         let response = AdmissionResponse {
+            checksum: DeviceChecksum::EMPTY,
             results: vec![
                 AdmissionResult::Applied {
                     admission_seq: AdmissionSeq(7),
@@ -408,5 +478,73 @@ mod tests {
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(7)));
         assert_eq!(response.applied_admission_seq(1), None);
+    }
+
+    fn entry(device: DeviceId, seq: DeviceSeq, name: &[u8]) -> DeviceEntry {
+        DeviceEntry {
+            mutation: Mutation::Set {
+                key: key(&[b"db", name]),
+                value: Ciphertext(name.to_vec()),
+            },
+            tag: DeviceTag {
+                device,
+                device_seq: seq,
+                ver: Ver(seq.0),
+                cipher_epoch: CipherEpoch(0),
+            },
+            seal: Seal::empty_aead_v1(),
+        }
+    }
+
+    #[test]
+    fn cumulative_checksum_commits_to_order_content_and_scope() {
+        let space = SpaceId([1; 16]);
+        let device = DeviceId([2; 16]);
+        let first = AdmissionBatch {
+            device_seq: DeviceSeq(1),
+            range_asserts: vec![],
+            entries: vec![entry(device, DeviceSeq(1), b"one")],
+        };
+        let second = AdmissionBatch {
+            device_seq: DeviceSeq(2),
+            range_asserts: vec![],
+            entries: vec![entry(device, DeviceSeq(2), b"two")],
+        };
+        let first_checksum = first.checksum(DeviceChecksum::EMPTY, space, device);
+        let ordered = second.checksum(first_checksum, space, device);
+
+        let omitted = second.checksum(DeviceChecksum::EMPTY, space, device);
+        let reordered = first.checksum(
+            second.checksum(DeviceChecksum::EMPTY, space, device),
+            space,
+            device,
+        );
+        let mut altered = second.clone();
+        altered.entries[0].seal.nonce[0] ^= 1;
+
+        assert_ne!(ordered, omitted);
+        assert_ne!(ordered, reordered);
+        assert_ne!(ordered, altered.checksum(first_checksum, space, device));
+        assert_ne!(
+            ordered,
+            second.checksum(first_checksum, SpaceId([9; 16]), device)
+        );
+        assert_ne!(
+            ordered,
+            second.checksum(first_checksum, space, DeviceId([9; 16]))
+        );
+    }
+
+    #[test]
+    fn empty_rollback_batch_still_extends_checksum() {
+        let batch = AdmissionBatch {
+            device_seq: DeviceSeq(7),
+            range_asserts: vec![],
+            entries: vec![],
+        };
+        assert_ne!(
+            batch.checksum(DeviceChecksum::EMPTY, SpaceId([1; 16]), DeviceId([2; 16])),
+            DeviceChecksum::EMPTY
+        );
     }
 }
