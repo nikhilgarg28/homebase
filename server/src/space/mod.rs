@@ -439,6 +439,29 @@ mod tests {
     }
 
     #[test]
+    fn delete_range_is_rejected_without_advancing_device_or_admission_state() {
+        let (mut space, store, lease) = setup();
+        let err = admit(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![(
+                Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                },
+                1,
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::Kernel(KernelError::DeleteRangeUnsupported));
+
+        let k = key(&[b"db", b"after-rejection"]);
+        let response = admit(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
+        assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(1)));
+    }
+
+    #[test]
     fn admit_coalesces_successive_client_batches_atomically() {
         let (mut space, store, lease) = setup();
         let k1 = key(&[b"db", b"t", b"r1"]);

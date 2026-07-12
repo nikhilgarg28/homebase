@@ -222,6 +222,7 @@ mod tests {
             .map(|e| match &e.device_entry.mutation {
                 Mutation::Set { value, .. } => value.0.clone(),
                 Mutation::Delete { .. } => panic!("tombstone in get"),
+                Mutation::DeleteRange { .. } => panic!("unsupported range delete in get"),
             })
     }
 

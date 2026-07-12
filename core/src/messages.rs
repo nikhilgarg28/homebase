@@ -19,6 +19,7 @@
 use crate::clock::{HybridTimestamp, Timestamp};
 use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode};
+pub use crate::range::Range;
 use crate::space::SpaceId;
 use crate::tag::{
     AdmissionSeq, AdmittedEntry, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation,
@@ -189,6 +190,10 @@ impl AdmissionBatch {
                 Mutation::Delete { key } => {
                     hash.update([1]);
                     hash_bytes(&mut hash, &key.encode());
+                }
+                Mutation::DeleteRange { range } => {
+                    hash.update([2]);
+                    hash_bytes(&mut hash, &range.encode());
                 }
             }
             hash.update(entry.tag.device.0);
@@ -436,33 +441,6 @@ pub struct ListResponse<T = OpaqueValue> {
 // ---------------------------------------------------------------------------
 // read_at
 
-/// A read range within one space.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Range {
-    /// The whole space: every live data key for snapshots, every changed
-    /// key for deltas.
-    Full,
-    /// All keys under this component-wise prefix.
-    Prefix(Key),
-}
-
-impl Range {
-    pub fn covers_key(&self, key: &Key) -> bool {
-        match self {
-            Self::Full => true,
-            Self::Prefix(prefix) => key.starts_with(prefix),
-        }
-    }
-
-    pub fn covers_range(&self, other: &Range) -> bool {
-        match (self, other) {
-            (Self::Full, _) => true,
-            (Self::Prefix(_), Self::Full) => false,
-            (Self::Prefix(a), Self::Prefix(b)) => b.starts_with(a),
-        }
-    }
-}
-
 /// A range with the caller's cursor position. `since: None` requests a full
 /// snapshot; `Some` requests the changes since that admission point.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -524,8 +502,11 @@ pub enum KernelError {
     LeaseInvalid { lease: LeaseId },
     /// Legacy coverage error. Reservation conflicts now use [`Contended`].
     NotCovered { key: Key },
-    /// A Set/Delete seal is malformed for its declared scheme.
+    /// A mutation seal is malformed for its declared scheme.
     InvalidSeal { reason: String },
+    /// Range deletes are understood by the protocol but not yet admitted by
+    /// this server implementation.
+    DeleteRangeUnsupported,
     /// One or more range watermarks did not match the server-visible prefix
     /// high water.
     RangeAssertFailed { failures: Vec<RangeAssertFailure> },
@@ -569,6 +550,7 @@ impl fmt::Display for KernelError {
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
             Self::InvalidSeal { reason } => write!(f, "invalid seal: {reason}"),
+            Self::DeleteRangeUnsupported => write!(f, "DeleteRange is not supported yet"),
             Self::RangeAssertFailed { failures } => {
                 write!(f, "{} range assert(s) failed", failures.len())
             }
@@ -703,6 +685,47 @@ mod tests {
             batch.checksum(DeviceChecksum::EMPTY, SpaceId([1; 16]), DeviceId([2; 16])),
             DeviceChecksum::EMPTY
         );
+    }
+
+    #[test]
+    fn checksum_commits_to_delete_range_kind_and_target() {
+        let space = SpaceId([1; 16]);
+        let device = DeviceId([2; 16]);
+        let range_entry = |range| DeviceEntry {
+            mutation: Mutation::DeleteRange { range },
+            tag: DeviceTag {
+                device,
+                device_seq: DeviceSeq(1),
+                ver: Ver(1),
+                cipher_epoch: CipherEpoch(0),
+            },
+            seal: Seal::empty_aead_v1(),
+        };
+        let checksum = |entry| {
+            AdmissionBatch {
+                device_seq: DeviceSeq(1),
+                range_asserts: vec![],
+                entries: vec![entry],
+            }
+            .checksum(DeviceChecksum::EMPTY, space, device)
+        };
+
+        let prefix = key(&[b"db"]);
+        let range = checksum(range_entry(Range::Prefix(prefix.clone())));
+        let full = checksum(range_entry(Range::Full));
+        let point = checksum(DeviceEntry {
+            mutation: Mutation::Delete { key: prefix },
+            tag: DeviceTag {
+                device,
+                device_seq: DeviceSeq(1),
+                ver: Ver(1),
+                cipher_epoch: CipherEpoch(0),
+            },
+            seal: Seal::empty_aead_v1(),
+        });
+
+        assert_ne!(range, full);
+        assert_ne!(range, point);
     }
 
     fn admitted_batch(admission: u64, device_seq: u64, op_count: u32) -> AdmittedBatch {

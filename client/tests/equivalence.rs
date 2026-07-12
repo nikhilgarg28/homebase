@@ -85,6 +85,7 @@ fn snapshot_from_pull(entries: &[AdmittedEntry<Vec<u8>>]) -> BTreeMap<Key, Optio
         .map(|e| match &e.device_entry.mutation {
             Mutation::Set { key, value } => (key.clone(), Some(value.clone())),
             Mutation::Delete { key } => (key.clone(), None),
+            Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
         })
         .collect()
 }
@@ -107,6 +108,7 @@ fn replay_oplog_plaintext(
                 Mutation::Delete { key } => {
                     view.insert(key.clone(), None);
                 }
+                Mutation::DeleteRange { .. } => unreachable!("test does not submit ranges"),
             }
             let _ = (seq, device);
         }
@@ -186,6 +188,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
                 (Some(expected), Some(entry)) => match entry.device_entry.mutation {
                     Mutation::Set { value, .. } => assert_eq!(value.0, *expected),
                     Mutation::Delete { .. } => panic!("get returned tombstone"),
+                    Mutation::DeleteRange { .. } => panic!("get returned range delete"),
                 },
                 other => panic!("server state mismatch: {other:?}"),
             }
@@ -277,6 +280,9 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
                 let value = match plain.device_entry.mutation {
                     Mutation::Set { value, .. } => Some(value),
                     Mutation::Delete { .. } => None,
+                    Mutation::DeleteRange { .. } => {
+                        unreachable!("DR1 server rejects range deletes")
+                    }
                 };
                 expected.insert(encoded_k2.clone(), value);
                 let _ = seq;

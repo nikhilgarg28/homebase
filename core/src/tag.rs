@@ -6,6 +6,7 @@
 //! admission metadata.
 
 use crate::key::Key;
+use crate::range::Range;
 use crate::seal::Seal;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -85,18 +86,34 @@ impl AsRef<[u8]> for OpaqueValue {
     }
 }
 
-/// A Set or Delete shape. Bare client mutations use plaintext `Vec<u8>`;
+/// A point or range mutation. Bare client mutations use plaintext `Vec<u8>`;
 /// device/server entries use [`OpaqueValue`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation<T = Vec<u8>> {
     Set { key: Key, value: T },
     Delete { key: Key },
+    DeleteRange { range: Range },
 }
 
 impl<T> Mutation<T> {
-    pub fn key(&self) -> &Key {
+    /// Returns the point key, or `None` for a range mutation.
+    pub fn point_key(&self) -> Option<&Key> {
         match self {
-            Self::Set { key, .. } | Self::Delete { key } => key,
+            Self::Set { key, .. } | Self::Delete { key } => Some(key),
+            Self::DeleteRange { .. } => None,
+        }
+    }
+
+    /// Point-key convenience for code paths that have already rejected
+    /// range mutations.
+    pub fn key(&self) -> &Key {
+        self.point_key().expect("range mutation has no point key")
+    }
+
+    pub fn range(&self) -> Option<&Range> {
+        match self {
+            Self::DeleteRange { range } => Some(range),
+            Self::Set { .. } | Self::Delete { .. } => None,
         }
     }
 
@@ -106,6 +123,10 @@ impl<T> Mutation<T> {
 
     pub fn is_delete(&self) -> bool {
         matches!(self, Self::Delete { .. })
+    }
+
+    pub fn is_delete_range(&self) -> bool {
+        matches!(self, Self::DeleteRange { .. })
     }
 }
 
@@ -127,8 +148,12 @@ pub struct DeviceEntry<T = OpaqueValue> {
 }
 
 impl<T> DeviceEntry<T> {
+    pub fn point_key(&self) -> Option<&Key> {
+        self.mutation.point_key()
+    }
+
     pub fn key(&self) -> &Key {
-        self.mutation.key()
+        self.point_key().expect("range entry has no point key")
     }
 
     pub fn ver(&self) -> Ver {
@@ -160,8 +185,12 @@ pub struct AdmittedEntry<T = OpaqueValue> {
 }
 
 impl<T> AdmittedEntry<T> {
+    pub fn point_key(&self) -> Option<&Key> {
+        self.device_entry.point_key()
+    }
+
     pub fn key(&self) -> &Key {
-        self.device_entry.key()
+        self.point_key().expect("range entry has no point key")
     }
 
     pub fn ver(&self) -> Ver {

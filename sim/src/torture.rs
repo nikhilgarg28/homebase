@@ -147,6 +147,9 @@ impl Replica {
                         Mutation::Delete { .. } => {
                             self.live.remove(e.key());
                         }
+                        Mutation::DeleteRange { .. } => {
+                            unreachable!("server rejects DeleteRange during DR1")
+                        }
                     }
                 }
             }

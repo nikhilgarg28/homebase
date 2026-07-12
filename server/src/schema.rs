@@ -419,6 +419,9 @@ impl DataRecord {
         let value_len = match &self.entry.device_entry.mutation {
             Mutation::Set { value, .. } => value.0.len(),
             Mutation::Delete { .. } => 0,
+            Mutation::DeleteRange { .. } => {
+                panic!("unsupported DeleteRange cannot be stored as point data")
+            }
         };
         let tag = self.entry.device_entry.tag;
         let seal = self.entry.device_entry.seal.encode();
@@ -437,6 +440,9 @@ impl DataRecord {
             Mutation::Set { value, .. } => {
                 out.push(1);
                 out.extend_from_slice(&value.0);
+            }
+            Mutation::DeleteRange { .. } => {
+                unreachable!("DeleteRange was rejected before point-data encoding")
             }
         }
         out

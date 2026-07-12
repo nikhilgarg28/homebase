@@ -383,6 +383,9 @@ fn sync_replica(
                     Mutation::Delete { .. } => {
                         replica.state.remove(e.key());
                     }
+                    Mutation::DeleteRange { .. } => {
+                        unreachable!("server rejects DeleteRange during DR1")
+                    }
                 }
             }
         }

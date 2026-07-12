@@ -221,6 +221,7 @@ fn op_ack(entry: &DeviceEntry) -> (&Key, ModelValue) {
     match &entry.mutation {
         Mutation::Set { key, value } => (key, ModelValue::Present(value.0.clone())),
         Mutation::Delete { key } => (key, ModelValue::Absent),
+        Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
     }
 }
 
@@ -482,6 +483,7 @@ fn replay_oplog(
                 Mutation::Delete { key } => {
                     view.insert(key.clone(), ModelValue::Absent);
                 }
+                Mutation::DeleteRange { .. } => unreachable!("torture does not submit ranges"),
             }
         }
     }
@@ -513,6 +515,7 @@ async fn read_equivalence(
         .map(|e| match &e.device_entry.mutation {
             Mutation::Set { key, value } => (key.clone(), ModelValue::Present(value.clone())),
             Mutation::Delete { key } => (key.clone(), ModelValue::Absent),
+            Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
         })
         .collect();
     expected = replay_oplog(expected, &state);
@@ -537,6 +540,7 @@ async fn read_equivalence(
         let got = match got.device_entry.mutation {
             Mutation::Set { value, .. } => ModelValue::Present(value.0),
             Mutation::Delete { .. } => ModelValue::Absent,
+            Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
         };
         assert_eq!(
             got, *expected_value,
@@ -572,6 +576,9 @@ fn phase_oracle(
                 if match &entry.device_entry.mutation {
                     Mutation::Set { value, .. } => ModelValue::Present(value.0.clone()),
                     Mutation::Delete { .. } => ModelValue::Absent,
+                    Mutation::DeleteRange { .. } => {
+                        unreachable!("DR1 server rejects range deletes")
+                    }
                 } == ack.value => {}
             (_, got) => {
                 panic!("acked value corrupted: {ack:?} got {got:?} (seed {seed}, phase {phase})")

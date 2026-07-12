@@ -69,6 +69,7 @@ fn value(entry: &AdmittedEntry<Vec<u8>>) -> &[u8] {
     match &entry.device_entry.mutation {
         Mutation::Set { value, .. } => value,
         Mutation::Delete { .. } => panic!("expected set"),
+        Mutation::DeleteRange { .. } => panic!("unexpected range delete"),
     }
 }
 

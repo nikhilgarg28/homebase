@@ -305,7 +305,12 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             }
             let keys: Vec<_> = batches
                 .iter()
-                .flat_map(|batch| batch.entries.iter().map(|entry| entry.key().clone()))
+                .flat_map(|batch| {
+                    batch
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.mutation.point_key().cloned())
+                })
                 .collect();
             let batch_count = batches.len();
             let request = AdmissionRequest {

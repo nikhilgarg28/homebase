@@ -225,6 +225,7 @@ async fn sync_once(
                 .map(|e| match &e.device_entry.mutation {
                     Mutation::Set { key, value } => (key.clone(), value.0.clone()),
                     Mutation::Delete { .. } => panic!("tombstone in snapshot"),
+                    Mutation::DeleteRange { .. } => panic!("range delete in DR1 snapshot"),
                 })
                 .collect();
         }
@@ -250,6 +251,9 @@ async fn sync_once(
                     }
                     Mutation::Delete { key } => {
                         state.remove(key);
+                    }
+                    Mutation::DeleteRange { .. } => {
+                        unreachable!("server rejects DeleteRange during DR1")
                     }
                 }
             }
@@ -341,6 +345,9 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
             .filter_map(|(k, rec)| match &rec.entry.device_entry.mutation {
                 Mutation::Set { value, .. } => Some((k.clone(), value.0.clone())),
                 Mutation::Delete { .. } => None,
+                Mutation::DeleteRange { .. } => {
+                    unreachable!("server rejects DeleteRange during DR1")
+                }
             })
             .collect();
         assert_eq!(

@@ -102,6 +102,15 @@ pub async fn admit<S: OrderedStore>(
         last_device_seq = client_batch.device_seq;
     }
 
+    if req
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.entries)
+        .any(|entry| entry.mutation.is_delete_range())
+    {
+        return Err(KernelError::DeleteRangeUnsupported.into());
+    }
+
     // 2. Reservation conflicts over data entries; an empty batch is a no-op.
     let keys: Vec<Key> = req
         .batches

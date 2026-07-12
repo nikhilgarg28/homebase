@@ -25,6 +25,7 @@ pub mod clock;
 pub mod key;
 pub mod lease;
 pub mod messages;
+pub mod range;
 pub mod seal;
 pub mod space;
 pub mod storage;
@@ -34,6 +35,7 @@ pub use clock::{Clock, ManualClock, MonotonicClock, Timestamp};
 pub use key::{Key, KeyComponent};
 pub use lease::{Lease, LeaseId, LeaseMode};
 pub use messages::KernelError;
+pub use range::Range;
 pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};
 pub use tag::{

@@ -391,6 +391,9 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                         Mutation::Delete { key } => Ok(Mutation::Delete {
                             key: name_cipher.encode_key(&key)?,
                         }),
+                        Mutation::DeleteRange { range } => Ok(Mutation::DeleteRange {
+                            range: name_cipher.encode_range(&range)?,
+                        }),
                     })
                     .collect::<Result<Vec<_>, CipherError>>()?;
                 let range_asserts = range_asserts

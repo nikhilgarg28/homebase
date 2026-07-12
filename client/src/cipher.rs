@@ -6,9 +6,10 @@
 //!
 //! Encrypted Set values use a non-empty versioned plaintext frame, then store
 //! the XChaCha20-Poly1305 ciphertext separately from [`Seal`]'s nonce and
-//! detached tag. Delete authenticates empty plaintext and carries no
-//! ciphertext. Both bind the scheme, operation kind, cipher epoch, anonymized
-//! key, device, device sequence, and value version as AEAD associated data.
+//! detached tag. Delete and DeleteRange authenticate empty plaintext and carry
+//! no ciphertext. All mutation kinds bind the scheme, operation kind, cipher
+//! epoch, anonymized target, device, device sequence, and value version as
+//! AEAD associated data.
 //! Admission sequence is omitted because the server assigns it after sealing.
 
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
@@ -37,6 +38,7 @@ const SEAL_AAD_PREFIX: &[u8] = b"homebase:seal-aad:v1";
 const SET_FRAME_V1: u8 = 1;
 const SET_OP_KIND: u8 = 1;
 const DELETE_OP_KIND: u8 = 2;
+const DELETE_RANGE_OP_KIND: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NameKey(pub [u8; KEY_LEN]);
@@ -321,8 +323,9 @@ impl SpaceCipher {
                         framed
                     }
                 };
+                let target = key.encode();
                 let (seal, ciphertext) =
-                    self.seal_detached(&key, SET_OP_KIND, framed, tag, nonce)?;
+                    self.seal_detached(&target, SET_OP_KIND, framed, tag, nonce)?;
                 (
                     Mutation::Set {
                         key,
@@ -332,10 +335,18 @@ impl SpaceCipher {
                 )
             }
             Mutation::Delete { key } => {
+                let target = key.encode();
                 let (seal, ciphertext) =
-                    self.seal_detached(&key, DELETE_OP_KIND, Vec::new(), tag, nonce)?;
+                    self.seal_detached(&target, DELETE_OP_KIND, Vec::new(), tag, nonce)?;
                 debug_assert!(ciphertext.is_empty());
                 (Mutation::Delete { key }, seal)
+            }
+            Mutation::DeleteRange { range } => {
+                let target = range.encode();
+                let (seal, ciphertext) =
+                    self.seal_detached(&target, DELETE_RANGE_OP_KIND, Vec::new(), tag, nonce)?;
+                debug_assert!(ciphertext.is_empty());
+                (Mutation::DeleteRange { range }, seal)
             }
         };
         Ok(DeviceEntry {
@@ -363,9 +374,13 @@ impl SpaceCipher {
             (CipherMode::Plaintext, Mutation::Delete { key }) => {
                 Mutation::Delete { key: key.clone() }
             }
+            (CipherMode::Plaintext, Mutation::DeleteRange { range }) => Mutation::DeleteRange {
+                range: range.clone(),
+            },
             (CipherMode::Encrypted { .. }, Mutation::Set { key, value }) => {
+                let target = key.encode();
                 let plaintext = self.open_detached(
-                    key,
+                    &target,
                     SET_OP_KIND,
                     value.0.clone(),
                     &device.seal,
@@ -380,12 +395,34 @@ impl SpaceCipher {
                 }
             }
             (CipherMode::Encrypted { .. }, Mutation::Delete { key }) => {
-                let plaintext =
-                    self.open_detached(key, DELETE_OP_KIND, Vec::new(), &device.seal, device.tag)?;
+                let target = key.encode();
+                let plaintext = self.open_detached(
+                    &target,
+                    DELETE_OP_KIND,
+                    Vec::new(),
+                    &device.seal,
+                    device.tag,
+                )?;
                 if !plaintext.is_empty() {
                     return Err(CipherError::MalformedSealedValue);
                 }
                 Mutation::Delete { key: key.clone() }
+            }
+            (CipherMode::Encrypted { .. }, Mutation::DeleteRange { range }) => {
+                let target = range.encode();
+                let plaintext = self.open_detached(
+                    &target,
+                    DELETE_RANGE_OP_KIND,
+                    Vec::new(),
+                    &device.seal,
+                    device.tag,
+                )?;
+                if !plaintext.is_empty() {
+                    return Err(CipherError::MalformedSealedValue);
+                }
+                Mutation::DeleteRange {
+                    range: range.clone(),
+                }
             }
         };
         Ok(AdmittedEntry {
@@ -400,7 +437,7 @@ impl SpaceCipher {
 
     fn seal_detached(
         &self,
-        encoded_key: &Key,
+        encoded_target: &[u8],
         op_kind: u8,
         mut plaintext: Vec<u8>,
         context: DeviceTag,
@@ -415,7 +452,7 @@ impl SpaceCipher {
                     },
                 )?;
                 let scheme = SealScheme::AeadV1;
-                let aad = seal_aad(encoded_key, scheme, op_kind, context);
+                let aad = seal_aad(encoded_target, scheme, op_kind, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -441,7 +478,7 @@ impl SpaceCipher {
 
     fn open_detached(
         &self,
-        encoded_key: &Key,
+        encoded_target: &[u8],
         op_kind: u8,
         mut ciphertext: Vec<u8>,
         seal: &Seal,
@@ -457,7 +494,7 @@ impl SpaceCipher {
                         epoch: context.cipher_epoch.0,
                     },
                 )?;
-                let aad = seal_aad(encoded_key, seal.scheme, op_kind, context);
+                let aad = seal_aad(encoded_target, seal.scheme, op_kind, context);
                 let cipher = XChaCha20Poly1305::new(
                     &AeadKey::try_from(&key.0[..]).expect("fixed-length value key"),
                 );
@@ -514,9 +551,9 @@ fn child_name_key(path_key: &[u8; KEY_LEN], component: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn seal_aad(encoded_key: &Key, scheme: SealScheme, op_kind: u8, context: DeviceTag) -> Vec<u8> {
-    let key = encoded_key.encode();
-    let mut out = Vec::with_capacity(SEAL_AAD_PREFIX.len() + 2 + 8 + 16 + 8 + 8 + 4 + key.len());
+fn seal_aad(encoded_target: &[u8], scheme: SealScheme, op_kind: u8, context: DeviceTag) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(SEAL_AAD_PREFIX.len() + 2 + 8 + 16 + 8 + 8 + 4 + encoded_target.len());
     out.extend_from_slice(SEAL_AAD_PREFIX);
     out.push(scheme.to_u8());
     out.push(op_kind);
@@ -524,8 +561,8 @@ fn seal_aad(encoded_key: &Key, scheme: SealScheme, op_kind: u8, context: DeviceT
     out.extend_from_slice(&context.device.0);
     out.extend_from_slice(&context.device_seq.0.to_be_bytes());
     out.extend_from_slice(&context.ver.0.to_be_bytes());
-    out.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    out.extend_from_slice(&key);
+    out.extend_from_slice(&(encoded_target.len() as u32).to_be_bytes());
+    out.extend_from_slice(encoded_target);
     out
 }
 
@@ -702,6 +739,53 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_delete_range_authenticates_kind_and_target() {
+        let codec = SpaceEnvelope::encrypted(name_key(1), space_key(2))
+            .open()
+            .unwrap();
+        let range = codec.encode_range(&Range::Prefix(key(&[b"db"]))).unwrap();
+        let entry = codec
+            .encode_device_entry(
+                Mutation::DeleteRange {
+                    range: range.clone(),
+                },
+                context(9),
+                nonce(5),
+            )
+            .unwrap();
+
+        assert!(entry.seal.payload.is_empty());
+        assert_ne!(entry.seal.aead, [0; 16]);
+        assert_eq!(
+            codec
+                .open_admitted_entry(&admitted(entry.clone()))
+                .unwrap()
+                .device_entry
+                .mutation,
+            Mutation::DeleteRange {
+                range: range.clone()
+            }
+        );
+
+        let mut wrong_target = admitted(entry.clone());
+        wrong_target.device_entry.mutation = Mutation::DeleteRange { range: Range::Full };
+        assert_eq!(
+            codec.open_admitted_entry(&wrong_target),
+            Err(CipherError::DecryptFailed)
+        );
+
+        let Range::Prefix(prefix) = range else {
+            unreachable!()
+        };
+        let mut wrong_kind = admitted(entry);
+        wrong_kind.device_entry.mutation = Mutation::Delete { key: prefix };
+        assert_eq!(
+            codec.open_admitted_entry(&wrong_kind),
+            Err(CipherError::DecryptFailed)
+        );
+    }
+
+    #[test]
     fn seal_binds_key_operation_and_full_write_context() {
         let codec = SpaceEnvelope::encrypted(name_key(1), space_key(2))
             .open()
@@ -717,6 +801,7 @@ mod tests {
                 *entry_key = codec.encode_key(&key(&[b"db", b"other"])).unwrap()
             }
             Mutation::Delete { .. } => unreachable!(),
+            Mutation::DeleteRange { .. } => unreachable!(),
         }
         assert_eq!(
             codec.open_admitted_entry(&wrong_key),

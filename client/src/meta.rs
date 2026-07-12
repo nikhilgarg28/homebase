@@ -110,6 +110,7 @@ use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{AdmittedBatch, PullResponse, RangeAssert};
+use homebase_core::range::Range;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{
@@ -380,7 +381,9 @@ pub fn certify(state: &ClientState) {
         }
         for (_, record) in space.active_oplog() {
             for entry in record.entries() {
-                let key = entry.key();
+                let Some(key) = entry.point_key() else {
+                    continue;
+                };
                 let ver = entry.ver();
                 if let Some(previous) = last_ver.get(key) {
                     assert!(
@@ -1807,14 +1810,14 @@ fn decode_entries(r: &mut Reader<'_>) -> Option<Vec<DeviceEntry>> {
 }
 
 fn encode_device_entry(out: &mut Vec<u8>, entry: &DeviceEntry) {
-    let (kind, key, value) = match &entry.mutation {
-        Mutation::Set { key, value } => (1, key, Some(value.0.as_slice())),
-        Mutation::Delete { key } => (2, key, None),
+    let (kind, target, value) = match &entry.mutation {
+        Mutation::Set { key, value } => (1, key.encode(), Some(value.0.as_slice())),
+        Mutation::Delete { key } => (2, key.encode(), None),
+        Mutation::DeleteRange { range } => (3, range.encode(), None),
     };
     out.push(kind);
-    let key = key.encode();
-    out.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    out.extend_from_slice(&key);
+    out.extend_from_slice(&(target.len() as u32).to_be_bytes());
+    out.extend_from_slice(&target);
     out.extend_from_slice(&entry.tag.device.0);
     out.extend_from_slice(&entry.tag.device_seq.0.to_be_bytes());
     out.extend_from_slice(&entry.tag.ver.0.to_be_bytes());
@@ -1830,8 +1833,8 @@ fn encode_device_entry(out: &mut Vec<u8>, entry: &DeviceEntry) {
 
 fn decode_device_entry(r: &mut Reader<'_>) -> Option<DeviceEntry> {
     let kind = r.u8()?;
-    let key_len = r.u32()? as usize;
-    let key = Key::decode(r.take(key_len)?).ok()?;
+    let target_len = r.u32()? as usize;
+    let target = r.take(target_len)?;
     let tag = homebase_core::tag::DeviceTag {
         device: DeviceId(r.bytes16()?),
         device_seq: DeviceSeq(r.u64()?),
@@ -1844,11 +1847,16 @@ fn decode_device_entry(r: &mut Reader<'_>) -> Option<DeviceEntry> {
         1 => {
             let len = r.u32()? as usize;
             Mutation::Set {
-                key,
+                key: Key::decode(target).ok()?,
                 value: OpaqueValue(r.take(len)?.to_vec()),
             }
         }
-        2 => Mutation::Delete { key },
+        2 => Mutation::Delete {
+            key: Key::decode(target).ok()?,
+        },
+        3 => Mutation::DeleteRange {
+            range: Range::decode(target)?,
+        },
         _ => return None,
     };
     Some(DeviceEntry {
@@ -2037,6 +2045,7 @@ pub mod conformance {
                         value: OpaqueValue(value),
                     },
                     Mutation::Delete { key } => Mutation::Delete { key },
+                    Mutation::DeleteRange { range } => Mutation::DeleteRange { range },
                 },
                 tag: homebase_core::tag::DeviceTag {
                     device: DeviceId([1; 16]),
@@ -2083,6 +2092,7 @@ pub mod conformance {
                                 value: OpaqueValue(value),
                             },
                             Mutation::Delete { key } => Mutation::Delete { key },
+                            Mutation::DeleteRange { range } => Mutation::DeleteRange { range },
                         },
                         tag: homebase_core::tag::DeviceTag {
                             device,
@@ -2760,6 +2770,7 @@ mod tests {
                 value: OpaqueValue(value),
             },
             Mutation::Delete { key } => Mutation::Delete { key },
+            Mutation::DeleteRange { range } => Mutation::DeleteRange { range },
         };
         DeviceEntry {
             mutation,
@@ -2861,6 +2872,22 @@ mod tests {
             decode_admitted_batch(&encode_admitted_batch(&admitted)),
             Some(admitted)
         );
+
+        let range_entries = vec![
+            entry(Mutation::DeleteRange { range: Range::Full }, Ver(10), 10),
+            entry(
+                Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db", b"rows"])),
+                },
+                Ver(11),
+                11,
+            ),
+        ];
+        let mut encoded = Vec::new();
+        encode_entries(&mut encoded, &range_entries);
+        let mut reader = Reader::new(&encoded);
+        assert_eq!(decode_entries(&mut reader), Some(range_entries));
+        assert_eq!(reader.end(), Some(()));
 
         let ver = VerHighRecord { high: Ver(9) };
         assert_eq!(VerHighRecord::decode(&ver.encode()), Some(ver));

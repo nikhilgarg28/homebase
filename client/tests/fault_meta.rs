@@ -143,6 +143,7 @@ async fn fetch(handle: &impl ServerHandle, k: &Key) -> Vec<u8> {
     match entry.device_entry.mutation {
         Mutation::Set { value, .. } => value.0,
         Mutation::Delete { .. } => panic!("expected live value"),
+        Mutation::DeleteRange { .. } => panic!("unexpected range delete"),
     }
 }
 

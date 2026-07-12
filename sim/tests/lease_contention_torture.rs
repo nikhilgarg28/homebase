@@ -144,6 +144,7 @@ async fn client(
                 .map(|e| match &e.device_entry.mutation {
                     Mutation::Set { value, .. } => (decode(&value.0), e.device_entry.tag.ver.0),
                     Mutation::Delete { .. } => panic!("tombstone leaked out of get"),
+                    Mutation::DeleteRange { .. } => panic!("range delete leaked out of get"),
                 })
                 .unwrap_or((0, 0)),
             Err(SpaceError::Unavailable { .. }) => return,
