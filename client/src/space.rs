@@ -353,7 +353,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             }
             if let Some(id) = held
                 .iter()
-                .find(|h| !h.forgotten && covers(h, spec) && h.barrier.is_none())
+                .find(|h| !h.forgotten && covers(h, spec) && !self.lease_live(h, &now))
                 .map(|h| h.lease.id)
             {
                 revive.push(id);

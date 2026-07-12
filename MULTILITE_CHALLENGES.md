@@ -226,12 +226,17 @@ the layout so adding partitions later isn't a key migration.
 
 **E1. Pure SELECTs are invisible.** Reads go straight to real tables — no capture. A write
 transaction's read dependencies (`SELECT balance` then `UPDATE orders`) are unguarded.
-Options: wrapper-level authorizer (`sqlite3_set_authorizer`) for table-granularity read
-sets on statements inside write transactions; EQP refinement later; or document reads as
-unasserted in v1.
-`Status: leaning — authorizer-derived table-level asserts for statements executed inside
-a write transaction; pure read-only transactions unasserted (they serve the local
-snapshot tier by design).`
+Options: (a) wrapper-level authorizer (`sqlite3_set_authorizer`) for table-granularity
+read sets on statements inside write transactions; (b) EQP + bound-parameter analysis for
+approximate index ranges (heuristic — parses plan output); (c) rewrite read statements
+*inside write transactions* to route through read-shadowing vtables — precise structured
+capture via `xBestIndex`, with vtable-forwarding overhead confined to write transactions
+(pure SELECTs stay native, and serializability only needs write-transaction read sets);
+or (d) document reads as unasserted in v1. Note this item is identical under a
+preupdate-hook architecture — hooks capture writes only; read capture is a separate
+channel in every design.
+`Status: leaning — (a) table-level asserts for v1; (c) is the precision upgrade path,
+preferred over (b) because it reuses the assert mapping (E2) instead of plan scraping.`
 
 **E2. xBestIndex → range assert mapping.** The write statement's own scan hands us
 structured constraints `(column, op, value)` at `xFilter` time (bindings resolved). Pin
@@ -444,6 +449,66 @@ mid-suite and continues — adoption must be cheap enough to run in CI constantl
 **K3. What breaks fidelity.** Forced WAL (J4), `hb_*` tables (contract), sparse rowids
 (F2). Keep this list exhaustive and in the exclusion manifest.
 `Status: open — maintain as a living list here until the manifest exists.`
+
+---
+
+## Group L — Isolation semantics and replica completeness
+
+**L1. Offered isolation level(s).** DESIGN.md's contract: **serializable writes,
+three-tier reads** — local (0 RTT, snapshot freshness), owned (0 RTT, authoritative under
+held leases), consistent (1 RTT, true `read_at` cut). Decide what multilite v1 actually
+exposes and how: default = local-snapshot reads + optimistic serializable write
+transactions (abort on assert/lease failure at the commit fixpoint); `BEGIN IMMEDIATE`
+escalates to pessimistic (acquire before executing, DESIGN's documented hole for write
+skew on *undeclared* invariants at default isolation); the strong-read pragma forces the
+consistent tier. Each tier must be nameable in the physics doc — no tier the docs can't
+explain.
+`Status: leaning — three tiers as above; v1 ships local + owned with commit-time
+serializability, consistent tier behind the pragma.`
+
+**L2. Conflict-detection granularity (how coarse is isolation).** With v1's table-level
+read asserts (E1), two write transactions touching the same *table* conflict even on
+disjoint rows — spurious aborts under concurrency, correct but coarse. Writes are already
+row-precise (row leases from the write set); reads are the coarse side. Decide the
+acceptable spurious-abort posture for v1 (single-writer default lease makes this moot
+initially — coarseness only bites once multi-writer contention exists) and the refinement
+trigger (E1-c precise read capture) when it does.
+`Status: leaning — accept table-level read coarseness for v1; revisit with E1-c when
+multi-writer workloads land. Document the asymmetry: row-precise writes, table-coarse
+reads.`
+
+**L3. Replica completeness model.** Does the local db hold a **complete prefix of the
+space's admission history** (full replica, one cursor: every table fully formed as of
+admission seq N), or a **patchwork of prefix-granular pulls** (shape/partition cursors at
+different points)? A patchwork breaks naive SQL: a table scan cannot distinguish "row not
+replicated" from "row absent", so any unscoped read over a partially-cached table is
+silently wrong; asserts also become ambiguous (which cursor does an assert pin — E5).
+Full replica makes every local read well-defined at one cut and gives asserts a single
+anchor.
+`Status: leaning — v1 assumes full-space replica with a single cursor; partial
+replication (shapes, per-prefix cursors) arrives only with query-shape coverage checking
+(unindexed reads → subscribe-table fallback, per DESIGN.md). This assumption should be
+stated as an invariant in hb_meta so shapes can't be half-adopted later.`
+
+**L4. Read-your-writes vs rejected batches (local rollback repair).** Local reads see
+committed-but-unacked writes — they live in the real tables. If the server rejects a
+pushed batch (assert failure, lease loss), the v2 kernel answer is caller-driven
+`rollback(to)` on the oplog; but multilite must also repair the **materialized SQLite
+state** — un-apply the rejected writes from real tables. With an after-image-only value
+codec (D4) there is nothing local to restore from: repair = re-pull authoritative state
+for the affected keys (or ranges) from the server. Decide: re-pull repair (needs
+connectivity — acceptable, rejection already implies connectivity) vs keeping local
+before-images for offline-capable undo (reopens D4). Also decide the app-visible surface:
+which error, on which call, and what "your last N transactions were undone" looks like.
+`Status: open — leaning re-pull repair keyed off the rollback marker; D4 stays
+after-image-only. The app-visible contract needs design (ties to the durability
+watermark API, J5).`
+
+**L5. Read-transaction stability under applies.** A long-running local read transaction
+must keep a stable snapshot while sync applies remote ops. WAL mode gives readers
+snapshot isolation natively, and applies queue behind write transactions (J3) — read
+snapshots come free as long as applies run as ordinary write transactions.
+`Status: decided — WAL reader snapshots (J4) + apply queuing (J3); no new machinery.`
 
 ---
 

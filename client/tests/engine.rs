@@ -1099,6 +1099,71 @@ fn lease_margin_has_ten_millisecond_floor() {
 }
 
 #[test]
+fn ensure_renews_live_reservation_or_reacquires_with_fresh_barrier() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let server_clock = Arc::new(ManualClock::new(Timestamp(0)));
+        let handle = spawn_server(Arc::clone(&server_clock), &[SPACE]);
+        let db = key(&[b"db"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PendingEntry {
+                key: key(&[b"db", b"first"]),
+                value: val(b"one"),
+                ver: Ver(1),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let first = space.ensure(vec![wspec(&db, 60)]).await.unwrap().leases[0].clone();
+        assert_eq!(first.barrier, AdmissionSeq(1));
+
+        // The new incarnation's conservative margin expires locally while
+        // the server reservation remains live. Ensure renews the same grant,
+        // so no new barrier is needed.
+        clock.set_lineage(Lineage([2; 16]));
+        clock.set(Timestamp(59_950));
+        let renewed = space.ensure(vec![wspec(&db, 60)]).await.unwrap().leases[0].clone();
+        assert_eq!(renewed.id, first.id);
+        assert_eq!(renewed.barrier, first.barrier);
+
+        // Once the server grant also expires, another device may write.
+        // Ensure observes the invalid renewal and acquires a new grant at the
+        // authority's current barrier.
+        server_clock.advance(Duration::from_secs(60));
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(3),
+            &db,
+            vec![PendingEntry {
+                key: key(&[b"db", b"second"]),
+                value: val(b"two"),
+                ver: Ver(2),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        clock.set(Timestamp(120_000));
+        let reacquired = space.ensure(vec![wspec(&db, 60)]).await.unwrap().leases[0].clone();
+        assert_ne!(reacquired.id, first.id);
+        assert_eq!(reacquired.barrier, AdmissionSeq(2));
+    });
+}
+
+#[test]
 fn repair_leases_reconciles_and_preserves_forgotten_intent() {
     block_on(async {
         let mem = MemoryStore::new();
