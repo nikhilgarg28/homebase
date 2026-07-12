@@ -2126,17 +2126,19 @@ fn ensure_advances_the_watermark_and_dominates_foreign_vers() {
             "stamped past the foreign chain"
         );
 
-        // The next pull is a delta from the stored cursor and carries
-        // exactly our own admitted write.
-        let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
-        assert!(matches!(&pulled.ranges[0], RangeCut::Delta(entries) if entries.len() == 1));
+        // Stateless fetch starts after the barrier cut and carries exactly
+        // our own admitted write.
+        let pulled = space
+            .fetch(Range::Prefix(db.clone()), AdmissionSeq(1))
+            .await
+            .unwrap();
+        assert!(matches!(&pulled.cut, RangeCut::Delta(entries) if entries.len() == 1));
 
-        // The cursor is durable: a resumed incarnation pulls deltas, not
-        // snapshots.
+        // Fetch does not alter the temporary lease-coverage watermark.
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert_eq!(
             state.spaces[&SPACE].watermarks[&Range::Prefix(db.clone())],
-            pulled.at
+            AdmissionSeq(1)
         );
     });
 }

@@ -13,17 +13,25 @@
 //! skips that potentially expensive local scan. [`Space::push`] drains only
 //! this space, [`Space::push_until`] stops at a chosen local sequence, and
 //! [`Submission::push`] is attribution sugar for the latter.
+//!
+//! Inbound operations have a separate durable admit log. [`Space::pull`]
+//! captures and authenticates the dense full-space server suffix but never
+//! claims that the application applied it. [`Space::admits`] exposes pending
+//! batches and the explicit application/trim cursor transitions. By contrast,
+//! [`Space::fetch`] is a stateless range observation and changes no client
+//! replication, version, or lease state.
 
 use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
 use crate::client::Client;
-use crate::meta::{Committed, HeldLease, MetaStore, SubmitMode};
+use crate::meta::{AdmitCursors, Committed, HeldLease, MetaStore, SubmitMode};
 use crate::server::ServerHandle;
 use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, ListLeasesRequest, Range, RangeAssert, RangeCursor,
-    RangeCut, ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, AdmittedBatch, KernelError, LeaseSpec, ListLeasesRequest, PullRequest, Range,
+    RangeAssert, RangeCursor, RangeCut, ReadAtRequest, ReadAtResponse, ReleaseRequest,
+    RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -34,6 +42,7 @@ use std::fmt;
 use std::time::Duration;
 
 pub const DEFAULT_PUSH_CAP: usize = 256;
+pub const DEFAULT_PULL_CAP: usize = 256;
 const MIN_LEASE_MARGIN: Duration = Duration::from_millis(10);
 
 pub fn lease_margin(ttl: Duration) -> Duration {
@@ -68,6 +77,9 @@ pub enum SpaceDriverError {
     },
     SubmissionNotPending {
         seq: DeviceSeq,
+    },
+    MalformedResponse {
+        reason: String,
     },
 }
 
@@ -124,6 +136,7 @@ impl fmt::Display for SpaceDriverError {
             Self::SubmissionNotPending { seq } => {
                 write!(f, "submission {seq:?} is no longer pending")
             }
+            Self::MalformedResponse { reason } => write!(f, "malformed server response: {reason}"),
         }
     }
 }
@@ -140,6 +153,14 @@ pub struct Ensured {
 pub struct RepairedLeases {
     pub active: Vec<Lease>,
     pub forgotten: Vec<LeaseId>,
+}
+
+/// One authenticated stateless range observation and its next cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedRange<T = Vec<u8>> {
+    pub range: Range,
+    pub at: AdmissionSeq,
+    pub cut: RangeCut<T>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +259,19 @@ pub struct Space<'a, M, H, C, N = SystemNonceSource> {
     id: SpaceId,
 }
 
+/// Application-facing access to one space's durable inbound admission log.
+pub struct Admits<'space, 'client, M, H, C, N = SystemNonceSource> {
+    space: &'space Space<'client, M, H, C, N>,
+}
+
+impl<M, H, C, N> fmt::Debug for Admits<'_, '_, M, H, C, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Admits")
+            .field("space", &self.space.id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'static>
     Space<'a, M, H, C, N>
 {
@@ -255,6 +289,10 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
 
     pub fn cipher(&self) -> SpaceCipher {
         self.client.cipher(self.id)
+    }
+
+    pub fn admits(&self) -> Admits<'_, 'a, M, H, C, N> {
+        Admits { space: self }
     }
 
     pub async fn leases(&self, prefixes: &[Key]) -> Result<Vec<LeaseState>, SpaceDriverError> {
@@ -681,10 +719,116 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         Ok(())
     }
 
-    pub async fn pull(&self, range: Range) -> Result<ReadAtResponse<Vec<u8>>, SpaceDriverError> {
+    /// Capture all currently available complete server batches into the
+    /// durable admit log. Each bounded page is authenticated before append.
+    /// Returns the last captured server admission sequence.
+    pub async fn pull(&self) -> Result<AdmissionSeq, SpaceDriverError> {
         let _permit = self.enter().await?;
-        let range = self.cipher().encode_range(&range)?;
-        self.pull_encoded(range).await
+        loop {
+            let cursors = self.client.store().admit_cursors(self.id).await?;
+            let after = AdmissionSeq(cursors.tail.0.checked_sub(1).ok_or_else(|| {
+                SpaceDriverError::MalformedResponse {
+                    reason: "local admit tail cannot be zero".into(),
+                }
+            })?);
+            let response = self
+                .client
+                .server()
+                .pull(
+                    &self.id,
+                    PullRequest {
+                        after,
+                        max_batches: Some(DEFAULT_PULL_CAP),
+                    },
+                )
+                .await?;
+            if response.after != after {
+                return Err(SpaceDriverError::MalformedResponse {
+                    reason: format!(
+                        "response starts after {:?}, request was after {:?}",
+                        response.after, after
+                    ),
+                });
+            }
+            response
+                .validate_dense()
+                .map_err(|error| SpaceDriverError::MalformedResponse {
+                    reason: error.to_string(),
+                })?;
+            if response.batches.len() > DEFAULT_PULL_CAP {
+                return Err(SpaceDriverError::MalformedResponse {
+                    reason: format!(
+                        "response contains {} batches, limit was {DEFAULT_PULL_CAP}",
+                        response.batches.len()
+                    ),
+                });
+            }
+            let page_len = response.batches.len();
+            let cipher = self.cipher();
+            let response = self
+                .client
+                .run_blocking(move || {
+                    for batch in &response.batches {
+                        for entry in &batch.entries {
+                            cipher.open_admitted_entry(entry)?;
+                        }
+                    }
+                    Ok::<_, CipherError>(response)
+                })
+                .await
+                .map_err(coordination_unavailable)??;
+            let through = response.through;
+            self.client
+                .store()
+                .append_admits(self.id, &response)
+                .await?;
+            if page_len < DEFAULT_PULL_CAP {
+                return Ok(through);
+            }
+        }
+    }
+
+    /// Read one authenticated range delta after `after` without changing any
+    /// client replication, version, or lease state.
+    pub async fn fetch(
+        &self,
+        range: Range,
+        after: AdmissionSeq,
+    ) -> Result<FetchedRange, SpaceDriverError> {
+        let _permit = self.enter().await?;
+        let encoded_range = self.cipher().encode_range(&range)?;
+        let response = self
+            .client
+            .server()
+            .read_at(
+                &self.id,
+                ReadAtRequest {
+                    ranges: vec![RangeCursor {
+                        range: encoded_range,
+                        since: Some(after),
+                    }],
+                },
+            )
+            .await?;
+        if response.ranges.len() != 1 {
+            return Err(SpaceDriverError::MalformedResponse {
+                reason: format!(
+                    "one-range fetch returned {} range cuts",
+                    response.ranges.len()
+                ),
+            });
+        }
+        let at = response.at;
+        let cipher = self.cipher();
+        let cut = self
+            .client
+            .run_blocking(move || {
+                open_range_cut(&cipher, response.ranges.into_iter().next().unwrap())
+            })
+            .await
+            .map_err(coordination_unavailable)?
+            .map_err(SpaceDriverError::from)?;
+        Ok(FetchedRange { range, at, cut })
     }
 
     async fn enter(
@@ -1018,6 +1162,93 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
     }
 }
 
+impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'static>
+    Admits<'_, '_, M, H, C, N>
+{
+    pub async fn cursors(&self) -> Result<AdmitCursors, SpaceDriverError> {
+        let _permit = self.space.enter().await?;
+        Ok(self
+            .space
+            .client
+            .store()
+            .admit_cursors(self.space.id)
+            .await?)
+    }
+
+    /// Return all retained unapplied batches in server admission order,
+    /// authenticating and opening their operations for application use.
+    pub async fn iter_from_neck(&self) -> Result<Vec<AdmittedBatch<Vec<u8>>>, SpaceDriverError> {
+        let _permit = self.space.enter().await?;
+        let cursors = self
+            .space
+            .client
+            .store()
+            .admit_cursors(self.space.id)
+            .await?;
+        if cursors.neck == cursors.tail {
+            return Ok(Vec::new());
+        }
+        let through = AdmissionSeq(cursors.tail.0.checked_sub(1).ok_or_else(|| {
+            SpaceDriverError::MalformedResponse {
+                reason: "local admit tail cannot be zero".into(),
+            }
+        })?);
+        let batches = self
+            .space
+            .client
+            .store()
+            .admitted_batches(self.space.id, cursors.neck, through)
+            .await?;
+        let cipher = self.space.cipher();
+        self.space
+            .client
+            .run_blocking(move || {
+                batches
+                    .into_iter()
+                    .map(|batch| {
+                        let entries = batch
+                            .entries
+                            .iter()
+                            .map(|entry| cipher.open_admitted_entry(entry))
+                            .collect::<Result<Vec<_>, CipherError>>()?;
+                        Ok(AdmittedBatch {
+                            admission_seq: batch.admission_seq,
+                            device: batch.device,
+                            device_seq: batch.device_seq,
+                            checksum: batch.checksum,
+                            entries,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CipherError>>()
+            })
+            .await
+            .map_err(coordination_unavailable)?
+            .map_err(Into::into)
+    }
+
+    /// Acknowledge application of the dense interval up to exclusive `to`.
+    pub async fn mark_applied(&self, to: AdmissionSeq) -> Result<(), SpaceDriverError> {
+        let _permit = self.space.enter().await?;
+        self.space
+            .client
+            .store()
+            .mark_admits_applied(self.space.id, to)
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim retained admitted batches below exclusive `to`.
+    pub async fn trim(&self, to: AdmissionSeq) -> Result<(), SpaceDriverError> {
+        let _permit = self.space.enter().await?;
+        self.space
+            .client
+            .store()
+            .trim_admits(self.space.id, to)
+            .await?;
+        Ok(())
+    }
+}
+
 pub(crate) async fn live_write_leases<M: MetaStore, C: HybridClock>(
     store: &M,
     clock: &C,
@@ -1072,6 +1303,21 @@ fn mode_covers(held: LeaseMode, want: LeaseMode) -> bool {
         (held, want),
         (LeaseMode::Write, _) | (LeaseMode::Read, LeaseMode::Read)
     )
+}
+
+fn open_range_cut(cipher: &SpaceCipher, cut: RangeCut) -> Result<RangeCut<Vec<u8>>, CipherError> {
+    match cut {
+        RangeCut::Snapshot(entries) => entries
+            .iter()
+            .map(|entry| cipher.open_admitted_entry(entry))
+            .collect::<Result<Vec<_>, _>>()
+            .map(RangeCut::Snapshot),
+        RangeCut::Delta(entries) => entries
+            .iter()
+            .map(|entry| cipher.open_admitted_entry(entry))
+            .collect::<Result<Vec<_>, _>>()
+            .map(RangeCut::Delta),
+    }
 }
 
 fn coordination_unavailable(error: crate::coordination::CoordinationError) -> SpaceDriverError {

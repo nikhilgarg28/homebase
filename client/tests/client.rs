@@ -11,7 +11,7 @@ use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{AdmittedEntry, DeviceId, DeviceSeq, Mutation};
+use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, DeviceSeq, Mutation};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -405,10 +405,13 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
         .unwrap();
         let db = key(&[b"db"]);
         let space = client.space(space).await.unwrap();
-        let pulled = space.pull(Range::Prefix(db)).await.unwrap();
+        let pulled = space
+            .fetch(Range::Prefix(db), AdmissionSeq(0))
+            .await
+            .unwrap();
         assert!(matches!(
-            &pulled.ranges[0],
-            RangeCut::Snapshot(entries) if entries.len() == 1 && entries[0].device_entry.mutation == set(entries[0].key().clone(), b"cached")
+            &pulled.cut,
+            RangeCut::Delta(entries) if entries.len() == 1 && entries[0].device_entry.mutation == set(entries[0].key().clone(), b"cached")
         ));
     });
 }
@@ -456,10 +459,13 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         .unwrap();
         reader.attach(&envelope).await.unwrap();
         let reader_space = reader.space(space).await.unwrap();
-        let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
+        let pulled = reader_space
+            .fetch(Range::Prefix(db), AdmissionSeq(0))
+            .await
+            .unwrap();
         assert!(matches!(
-            &pulled.ranges[0],
-            RangeCut::Snapshot(entries)
+            &pulled.cut,
+            RangeCut::Delta(entries)
                 if entries.len() == 1 && entries[0].device_entry.mutation == set(entries[0].key().clone(), b"roundtrip")
         ));
     });

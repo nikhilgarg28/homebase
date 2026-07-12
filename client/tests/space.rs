@@ -2,15 +2,20 @@ use homebase::Client;
 use homebase::cipher::{
     NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
-use homebase::meta::OrderedMetaStore;
+use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
-use homebase_core::space::SpaceId;
+use homebase_core::messages::{
+    AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
+    LeaseSpec, ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest,
+    PullResponse, Range, RangeCut, ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse,
+    RenewRequest, RenewResponse,
+};
+use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{AdmittedEntry, DeviceId, Mutation};
+use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, Mutation, Ver};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -90,6 +95,76 @@ fn spawn_server(
         assert!(server.create_space(*space));
     }
     move |id: &SpaceId| server.space(id)
+}
+
+struct TamperPull<H> {
+    inner: H,
+}
+
+impl<H: ServerHandle + Sync> ServerHandle for TamperPull<H> {
+    async fn acquire(
+        &self,
+        space: &SpaceId,
+        req: AcquireRequest,
+    ) -> Result<AcquireResponse, SpaceError> {
+        self.inner.acquire(space, req).await
+    }
+
+    async fn renew(&self, space: &SpaceId, req: RenewRequest) -> Result<RenewResponse, SpaceError> {
+        self.inner.renew(space, req).await
+    }
+
+    async fn release(
+        &self,
+        space: &SpaceId,
+        req: ReleaseRequest,
+    ) -> Result<ReleaseResponse, SpaceError> {
+        self.inner.release(space, req).await
+    }
+
+    async fn list_leases(
+        &self,
+        space: &SpaceId,
+        req: ListLeasesRequest,
+    ) -> Result<ListLeasesResponse, SpaceError> {
+        self.inner.list_leases(space, req).await
+    }
+
+    async fn admit(
+        &self,
+        space: &SpaceId,
+        req: AdmissionRequest,
+    ) -> Result<AdmissionResponse, SpaceError> {
+        self.inner.admit(space, req).await
+    }
+
+    async fn pull(&self, space: &SpaceId, req: PullRequest) -> Result<PullResponse, SpaceError> {
+        let mut response = self.inner.pull(space, req).await?;
+        if let Some(entry) = response
+            .batches
+            .first_mut()
+            .and_then(|batch| batch.entries.first_mut())
+        {
+            entry.device_entry.seal.aead[0] ^= 1;
+        }
+        Ok(response)
+    }
+
+    async fn get(&self, space: &SpaceId, req: GetRequest) -> Result<GetResponse, SpaceError> {
+        self.inner.get(space, req).await
+    }
+
+    async fn list(&self, space: &SpaceId, req: ListRequest) -> Result<ListResponse, SpaceError> {
+        self.inner.list(space, req).await
+    }
+
+    async fn read_at(
+        &self,
+        space: &SpaceId,
+        req: ReadAtRequest,
+    ) -> Result<ReadAtResponse, SpaceError> {
+        self.inner.read_at(space, req).await
+    }
 }
 
 async fn fetch(handle: &impl ServerHandle, space: SpaceId, k: &Key) -> Option<AdmittedEntry> {
@@ -199,10 +274,13 @@ fn encrypted_push_preserves_per_commit_device_seq_aad() {
         .unwrap();
         reader.attach(&envelope).await.unwrap();
         let reader_space = reader.space(space).await.unwrap();
-        let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
+        let pulled = reader_space
+            .fetch(Range::Prefix(db), AdmissionSeq(0))
+            .await
+            .unwrap();
 
-        let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
-            panic!("initial pull should snapshot")
+        let RangeCut::Delta(entries) = &pulled.cut else {
+            panic!("fetch should return a delta")
         };
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|entry| matches!(&entry.device_entry.mutation, Mutation::Set { value, .. } if value == b"one")));
@@ -259,12 +337,184 @@ fn envelope_can_be_reused_after_linking_without_changing_space() {
         .unwrap();
         reader.attach(&linked_envelope).await.unwrap();
         let reader_space = reader.space(space).await.unwrap();
-        let pulled = reader_space.pull(Range::Prefix(db)).await.unwrap();
+        let pulled = reader_space
+            .fetch(Range::Prefix(db), AdmissionSeq(0))
+            .await
+            .unwrap();
 
         assert!(matches!(
-            &pulled.ranges[0],
-            RangeCut::Snapshot(entries)
+            &pulled.cut,
+            RangeCut::Delta(entries)
                 if entries.len() == 1 && matches!(&entries[0].device_entry.mutation, Mutation::Set { value, .. } if value == b"before-link")
         ));
+    });
+}
+
+#[test]
+fn dense_pull_pages_into_admit_log_and_application_moves_only_neck() {
+    block_on(async {
+        let space = SpaceId([42; 16]);
+        let envelope = SpaceEnvelope::plaintext(space);
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+
+        let writer_store = MemoryStore::new();
+        let writer_clock = ManualClock::new(Timestamp(0));
+        let writer = Client::open(
+            OrderedMetaStore::new(&writer_store),
+            &handle,
+            &writer_clock,
+            dev(1),
+            TestNonceSource::new(0),
+        )
+        .await
+        .unwrap();
+        writer.attach(&envelope).await.unwrap();
+        let writer_space = writer.space(space).await.unwrap();
+        for n in 0..257_u16 {
+            writer_space
+                .submit_unchecked(
+                    [set(key(&[b"db", &n.to_be_bytes()]), &n.to_be_bytes())],
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+        writer_space.push().await.unwrap();
+
+        let reader_store = MemoryStore::new();
+        let reader_clock = ManualClock::new(Timestamp(0));
+        let reader = Client::open(
+            OrderedMetaStore::new(&reader_store),
+            &handle,
+            &reader_clock,
+            dev(2),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        reader.attach(&envelope).await.unwrap();
+        let reader_space = reader.space(space).await.unwrap();
+
+        assert_eq!(reader_space.pull().await.unwrap(), AdmissionSeq(257));
+        let state = audit(&OrderedMetaStore::new(&reader_store)).await;
+        let state = &state.spaces[&space];
+        assert_eq!(state.admit_cursors.head, AdmissionSeq(1));
+        assert_eq!(state.admit_cursors.neck, AdmissionSeq(1));
+        assert_eq!(state.admit_cursors.tail, AdmissionSeq(258));
+        assert_eq!(state.ver_high, Some(Ver(257)));
+        assert_eq!(state.admits.len(), 257);
+
+        let pending = reader_space.admits().iter_from_neck().await.unwrap();
+        assert_eq!(pending.len(), 257);
+        for (offset, batch) in pending.iter().enumerate() {
+            let expected = AdmissionSeq(offset as u64 + 1);
+            assert_eq!(batch.admission_seq, expected);
+            assert!(batch.entries.iter().all(|entry| {
+                entry.admission.admission_seq == expected
+                    && entry.device_entry.tag.device == batch.device
+                    && entry.device_entry.tag.device_seq == batch.device_seq
+            }));
+        }
+
+        reader_space
+            .admits()
+            .mark_applied(AdmissionSeq(3))
+            .await
+            .unwrap();
+        reader_space.admits().trim(AdmissionSeq(2)).await.unwrap();
+        let cursors = reader_space.admits().cursors().await.unwrap();
+        assert_eq!(cursors.head, AdmissionSeq(2));
+        assert_eq!(cursors.neck, AdmissionSeq(3));
+        assert_eq!(cursors.tail, AdmissionSeq(258));
+
+        assert_eq!(reader_space.pull().await.unwrap(), AdmissionSeq(257));
+        assert_eq!(reader_space.admits().cursors().await.unwrap(), cursors);
+    });
+}
+
+#[test]
+fn stateless_fetch_leaves_all_client_state_unchanged() {
+    block_on(async {
+        let space = SpaceId([43; 16]);
+        let envelope = SpaceEnvelope::plaintext(space);
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let store = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let client = Client::open(
+            OrderedMetaStore::new(&store),
+            &handle,
+            &clock,
+            dev(1),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        client.attach(&envelope).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
+        space_handle
+            .submit_unchecked([set(key(&[b"db", b"row"]), b"value")], vec![])
+            .await
+            .unwrap();
+        space_handle.push().await.unwrap();
+
+        let before = audit(&OrderedMetaStore::new(&store)).await;
+        let fetched = space_handle
+            .fetch(Range::Prefix(key(&[b"db"])), AdmissionSeq(0))
+            .await
+            .unwrap();
+        assert!(matches!(fetched.cut, RangeCut::Delta(ref entries) if entries.len() == 1));
+        let after = audit(&OrderedMetaStore::new(&store)).await;
+        assert_eq!(after, before);
+    });
+}
+
+#[test]
+fn pull_authenticates_the_complete_page_before_appending_any_batch() {
+    block_on(async {
+        let envelope = encrypted_envelope();
+        let space = envelope.space_id();
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let writer_store = MemoryStore::new();
+        let writer_clock = ManualClock::new(Timestamp(0));
+        let writer = Client::open(
+            OrderedMetaStore::new(&writer_store),
+            &handle,
+            &writer_clock,
+            dev(1),
+            TestNonceSource::new(1),
+        )
+        .await
+        .unwrap();
+        writer.attach(&envelope).await.unwrap();
+        let writer_space = writer.space(space).await.unwrap();
+        writer_space
+            .submit_unchecked([set(key(&[b"db", b"row"]), b"secret")], vec![])
+            .await
+            .unwrap();
+        writer_space.push().await.unwrap();
+        drop(writer_space);
+        drop(writer);
+
+        let tampered = TamperPull { inner: handle };
+        let reader_store = MemoryStore::new();
+        let reader_clock = ManualClock::new(Timestamp(0));
+        let reader = Client::open(
+            OrderedMetaStore::new(&reader_store),
+            tampered,
+            &reader_clock,
+            dev(2),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        reader.attach(&envelope).await.unwrap();
+        let error = reader.space(space).await.unwrap().pull().await.unwrap_err();
+        assert!(matches!(error, homebase::SpaceDriverError::Cipher(_)));
+
+        let state = audit(&OrderedMetaStore::new(&reader_store)).await;
+        let state = &state.spaces[&space];
+        assert_eq!(state.admit_cursors, homebase::meta::AdmitCursors::default());
+        assert!(state.admits.is_empty());
+        assert_eq!(state.ver_high, None);
     });
 }

@@ -14,7 +14,7 @@ use homebase_core::messages::{
 };
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{DeviceEntry, DeviceId, Mutation};
+use homebase_core::tag::{AdmissionSeq, DeviceEntry, DeviceId, Mutation};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::seeds;
 use homebase_sim::store::{FaultConfig, SimStore};
@@ -499,10 +499,13 @@ async fn read_equivalence(
     let mut guard = take_client(slot);
     let client = guard.client.as_mut().expect("client slot empty");
     let space = client.space(SPACE).await.unwrap();
-    let pulled = space.pull(Range::Prefix(prefix())).await.unwrap();
+    let pulled = space
+        .fetch(Range::Prefix(prefix()), AdmissionSeq(0))
+        .await
+        .unwrap();
     finish_client(slot, guard);
 
-    let entries = match &pulled.ranges[0] {
+    let entries = match &pulled.cut {
         RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
     };
     let mut expected: BTreeMap<Key, ModelValue> = entries

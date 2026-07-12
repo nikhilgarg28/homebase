@@ -519,6 +519,10 @@ replica of the server admission log. Client records use the original
 `AdmissionSeq` and contain the complete admitted batch; there is no local
 admit sequence or scoped wrapper.
 
+The log stores verified opaque values rather than decrypted values. Iteration
+authenticates them again while opening operations, minimizing secret-bearing
+durable state and checking integrity at the application boundary.
+
 The submit and admit logs use the same cursor geometry:
 
 ```text
@@ -534,7 +538,7 @@ All cursors are exclusive durable positions and satisfy
 - `neck`: next server admission not yet acknowledged as applied.
 - `tail`: next server admission not yet captured locally.
 
-`pull()` performs one atomic client transition:
+Each bounded `pull()` page performs one atomic client transition:
 
 1. Read a dense full-space `PullResponse` after `tail - 1`.
 2. Decrypt and authenticate every returned operation and validate batch/order
@@ -588,8 +592,9 @@ replayed from retained server history. Pulling must apply backpressure when
 ### Stateless range read
 
 `fetch(range, after)` is client convenience sugar over a one-range `read_at`
-delta. It returns authenticated source operations and the requested scope to
-its caller but performs no MetaStore transition. In particular, it cannot advance admit
+delta. It returns `FetchedRange { range, at, cut }`: authenticated source
+operations, the requested scope, and the `at` cursor required for the next
+fetch. It performs no MetaStore transition. In particular, it cannot advance admit
 `tail` or `neck`, `ver_high`, leases, or checked-submission readiness.
 
 For DeleteRange, a fetch caller that materializes only the requested range
@@ -871,19 +876,17 @@ versions directly instead of carrying compatibility decoders.
 ## Open Decisions
 
 1. Final `PullResponse` and `read_at` response byte/operation limits.
-2. Whether the client admit log stores verified ciphertext (preferred) or
-   decrypted values; iteration always exposes decrypted operations.
-3. Exact persisted split between range tombstones and prefix aggregate count
+2. Exact persisted split between range tombstones and prefix aggregate count
    generations.
-4. Whether DeleteRange ver regression uses a new range-specific error or a
+3. Whether DeleteRange ver regression uses a new range-specific error or a
    generalized target-aware `VerRegression`.
-5. Whether `mark_applied(to)` remains the only neck-advance API or receives
+4. Whether `mark_applied(to)` remains the only neck-advance API or receives
    per-record convenience sugar.
-6. Admit-log byte/record backpressure defaults and the future semantics of
+5. Admit-log byte/record backpressure defaults and the future semantics of
    abandoning pending captures.
-7. Retention tripwires that would justify checkpoints, Merkle consistency
+6. Retention tripwires that would justify checkpoints, Merkle consistency
    proofs, or whole-space checksums for anti-entropy and checkpoint proofs.
 
-Items 1-2 should be resolved before AL3/AL4 as applicable; the others may be
-settled in their owning batch. Visibility, ordering, cursor geometry,
+Item 1 should be resolved before transport adapters; the others may be settled
+in their owning batch. Visibility, ordering, cursor geometry,
 version-floor, and atomicity invariants are not optional API details.

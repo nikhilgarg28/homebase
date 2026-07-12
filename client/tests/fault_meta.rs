@@ -179,6 +179,14 @@ fn admit_log_transitions_are_atomic_across_crash_and_reopen() {
             homebase::meta::AdmitCursors::default(),
             "an unflushed append vanishes completely"
         );
+        assert_eq!(
+            audit(&meta)
+                .await
+                .spaces
+                .get(&SPACE)
+                .and_then(|s| s.ver_high),
+            None
+        );
 
         meta.append_admits(SPACE, &response).await.unwrap();
         sim.flush();
@@ -187,6 +195,7 @@ fn admit_log_transitions_are_atomic_across_crash_and_reopen() {
         let state = audit(&meta).await;
         assert_eq!(state.spaces[&SPACE].admit_cursors.tail, AdmissionSeq(3));
         assert_eq!(state.spaces[&SPACE].admits.len(), 2);
+        assert_eq!(state.spaces[&SPACE].ver_high, Some(Ver(1)));
 
         meta.mark_admits_applied(SPACE, AdmissionSeq(3))
             .await

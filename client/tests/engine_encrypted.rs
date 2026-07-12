@@ -14,7 +14,7 @@ use homebase_core::messages::{
 };
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{AdmittedEntry, DeviceId, DeviceSeq};
+use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, DeviceSeq};
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
@@ -167,9 +167,12 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
             .await
             .unwrap();
         space_handle.push().await.unwrap();
-        let first = space_handle.pull(Range::Prefix(db.clone())).await.unwrap();
-        let RangeCut::Snapshot(entries) = &first.ranges[0] else {
-            panic!("expected snapshot")
+        let first = space_handle
+            .fetch(Range::Prefix(db.clone()), AdmissionSeq(0))
+            .await
+            .unwrap();
+        let RangeCut::Delta(entries) = &first.cut else {
+            panic!("expected delta")
         };
         assert_eq!(entries.len(), 1);
         assert!(
@@ -181,8 +184,11 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
             .await
             .unwrap();
         space_handle.push().await.unwrap();
-        let second = space_handle.pull(Range::Prefix(db)).await.unwrap();
-        let RangeCut::Delta(entries) = &second.ranges[0] else {
+        let second = space_handle
+            .fetch(Range::Prefix(db), first.at)
+            .await
+            .unwrap();
+        let RangeCut::Delta(entries) = &second.cut else {
             panic!("expected delta")
         };
         assert_eq!(entries.len(), 1);

@@ -157,9 +157,12 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
             1
         );
 
-        let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
-        let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
-            panic!("expected snapshot")
+        let pulled = space
+            .fetch(Range::Prefix(db.clone()), AdmissionSeq(0))
+            .await
+            .unwrap();
+        let RangeCut::Delta(entries) = &pulled.cut else {
+            panic!("expected delta")
         };
         let mut expected = snapshot_from_pull(entries);
         expected = replay_oplog_plaintext(
@@ -246,9 +249,12 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
             .await
             .unwrap();
 
-        let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
-        let RangeCut::Snapshot(entries) = &pulled.ranges[0] else {
-            panic!("expected snapshot")
+        let pulled = space
+            .fetch(Range::Prefix(db.clone()), AdmissionSeq(0))
+            .await
+            .unwrap();
+        let RangeCut::Delta(entries) = &pulled.cut else {
+            panic!("expected delta")
         };
         let mut expected = snapshot_from_pull(entries);
 

@@ -69,8 +69,8 @@
 //! with consecutive vers above the high-water (`+1, +2, …` in entry
 //! order — so duplicate keys in one batch behave like a sequence,
 //! mirroring the kernel's own within-batch rule), and pulls raise the
-//! high-water to the maximum ver observed
-//! ([`advance_watermark`](MetaStore::advance_watermark)). By the
+//! high-water to the maximum ver observed, atomically with admit-log append.
+//! By the
 //! acquire-barrier rule a writer has pulled everything under its lease
 //! before writing, so the counter dominates the stored ver of every key
 //! it may touch. (Multilite may additionally keep a per-row shadow tag
@@ -560,7 +560,8 @@ pub trait MetaStore {
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Append one validated dense server pull at the current admit tail.
-    /// Stores every complete batch and advances only `tail`, atomically.
+    /// Stores every complete batch, advances only `tail`, and raises the
+    /// space-local ver high-water from the admitted entries, atomically.
     fn append_admits(
         &self,
         space: SpaceId,
@@ -1381,6 +1382,18 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                 .checked_add(1)
                 .ok_or_else(|| StorageError("admit tail overflow".into()))?,
         );
+        let high = self.store.get(&ver_key(space)).await?.map(|bytes| {
+            VerHighRecord::decode(&bytes)
+                .expect("undecodable ver record")
+                .high
+        });
+        let ver_seen = response
+            .batches
+            .iter()
+            .flat_map(|admitted| admitted.entries.iter())
+            .map(|entry| entry.ver())
+            .max()
+            .unwrap_or(Ver(0));
         let mut batch = WriteBatch::new();
         for admitted in &response.batches {
             batch.put(
@@ -1396,6 +1409,15 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
             .encode(),
         );
+        if high.is_some() || ver_seen > Ver(0) {
+            batch.put(
+                ver_key(space),
+                VerHighRecord {
+                    high: high.unwrap_or(Ver(0)).max(ver_seen),
+                }
+                .encode(),
+            );
+        }
         self.store.apply(batch).await
     }
 
@@ -2261,6 +2283,7 @@ pub mod conformance {
     pub async fn run_all<M: MetaStore>(store: &M) {
         let space = SpaceId([7; 16]);
         let link = SpaceId([8; 16]);
+        let admit_space = SpaceId([9; 16]);
 
         // Fresh: empty, certifiable.
         let state = audit(store).await;
@@ -2283,9 +2306,9 @@ pub mod conformance {
             through: AdmissionSeq(2),
             batches: vec![admitted_batch(1, 1, vec![])],
         };
-        assert!(store.append_admits(space, &malformed).await.is_err());
+        assert!(store.append_admits(admit_space, &malformed).await.is_err());
         assert_eq!(
-            store.admit_cursors(space).await.unwrap(),
+            store.admit_cursors(admit_space).await.unwrap(),
             AdmitCursors::default()
         );
 
@@ -2304,10 +2327,10 @@ pub mod conformance {
                 admitted_batch(2, 2, vec![]),
             ],
         };
-        store.append_admits(space, &pulled).await.unwrap();
+        store.append_admits(admit_space, &pulled).await.unwrap();
         let state = audit(store).await;
         assert_eq!(
-            state.spaces[&space].admit_cursors,
+            state.spaces[&admit_space].admit_cursors,
             AdmitCursors {
                 head: AdmissionSeq(1),
                 neck: AdmissionSeq(1),
@@ -2316,65 +2339,77 @@ pub mod conformance {
         );
         assert_eq!(
             store
-                .admitted_batches(space, AdmissionSeq(1), AdmissionSeq(2))
+                .admitted_batches(admit_space, AdmissionSeq(1), AdmissionSeq(2))
                 .await
                 .unwrap(),
             pulled.batches
         );
         assert!(
-            state.spaces[&space].admits[&AdmissionSeq(2)]
+            state.spaces[&admit_space].admits[&AdmissionSeq(2)]
                 .entries
                 .is_empty()
         );
 
         assert!(
-            store.append_admits(space, &pulled).await.is_err(),
+            store.append_admits(admit_space, &pulled).await.is_err(),
             "a stale pull cannot fork the local dense suffix"
         );
         assert!(
             store
-                .mark_admits_applied(space, AdmissionSeq(4))
+                .mark_admits_applied(admit_space, AdmissionSeq(4))
                 .await
                 .is_err()
         );
         assert!(
-            store.trim_admits(space, AdmissionSeq(2)).await.is_err(),
+            store
+                .trim_admits(admit_space, AdmissionSeq(2))
+                .await
+                .is_err(),
             "captured but unapplied batches cannot be trimmed"
         );
 
         store
-            .mark_admits_applied(space, AdmissionSeq(3))
+            .mark_admits_applied(admit_space, AdmissionSeq(3))
             .await
             .unwrap();
         assert!(
             store
-                .mark_admits_applied(space, AdmissionSeq(2))
+                .mark_admits_applied(admit_space, AdmissionSeq(2))
                 .await
                 .is_err(),
             "application coverage cannot regress"
         );
-        store.trim_admits(space, AdmissionSeq(2)).await.unwrap();
+        store
+            .trim_admits(admit_space, AdmissionSeq(2))
+            .await
+            .unwrap();
         let state = audit(store).await;
-        assert_eq!(state.spaces[&space].admit_cursors.head, AdmissionSeq(2));
         assert_eq!(
-            state.spaces[&space]
+            state.spaces[&admit_space].admit_cursors.head,
+            AdmissionSeq(2)
+        );
+        assert_eq!(
+            state.spaces[&admit_space]
                 .admits
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
             vec![AdmissionSeq(2)]
         );
-        store.trim_admits(space, AdmissionSeq(3)).await.unwrap();
+        store
+            .trim_admits(admit_space, AdmissionSeq(3))
+            .await
+            .unwrap();
         let state = audit(store).await;
         assert_eq!(
-            state.spaces[&space].admit_cursors,
+            state.spaces[&admit_space].admit_cursors,
             AdmitCursors {
                 head: AdmissionSeq(3),
                 neck: AdmissionSeq(3),
                 tail: AdmissionSeq(3),
             }
         );
-        assert!(state.spaces[&space].admits.is_empty());
+        assert!(state.spaces[&admit_space].admits.is_empty());
 
         // Two spaces have independent sequence and version streams.
         let first = commit_entries(

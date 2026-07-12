@@ -515,7 +515,7 @@ space.push_until(seq: DeviceSeq) -> PushOutcome
 
 // Ops-only inbound log surface.
 space.pull() -> AdmissionSeq
-space.fetch(range: Range, after: AdmissionSeq) -> RangeCut // one-range read_at sugar
+space.fetch(range: Range, after: AdmissionSeq) -> FetchedRange { range, at, cut }
 space.admits().iter_from_neck() -> Iterator<AdmittedBatch>
 space.admits().mark_applied(to: AdmissionSeq) -> ()
 space.admits().trim(to: AdmissionSeq) -> ()

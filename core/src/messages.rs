@@ -260,12 +260,12 @@ impl AdmissionResponse {
 /// batch. Empty rollback batches have an empty `entries` vector but retain
 /// the rest of their identity here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AdmittedBatch {
+pub struct AdmittedBatch<T = OpaqueValue> {
     pub admission_seq: AdmissionSeq,
     pub device: DeviceId,
     pub device_seq: DeviceSeq,
     pub checksum: DeviceChecksum,
-    pub entries: Vec<AdmittedEntry>,
+    pub entries: Vec<AdmittedEntry<T>>,
 }
 
 /// Reads a dense prefix of the retained server admission log after `after`.
@@ -286,7 +286,7 @@ pub struct PullResponse {
     pub batches: Vec<AdmittedBatch>,
 }
 
-impl AdmittedBatch {
+impl<T> AdmittedBatch<T> {
     /// Validates all redundant batch/entry ordering and device metadata.
     pub fn validate(&self) -> Result<(), PullDensityError> {
         u32::try_from(self.entries.len()).map_err(|_| PullDensityError::OperationCountOverflow)?;
