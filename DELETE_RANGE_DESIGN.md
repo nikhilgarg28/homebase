@@ -485,9 +485,10 @@ It does not contain the current admitted KV map and cannot answer application
 point or range reads locally. The reference `OrderedMetaStore` reserves a
 separate `Data` namespace for cohabitants but never reads or writes it.
 
-The legacy MetaStore watermark records remain temporarily for AL7 cleanup, but
-no client pull or lease path advances or consults them. The admit log now keeps
-capture and application separate without introducing a managed replica.
+MetaStore has no range-watermark records or transitions. Stateful replication
+progress exists only in the dense admit log; stateless `fetch` callers own
+their cursors outside MetaStore. This keeps capture and application separate
+without introducing a managed replica.
 
 ## Ops-Only API
 

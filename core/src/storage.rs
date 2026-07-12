@@ -4,7 +4,7 @@
 //! shard through [`OrderedStore`] (slatedb in production — behind the
 //! server crate's `slatedb` feature — local-NVMe object store for dev, S3
 //! for prod). The client persists its own durable state — device identity,
-//! per-space seq/oplog/watermarks/leases — through the *same* trait, so one
+//! per-space submit/admit logs, cursors, version high-water, and leases — through the *same* trait, so one
 //! storage vocabulary serves both halves and the sim's fault-injecting
 //! store can torture either side. The trait is async and fallible because
 //! production backends do real IO that can fail. [`MemoryStore`] backs

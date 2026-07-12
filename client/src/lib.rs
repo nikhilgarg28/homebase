@@ -11,7 +11,7 @@
 //!
 //! - [`meta`] — **contract 2 of 3**: [`MetaStore`](meta::MetaStore), a
 //!   device's durable truth (global identity and clock tripwire; per-space
-//!   oplog cursors, version high-water, range watermarks, leases, and codec cache) expressed as the transition
+//!   submit/admit cursors and logs, version high-water, leases, and codec cache) expressed as the transition
 //!   vocabulary itself — every method one atomic, durable, async step.
 //!
 //! - [`client`] — the device-scoped coordinator: one store, one device
