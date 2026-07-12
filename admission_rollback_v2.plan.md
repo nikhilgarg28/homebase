@@ -542,6 +542,7 @@ and mutates none of this client state.
 
 1. Reserve a `DeviceSeq` and consecutive `ver` values from the space-local disk `ver_high` for each mutation.
 2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require a live local read or write lease whose prefix covers it, require admit `neck > lease.barrier`, and require `neck > upto`. Because neck is the complete applied server-log prefix, no range-local coverage map is needed. Server admission remains authoritative.
+   The application must issue a truthful assertion: in its durably applied state `[1, neck)`, the maximum relevant foreign admission for each declared prefix is `<= upto`, and every foreign-sensitive input range is declared. `upto = neck - 1` is the ordinary current-cut choice; an older optimistic cut requires the application to establish that no relevant operation in `(upto, neck)` invalidated its decision. A live covering lease keeps a valid predicate stable until expiry/unlease; afterward the server assertion catches any later foreign race.
 3. **`submit_unchecked`:** skip the local lease/range-assert gate; server admission still decides.
 4. **`reserve_commit`** → build sealed `DeviceEntry` values with `encode_device_entry` → atomically append the finished `DeviceOp::Commit` to `MetaStore`.
 5. Return `Submission { seq }` after durable local append.

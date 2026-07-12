@@ -154,7 +154,7 @@ fn encrypted_empty_set_and_delete_roundtrip_through_pull() {
         let space_handle = client.space(space).await.unwrap();
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"empty"]);
-        space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
+        space_handle.lease(vec![wspec(&db, 60)]).await.unwrap();
 
         space_handle
             .submit_checked(
@@ -226,12 +226,12 @@ fn encrypted_resume_keeps_wall_clock_authority() {
             .unwrap();
             client.attach(&envelope).await.unwrap();
             let space_handle = client.space(space).await.unwrap();
-            let granted = space_handle.ensure(vec![wspec(&db, 3_600)]).await.unwrap();
+            let granted = space_handle.lease(vec![wspec(&db, 3_600)]).await.unwrap();
             space_handle
                 .submit_checked(vec![set(row.clone(), b"secret")], vec![])
                 .await
                 .unwrap();
-            granted.leases[0].id
+            granted[0].id
         };
 
         let state = audit(&OrderedMetaStore::new(&mem)).await;
@@ -289,8 +289,8 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
-        let lease = granted.leases[0].id;
+        let granted = space_handle.lease(vec![wspec(&db, 60)]).await.unwrap();
+        let lease = granted[0].id;
         space_handle
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
             .await
@@ -383,7 +383,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
 }
 
 #[test]
-fn push_stall_recovers_via_ensure() {
+fn push_stall_recovers_via_lease() {
     block_on(async {
         let envelope = SpaceEnvelope::mint(NameKey([24; 32]), SpaceKey([25; 32]));
         let space = envelope.space_id();
@@ -405,7 +405,7 @@ fn push_stall_recovers_via_ensure() {
 
         let db = key(&[b"db"]);
         let row = key(&[b"db", b"k"]);
-        space_handle.ensure(vec![wspec(&db, 60)]).await.unwrap();
+        space_handle.lease(vec![wspec(&db, 60)]).await.unwrap();
         space_handle
             .submit_checked(vec![set(row.clone(), b"v")], vec![])
             .await

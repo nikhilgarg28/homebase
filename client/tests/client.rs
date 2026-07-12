@@ -142,8 +142,8 @@ fn multi_space_uses_independent_seq_streams_with_distinct_ciphertext() {
 
         let space_a = client.space(id_a).await.unwrap();
         let space_b = client.space(id_b).await.unwrap();
-        space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
-        space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
+        space_a.lease(vec![wspec(&db_a, 60)]).await.unwrap();
+        space_b.lease(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
             .submit_checked(vec![set(row_a.clone(), b"alpha")], vec![])
@@ -250,8 +250,8 @@ fn space_push_does_not_drain_another_space() {
 
         let space_a = client.space(id_a).await.unwrap();
         let space_b = client.space(id_b).await.unwrap();
-        space_a.ensure(vec![wspec(&db_a, 60)]).await.unwrap();
-        space_b.ensure(vec![wspec(&db_b, 60)]).await.unwrap();
+        space_a.lease(vec![wspec(&db_a, 60)]).await.unwrap();
+        space_b.lease(vec![wspec(&db_b, 60)]).await.unwrap();
 
         space_a
             .submit_checked(vec![set(row_a1.clone(), b"a1")], vec![])
@@ -312,7 +312,7 @@ fn offline_commit_survives_until_online_push() {
             .unwrap();
             client.attach(&envelope).await.unwrap();
             let online_space = client.space(space).await.unwrap();
-            online_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
+            online_space.lease(vec![wspec(&db, 60)]).await.unwrap();
         }
 
         let offline = open_offline(
@@ -386,7 +386,7 @@ fn resume_from_codec_cache_decrypts_without_envelope() {
             let db = key(&[b"db"]);
             let row = key(&[b"db", b"k"]);
             let space = client.space(space).await.unwrap();
-            space.ensure(vec![wspec(&db, 60)]).await.unwrap();
+            space.lease(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .submit_checked(vec![set(row.clone(), b"cached")], vec![])
                 .await
@@ -439,7 +439,7 @@ fn encrypted_init_roundtrips_through_push_and_pull() {
         writer.attach(&envelope).await.unwrap();
         {
             let writer_space = writer.space(space).await.unwrap();
-            writer_space.ensure(vec![wspec(&db, 60)]).await.unwrap();
+            writer_space.lease(vec![wspec(&db, 60)]).await.unwrap();
             writer_space
                 .submit_checked(vec![set(row.clone(), b"roundtrip")], vec![])
                 .await

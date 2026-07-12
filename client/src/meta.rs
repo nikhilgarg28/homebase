@@ -221,15 +221,14 @@ pub struct CodecRecord {
 /// which is what keeps offline authority across restarts. The clock
 /// high-water is the tripwire for wall regression: a poisoned open
 /// zeroes the stamp (structurally dead) until a renewal re-stamps it.
+/// The immutable admission barrier remains in [`Lease::barrier`]; this record
+/// is usable only when the space's durable admit `neck` is greater than it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldLease {
     pub lease: Lease,
     /// Send time + granted TTL, stamped by the incarnation that heard
     /// the grant.
     pub deadline: HybridTimestamp,
-    /// Fresh acquires are not local authority until the effective watermark
-    /// for this lease prefix has reached the grant's barrier. Renewals preserve this.
-    pub barrier: Option<AdmissionSeq>,
     /// A release intent has been durably recorded. Forgotten leases are
     /// never local authority, but keep the id so the server release can
     /// be retried after a crash.
@@ -1766,7 +1765,7 @@ impl CodecRecord {
 impl HeldLease {
     pub fn encode(&self) -> Vec<u8> {
         let l = &self.lease;
-        let mut out = Vec::with_capacity(1 + 8 + 1 + 8 * 5 + 16 * 2 + 10);
+        let mut out = Vec::with_capacity(1 + 8 + 1 + 8 * 5 + 16 * 2 + 1);
         out.push(LEASE_RECORD_VERSION);
         out.extend_from_slice(&l.id.0.to_be_bytes());
         out.push(match l.mode {
@@ -1784,13 +1783,6 @@ impl HeldLease {
         out.extend_from_slice(&self.deadline.mono.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.lineage.0);
         out.push(self.forgotten as u8);
-        match self.barrier {
-            Some(barrier) => {
-                out.push(1);
-                out.extend_from_slice(&barrier.0.to_be_bytes());
-            }
-            None => out.push(0),
-        }
         out.extend_from_slice(&l.prefix.encode());
         out
     }
@@ -1825,11 +1817,6 @@ impl HeldLease {
             1 => true,
             _ => return None,
         };
-        let barrier = match r.u8()? {
-            0 => None,
-            1 => Some(AdmissionSeq(r.u64()?)),
-            _ => return None,
-        };
         let prefix = Key::decode(r.rest()).ok()?;
         Some(Self {
             lease: Lease {
@@ -1842,7 +1829,6 @@ impl HeldLease {
                 barrier: lease_barrier,
             },
             deadline,
-            barrier,
             forgotten,
         })
     }
@@ -2190,7 +2176,6 @@ pub mod conformance {
                 barrier: AdmissionSeq(13),
             },
             deadline: stamp(1_300),
-            barrier: None,
             forgotten: false,
         }
     }
@@ -2764,7 +2749,6 @@ pub mod conformance {
                 barrier: AdmissionSeq(40),
             },
             deadline: stamp(2_000),
-            barrier: Some(AdmissionSeq(40)),
             forgotten: false,
         };
         store
@@ -2782,7 +2766,6 @@ pub mod conformance {
                 barrier: AdmissionSeq(0),
             },
             deadline: stamp(900),
-            barrier: None,
             forgotten: false,
         };
         store
@@ -2851,7 +2834,6 @@ pub mod conformance {
                 ..sample_lease().lease
             },
             deadline: stamp(5_000),
-            barrier: None,
             forgotten: false,
         };
         store
@@ -2870,7 +2852,6 @@ pub mod conformance {
                 ..sample_lease().lease
             },
             deadline: stamp(9_000),
-            barrier: None,
             forgotten: false,
         };
         store
@@ -2891,7 +2872,6 @@ pub mod conformance {
                 ..sample_lease().lease
             },
             deadline: stamp(10_000),
-            barrier: Some(AdmissionSeq(55)),
             forgotten: false,
         };
         store
@@ -3088,7 +3068,6 @@ mod tests {
                 barrier: AdmissionSeq(17),
             },
             deadline: stamp(1_234),
-            barrier: Some(AdmissionSeq(17)),
             forgotten: true,
         };
         assert_eq!(HeldLease::decode(&lease.encode()), Some(lease));
@@ -3355,7 +3334,6 @@ mod tests {
                 // wall send = 100_000 − 1_000 = 99_000, far past the
                 // high-water: a stamp the recorded timeline never saw.
                 deadline: stamp(100_000),
-                barrier: None,
                 forgotten: false,
             },
         );

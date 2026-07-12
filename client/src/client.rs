@@ -85,7 +85,6 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                     .map(|held| crate::meta::HeldLease {
                         lease: held.lease.clone(),
                         deadline: homebase_core::clock::HybridTimestamp::ZERO,
-                        barrier: held.barrier,
                         forgotten: held.forgotten,
                     })
                     .collect();

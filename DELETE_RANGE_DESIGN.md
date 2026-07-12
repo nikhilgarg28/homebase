@@ -485,9 +485,9 @@ It does not contain the current admitted KV map and cannot answer application
 point or range reads locally. The reference `OrderedMetaStore` reserves a
 separate `Data` namespace for cohabitants but never reads or writes it.
 
-The current implementation advances a range watermark when bytes are pulled,
-which conflates capture with application. The admit log makes those facts
-separate and durable without introducing a managed replica.
+The legacy MetaStore watermark records remain temporarily for AL7 cleanup, but
+no client pull or lease path advances or consults them. The admit log now keeps
+capture and application separate without introducing a managed replica.
 
 ## Ops-Only API
 
@@ -628,6 +628,25 @@ application has processed the complete server log through that assertion cut.
 Fetched `tail` is never application authority. `ver_high`, by contrast, may
 advance at append time because it means "do not reuse an observed version,"
 not "the application has installed this state."
+
+The application owns one essential range-assert invariant. At
+`submit_checked`, `RangeAssert { prefix, upto }` must be true in the
+application state represented by the applied log prefix `[1, neck)`: the
+maximum relevant foreign admission affecting `prefix` is at most `upto`.
+Usually the application can use `upto = neck - 1`; if it uses an older
+optimistic read cut, it must establish that no relevant applied operation in
+`(upto, neck)` invalidated that read. It must also assert every range whose
+foreign state influenced the submitted decision.
+
+Once that predicate is true and a covering lease is live, it remains true
+while the lease continuously reserves the range: own-device and unrelated
+admissions may advance the space sequence, but conflicting foreign admissions
+cannot enter the range. Lease expiry or unlease does not itself falsify the
+predicate; it permits a later relevant foreign admission that may do so. The
+server therefore re-evaluates the literal range predicate at admission and
+rejects any such race. Homebase can verify `neck > upto` and
+`neck > lease.barrier`, but cannot verify that the application's operation was
+actually derived from all and only the ranges it declared.
 
 The client methods are `unlease_checked()` and `unlease_unchecked()`; the wire
 verb remains `release`. Checked unlease preserves a live covering reservation

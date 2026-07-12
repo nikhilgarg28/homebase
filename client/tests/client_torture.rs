@@ -352,11 +352,11 @@ async fn driver(
             }
             Err(err) => panic!("unexpected space open: {err:?}"),
         };
-        if let Err(err) = space.ensure(vec![wspec()]).await {
+        if let Err(err) = space.lease(vec![wspec()]).await {
             match err {
                 SpaceDriverError::Storage(_) => coverage.borrow_mut().storage_errors += 1,
                 SpaceDriverError::Rejected(KernelError::Contended { .. }) => {}
-                other => panic!("unexpected ensure failure: {other:?}"),
+                other => panic!("unexpected lease failure: {other:?}"),
             }
             finish_client(&slot, guard);
             continue;
@@ -442,7 +442,7 @@ async fn drain_push(
                     let mut guard = take_client(slot);
                     let client = guard.client.as_mut().unwrap();
                     let space = client.space(SPACE).await.unwrap();
-                    let _ = space.ensure(vec![wspec()]).await;
+                    let _ = space.lease(vec![wspec()]).await;
                     finish_client(slot, guard);
                 }
             }

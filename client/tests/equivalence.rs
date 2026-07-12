@@ -138,7 +138,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        space.ensure(vec![wspec(&db)]).await.unwrap();
+        space.lease(vec![wspec(&db)]).await.unwrap();
 
         space
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
@@ -237,7 +237,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
         .unwrap();
         client.attach(&envelope).await.unwrap();
         let space = client.space(space_id).await.unwrap();
-        space.ensure(vec![wspec(&db)]).await.unwrap();
+        space.lease(vec![wspec(&db)]).await.unwrap();
 
         space
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
