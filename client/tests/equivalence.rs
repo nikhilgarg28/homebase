@@ -264,6 +264,7 @@ fn encrypted_pull_plus_oplog_matches_server_after_push() {
                     device_entry: device_entry.clone(),
                     admission: AdmissionTag {
                         admission_seq: AdmissionSeq(0),
+                        op_index: 0,
                     },
                 };
                 let plain = cipher.open_admitted_entry(&entry).unwrap();

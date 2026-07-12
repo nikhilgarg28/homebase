@@ -18,7 +18,7 @@ todos:
     content: "Phase 4: Client meta — per-space oplogs/ver_high, rollback(to), head/neck/tail persisted, forgotten lease release intents, certify [neck,tail), reserve_batch only, drop discard_from"
     status: pending
   - id: p5-data-submit
-    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose ensure()+release_checked/release_unchecked, no public acquire()"
+    content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose lease()+unlease_checked/unlease_unchecked, no public acquire()"
     status: pending
   - id: p6-push-ack
     content: "Phase 6: Push + ack — PushOptions, disk head/neck/tail only, push_until wait-through, Submission::push sugar, data-only ack, Fork trim vs rollback"
@@ -126,19 +126,28 @@ sequenceDiagram
     Server-->>Push: per-batch results
     Push->>Meta: trim data oplog
 
+    Note over App,Server: Stateless range observation
+    App->>Space: fetch(range, after)
+    Space->>Server: fetch_range(range, after)
+    Server-->>App: filtered operations + through cut
+    Note over App,Meta: No client MetaStore transition
+
     Note over App,Server: Lease reservation path
-    App->>Space: ensure(specs)
+    App->>Space: lease(specs)
     Space->>Server: acquire(specs)
     Server-->>Space: leases with requested_at + prefix barriers
-    Space->>Server: read_at(prefixes)
-    Space->>Meta: record leases + advance watermarks
+    Space->>Server: read full admission log after tail - 1
+    Space->>Meta: append exact admitted batches at server seqs
+    Space-->>App: held leases (usable only when neck > barrier)
+    App->>Meta: mark_applied(to) moves admit neck
 
     Note over App,Server: Lease repair path
     App->>Space: repair_leases()
     Space->>Server: list_leases(device)
     Server-->>Space: leases with requested_at + prefix barriers
-    Space->>Server: read_at(prefixes)
-    Space->>Meta: reconcile active leases + advance watermarks
+    Space->>Server: read full admission log through needed barriers
+    Space->>Meta: reconcile leases + append exact batches
+    App->>Meta: mark_applied(to) moves admit neck
 
     Note over App,Server: Abandon path (caller-driven)
     Push-->>App: Stalled / Rejected
@@ -287,7 +296,7 @@ pub struct Lease {
 }
 ```
 
-- `barrier` is **prefix-scoped in meaning** and global only in type: it is an `AdmissionSeq`, but its value is `effective_prefix_max(lease.prefix)` at grant/refresh time, not the server's global admission high-water. Writes outside the leased prefix/range do not affect the barrier the client must pull before treating the lease as local authority.
+- `barrier` is **prefix-scoped in meaning** but shares the global `AdmissionSeq` domain: its value is `effective_prefix_max(lease.prefix)` at grant/refresh time, not the server's global admission high-water. The client nevertheless replicates the complete dense server log through that sequence before the lease can become application authority; unrelated writes do not raise the barrier but may be replayed on the way to it.
 - `requested_at` is minted by the client before sending the acquire/refresh request and stored on the lease. The server does not compare it with server time and must not use it for authority; it returns it so the owning client can anchor local deadline math in the client time domain.
 - Server lease expiry remains server-domain: `granted_at + ttl`. Client local usability is conservative: for bounded leases, local authority expires at `requested_at + ttl - margin`. Because the server grants at or after the client request timestamp, this may expire local authority earlier than server authority, preserving the subset invariant.
 
@@ -306,7 +315,7 @@ pub struct ListLeasesResponse {
 - `ListLeasesResponse.leases` contains all active leases in the space held by `device`.
 - Leases carry original client `requested_at`, server `granted_at`, and original `ttl`, not remaining TTL. Server timestamps are never compared directly to client timestamps.
 - `ListLeasesResponse` does **not** include `server_now`. For bounded leases, the client reconstructs its conservative local deadline from the returned lease as `requested_at + ttl - margin`.
-- Each lease's `barrier` is the prefix-scoped `effective_prefix_max(prefix)` when that lease was granted/refreshed. Repaired leases are not local authority until their prefixes are pulled through their own barriers.
+- Each lease's `barrier` is the prefix-scoped `effective_prefix_max(prefix)` when that lease was granted/refreshed. Repaired leases are not local authority until the complete admit-log prefix is captured and applied so `neck > barrier`.
 - Client reconciliation records listed leases as Active/pending-barrier, drops local Active leases absent from the server response, and clears Forgotten release intents absent from the server response. Forgotten leases still present on the server remain Forgotten for retry.
 
 ### Admission shape
@@ -504,34 +513,53 @@ impl Submission {
 space.push() -> PushOutcome
 space.push_until(seq: DeviceSeq) -> PushOutcome
 
+// Ops-only inbound log surface.
+space.pull() -> AdmissionSeq
+space.fetch(range: Range, after: AdmissionSeq) -> RangeFetch
+space.admits().iter_from_neck() -> Iterator<AdmittedBatch>
+space.admits().mark_applied(to: AdmissionSeq) -> ()
+space.admits().trim(to: AdmissionSeq) -> ()
+
 // Lease reservation surface.
-space.ensure(specs: Vec<LeaseSpec>) -> Ensured
-space.release_checked(leases: Vec<LeaseId>) -> Released
-space.release_unchecked(leases: Vec<LeaseId>) -> Released
-space.repair_leases() -> RepairedLeases
+space.lease(specs: Vec<LeaseSpec>) -> Vec<Lease>
+space.unlease_checked(leases: Vec<LeaseId>) -> ()
+space.unlease_unchecked(leases: Vec<LeaseId>) -> ()
+space.repair_leases() -> Vec<Lease>
 ```
 
-**Removed:** public `acquire()` and `Acquired`. `ensure()` is the only acquisition API and always performs the barrier pull before returning local authority. `release_checked()` and `release_unchecked()` remain explicit and sync.
+Each space has independent submit-log and admit-log `head/neck/tail` cursors.
+Admit cursors are exclusive server `AdmissionSeq` positions. Pull appends
+complete dense server batches at those same sequence numbers and moves admit
+`tail`.
+The application advances admit `neck` with `mark_applied`; `trim(to)` may move
+admit `head` only through `neck`. Homebase never applies operations or stores a
+materialized KV replica. `fetch(range, after)` is an observational server read
+and mutates none of this client state.
+
+**Removed:** public `acquire()` and `Acquired`. `lease()` is the only reservation API. It may acquire or reuse server reservations and pulls the complete server log until `tail > barrier`. Returned leases are held reservations but become locally usable only when admit `neck > barrier`. `unlease_checked()` and `unlease_unchecked()` remain explicit and sync. The wire verbs stay `acquire` and `release`.
 
 ### Inside `submit`
 
 1. Reserve a `DeviceSeq` and consecutive `ver` values from the space-local disk `ver_high` for each mutation.
-2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require an Active local read or write lease whose prefix covers it, require the lease barrier to be satisfied, and require the effective local coverage watermark to be greater than or equal to `upto`. Parent pulls cover child assertions; child or sibling pulls do not cover parent/sibling assertions. Server admission remains authoritative.
+2. **`submit_checked`:** locally fast-fail only when the client cannot substantiate the caller's range assertions: for every asserted prefix, require a live local read or write lease whose prefix covers it, require admit `neck > lease.barrier`, and require `neck > upto`. Because neck is the complete applied server-log prefix, no range-local coverage map is needed. Server admission remains authoritative.
 3. **`submit_unchecked`:** skip the local lease/range-assert gate; server admission still decides.
 4. **`reserve_commit`** → build sealed `DeviceEntry` values with `encode_device_entry` → atomically append the finished `DeviceOp::Commit` to `MetaStore`.
 5. Return `Submission { seq }` after durable local append.
 6. `Submission::push()` is convenience only: it calls `space.push_until(seq).await` and extracts the disposition for this exact seq. It does not add a second admission/await mechanism.
 7. There is no empty-oplog precondition for `Submission::push()`. Semantics match "submit locally, then push through my seq"; earlier queued ops in the same space may be pushed first as part of reaching the target seq.
 
-### Inside `ensure` / `release`
+### Inside `lease` / `unlease`
 
-- `ensure()` mints client `requested_at`, calls the server `acquire` verb directly, records returned leases with local deadlines derived from `lease.requested_at + lease.ttl`, pulls every prefix needed to satisfy each lease's grant barrier, advances watermarks, and only then returns.
-- `ensure()` is allowed with non-empty local oplogs; it does not push buffered data first.
+- `lease()` mints client `requested_at`, calls the server `acquire` verb directly when needed, records returned leases with local deadlines derived from `lease.requested_at + lease.ttl`, and pulls the complete server log until admit `tail > lease.barrier`. It returns held leases without applying their records.
+- Lease usability is derived, never stored as a pending bit: `held && live && admit_neck > lease.barrier`.
+- Admit-log append atomically advances `tail` and `ver_high`; `mark_applied` atomically advances `neck`. Checked assertions require `neck > upto`. Stateless range fetch changes none of these facts.
+- `lease()` is allowed with non-empty local oplogs; it does not push buffered data first.
 - Every `DeviceOp::Commit` persists a local-only `SubmitMode::{Checked, Unchecked}` field. It is not sent to the server or included in AAD.
-- `release_checked()` scans active checked commits and refuses to remove the last live covering reservation for any queued range assertion. Coverage is re-evaluated after excluding the complete release set; unchecked commits do not block it.
-- `release_unchecked()` skips that guard. Both release methods first mark leases Forgotten locally, then call the server `release` verb, and delete them locally only after success. Release is not appended to the oplog.
+- `unlease_checked()` scans active checked commits and refuses to remove the last live covering reservation for any queued range assertion. Coverage is re-evaluated after excluding the complete unlease set; unchecked commits do not block it. A replacement reservation may preserve server exclusion for an already-validated submission even while `neck <= its barrier`, but it cannot validate a new local check until neck passes that barrier.
+- `unlease_unchecked()` skips that guard. Both unlease methods first mark leases Forgotten locally, then call the server `release` verb, and delete them locally only after success. Unlease is not appended to the oplog.
+- An unapplied lease may be unleased. Later admit-neck advancement must not recreate or return a released, forgotten, or expired lease.
 - A failed/unavailable release leaves Forgotten records behind for retry; callers and local checks treat them as already gone.
-- `repair_leases()` first calls `list_leases(device)` without changing local state. After a successful response, it atomically reconciles Active/Forgotten records, clears records no longer live server-side, stamps repaired deadlines from each returned lease's `requested_at + ttl`, pulls each active prefix through its own grant barrier, and only then exposes repaired leases as usable. An unavailable repair leaves existing conservative local authority unchanged.
+- `repair_leases()` first calls `list_leases(device)` without changing local state. After a successful response, it atomically reconciles Active/Forgotten records, clears records no longer live server-side, stamps repaired deadlines from each returned lease's `requested_at + ttl`, and pulls the complete missing server-log suffix. It never applies or discards admit records. An unavailable repair leaves existing conservative local authority unchanged.
 - Renewal requests carry a fresh client `requested_at`; the server stores it with the refreshed `granted_at` and TTL so a later repair can reconstruct the deadline entirely in the client's clock domain.
 
 ### Cipher
@@ -541,7 +569,7 @@ space.repair_leases() -> RepairedLeases
 - **Delete:** encrypt empty plaintext → `Seal` only; **Set:** encrypt payload → `Seal` + ciphertext.
 - **`open_admitted_entry`** on read: verify the seal and return `AdmittedEntry<Vec<u8>>` with the same mutation shape.
 
-**Exit:** space driver tests for data submit API, `ensure()` barrier pull, release, release retry after unavailable server, lease repair after local state loss/staleness, and acquire/release/list_leases working while local data oplogs are non-empty.
+**Exit:** space driver tests for data submit API, admit-log lease gating, unlease, unlease retry after unavailable server, lease repair after local state loss/staleness, and acquire/release/list_leases working while local submit logs are non-empty.
 
 ---
 
@@ -600,7 +628,7 @@ space.repair_leases() -> RepairedLeases
 
 | API | Meaning | On stall/failure |
 |-----|---------|------------------|
-| `space.submit_checked(ops, asserts)` | Local append after local lease/range-assert gate; requires Active covering lease state and local coverage watermark `>= upto` for each assert; returns `Submission { seq }` | Caller owns retry/push/rollback policy |
+| `space.submit_checked(ops, asserts)` | Local append after local lease/range-assert gate; requires a live covering lease plus admit `neck > lease.barrier` and `neck > upto`; returns `Submission { seq }` | Caller owns retry/push/rollback policy |
 | `space.submit_unchecked(ops, asserts)` | Local append without local gate; server admission still decides | Caller owns retry/push/rollback policy |
 | `space.push()` | Push this space's oplog as far as possible | Returns stream outcome |
 | `space.push_until(seq)` | Push this space until `seq` is acked/failed/stalled | Returns outcome containing disposition for relevant seqs |
@@ -612,7 +640,11 @@ space.repair_leases() -> RepairedLeases
 let submission = space.submit_checked(set_ops, asserts).await?;
 let receipt = submission.push().await?;
 
-space.ensure(vec![write_spec(db)]).await?;  // allowed even with pending data
+let leases = space.lease(vec![write_spec(db)]).await?; // may append admit records
+for batch in space.admits().iter_from_neck().await? {
+    consumer.apply_atomically(&batch)?;
+    space.admits().mark_applied(batch.admission_seq.next()).await?;
+}
 space.push().await?;
 ```
 
@@ -625,12 +657,12 @@ space.push().await?;
 | Area | Action |
 |------|--------|
 | `client/tests/rollback.rs` | New — `submit_checked` / `submit_unchecked`, `push_until`, `Submission::push`, stall, rollback marker, cursors |
-| `client/tests/common/mod.rs` | Test helpers only (`set_op`, `blocking_ensure`, `blocking_release`, …) — **not** exported from crate |
+| `client/tests/common/mod.rs` | Test helpers only (`set_op`, `blocking_lease`, `blocking_unlease`, …) — **not** exported from crate |
 | `engine.rs` / torture / equivalence / sim | Update for AdmissionBatch shape, data-only submit/push, Fork trim |
 | meta conformance | per-space head/neck/tail; space-local `ver_high`; certify `[neck,tail)` per space |
 | lease release | Forgotten lease is not authority, survives failed release, retries until remote ack deletes it |
 | lease deadlines | local usability margin is `max(ttl / 1000, 10ms)` |
-| lease repair | `list_leases` restores active server leases with per-lease prefix barrier pull, uses returned `requested_at + ttl` for local deadlines, drops stale local Active leases, and clears acked Forgotten leases |
+| lease repair | `list_leases` restores server leases, full-log pull captures through their barriers, returned `requested_at + ttl` reconstructs local deadlines, stale Active and acked Forgotten records clear, and restored leases remain unusable until admit `neck > barrier` |
 | client event loop | coordination-state transitions are serialized through the loop; blocking SQLite/bulk crypto are offloaded; network/timers return via channels |
 | server props | sequential ops, assert aggregation, per-batch results, multi-batch all-or-nothing, write-without-lease, lease-conflict rejection |
 
@@ -677,7 +709,7 @@ Items from conversation + `TODO.md` — **not** scheduled in v2 rebuild unless y
 - **`resume_pending()`** after open when online (`push_until` wait-through / rollback marker push / offline push retry semantics).
 - Client-level oplog for cross-space / two-phase commits if needed later.
 - **`verify` Cargo feature** — gate `meta::conformance`, `server::conformance`, `audit()`; keep `certify` always on.
-- Export `blocking_ensure` / `blocking_release` from crate vs test-only helpers.
+- Export `blocking_lease` / `blocking_unlease` from crate vs test-only helpers.
 
 ### Server / kernel
 
@@ -721,11 +753,13 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | B10a Causal range assertions | Rename `RangeAssert.at` to inclusive `upto`; maintain the two greatest historical admission points from distinct devices per prefix; server checks maximum excluding the submitting device `<= upto`; local checked gate requires an Active covering read/write lease with satisfied barrier and effective coverage watermark `>= upto`; preserve same-device dependent submissions across coalesced and split pushes | core/schema roundtrips; same-device offline dependency chain in one and multiple requests; foreign write after `upto` rejects; foreign write remains visible after own overwrite/delete; parent lease+watermark covers child; sibling and child coverage reject; local watermark above `upto` accepts; document same-device fork test as completed by B14 | core/server/client docs for inclusive `upto`, top-two distinct-device history, local coverage direction, offline chains, and B14 dependency |
 | B11 Cipher integration | Implement sealing with scheme/op kind/anonymized key/write context/`cipher_epoch`; delete seal over empty plaintext; Set uses a non-empty plaintext frame before AEAD | cipher tests for Set/Delete roundtrip, empty Set has non-empty ciphertext, key mismatch failure, op-kind replay failure, unknown scheme failure | cipher docs for AEAD AAD fields, Set plaintext framing, and `SealScheme` conversions |
 | B11a Canonical entry model | Replace intermediate `BatchOp`/`PutEntry`/`Value`/combined `Tag` shapes with `Mutation`, `DeviceTag`, `DeviceEntry`, `AdmissionTag`, and `AdmittedEntry`; rename `PutBatch` family to `AdmissionBatch`/`AdmissionRequest`/`AdmissionResponse`; rename local oplog record to `DeviceOp`; represent rollback on wire as empty `entries` | full core/server/client/sim target checks; cipher tamper tests; engine, crash, equivalence, and torture suites migrated to the canonical object boundaries | core tag/messages docs plus this plan and DESIGN terminology |
-| B12 Lease client API | Expose `ensure`, `release_checked`, `release_unchecked`, `repair_leases`; remove public acquire; persist local `SubmitMode`; implement Forgotten release intents, `max(TTL/1000, 10ms)` deadline margin, barrier pulls, and client-stamped renewals; initially re-evaluate checked assertion coverage by scanning the active oplog and track an indexed optimization in `TODO.md` | client lease tests for ensure barrier pull, non-empty oplog ensure, checked release blocks only checked assertions losing their last reservation, unchecked release, forgotten release retry, repair drops stale Active and clears acked Forgotten, unavailable repair preserves local state, renewal repair deadline reconstruction | lease/client docs for subset invariant, guarded release, and repair algorithm |
+| B12 Lease client API | Expose the initial `ensure`, checked/unchecked release, and `repair_leases` implementation; remove public acquire; persist local `SubmitMode`; implement Forgotten release intents, `max(TTL/1000, 10ms)` deadline margin, barrier pulls, and client-stamped renewals; initially re-evaluate checked assertion coverage by scanning the active oplog and track an indexed optimization in `TODO.md`. The durable admit-log correction is ratified in B15 and implemented by AL1-AL7. | client lease tests for barrier pull, non-empty oplog acquisition, checked release blocks only checked assertions losing their last reservation, unchecked release, forgotten release retry, repair drops stale Active and clears acked Forgotten, unavailable repair preserves local state, renewal repair deadline reconstruction | lease/client docs for subset invariant, guarded release, repair algorithm, and the later admit-log correction |
 | B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits an empty-entry wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
 | B14 Fork/trim + cumulative checksum | Add per-space persisted confirmed `DeviceChecksum`; server recomputes a cumulative canonical batch hash and requires the expected prior checksum; atomically advance the client checksum with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; empty rollback-batch chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative checksum, duplicate device identity, catch-up trim, and honest-server threat boundary |
-| B15 Prefix aggregate + DeleteRange prep | Keep `live_count`; harden delete-aware snapshot paths; design-only prep for `DeleteRange` aggregate strategy | aggregate regression tests for repeated delete, delete-present flips, zero-length Set | server docs for why live_count remains and DeleteRange prerequisites |
-| B16 Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit wording and link this plan |
+| B15 Admit-log + DeleteRange design | Keep `live_count`; ratify exact append-only server admissions, per-space client admit `head/neck/tail` in server `AdmissionSeq`, full-log `pull`, stateless arbitrary-range `fetch`, `mark_applied`, trim-through-neck, neck-gated leases, `AdmissionOrder`, full root metadata, range tombstones, and the reference-model method | design review plus point-delete aggregate regressions; `git diff --check` | link `DELETE_RANGE_DESIGN.md`; state that Homebase is an ops/log service with no managed KV application layer |
+| AL1-AL7 Admit-log implementation | Execute the seven independently tested admit-log batches defined in `DELETE_RANGE_DESIGN.md`, then remove the old snapshot/delta/changelog path | tests and docs listed per AL batch | update owning core/server/client module in every batch |
+| DR1-DR9 DeleteRange implementation | Execute the nine independently tested range-delete batches defined in `DELETE_RANGE_DESIGN.md`; keep public admission rejected through DR7 and enable it only with client integration in DR8 | tests and docs listed per DR batch | update owning module and standalone design in every batch |
+| Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit/snapshot-delta wording and link this plan |
 
 Suggested commit messages: `batch NN: <short description>`. Promote optional or backlog work only by adding a new batch with its own tests/docs row.
 
@@ -733,10 +767,10 @@ Suggested commit messages: `batch NN: <short description>`. Promote optional or 
 
 ## Key risks (updated)
 
-1. **Split data/lease API** — data writes go through `submit_checked` / `submit_unchecked`; lease reservation uses `ensure()` and explicit checked/unchecked release methods, never the oplog.
-2. **Local lease subset invariant** — release must mark Forgotten before network IO; Forgotten leases are retry state, not authority.
+1. **Two-log API** — outgoing writes use the submit log; incoming exact admissions use the admit log. Homebase captures and exposes operations but never applies them to a KV replica.
+2. **Local lease subset invariant** — usability is derived as held + live + `admit_neck > lease.barrier`. Unlease must mark Forgotten before network IO; Forgotten leases are retry state, not authority.
 3. **Per-space oplog migration** — every MetaStore oplog/cursor method must be audited for explicit `space_id`.
-4. **Lease barrier scope** — server-listed or newly acquired leases must not become usable until pulled through each lease's prefix-scoped grant barrier (`effective_prefix_max(prefix)`), not a global high-water.
+4. **Lease barrier scope** — barriers remain prefix-derived values in global `AdmissionSeq`, while client pull is full-space. A lease remains unusable until admit `neck > barrier`; captured `tail` is never application authority.
 5. **Submission push is sugar, not mechanism** — `Submission::push()` must remain a thin wrapper over `space.push_until(seq)` with no empty-oplog precondition and no automatic rollback.
 6. **Lease deadline clock domains** — server expiry uses `granted_at + ttl`; client local authority expiry uses stored client-domain `requested_at + ttl`, then subtracts the `max(ttl / 1000, 10ms)` margin. This may expire locally early, preserving the subset invariant.
 7. **Seal scheme discipline** — present vs delete vs zero-length present must stay unambiguous via explicit wire op + op-kind-bound AAD; `scheme` is only the sealing scheme; empty Set must not leak as empty ciphertext.

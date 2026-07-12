@@ -564,6 +564,7 @@ mod tests {
             device_entry,
             admission: AdmissionTag {
                 admission_seq: AdmissionSeq(0),
+                op_index: 0,
             },
         }
     }

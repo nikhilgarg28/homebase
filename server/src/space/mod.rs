@@ -349,6 +349,7 @@ mod tests {
             }
         );
         assert_eq!(entry.admission.admission_seq, AdmissionSeq(1));
+        assert_eq!(entry.admission.op_index, 0);
         assert_eq!(entry.device_entry.tag.device, dev(1));
         assert_eq!(entry.device_entry.tag.ver, Ver(1));
 
@@ -432,8 +433,10 @@ mod tests {
         let second = got.entries[1].as_ref().unwrap();
         assert_eq!(first.device_entry.tag.device_seq, DeviceSeq(1));
         assert_eq!(first.admission.admission_seq, AdmissionSeq(1));
+        assert_eq!(first.admission.op_index, 0);
         assert_eq!(second.device_entry.tag.device_seq, DeviceSeq(2));
         assert_eq!(second.admission.admission_seq, AdmissionSeq(2));
+        assert_eq!(second.admission.op_index, 0);
     }
 
     #[test]
@@ -864,6 +867,7 @@ mod tests {
                 value: Ciphertext(b"v2".to_vec())
             }
         );
+        assert_eq!(got.entries[0].as_ref().unwrap().admission.op_index, 1);
 
         // …and an equal ver within the batch is a regression.
         let err = admit(

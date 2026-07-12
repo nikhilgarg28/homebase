@@ -141,7 +141,10 @@ pub async fn admit<S: OrderedStore>(
         results.push(AdmissionResult::Applied { admission_seq: seq });
         next_admission_seq = AdmissionSeq(seq.0 + 1);
         let mut touched_prefixes = Vec::new();
-        for entry in &client_batch.entries {
+        for (op_index, entry) in client_batch.entries.iter().enumerate() {
+            let op_index = u32::try_from(op_index).map_err(|_| KernelError::InvalidSeal {
+                reason: "admission batch has too many entries".into(),
+            })?;
             if entry.tag.device != req.device || entry.tag.device_seq != client_batch.device_seq {
                 return Err(KernelError::InvalidSeal {
                     reason: "device entry tag does not match its admission batch".into(),
@@ -187,7 +190,10 @@ pub async fn admit<S: OrderedStore>(
                 DataRecord {
                     entry: AdmittedEntry {
                         device_entry: entry.clone(),
-                        admission: AdmissionTag { admission_seq: seq },
+                        admission: AdmissionTag {
+                            admission_seq: seq,
+                            op_index,
+                        },
                     },
                 },
             );

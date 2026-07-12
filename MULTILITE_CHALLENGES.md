@@ -515,9 +515,13 @@ is *tractable*, not free), so v1 avoids needing it at all. Two regimes:
   incremental risk over offline data writes, which the lifecycle already accepts. The
   discarded-tail export covers the human side — DDL exports as literal SQL text.
 - **Anything less** (bounded lease — offline expiry makes rejection *routine*, not
-  exceptional; partial-prefix coverage; future multi-writer): **sync-barrier DDL** —
-  empty unacked oplog (push first) + synchronous push before returning; the v2 kernel's
-  Sync-mode `PendingOps` discipline applied one level up. Offline DDL errors.
+  exceptional; partial-prefix coverage; OCC/`submit_unchecked` multi-writer):
+  **sync-barrier DDL** — empty unacked oplog (push first) + synchronous push before
+  returning; the v2 kernel's Sync-mode `PendingOps` discipline applied one level up.
+  Offline DDL errors. Refinement that eliminates DDL undo here too: **push the schema
+  record first, execute locally on ack** — concurrent DDL loses the ver race on the
+  schema key and fails cleanly to the app with nothing local to unwind; crash between
+  ack and execute = resumable saga (schema cursor vs oplog).
 
 Either way v1's `hb_undo` (L4) never needs schema pre-images, and authorization is lease
 coverage, not asserts — a held db-level W lease is strictly stronger than any assert.
@@ -551,6 +555,32 @@ Payoff: relaxes I6's sync-barrier — offline DDL for bounded/partial-lease tier
 just forever-W holders. Staging: sync-barrier everywhere first; rename-defer DROP TABLE
 next (biggest win, O(1)); remaining kinds after.
 `Status: leaning — design as stated, sequenced post-wedge; not a v1 requirement.`
+
+**I8. DDL data-plane effects (v1 walkthrough discoveries).** Mechanics per I1/I3/I6:
+first-token intercept; **DDL standalone-transaction-only** (never mixed with DML in a
+user BEGIN — v1 restriction); execute natively; record as a `Set` on a **reserved
+schema key** (`(schema-prefix, counter++)` → SQL text, encrypted, ver-chained); replay
+on replicas is deterministic (SQLite itself forbids non-constant ADD COLUMN defaults).
+**Admission-time drift guard:** every data batch carries a range assert on the schema
+prefix at the local schema cursor — stale-schema writers auto-reject at admission
+(upgrades I4's apply-time hash check). Two data-plane consequences:
+- **DROP TABLE leaves kernel garbage.** Replicas replay the drop locally, but the
+  kernel still holds every row as live KV — permanent garbage, and fresh bootstraps
+  download rows with no table to land in. Resolved by kernel **DeleteRange** (in
+  progress, will land): DROP TABLE emits DeleteRange over the table prefix in the same
+  batch. Mass tombstones remain only as a contingency if DeleteRange slips.
+- **Schema evolution vs stored frames.** After destructive DDL (DROP/RENAME COLUMN),
+  live replicas are fine but kernel value frames keep the old layout — a fresh
+  bootstrap must decode old frames under new schema. Options: (a) re-emit all rows
+  after destructive DDL (eager rewrite, O(table)); (b) schema-versioned frames decoded
+  against the DDL chain (materializer becomes history-dependent); (c) **v1 additive-only
+  DDL** — CREATE TABLE / ADD COLUMN / CREATE+DROP INDEX supported; destructive DDL
+  rejected or sync-barrier + re-emit.
+`Status: leaning — (c) additive-only for v1 with (a) as escape hatch; schema-prefix
+assert on every batch decided; DeleteRange landing in kernel (unblocks DROP TABLE's
+data plane — the frame-evolution question for DROP/RENAME COLUMN remains the reason
+for additive-only). Namespace/lease placement of the schema prefix (outside (User,)?
+covered by what?) still open.`
 
 ---
 
@@ -714,13 +744,54 @@ in the fenced-takeover flow. D4 stays after-image-only on the wire — pre-image
 local-only rows, never shipped.
 
 Fallbacks: re-pull affected ranges (needs connectivity) or full re-bootstrap (M1 path).
-Note: under the single-writer forever-W default, **surgical rollback never fires at
-all** — the only rejections (fence, fork) forfeit the whole unacked tail via
-re-bootstrap (see I6). `hb_undo` therefore activates with bounded/partial leases, not
-the wedge: a clean fast-follow. DDL undo is avoided in v1 by regime (I6) and becomes
-available later via invertible DDL (I7).
-`Status: leaning — hb_undo as designed; sequencing (wedge vs fast-follow) open. The
-app-visible contract ("your last N transactions were undone": which error, on which
+
+**v1 decision: no undo log in either variant.** Variant A: surgical rollback never
+fires (fence/fork → re-bootstrap; the discarded-tail export needs only oplog
+post-images, not pre-images). Variant B (OCC): repair is required but **re-pull repair
+suffices** — rejection happens at push = online by definition; repair = for every key
+in the discarded suffix, server point-read → overwrite or delete locally under apply
+suppression; inputs are oplog post-images + server reads, no pre-images. `hb_undo`'s
+unique additions — zero-RTT repair and **offline-initiated abandon** ("discard my
+unsynced changes" without connectivity) — are the fast-follow triggers.
+
+**Layer placement (revised): split ownership, client-level per-key pre-images.**
+Pre-images are KV-native, and **restore reuses the existing apply path** — the client
+replays stored pre-image entries through the same pipeline that materializes server
+deltas (decode frame → suppressed row write). Property gained: *any consumer that can
+sync can roll back*, with zero consumer-specific restore machinery. Split: **multilite
+captures + encodes** (preupdate old values → value frames, supplied with the batch at
+commit); **client stores + orchestrates** (pre-image records in MetaStore, atomic with
+the oplog record via the J6 savepoint — physically still an hb_ table; the layering
+question is API ownership, not byte placement); **restore = client emits pre-images
+through the consumer's apply path**. Plaintext frames are fine locally (N1). Kernel
+cost when built: MetaStore trait pre-image extension + conformance coverage (v2
+backlog item).
+
+**DeleteRange is the leak in per-key undo** — its pre-image is every live pair in the
+range (O(table) capture; no rename exists at the KV layer). Resolution: **barrier
+discipline** — destructive DDL is sync-barrier'd (I8 additive-only v1), and
+sync-barrier ops never sit in the unacked window, which *is* the undo window — so
+DeleteRange never needs undo in v1. If offline destructive DDL ever lands (I7), the
+DeleteRange undo record becomes a **reference to the consumer's artifact** (the
+rename-deferred trash table is the O(1) pre-image) — inherently consumer-assisted;
+ranges are where pure-KV undo genuinely leaks.
+
+**MetaStore under rollback: atomicity, not undo.** MetaStore state is designed to move
+forward only — oplog rollback is a marker append + cursor advance (v2, dead rows until
+trim); `ver_high` never rewinds (Lamport: gaps legal, rewind invites reuse bugs); pull
+cursors/watermarks track server state, untouched; schema state never participates
+(barrier discipline, I6/I8); consumed pre-images are deleted as cleanup. Requirement:
+marker + cursors + restored rows + pre-image cleanup = **one SQLite transaction** (J6
+savepoints), restore writes under J2 suppression; crash mid-rollback = transition never
+happened, re-detected and re-run idempotently off the marker. **Flagged for the kernel
+plan:** discarded `Release` ops — v2 retires leases locally at commit; a rolled-back
+release never shipped, leaving the lease live server-side but locally forgotten (TTL
+reclaims bounded; same-device refresh recovers forever leases) — needs an explicit
+story, not an accident that works.
+
+DDL undo is avoided in v1 by regime (I6) and arrives later via invertible DDL (I7).
+`Status: decided — v1 ships re-pull repair; hb_undo fast-follow in the multilite layer.
+The app-visible contract ("your last N transactions were undone": which error, on which
 call) still needs design (ties to J5/N5).`
 
 **L5. Read-transaction stability under applies.** A long-running local read transaction
@@ -915,10 +986,10 @@ Do not let a green SLT bar masquerade as sync correctness.
 Two lease postures, same flows except where marked:
 - **Variant A (DESIGN default):** forever-W db lease auto-acquired at open; asserts never
   fail in steady state; rejection = fence/fork = re-bootstrap (I6/L4).
-- **Variant B (pure OCC, no lease):** asserts carry all correctness. Requires a **kernel
-  assert-only admission mode** (today admission demands write-lease coverage — kernel
-  change to design), and assert failure is *routine* → `hb_undo`, rollback repair, and
-  the app retry surface move **into the wedge**.
+- **Variant B (pure OCC, no lease):** asserts carry all correctness, shipped via the
+  kernel's **`submit_unchecked` mode** (no lease check on writes — already exists).
+  Assert failure is *routine* → `hb_undo`, rollback repair, and the app retry surface
+  move **into the wedge**.
 
 **Open:** connection (WAL+NORMAL, busy_timeout) → `ATTACH ':memory:' AS hb` → register
 authorizer + preupdate hook + commit interception → adoption (A1) or B1 assertion + M4
@@ -952,11 +1023,56 @@ hb_undo + repair + retry, plus the kernel admission-mode decision.
 **Not in v1:** rewriter, vtables/read-shadows, eager leases, LEASE statements, witness
 compiler, partitions, invertible DDL, shapes.
 
-**Subtleties:** (i) **own-pipeline asserts** — commit 2's assert at cursor N
-self-collides with own unacked commit 1 on the same table; coalesce unacked commits
-into one multi-batch request (server evaluates asserts sequentially on scratch) and
-allow only one outstanding push. (ii) **Variant B couples abort rate to pull
+**Subtleties:** (i) **own-pipeline asserts — handled by the kernel**: range-assert
+evaluation excludes the asserting device's own writes (foreign seqnums only), so
+successive commits touching the same table never self-collide; no coalescing or
+single-outstanding-push constraint needed. (ii) **Variant B couples abort rate to pull
 freshness** — N3's cadence becomes the OCC abort-rate dial, not a UX knob.
+
+---
+
+## v1 corner-cut register
+
+Every accepted v1 simplification, by dimension. Three kinds: **precision** cuts (safe,
+degrade concurrency/freshness), **scope** cuts (loud rejection at adoption/DDL),
+**contract** cuts (documented weaker promises). None is a silent-corruption risk —
+defend that property as implementation pressure mounts.
+
+**Consistency & isolation (precision):** recency — local reads serializable-but-stale,
+strictness only via refresh()/strong-read (L2a/N4) · revocable reads — unacked writes
+visible locally, guarantee attaches to admitted history (L2a) · table-coarse conflicts →
+spurious aborts (L2) · no per-statement freshness (N4). Note: isolation *level* is not
+cut — v1 is serializable, stronger than SI (L2a).
+
+**Replication scope (precision):** full-space replica, single cursor — no shapes/sparse
+ranges (L3) · simple pull cadence, no subscriptions (N3).
+
+**SQL surface (scope):** additive-only DDL (I8) · DDL standalone + sync-barrier outside
+forever-W (I6/I8) · custom collations rejected in indexed positions (D2) · UTF-16
+rejected (D8) · expression/partial indexes escalate/reject (D5) · virtual generated
+columns excluded from frames (G5) · composite WITHOUT ROWID pending hook spike (F4/C6) ·
+pre-existing vtables passthrough-unsynced (A7) · AUTOINCREMENT open (F1).
+
+**Concurrency machinery (precision):** one write connection (H4) · applies queue behind
+open txns (J3) · optimistic only, no eager leases (N6) · no LEASE
+statements/partitions/RBAC (D7) · **no witness keys — safe only while asserts are
+table-coarse; the E1-c precision upgrade and witness machinery must land together**
+(C5/D5) · no read-shadows (E1-c/E6).
+
+**Durability (contract):** WAL+NORMAL — power loss may eat unpushed commits
+(safe-by-construction, documented) (J7) · per-commit durability and remote-sync commit
+are later opt-ins.
+
+**Repair & recovery (contract):** re-pull repair only — no hb_undo, no offline abandon
+(L4) · no invertible DDL (I7) · foreign write → warn + refuse sync, no recovery (B4) ·
+divergence CRC deferred (M3) · app-visible rollback contract undesigned (L4 open).
+
+**Security posture (contract):** plaintext local file (N1) · no key rotation (epoch 0)
+· no padding — lengths leak (D6) · key delivery: envelope-or-callback only (N2).
+
+**Packaging & adoption (scope):** Rust crate only — no C-ABI/Python · three CI topology
+cells (O4) · adoption hard-rejects unsupported schemas (A5) · forced WAL at adoption
+(J4) · ~2× file size until first sync if A3 = materialize.
 
 ---
 

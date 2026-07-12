@@ -33,6 +33,13 @@ pub struct DeviceSeq(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AdmissionSeq(pub u64);
 
+/// Stable order of one operation within a space's admission history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AdmissionOrder {
+    pub admission_seq: AdmissionSeq,
+    pub op_index: u32,
+}
+
 /// Cumulative cryptographic checksum of one device's admitted batch stream
 /// within a space. The all-zero value is the empty stream.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -132,6 +139,16 @@ impl<T> DeviceEntry<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionTag {
     pub admission_seq: AdmissionSeq,
+    pub op_index: u32,
+}
+
+impl AdmissionTag {
+    pub const fn order(self) -> AdmissionOrder {
+        AdmissionOrder {
+            admission_seq: self.admission_seq,
+            op_index: self.op_index,
+        }
+    }
 }
 
 /// An unchanged device-authenticated entry plus authority metadata.
@@ -148,5 +165,29 @@ impl<T> AdmittedEntry<T> {
 
     pub fn ver(&self) -> Ver {
         self.device_entry.ver()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_order_is_lexicographic() {
+        let first = AdmissionOrder {
+            admission_seq: AdmissionSeq(7),
+            op_index: 0,
+        };
+        let second = AdmissionOrder {
+            admission_seq: AdmissionSeq(7),
+            op_index: 1,
+        };
+        let next_batch = AdmissionOrder {
+            admission_seq: AdmissionSeq(8),
+            op_index: 0,
+        };
+
+        assert!(first < second);
+        assert!(second < next_batch);
     }
 }

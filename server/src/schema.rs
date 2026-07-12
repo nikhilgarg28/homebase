@@ -358,13 +358,14 @@ impl DataRecord {
         };
         let tag = self.entry.device_entry.tag;
         let seal = self.entry.device_entry.seal.encode();
-        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 + seal.len() + 1 + value_len);
+        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 * 2 + seal.len() + 1 + value_len);
         out.push(DATA_RECORD_VERSION);
         out.extend_from_slice(&tag.device.0);
         out.extend_from_slice(&tag.device_seq.0.to_be_bytes());
         out.extend_from_slice(&tag.ver.0.to_be_bytes());
         out.extend_from_slice(&tag.cipher_epoch.0.to_be_bytes());
         out.extend_from_slice(&self.entry.admission.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.entry.admission.op_index.to_be_bytes());
         out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
         out.extend_from_slice(&seal);
         match &self.entry.device_entry.mutation {
@@ -390,6 +391,7 @@ impl DataRecord {
         };
         let admission = AdmissionTag {
             admission_seq: AdmissionSeq(r.u64()?),
+            op_index: r.u32()?,
         };
         let seal_len = r.u32()? as usize;
         let seal = Seal::decode(r.take(seal_len)?).ok()?;
@@ -684,6 +686,7 @@ mod tests {
                 },
                 admission: AdmissionTag {
                     admission_seq: AdmissionSeq(99),
+                    op_index: 3,
                 },
             },
         };
@@ -700,6 +703,7 @@ mod tests {
                 },
                 admission: AdmissionTag {
                     admission_seq: AdmissionSeq(99),
+                    op_index: 4,
                 },
             },
         };
