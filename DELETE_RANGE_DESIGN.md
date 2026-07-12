@@ -685,6 +685,13 @@ append-only reference model. The model stores every admitted mutation in
 full-log replay, and arbitrary range reads directly. It deliberately has no
 prefix aggregates, lazy count epochs, or materialized-record shortcuts.
 
+The test-only server `ReferenceModel` is that executable specification. Its
+only state is a dense vector of exact admitted batches. Queries at an explicit
+cut rescan that history, including empty batches, same-batch `op_index` order,
+covering ancestor tombstones, and overlapping descendant tombstones. It must
+remain structurally independent of production schema and admission code so a
+shared implementation bug cannot make differential tests agree falsely.
+
 The production implementation is exercised after every randomly generated
 command and compared with that model. Commands include multiple devices,
 mixed batches, Set/Delete/DeleteRange at parent/child/full ranges, assertions,
