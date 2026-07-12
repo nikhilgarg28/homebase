@@ -44,8 +44,9 @@ use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
     AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord,
-    admission_header_key, admission_op_key, admission_op_parts, admission_op_scan, counters_key,
-    data_key, data_scan_all, device_key, prefix_meta_key, user_key_from_data,
+    RangeDeleteRecord, admission_header_key, admission_op_key, admission_op_parts,
+    admission_op_scan, counters_key, covering_range_delete_keys, data_key, data_scan_all,
+    device_key, prefix_meta_key, range_delete_parts, user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homebase_core::clock::Timestamp;
@@ -569,6 +570,32 @@ async fn prefix_meta<S: OrderedStore>(
         .get(&prefix_meta_key(space, prefix.components()))
         .await?
         .map(|bytes| PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record")))
+}
+
+/// Newest exact tombstone whose Full/Prefix target covers `target`.
+/// The lookup is bounded by user-key depth: one Full read plus one read per
+/// component-wise ancestor, with no descendant scan.
+#[allow(dead_code)] // Wired into visibility and version checks in DR5.
+pub(crate) async fn covering_range_delete<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    target: &Range,
+) -> Result<Option<RangeDeleteRecord>, StorageError> {
+    let mut newest: Option<RangeDeleteRecord> = None;
+    for storage_key in covering_range_delete_keys(space, target) {
+        let Some(bytes) = store.get(&storage_key).await? else {
+            continue;
+        };
+        let (_, range) = range_delete_parts(&storage_key).expect("corrupt range-delete key");
+        let record = RangeDeleteRecord::decode(range, &bytes).expect("corrupt range-delete record");
+        if newest
+            .as_ref()
+            .is_none_or(|current| record.entry.admission.order() > current.entry.admission.order())
+        {
+            newest = Some(record);
+        }
+    }
+    Ok(newest)
 }
 
 async fn data<S: OrderedStore>(

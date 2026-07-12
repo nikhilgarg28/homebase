@@ -33,3 +33,5 @@ Ensure that prefix can be empty but keys can not be
 many responses should return global seqnum or return ops when range assert fails
 
 Add bucketing/padding to key components & values before encrypting
+
+Relax the constraint that there can be at most 16 components

@@ -307,12 +307,21 @@ admission log:
 
 ```text
 (space, Data, key) -> latest point record
-(space, RangeDelete, depth, prefix) -> latest exact range tombstone
+(space, RangeDelete, 0) -> latest Full tombstone
+(space, RangeDelete, depth, prefix) -> latest exact Prefix tombstone
+(space, Meta, "root") -> full-space aggregate
 (space, AdmissionLog, admission_seq, Header) -> admitted batch header
 (space, AdmissionLog, admission_seq, Op, op_index) -> admitted operation
 ```
 
-`Range::Full` uses dedicated root key shapes rather than an empty prefix.
+Depth zero is reserved for `Range::Full`; prefix records require a valid,
+non-empty key whose component count exactly matches `depth`. Covering-ancestor
+lookup reads only the Full key and each component-wise ancestor key, then
+chooses the greatest `AdmissionOrder` rather than assuming the deepest record
+is newest. The Full aggregate reuses the prefix aggregate value codec at its
+dedicated `Meta/root` key. DR3 reserves and validates these storage shapes;
+admission begins maintaining them only in the later semantic batches.
+
 Every admitted Set, Delete, and DeleteRange is appended once in
 `AdmissionOrder`; old entries are not moved or replaced when the same target
 is written again. The materialized records make `get`, `list`, conflict
@@ -903,8 +912,8 @@ versions directly instead of carrying compatibility decoders.
 ## Open Decisions
 
 1. Final `PullResponse` and `read_at` response byte/operation limits.
-2. Exact persisted split between range tombstones and prefix aggregate count
-   generations.
+2. Exact persisted fields and split for prefix/root aggregate count
+   generations introduced by the lazy-count implementation.
 3. Whether DeleteRange ver regression uses a new range-specific error or a
    generalized target-aware `VerRegression`.
 4. Whether `mark_applied(to)` remains the only neck-advance API or receives

@@ -7,9 +7,12 @@
 //!
 //! ```text
 //! (space, Data,          k1, k2, …)             → DataRecord (tag + value)
+//! (space, RangeDelete,   0)                     → RangeDeleteRecord (Full)
+//! (space, RangeDelete,   depth, p1…pd)           → RangeDeleteRecord (Prefix)
 //! (space, LeaseByPrefix, depth, p1…pd, id_be)   → LeaseRecord
 //! (space, LeaseById,     id_be)                 → LeaseRecord
 //! (space, Meta,          "counters")            → CountersRecord
+//! (space, Meta,          "root")                → PrefixMetaRecord (Full)
 //! (space, Device,        device_id)             → DeviceRecord
 //! (space, PrefixMeta,    depth, p1…pd)          → PrefixMetaRecord
 //! (space, AdmissionLog,  seq_be, Header)         → AdmissionHeaderRecord
@@ -46,6 +49,7 @@
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{LeaseId, LeaseMode};
+use homebase_core::range::Range;
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
@@ -59,6 +63,7 @@ use std::time::Duration;
 #[repr(u8)]
 pub enum RecordKind {
     Data = 0,
+    RangeDelete = 1,
     LeaseByPrefix = 2,
     LeaseById = 3,
     Meta = 4,
@@ -119,6 +124,73 @@ pub fn prefix_meta_key(space: SpaceId, head: &[KeyComponent]) -> Vec<u8> {
 /// Byte prefix of a space's whole PrefixMeta keyspace.
 pub fn prefix_meta_scan_all(space: SpaceId) -> Vec<u8> {
     encode_components(&[space_component(space), RecordKind::PrefixMeta.component()])
+}
+
+/// Dedicated full-space aggregate. Full is not represented by an empty user
+/// key; its value uses the same aggregate codec as [`PrefixMetaRecord`].
+pub fn root_meta_key(space: SpaceId) -> Vec<u8> {
+    encode_components(&[
+        space_component(space),
+        RecordKind::Meta.component(),
+        KeyComponent::new(b"root".to_vec()).expect("literal component"),
+    ])
+}
+
+/// Exact materialized range tombstone key. Depth zero is reserved for Full;
+/// every Prefix has at least one non-empty user-key component.
+pub fn range_delete_key(space: SpaceId, range: &Range) -> Vec<u8> {
+    let mut components = vec![space_component(space), RecordKind::RangeDelete.component()];
+    match range {
+        Range::Full => {
+            components.push(KeyComponent::new(vec![0]).expect("depth byte"));
+        }
+        Range::Prefix(prefix) => {
+            components.push(
+                KeyComponent::new(vec![prefix.components().len() as u8]).expect("depth byte"),
+            );
+            components.extend(prefix.components().iter().cloned());
+        }
+    }
+    encode_components(&components)
+}
+
+/// Byte prefix of one space's materialized range tombstones.
+pub fn range_delete_scan_all(space: SpaceId) -> Vec<u8> {
+    encode_components(&[space_component(space), RecordKind::RangeDelete.component()])
+}
+
+/// Recovers the owning space and exact Full/Prefix target from a range-delete
+/// storage key. Depth and component count must agree exactly.
+pub fn range_delete_parts(storage_key: &[u8]) -> Option<(SpaceId, Range)> {
+    let components = decode_components(storage_key).ok()?;
+    let space = SpaceId(components.first()?.as_bytes().try_into().ok()?);
+    if components.get(1)?.as_bytes() != [RecordKind::RangeDelete as u8] {
+        return None;
+    }
+    let depth = *components.get(2)?.as_bytes().first()? as usize;
+    if components.get(2)?.as_bytes().len() != 1 || components.len() != 3 + depth {
+        return None;
+    }
+    let range = if depth == 0 {
+        Range::Full
+    } else {
+        Range::Prefix(Key::new(components[3..].to_vec()).ok()?)
+    };
+    Some((space, range))
+}
+
+/// Full followed by every component-wise ancestor through the exact prefix.
+/// Reading these keys is sufficient to find every tombstone covering target.
+pub fn covering_range_delete_keys(space: SpaceId, target: &Range) -> Vec<Vec<u8>> {
+    let mut keys = vec![range_delete_key(space, &Range::Full)];
+    if let Range::Prefix(prefix) = target {
+        for depth in 1..=prefix.components().len() {
+            let ancestor = Key::new(prefix.components()[..depth].to_vec())
+                .expect("a non-empty prefix of a valid key is valid");
+            keys.push(range_delete_key(space, &Range::Prefix(ancestor)));
+        }
+    }
+    keys
 }
 
 const ADMISSION_HEADER_COMPONENT: u8 = 0;
@@ -255,6 +327,7 @@ const DATA_RECORD_VERSION: u8 = 1;
 const DEVICE_RECORD_VERSION: u8 = 1;
 const PREFIX_META_RECORD_VERSION: u8 = 1;
 const ADMISSION_HEADER_RECORD_VERSION: u8 = 1;
+const RANGE_DELETE_RECORD_VERSION: u8 = 1;
 
 /// Durable identity and completeness check for one admitted client batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,6 +550,70 @@ impl DataRecord {
             entry: AdmittedEntry {
                 device_entry: DeviceEntry {
                     mutation,
+                    tag,
+                    seal,
+                },
+                admission,
+            },
+        })
+    }
+}
+
+/// Latest materialized tombstone at one exact Full/Prefix target.
+///
+/// The target is encoded in the storage key and supplied to [`decode`], while
+/// the value preserves the original authenticated device metadata and exact
+/// server-assigned operation order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeDeleteRecord {
+    pub entry: AdmittedEntry,
+}
+
+impl RangeDeleteRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        assert!(
+            self.entry.device_entry.mutation.is_delete_range(),
+            "range tombstone record requires DeleteRange"
+        );
+        let tag = self.entry.device_entry.tag;
+        let seal = self.entry.device_entry.seal.encode();
+        let mut out = Vec::with_capacity(1 + 16 + 8 * 4 + 4 * 2 + seal.len());
+        out.push(RANGE_DELETE_RECORD_VERSION);
+        out.extend_from_slice(&tag.device.0);
+        out.extend_from_slice(&tag.device_seq.0.to_be_bytes());
+        out.extend_from_slice(&tag.ver.0.to_be_bytes());
+        out.extend_from_slice(&tag.cipher_epoch.0.to_be_bytes());
+        out.extend_from_slice(&self.entry.admission.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.entry.admission.op_index.to_be_bytes());
+        out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
+        out.extend_from_slice(&seal);
+        out
+    }
+
+    pub fn decode(range: Range, bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != RANGE_DELETE_RECORD_VERSION {
+            return None;
+        }
+        let tag = DeviceTag {
+            device: DeviceId(r.bytes16()?),
+            device_seq: DeviceSeq(r.u64()?),
+            ver: Ver(r.u64()?),
+            cipher_epoch: CipherEpoch(r.u64()?),
+        };
+        let admission = AdmissionTag {
+            admission_seq: AdmissionSeq(r.u64()?),
+            op_index: r.u32()?,
+        };
+        let seal_len = r.u32()? as usize;
+        let seal = Seal::decode(r.take(seal_len)?).ok()?;
+        if !r.rest().is_empty() {
+            return None;
+        }
+        Some(Self {
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation: Mutation::DeleteRange { range },
                     tag,
                     seal,
                 },
@@ -724,6 +861,123 @@ mod tests {
         assert!(!deep.starts_with(&shallow));
         assert!(deep.starts_with(&prefix_meta_scan_all(space)));
         assert!(shallow.starts_with(&prefix_meta_scan_all(space)));
+    }
+
+    #[test]
+    fn range_delete_keys_roundtrip_full_and_prefix_in_storage_order() {
+        use homebase_core::range::Range;
+
+        let space = SpaceId([1; 16]);
+        let parent = Range::Prefix(Key::from_bytes([&b"db"[..]]).unwrap());
+        let child = Range::Prefix(Key::from_bytes([&b"db"[..], &b"row"[..]]).unwrap());
+        let full_key = range_delete_key(space, &Range::Full);
+        let parent_key = range_delete_key(space, &parent);
+        let child_key = range_delete_key(space, &child);
+
+        assert_eq!(range_delete_parts(&full_key), Some((space, Range::Full)));
+        assert_eq!(
+            range_delete_parts(&parent_key),
+            Some((space, parent.clone()))
+        );
+        assert_eq!(range_delete_parts(&child_key), Some((space, child.clone())));
+        assert!(full_key < parent_key);
+        assert!(parent_key < child_key);
+        assert!(full_key.starts_with(&range_delete_scan_all(space)));
+        assert!(parent_key.starts_with(&range_delete_scan_all(space)));
+        assert_eq!(
+            covering_range_delete_keys(space, &child),
+            vec![full_key, parent_key, child_key]
+        );
+    }
+
+    #[test]
+    fn range_delete_key_decode_rejects_malformed_shapes() {
+        let space = SpaceId([1; 16]);
+        let malformed = |depth: u8, suffix: &[&[u8]]| {
+            let mut components = vec![
+                space_component(space),
+                RecordKind::RangeDelete.component(),
+                KeyComponent::new(vec![depth]).unwrap(),
+            ];
+            components.extend(
+                suffix
+                    .iter()
+                    .map(|part| KeyComponent::new(part.to_vec()).unwrap()),
+            );
+            encode_components(&components)
+        };
+
+        assert_eq!(range_delete_parts(&malformed(0, &[b"extra"])), None);
+        assert_eq!(range_delete_parts(&malformed(1, &[])), None);
+        assert_eq!(range_delete_parts(&malformed(2, &[b"only-one"])), None);
+        assert_eq!(
+            range_delete_parts(&data_key(space, &Key::from_bytes([&b"db"[..]]).unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn full_root_has_a_dedicated_non_prefix_key() {
+        let space = SpaceId([2; 16]);
+        let root = root_meta_key(space);
+        let counters = counters_key(space);
+        let prefix = prefix_meta_key(space, Key::from_bytes([&b"db"[..]]).unwrap().components());
+        assert_ne!(root, counters);
+        assert_ne!(root, prefix);
+        let components = decode_components(&root).unwrap();
+        assert_eq!(components.len(), 3);
+        assert_eq!(components[1].as_bytes(), [RecordKind::Meta as u8]);
+        assert_eq!(components[2].as_bytes(), b"root");
+
+        let mut aggregate = PrefixMetaRecord::empty();
+        aggregate.observe(DeviceId([3; 16]), AdmissionSeq(4));
+        aggregate.live_count = 9;
+        assert_eq!(
+            PrefixMetaRecord::decode(&aggregate.encode()),
+            Some(aggregate)
+        );
+    }
+
+    #[test]
+    fn range_delete_record_roundtrips_and_rejects_malformed_bytes() {
+        use homebase_core::range::Range;
+
+        let range = Range::Prefix(Key::from_bytes([&b"db"[..]]).unwrap());
+        let record = RangeDeleteRecord {
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation: Mutation::DeleteRange {
+                        range: range.clone(),
+                    },
+                    tag: DeviceTag {
+                        device: DeviceId([5; 16]),
+                        device_seq: DeviceSeq(6),
+                        ver: Ver(7),
+                        cipher_epoch: CipherEpoch(8),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                },
+                admission: AdmissionTag {
+                    admission_seq: AdmissionSeq(9),
+                    op_index: 10,
+                },
+            },
+        };
+        let encoded = record.encode();
+        assert_eq!(
+            RangeDeleteRecord::decode(range.clone(), &encoded),
+            Some(record)
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(RangeDeleteRecord::decode(range.clone(), &trailing), None);
+        assert_eq!(
+            RangeDeleteRecord::decode(range.clone(), &encoded[..20]),
+            None
+        );
+        let mut wrong_version = encoded;
+        wrong_version[0] = 2;
+        assert_eq!(RangeDeleteRecord::decode(range, &wrong_version), None);
     }
 
     #[test]

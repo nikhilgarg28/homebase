@@ -131,7 +131,10 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DeviceRecord, PrefixMetaRecord, device_key, prefix_meta_key};
+    use crate::schema::{
+        DeviceRecord, PrefixMetaRecord, RangeDeleteRecord, device_key, prefix_meta_key,
+        range_delete_key,
+    };
     use crate::storage::{MemoryStore, OrderedStore, ScanIter, StorageError, WriteBatch};
     use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
@@ -142,8 +145,8 @@ mod tests {
     };
     use homebase_core::seal::{SEAL_AEAD_TAG_LEN, SEAL_NONCE_LEN, Seal, SealScheme};
     use homebase_core::tag::{
-        AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-        OpaqueValue, Ver,
+        AdmissionSeq, AdmittedEntry, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+        Mutation, OpaqueValue, Ver,
     };
     use pollster::block_on;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -436,6 +439,70 @@ mod tests {
             err,
             Error::Kernel(KernelError::InvalidSeal { .. })
         ));
+    }
+
+    #[test]
+    fn covering_range_delete_lookup_chooses_newest_order_not_deepest_prefix() {
+        let store = MemoryStore::new();
+        let target = Range::Prefix(key(&[b"db", b"row", b"child"]));
+        let record = |range: Range, seq: u64, op_index: u32| RangeDeleteRecord {
+            entry: AdmittedEntry {
+                device_entry: DeviceEntry {
+                    mutation: Mutation::DeleteRange { range },
+                    tag: DeviceTag {
+                        device: dev(1),
+                        device_seq: DeviceSeq(seq),
+                        ver: Ver(seq),
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                },
+                admission: homebase_core::tag::AdmissionTag {
+                    admission_seq: AdmissionSeq(seq),
+                    op_index,
+                },
+            },
+        };
+        let full = record(Range::Full, 5, 0);
+        let parent_range = Range::Prefix(key(&[b"db"]));
+        let parent = record(parent_range.clone(), 9, 0);
+        let exact_range = Range::Prefix(key(&[b"db", b"row"]));
+        let exact = record(exact_range.clone(), 8, 0);
+        let sibling_range = Range::Prefix(key(&[b"db", b"other"]));
+        let sibling = record(sibling_range.clone(), 12, 0);
+        let mut batch = WriteBatch::new();
+        for (range, record) in [
+            (Range::Full, &full),
+            (parent_range, &parent),
+            (exact_range.clone(), &exact),
+            (sibling_range, &sibling),
+        ] {
+            batch.put(range_delete_key(SPACE, &range), record.encode());
+        }
+        block_on(store.apply(batch)).unwrap();
+
+        let found = block_on(data::covering_range_delete(SPACE, &store, &target))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, parent, "newest ancestor beats deepest ancestor");
+
+        let same_batch_later = record(exact_range.clone(), 9, 1);
+        let mut batch = WriteBatch::new();
+        batch.put(
+            range_delete_key(SPACE, &exact_range),
+            same_batch_later.encode(),
+        );
+        block_on(store.apply(batch)).unwrap();
+        let found = block_on(data::covering_range_delete(SPACE, &store, &target))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, same_batch_later);
+
+        let unrelated = Range::Prefix(key(&[b"outside"]));
+        let found = block_on(data::covering_range_delete(SPACE, &store, &unrelated))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, full, "only Full covers an unrelated prefix");
     }
 
     #[test]
