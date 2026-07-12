@@ -286,6 +286,119 @@ pub struct PullResponse {
     pub batches: Vec<AdmittedBatch>,
 }
 
+impl AdmittedBatch {
+    /// Validates all redundant batch/entry ordering and device metadata.
+    pub fn validate(&self) -> Result<(), PullDensityError> {
+        u32::try_from(self.entries.len()).map_err(|_| PullDensityError::OperationCountOverflow)?;
+        for (expected_index, entry) in self.entries.iter().enumerate() {
+            let expected_index = u32::try_from(expected_index)
+                .map_err(|_| PullDensityError::OperationCountOverflow)?;
+            if entry.admission.admission_seq != self.admission_seq {
+                return Err(PullDensityError::EntryAdmissionMismatch {
+                    batch: self.admission_seq,
+                    entry: entry.admission.admission_seq,
+                });
+            }
+            if entry.admission.op_index != expected_index {
+                return Err(PullDensityError::OperationIndexMismatch {
+                    admission_seq: self.admission_seq,
+                    expected: expected_index,
+                    actual: entry.admission.op_index,
+                });
+            }
+            if entry.device_entry.tag.device != self.device
+                || entry.device_entry.tag.device_seq != self.device_seq
+            {
+                return Err(PullDensityError::EntryDeviceMismatch {
+                    admission_seq: self.admission_seq,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PullResponse {
+    /// Validates that this response contains exactly the complete dense
+    /// interval `(after, through]`, including headers for empty batches.
+    pub fn validate_dense(&self) -> Result<(), PullDensityError> {
+        if self.through < self.after {
+            return Err(PullDensityError::CursorRegression {
+                after: self.after,
+                through: self.through,
+            });
+        }
+        let expected_len = self.through.0 - self.after.0;
+        if u64::try_from(self.batches.len()).ok() != Some(expected_len) {
+            return Err(PullDensityError::BatchCountMismatch {
+                expected: expected_len,
+                actual: self.batches.len(),
+            });
+        }
+        for (offset, batch) in self.batches.iter().enumerate() {
+            let offset =
+                u64::try_from(offset).map_err(|_| PullDensityError::AdmissionSeqOverflow)?;
+            let expected = AdmissionSeq(
+                self.after
+                    .0
+                    .checked_add(
+                        offset
+                            .checked_add(1)
+                            .ok_or(PullDensityError::AdmissionSeqOverflow)?,
+                    )
+                    .ok_or(PullDensityError::AdmissionSeqOverflow)?,
+            );
+            if batch.admission_seq != expected {
+                return Err(PullDensityError::BatchSequenceMismatch {
+                    expected,
+                    actual: batch.admission_seq,
+                });
+            }
+            batch.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// A malformed supposedly dense server pull.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullDensityError {
+    CursorRegression {
+        after: AdmissionSeq,
+        through: AdmissionSeq,
+    },
+    BatchCountMismatch {
+        expected: u64,
+        actual: usize,
+    },
+    BatchSequenceMismatch {
+        expected: AdmissionSeq,
+        actual: AdmissionSeq,
+    },
+    EntryAdmissionMismatch {
+        batch: AdmissionSeq,
+        entry: AdmissionSeq,
+    },
+    OperationIndexMismatch {
+        admission_seq: AdmissionSeq,
+        expected: u32,
+        actual: u32,
+    },
+    EntryDeviceMismatch {
+        admission_seq: AdmissionSeq,
+    },
+    AdmissionSeqOverflow,
+    OperationCountOverflow,
+}
+
+impl fmt::Display for PullDensityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "malformed dense pull: {self:?}")
+    }
+}
+
+impl std::error::Error for PullDensityError {}
+
 // ---------------------------------------------------------------------------
 // get / list
 
@@ -590,5 +703,71 @@ mod tests {
             batch.checksum(DeviceChecksum::EMPTY, SpaceId([1; 16]), DeviceId([2; 16])),
             DeviceChecksum::EMPTY
         );
+    }
+
+    fn admitted_batch(admission: u64, device_seq: u64, op_count: u32) -> AdmittedBatch {
+        let device = DeviceId([2; 16]);
+        AdmittedBatch {
+            admission_seq: AdmissionSeq(admission),
+            device,
+            device_seq: DeviceSeq(device_seq),
+            checksum: DeviceChecksum([admission as u8; 32]),
+            entries: (0..op_count)
+                .map(|op_index| AdmittedEntry {
+                    device_entry: entry(device, DeviceSeq(device_seq), &[op_index as u8 + 1]),
+                    admission: crate::tag::AdmissionTag {
+                        admission_seq: AdmissionSeq(admission),
+                        op_index,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn pull_density_accepts_complete_batches_and_empty_headers() {
+        let response = PullResponse {
+            after: AdmissionSeq(4),
+            through: AdmissionSeq(6),
+            batches: vec![admitted_batch(5, 8, 2), admitted_batch(6, 9, 0)],
+        };
+        assert_eq!(response.validate_dense(), Ok(()));
+    }
+
+    #[test]
+    fn pull_density_rejects_batch_and_operation_gaps() {
+        let mut missing_batch = PullResponse {
+            after: AdmissionSeq(4),
+            through: AdmissionSeq(6),
+            batches: vec![admitted_batch(5, 8, 1)],
+        };
+        assert!(matches!(
+            missing_batch.validate_dense(),
+            Err(PullDensityError::BatchCountMismatch { .. })
+        ));
+
+        missing_batch.through = AdmissionSeq(5);
+        missing_batch.batches[0].entries[0].admission.op_index = 1;
+        assert!(matches!(
+            missing_batch.validate_dense(),
+            Err(PullDensityError::OperationIndexMismatch { .. })
+        ));
+
+        let mut wrong_sequence = PullResponse {
+            after: AdmissionSeq(4),
+            through: AdmissionSeq(5),
+            batches: vec![admitted_batch(6, 8, 1)],
+        };
+        assert!(matches!(
+            wrong_sequence.validate_dense(),
+            Err(PullDensityError::BatchSequenceMismatch { .. })
+        ));
+
+        wrong_sequence.batches[0] = admitted_batch(5, 8, 1);
+        wrong_sequence.batches[0].entries[0].admission.admission_seq = AdmissionSeq(4);
+        assert!(matches!(
+            wrong_sequence.validate_dense(),
+            Err(PullDensityError::EntryAdmissionMismatch { .. })
+        ));
     }
 }

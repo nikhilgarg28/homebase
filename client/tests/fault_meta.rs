@@ -8,13 +8,15 @@ use homebase::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
-use homebase_core::messages::{AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec};
+use homebase_core::messages::{
+    AdmissionBatch, AdmissionRequest, AdmittedBatch, GetRequest, LeaseSpec, PullResponse,
+};
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{
-    CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    OpaqueValue, Ver,
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId,
+    DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
@@ -71,6 +73,42 @@ fn wire_entry(device: DeviceId, seq: DeviceSeq, key: Key, value: &[u8], ver: Ver
     }
 }
 
+fn pulled() -> PullResponse {
+    let device = dev(2);
+    PullResponse {
+        after: AdmissionSeq(0),
+        through: AdmissionSeq(2),
+        batches: vec![
+            AdmittedBatch {
+                admission_seq: AdmissionSeq(1),
+                device,
+                device_seq: DeviceSeq(1),
+                checksum: DeviceChecksum([1; 32]),
+                entries: vec![AdmittedEntry {
+                    device_entry: wire_entry(
+                        device,
+                        DeviceSeq(1),
+                        key(&[b"db", b"remote"]),
+                        b"value",
+                        Ver(1),
+                    ),
+                    admission: AdmissionTag {
+                        admission_seq: AdmissionSeq(1),
+                        op_index: 0,
+                    },
+                }],
+            },
+            AdmittedBatch {
+                admission_seq: AdmissionSeq(2),
+                device,
+                device_seq: DeviceSeq(2),
+                checksum: DeviceChecksum([2; 32]),
+                entries: vec![],
+            },
+        ],
+    }
+}
+
 fn wspec(prefix: &Key) -> LeaseSpec {
     LeaseSpec {
         prefix: prefix.clone(),
@@ -115,6 +153,84 @@ fn simstore_meta_passes_conformance() {
         store.flush();
         let meta = OrderedMetaStore::new(store);
         conformance::run_all(&meta).await;
+    });
+}
+
+#[test]
+fn admit_log_transitions_are_atomic_across_crash_and_reopen() {
+    block_on(async {
+        let sim = SimStore::new(
+            123,
+            FaultConfig {
+                error_rate: 0.0,
+                flush_rate: 0.0,
+                max_latency_yields: 0,
+            },
+        );
+        sim.flush();
+        let response = pulled();
+
+        let meta = OrderedMetaStore::new(sim.clone());
+        meta.append_admits(SPACE, &response).await.unwrap();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim.clone());
+        assert_eq!(
+            meta.admit_cursors(SPACE).await.unwrap(),
+            homebase::meta::AdmitCursors::default(),
+            "an unflushed append vanishes completely"
+        );
+
+        meta.append_admits(SPACE, &response).await.unwrap();
+        sim.flush();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim.clone());
+        let state = audit(&meta).await;
+        assert_eq!(state.spaces[&SPACE].admit_cursors.tail, AdmissionSeq(3));
+        assert_eq!(state.spaces[&SPACE].admits.len(), 2);
+
+        meta.mark_admits_applied(SPACE, AdmissionSeq(3))
+            .await
+            .unwrap();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim.clone());
+        assert_eq!(
+            audit(&meta).await.spaces[&SPACE].admit_cursors.neck,
+            AdmissionSeq(1),
+            "an unflushed mark leaves application coverage unchanged"
+        );
+
+        meta.mark_admits_applied(SPACE, AdmissionSeq(3))
+            .await
+            .unwrap();
+        sim.flush();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim.clone());
+        assert_eq!(
+            audit(&meta).await.spaces[&SPACE].admit_cursors.neck,
+            AdmissionSeq(3)
+        );
+
+        meta.trim_admits(SPACE, AdmissionSeq(2)).await.unwrap();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim.clone());
+        let state = audit(&meta).await;
+        assert_eq!(state.spaces[&SPACE].admit_cursors.head, AdmissionSeq(1));
+        assert_eq!(state.spaces[&SPACE].admits.len(), 2);
+
+        meta.trim_admits(SPACE, AdmissionSeq(2)).await.unwrap();
+        sim.flush();
+        sim.crash();
+        let meta = OrderedMetaStore::new(sim);
+        let state = audit(&meta).await;
+        assert_eq!(state.spaces[&SPACE].admit_cursors.head, AdmissionSeq(2));
+        assert_eq!(
+            state.spaces[&SPACE]
+                .admits
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(2)]
+        );
     });
 }
 

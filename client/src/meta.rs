@@ -26,10 +26,11 @@
 //! # The state doctrine
 //!
 //! **A client serves any number of spaces.** Device identity and the wall
-//! clock tripwire are client-global; each space owns its persisted
-//! `head`/`neck`/`tail` cursors, oplog, and ver high-water. The server's
-//! replay fence is per `(space, device)`, so independent local streams
-//! match the authority's sequencing domain directly.
+//! clock tripwire are client-global; each space owns independent persisted
+//! submit and admit `head`/`neck`/`tail` cursors, their two logs, and one ver
+//! high-water. The server's replay fence is per `(space, device)`, so
+//! independent local submit streams match the authority's sequencing domain
+//! directly.
 //!
 //! **The queue is keyed by the wire seq, assigned by reservation.**
 //! [`reserve_commit`](MetaStore::reserve_commit) stamps each batch with
@@ -52,15 +53,13 @@
 //! the durable invariant is local: `head <= neck <= tail`, with only
 //! `[neck, tail)` eligible for push.
 //!
-//! **Two cursor domains — they never meet.** Range watermarks are
-//! the *pull* cursors: per space and exact range, in the server's
-//! `AdmissionSeq` domain — "this range has synced down through here."
-//! Effective watermark lookup walks ancestor ranges and takes the max.
-//! Trim is *push* acknowledgment in that space's own `DeviceSeq` domain:
-//! "the server admitted my queue through here, drop the prefix."
-//! Different sequence spaces, never compared: a write-only client trims
-//! forever without a range watermark; a read-only one advances range
-//! watermarks without ever trimming.
+//! **Two logs, two sequence domains — they never compare.** The submit log is
+//! keyed by client `DeviceSeq`; its `neck` advances on push acknowledgement.
+//! The admit log is keyed by the server's exact `AdmissionSeq`; pull advances
+//! only its `tail`, application acknowledgement advances its `neck`, and trim
+//! may reclaim only through that neck. Legacy per-range watermarks remain
+//! temporarily for stateless `read_at` consumers, but they cannot advance the
+//! admit log or establish replication progress.
 //!
 //! **Vers are assigned by the store: one Lamport high-water per space,
 //! no per-key table.** The protocol's per-key ver chains stay (the untrusted-server
@@ -111,11 +110,12 @@
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
 use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
-use homebase_core::messages::{Range, RangeAssert};
+use homebase_core::messages::{AdmittedBatch, PullResponse, Range, RangeAssert};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{
-    AdmissionSeq, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation, OpaqueValue, Ver,
+    AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
+    Mutation, OpaqueValue, Ver,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -150,6 +150,27 @@ impl Default for OplogCursors {
             head: DeviceSeq(1),
             neck: DeviceSeq(1),
             tail: DeviceSeq(1),
+        }
+    }
+}
+
+/// One space's durable inbound admission-log cursors, all in the server's
+/// `AdmissionSeq` domain. `[head, neck)` is applied and retained;
+/// `[neck, tail)` is captured and awaiting application. `{1, 1, 1}` is the
+/// canonical empty frontier because server admissions begin at sequence 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmitCursors {
+    pub head: AdmissionSeq,
+    pub neck: AdmissionSeq,
+    pub tail: AdmissionSeq,
+}
+
+impl Default for AdmitCursors {
+    fn default() -> Self {
+        Self {
+            head: AdmissionSeq(1),
+            neck: AdmissionSeq(1),
+            tail: AdmissionSeq(1),
         }
     }
 }
@@ -247,10 +268,14 @@ pub enum SubmitMode {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SpaceState {
     pub cursors: OplogCursors,
+    pub admit_cursors: AdmitCursors,
     /// DeviceChecksum confirmed by the server for this space's device stream.
     pub checksum: DeviceChecksum,
     pub ver_high: Option<Ver>,
     pub oplog: BTreeMap<DeviceSeq, DeviceOp>,
+    /// Exact retained server batches in `[admit_cursors.head,
+    /// admit_cursors.tail)`, including empty admitted batches.
+    pub admits: BTreeMap<AdmissionSeq, AdmittedBatch>,
     pub watermarks: BTreeMap<Range, AdmissionSeq>,
     pub codec: Option<CodecRecord>,
     pub leases: BTreeMap<LeaseId, HeldLease>,
@@ -280,12 +305,14 @@ pub struct ClientState {
 /// 1. vers are **strictly increasing per key** within each space's active
 ///    `[neck, tail)` window — a regression would bounce off the server as
 ///    `VerRegression`; retired rows below `neck` are deliberately ignored;
-/// 2. each space's cursors cover its retained queue and `ver_high` is at
+/// 2. each space's submit cursors cover its retained queue and `ver_high` is at
 ///    least every active queued ver — a lagging durable scalar
 ///    means a torn commit (the assignment and the entry are one atomic
 ///    transition).
+/// 3. each space's admit cursors cover an exactly dense map of complete
+///    server batches; every key, batch sequence, and operation index agrees.
 ///
-/// 3. when a clock high-water is recorded, every lease's send stamp
+/// 4. when a clock high-water is recorded, every lease's send stamp
 ///    (`deadline − ttl`) lies at or under it — a stamp past the
 ///    high-water is a torn transition or a tampered timeline.
 ///
@@ -318,6 +345,37 @@ pub fn certify(state: &ClientState) {
             "oplog cursors out of order in {space_id:?}: {:?}",
             space.cursors
         );
+        assert!(
+            space.admit_cursors.head <= space.admit_cursors.neck
+                && space.admit_cursors.neck <= space.admit_cursors.tail,
+            "admit cursors out of order in {space_id:?}: {:?}",
+            space.admit_cursors
+        );
+        let expected_admits = space
+            .admit_cursors
+            .tail
+            .0
+            .checked_sub(space.admit_cursors.head.0)
+            .expect("ordered admit cursors");
+        assert_eq!(
+            u64::try_from(space.admits.len()).ok(),
+            Some(expected_admits),
+            "admit log is not dense in {space_id:?}"
+        );
+        for (offset, (seq, admitted)) in space.admits.iter().enumerate() {
+            let expected = AdmissionSeq(
+                space.admit_cursors.head.0
+                    + u64::try_from(offset).expect("admit log length fits u64"),
+            );
+            assert_eq!(*seq, expected, "admit log key gap in {space_id:?}");
+            assert_eq!(
+                admitted.admission_seq, *seq,
+                "admitted batch diverges from its key in {space_id:?}"
+            );
+            admitted
+                .validate()
+                .expect("stored admitted batch violates density");
+        }
         let mut last_ver: BTreeMap<&Key, Ver> = BTreeMap::new();
         for (seq, record) in &space.oplog {
             assert!(
@@ -397,6 +455,22 @@ pub trait MetaStore {
         from: DeviceSeq,
         through: DeviceSeq,
     ) -> impl Future<Output = Result<Vec<(DeviceSeq, DeviceOp)>, StorageError>> + Send;
+
+    /// One space's durable inbound-log cursors.
+    fn admit_cursors(
+        &self,
+        space: SpaceId,
+    ) -> impl Future<Output = Result<AdmitCursors, StorageError>> + Send;
+
+    /// Retained admitted batches with `from <= admission_seq <= through`,
+    /// ascending. Unlike the submit log, a range inside the retained admit
+    /// window is always dense.
+    fn admitted_batches(
+        &self,
+        space: SpaceId,
+        from: AdmissionSeq,
+        through: AdmissionSeq,
+    ) -> impl Future<Output = Result<Vec<AdmittedBatch>, StorageError>> + Send;
 
     /// The held leases whose prefixes **cover** any of `prefixes`
     /// (component-wise ancestors, the query itself included) — the only
@@ -483,6 +557,30 @@ pub trait MetaStore {
         &self,
         space: SpaceId,
         to: DeviceSeq,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Append one validated dense server pull at the current admit tail.
+    /// Stores every complete batch and advances only `tail`, atomically.
+    fn append_admits(
+        &self,
+        space: SpaceId,
+        response: &PullResponse,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Record application of every captured batch in `[neck, to)` by moving
+    /// only the admit `neck`. Requires `neck <= to <= tail`.
+    fn mark_admits_applied(
+        &self,
+        space: SpaceId,
+        to: AdmissionSeq,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Physically delete retained batches in `[head, to)` and move only the
+    /// admit `head`. Requires `head <= to <= neck`.
+    fn trim_admits(
+        &self,
+        space: SpaceId,
+        to: AdmissionSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// A pulled range cut records that exact range's sync point — and
@@ -605,6 +703,8 @@ pub enum StoreNamespace {
 /// (Meta, Space, id, DeviceChecksum)          → ChecksumRecord
 /// (Meta, Space, id, Ver)               → VerHighRecord
 /// (Meta, Space, id, Oplog, seq_be)     → DeviceOp
+/// (Meta, Space, id, AdmitCursors)       → AdmitCursors
+/// (Meta, Space, id, AdmitLog, seq_be)   → AdmittedBatch
 /// (Meta, Space, id, Watermark, range)  → WatermarkRecord (exact range cursor)
 /// (Meta, Space, id, Codec)             → CodecRecord
 /// (Meta, Space, id, Lease, prefix)      → LeaseRecord
@@ -646,6 +746,8 @@ enum SpaceKind {
     Ver = 4,
     Oplog = 5,
     DeviceChecksum = 6,
+    AdmitCursors = 7,
+    AdmitLog = 8,
 }
 
 fn byte_component(b: u8) -> KeyComponent {
@@ -708,6 +810,20 @@ fn oplog_scan(space: SpaceId) -> Vec<u8> {
 
 fn oplog_key(space: SpaceId, seq: DeviceSeq) -> Vec<u8> {
     let mut components = space_kind(space, SpaceKind::Oplog);
+    components.push(u64_component(seq.0));
+    encode_components(&components)
+}
+
+fn admit_cursors_key(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::AdmitCursors))
+}
+
+fn admit_log_scan(space: SpaceId) -> Vec<u8> {
+    encode_components(&space_kind(space, SpaceKind::AdmitLog))
+}
+
+fn admit_log_key(space: SpaceId, seq: AdmissionSeq) -> Vec<u8> {
+    let mut components = space_kind(space, SpaceKind::AdmitLog);
     components.push(u64_component(seq.0));
     encode_components(&components)
 }
@@ -872,6 +988,22 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                                 DeviceOp::decode(&bytes).expect("undecodable commit record");
                             space.oplog.insert(seq, record);
                         }
+                        k if k == SpaceKind::AdmitCursors as u8 => {
+                            assert_eq!(components.len(), 4, "admit cursor key has no suffix");
+                            space.admit_cursors =
+                                AdmitCursors::decode(&bytes).expect("undecodable admit cursors");
+                        }
+                        k if k == SpaceKind::AdmitLog as u8 => {
+                            assert_eq!(components.len(), 5, "admit log key has one seq suffix");
+                            let seq = AdmissionSeq(u64_at(&components, 4, "admission seq"));
+                            let admitted =
+                                decode_admitted_batch(&bytes).expect("undecodable admitted batch");
+                            assert_eq!(
+                                admitted.admission_seq, seq,
+                                "admitted batch diverges from its storage key"
+                            );
+                            space.admits.insert(seq, admitted);
+                        }
                         other => panic!("unknown space record kind {other}"),
                     }
                 }
@@ -901,6 +1033,71 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
             let record = DeviceOp::decode(&bytes).expect("undecodable commit record");
             out.push((seq, record));
+        }
+        Ok(out)
+    }
+
+    async fn admit_cursors(&self, space: SpaceId) -> Result<AdmitCursors, StorageError> {
+        Ok(match self.store.get(&admit_cursors_key(space)).await? {
+            Some(bytes) => AdmitCursors::decode(&bytes).expect("undecodable admit cursors"),
+            None => AdmitCursors::default(),
+        })
+    }
+
+    async fn admitted_batches(
+        &self,
+        space: SpaceId,
+        from: AdmissionSeq,
+        through: AdmissionSeq,
+    ) -> Result<Vec<AdmittedBatch>, StorageError> {
+        let mut out = Vec::new();
+        if from > through {
+            return Ok(out);
+        }
+        let cursors = self.admit_cursors(space).await?;
+        if from < cursors.head || through >= cursors.tail {
+            return Err(StorageError(format!(
+                "admit read [{from:?}, {through:?}] outside retained window [{:?}, {:?})",
+                cursors.head, cursors.tail
+            )));
+        }
+        let end = homebase_core::storage::prefix_successor(&admit_log_scan(space));
+        let mut scan = self.store.scan(admit_log_key(space, from), end);
+        while let Some((storage_key, bytes)) = scan.next().await? {
+            let components = decode_components(&storage_key).expect("undecodable storage key");
+            let seq = AdmissionSeq(u64_at(&components, 4, "admission seq"));
+            if seq > through {
+                break;
+            }
+            let admitted =
+                decode_admitted_batch(&bytes).expect("undecodable admitted batch record");
+            assert_eq!(
+                admitted.admission_seq, seq,
+                "admitted batch diverges from its storage key"
+            );
+            out.push(admitted);
+        }
+        let expected_len = through.0 - from.0 + 1;
+        if u64::try_from(out.len()).ok() != Some(expected_len) {
+            return Err(StorageError(format!(
+                "admit read expected {expected_len} dense batches, found {}",
+                out.len()
+            )));
+        }
+        for (offset, admitted) in out.iter().enumerate() {
+            let offset = u64::try_from(offset)
+                .map_err(|_| StorageError("admit read sequence overflow".into()))?;
+            let expected = AdmissionSeq(
+                from.0
+                    .checked_add(offset)
+                    .ok_or_else(|| StorageError("admit read sequence overflow".into()))?,
+            );
+            if admitted.admission_seq != expected {
+                return Err(StorageError(format!(
+                    "admit read expected {expected:?}, found {:?}",
+                    admitted.admission_seq
+                )));
+            }
         }
         Ok(out)
     }
@@ -1152,6 +1349,109 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         self.store.apply(batch).await
     }
 
+    async fn append_admits(
+        &self,
+        space: SpaceId,
+        response: &PullResponse,
+    ) -> Result<(), StorageError> {
+        response
+            .validate_dense()
+            .map_err(|err| StorageError(err.to_string()))?;
+        let cursors = self.admit_cursors(space).await?;
+        let expected_after = AdmissionSeq(
+            cursors
+                .tail
+                .0
+                .checked_sub(1)
+                .ok_or_else(|| StorageError("admit tail cannot be zero".into()))?,
+        );
+        if response.after != expected_after {
+            return Err(StorageError(format!(
+                "pull starts after {:?}, but admit tail expects {:?}",
+                response.after, expected_after
+            )));
+        }
+        if response.batches.is_empty() {
+            return Ok(());
+        }
+        let next_tail = AdmissionSeq(
+            response
+                .through
+                .0
+                .checked_add(1)
+                .ok_or_else(|| StorageError("admit tail overflow".into()))?,
+        );
+        let mut batch = WriteBatch::new();
+        for admitted in &response.batches {
+            batch.put(
+                admit_log_key(space, admitted.admission_seq),
+                encode_admitted_batch(admitted),
+            );
+        }
+        batch.put(
+            admit_cursors_key(space),
+            AdmitCursors {
+                tail: next_tail,
+                ..cursors
+            }
+            .encode(),
+        );
+        self.store.apply(batch).await
+    }
+
+    async fn mark_admits_applied(
+        &self,
+        space: SpaceId,
+        to: AdmissionSeq,
+    ) -> Result<(), StorageError> {
+        let cursors = self.admit_cursors(space).await?;
+        if to < cursors.neck || to > cursors.tail {
+            return Err(StorageError(format!(
+                "admit apply target {to:?} outside [{:?}, {:?}]",
+                cursors.neck, cursors.tail
+            )));
+        }
+        if to == cursors.neck {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(
+            admit_cursors_key(space),
+            AdmitCursors {
+                neck: to,
+                ..cursors
+            }
+            .encode(),
+        );
+        self.store.apply(batch).await
+    }
+
+    async fn trim_admits(&self, space: SpaceId, to: AdmissionSeq) -> Result<(), StorageError> {
+        let cursors = self.admit_cursors(space).await?;
+        if to < cursors.head || to > cursors.neck {
+            return Err(StorageError(format!(
+                "admit trim target {to:?} outside [{:?}, {:?}]",
+                cursors.head, cursors.neck
+            )));
+        }
+        if to == cursors.head {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        for raw_seq in cursors.head.0..to.0 {
+            batch.delete(admit_log_key(space, AdmissionSeq(raw_seq)));
+        }
+        batch.put(
+            admit_cursors_key(space),
+            AdmitCursors {
+                head: to,
+                ..cursors
+            }
+            .encode(),
+        );
+        self.store.apply(batch).await
+    }
+
     async fn advance_watermark(
         &self,
         space: SpaceId,
@@ -1271,6 +1571,8 @@ const CODEC_RECORD_VERSION: u8 = 1;
 const LEASE_RECORD_VERSION: u8 = 3;
 const OPLOG_RECORD_VERSION: u8 = 4;
 const CHECKSUM_RECORD_VERSION: u8 = 1;
+const ADMIT_CURSORS_RECORD_VERSION: u8 = 1;
+const ADMITTED_BATCH_RECORD_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ChecksumRecord {
@@ -1333,6 +1635,29 @@ impl OplogCursors {
         let head = DeviceSeq(r.u64()?);
         let neck = DeviceSeq(r.u64()?);
         let tail = DeviceSeq(r.u64()?);
+        r.end()?;
+        Some(Self { head, neck, tail })
+    }
+}
+
+impl AdmitCursors {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 24);
+        out.push(ADMIT_CURSORS_RECORD_VERSION);
+        out.extend_from_slice(&self.head.0.to_be_bytes());
+        out.extend_from_slice(&self.neck.0.to_be_bytes());
+        out.extend_from_slice(&self.tail.0.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != ADMIT_CURSORS_RECORD_VERSION {
+            return None;
+        }
+        let head = AdmissionSeq(r.u64()?);
+        let neck = AdmissionSeq(r.u64()?);
+        let tail = AdmissionSeq(r.u64()?);
         r.end()?;
         Some(Self { head, neck, tail })
     }
@@ -1622,25 +1947,7 @@ impl DeviceOp {
 fn encode_entries(out: &mut Vec<u8>, entries: &[DeviceEntry]) {
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for entry in entries {
-        let (kind, key, ciphertext) = match &entry.mutation {
-            Mutation::Set { key, value } => (1, key, Some(value.0.as_slice())),
-            Mutation::Delete { key } => (2, key, None),
-        };
-        out.push(kind);
-        let key = key.encode();
-        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
-        out.extend_from_slice(&key);
-        out.extend_from_slice(&entry.tag.device.0);
-        out.extend_from_slice(&entry.tag.device_seq.0.to_be_bytes());
-        out.extend_from_slice(&entry.tag.ver.0.to_be_bytes());
-        out.extend_from_slice(&entry.tag.cipher_epoch.0.to_be_bytes());
-        let seal = entry.seal.encode();
-        out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
-        out.extend_from_slice(&seal);
-        if let Some(ciphertext) = ciphertext {
-            out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
-            out.extend_from_slice(ciphertext);
-        }
+        encode_device_entry(out, entry);
     }
 }
 
@@ -1648,35 +1955,109 @@ fn decode_entries(r: &mut Reader<'_>) -> Option<Vec<DeviceEntry>> {
     let count = r.u32()? as usize;
     let mut entries = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let kind = r.u8()?;
-        let key_len = r.u32()? as usize;
-        let key = Key::decode(r.take(key_len)?).ok()?;
-        let tag = homebase_core::tag::DeviceTag {
-            device: DeviceId(r.bytes16()?),
-            device_seq: DeviceSeq(r.u64()?),
-            ver: Ver(r.u64()?),
-            cipher_epoch: homebase_core::tag::CipherEpoch(r.u64()?),
-        };
-        let seal_len = r.u32()? as usize;
-        let seal = homebase_core::seal::Seal::decode(r.take(seal_len)?).ok()?;
-        let mutation = match kind {
-            1 => {
-                let len = r.u32()? as usize;
-                Mutation::Set {
-                    key,
-                    value: OpaqueValue(r.take(len)?.to_vec()),
-                }
-            }
-            2 => Mutation::Delete { key },
-            _ => return None,
-        };
-        entries.push(DeviceEntry {
-            mutation,
-            tag,
-            seal,
-        });
+        entries.push(decode_device_entry(r)?);
     }
     Some(entries)
+}
+
+fn encode_device_entry(out: &mut Vec<u8>, entry: &DeviceEntry) {
+    let (kind, key, value) = match &entry.mutation {
+        Mutation::Set { key, value } => (1, key, Some(value.0.as_slice())),
+        Mutation::Delete { key } => (2, key, None),
+    };
+    out.push(kind);
+    let key = key.encode();
+    out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    out.extend_from_slice(&key);
+    out.extend_from_slice(&entry.tag.device.0);
+    out.extend_from_slice(&entry.tag.device_seq.0.to_be_bytes());
+    out.extend_from_slice(&entry.tag.ver.0.to_be_bytes());
+    out.extend_from_slice(&entry.tag.cipher_epoch.0.to_be_bytes());
+    let seal = entry.seal.encode();
+    out.extend_from_slice(&(seal.len() as u32).to_be_bytes());
+    out.extend_from_slice(&seal);
+    if let Some(value) = value {
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+}
+
+fn decode_device_entry(r: &mut Reader<'_>) -> Option<DeviceEntry> {
+    let kind = r.u8()?;
+    let key_len = r.u32()? as usize;
+    let key = Key::decode(r.take(key_len)?).ok()?;
+    let tag = homebase_core::tag::DeviceTag {
+        device: DeviceId(r.bytes16()?),
+        device_seq: DeviceSeq(r.u64()?),
+        ver: Ver(r.u64()?),
+        cipher_epoch: homebase_core::tag::CipherEpoch(r.u64()?),
+    };
+    let seal_len = r.u32()? as usize;
+    let seal = homebase_core::seal::Seal::decode(r.take(seal_len)?).ok()?;
+    let mutation = match kind {
+        1 => {
+            let len = r.u32()? as usize;
+            Mutation::Set {
+                key,
+                value: OpaqueValue(r.take(len)?.to_vec()),
+            }
+        }
+        2 => Mutation::Delete { key },
+        _ => return None,
+    };
+    Some(DeviceEntry {
+        mutation,
+        tag,
+        seal,
+    })
+}
+
+fn encode_admitted_batch(admitted: &AdmittedBatch) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(ADMITTED_BATCH_RECORD_VERSION);
+    out.extend_from_slice(&admitted.admission_seq.0.to_be_bytes());
+    out.extend_from_slice(&admitted.device.0);
+    out.extend_from_slice(&admitted.device_seq.0.to_be_bytes());
+    out.extend_from_slice(&admitted.checksum.0);
+    out.extend_from_slice(&(admitted.entries.len() as u32).to_be_bytes());
+    for entry in &admitted.entries {
+        encode_device_entry(&mut out, &entry.device_entry);
+        out.extend_from_slice(&entry.admission.admission_seq.0.to_be_bytes());
+        out.extend_from_slice(&entry.admission.op_index.to_be_bytes());
+    }
+    out
+}
+
+fn decode_admitted_batch(bytes: &[u8]) -> Option<AdmittedBatch> {
+    let mut r = Reader::new(bytes);
+    if r.u8()? != ADMITTED_BATCH_RECORD_VERSION {
+        return None;
+    }
+    let admission_seq = AdmissionSeq(r.u64()?);
+    let device = DeviceId(r.bytes16()?);
+    let device_seq = DeviceSeq(r.u64()?);
+    let checksum = DeviceChecksum(r.take(32)?.try_into().ok()?);
+    let count = r.u32()? as usize;
+    let mut entries = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        entries.push(AdmittedEntry {
+            device_entry: decode_device_entry(&mut r)?,
+            admission: AdmissionTag {
+                admission_seq: AdmissionSeq(r.u64()?),
+                op_index: r.u32()?,
+            },
+        });
+    }
+    r.end()?;
+    let admitted = AdmittedBatch {
+        admission_seq,
+        device,
+        device_seq,
+        checksum,
+        entries,
+    };
+    admitted.validate().ok()?;
+    Some(admitted)
 }
 
 fn single_byte(components: &[KeyComponent], index: usize, what: &str) -> u8 {
@@ -1835,6 +2216,46 @@ pub mod conformance {
         Mutation::Delete { key }
     }
 
+    fn admitted_batch(
+        admission_seq: u64,
+        device_seq: u64,
+        mutations: Vec<Mutation>,
+    ) -> AdmittedBatch {
+        let device = DeviceId([3; 16]);
+        AdmittedBatch {
+            admission_seq: AdmissionSeq(admission_seq),
+            device,
+            device_seq: DeviceSeq(device_seq),
+            checksum: DeviceChecksum([admission_seq as u8; 32]),
+            entries: mutations
+                .into_iter()
+                .enumerate()
+                .map(|(op_index, mutation)| AdmittedEntry {
+                    device_entry: DeviceEntry {
+                        mutation: match mutation {
+                            Mutation::Set { key, value } => Mutation::Set {
+                                key,
+                                value: OpaqueValue(value),
+                            },
+                            Mutation::Delete { key } => Mutation::Delete { key },
+                        },
+                        tag: homebase_core::tag::DeviceTag {
+                            device,
+                            device_seq: DeviceSeq(device_seq),
+                            ver: Ver(admission_seq * 10 + op_index as u64 + 1),
+                            cipher_epoch: homebase_core::tag::CipherEpoch(0),
+                        },
+                        seal: homebase_core::seal::Seal::empty_aead_v1(),
+                    },
+                    admission: AdmissionTag {
+                        admission_seq: AdmissionSeq(admission_seq),
+                        op_index: op_index as u32,
+                    },
+                })
+                .collect(),
+        }
+    }
+
     /// Drives the whole lifecycle against a **fresh** store. Panics on any
     /// contract violation.
     pub async fn run_all<M: MetaStore>(store: &M) {
@@ -1853,6 +2274,107 @@ pub mod conformance {
         let device = DeviceId([1; 16]);
         store.record_device(device).await.unwrap();
         assert_eq!(audit(store).await.device, Some(device));
+
+        // The inbound admit log is an exact dense replica in server
+        // AdmissionSeq. A missing header or operation-order gap is rejected
+        // before any durable transition.
+        let malformed = PullResponse {
+            after: AdmissionSeq(0),
+            through: AdmissionSeq(2),
+            batches: vec![admitted_batch(1, 1, vec![])],
+        };
+        assert!(store.append_admits(space, &malformed).await.is_err());
+        assert_eq!(
+            store.admit_cursors(space).await.unwrap(),
+            AdmitCursors::default()
+        );
+
+        let pulled = PullResponse {
+            after: AdmissionSeq(0),
+            through: AdmissionSeq(2),
+            batches: vec![
+                admitted_batch(
+                    1,
+                    1,
+                    vec![
+                        set(key(&[b"db", b"remote"]), b"one"),
+                        delete(key(&[b"db", b"gone"])),
+                    ],
+                ),
+                admitted_batch(2, 2, vec![]),
+            ],
+        };
+        store.append_admits(space, &pulled).await.unwrap();
+        let state = audit(store).await;
+        assert_eq!(
+            state.spaces[&space].admit_cursors,
+            AdmitCursors {
+                head: AdmissionSeq(1),
+                neck: AdmissionSeq(1),
+                tail: AdmissionSeq(3),
+            }
+        );
+        assert_eq!(
+            store
+                .admitted_batches(space, AdmissionSeq(1), AdmissionSeq(2))
+                .await
+                .unwrap(),
+            pulled.batches
+        );
+        assert!(
+            state.spaces[&space].admits[&AdmissionSeq(2)]
+                .entries
+                .is_empty()
+        );
+
+        assert!(
+            store.append_admits(space, &pulled).await.is_err(),
+            "a stale pull cannot fork the local dense suffix"
+        );
+        assert!(
+            store
+                .mark_admits_applied(space, AdmissionSeq(4))
+                .await
+                .is_err()
+        );
+        assert!(
+            store.trim_admits(space, AdmissionSeq(2)).await.is_err(),
+            "captured but unapplied batches cannot be trimmed"
+        );
+
+        store
+            .mark_admits_applied(space, AdmissionSeq(3))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_admits_applied(space, AdmissionSeq(2))
+                .await
+                .is_err(),
+            "application coverage cannot regress"
+        );
+        store.trim_admits(space, AdmissionSeq(2)).await.unwrap();
+        let state = audit(store).await;
+        assert_eq!(state.spaces[&space].admit_cursors.head, AdmissionSeq(2));
+        assert_eq!(
+            state.spaces[&space]
+                .admits
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(2)]
+        );
+        store.trim_admits(space, AdmissionSeq(3)).await.unwrap();
+        let state = audit(store).await;
+        assert_eq!(
+            state.spaces[&space].admit_cursors,
+            AdmitCursors {
+                head: AdmissionSeq(3),
+                neck: AdmissionSeq(3),
+                tail: AdmissionSeq(3),
+            }
+        );
+        assert!(state.spaces[&space].admits.is_empty());
 
         // Two spaces have independent sequence and version streams.
         let first = commit_entries(
@@ -2434,6 +2956,30 @@ mod tests {
         ])
     }
 
+    fn sample_admitted() -> AdmittedBatch {
+        let mut entries = sample_commit().entries().to_vec();
+        for entry in &mut entries {
+            entry.tag.device_seq = DeviceSeq(4);
+        }
+        AdmittedBatch {
+            admission_seq: AdmissionSeq(9),
+            device: DeviceId([1; 16]),
+            device_seq: DeviceSeq(4),
+            checksum: DeviceChecksum([7; 32]),
+            entries: entries
+                .into_iter()
+                .enumerate()
+                .map(|(op_index, device_entry)| AdmittedEntry {
+                    device_entry,
+                    admission: AdmissionTag {
+                        admission_seq: AdmissionSeq(9),
+                        op_index: op_index as u32,
+                    },
+                })
+                .collect(),
+        }
+    }
+
     /// A hand-built state whose counters cover its queue, for corrupting.
     fn covered_state() -> ClientState {
         let mut state = ClientState::default();
@@ -2457,6 +3003,22 @@ mod tests {
             tail: DeviceSeq(17),
         };
         assert_eq!(OplogCursors::decode(&cursors.encode()), Some(cursors));
+
+        let admit_cursors = AdmitCursors {
+            head: AdmissionSeq(3),
+            neck: AdmissionSeq(7),
+            tail: AdmissionSeq(17),
+        };
+        assert_eq!(
+            AdmitCursors::decode(&admit_cursors.encode()),
+            Some(admit_cursors)
+        );
+
+        let admitted = sample_admitted();
+        assert_eq!(
+            decode_admitted_batch(&encode_admitted_batch(&admitted)),
+            Some(admitted)
+        );
 
         let ver = VerHighRecord { high: Ver(9) };
         assert_eq!(VerHighRecord::decode(&ver.encode()), Some(ver));
@@ -2526,6 +3088,14 @@ mod tests {
         let mut bytes = sample_commit().encode();
         bytes.push(0);
         assert_eq!(DeviceOp::decode(&bytes), None);
+
+        let mut bytes = AdmitCursors::default().encode();
+        bytes.push(0);
+        assert_eq!(AdmitCursors::decode(&bytes), None);
+
+        let mut bytes = encode_admitted_batch(&sample_admitted());
+        bytes.push(0);
+        assert_eq!(decode_admitted_batch(&bytes), None);
     }
 
     #[test]
@@ -2537,6 +3107,8 @@ mod tests {
             ver_key(SPACE),
             clock_key(),
             oplog_key(SPACE, DeviceSeq(1)),
+            admit_cursors_key(SPACE),
+            admit_log_key(SPACE, AdmissionSeq(1)),
             watermark_key(SPACE, &Range::Full),
             watermark_key(SPACE, &Range::Prefix(key(&[b"db"]))),
             codec_key(SPACE),
@@ -2605,6 +3177,33 @@ mod tests {
         );
         space.cursors.tail = DeviceSeq(4);
         space.ver_high = Some(Ver(4));
+        certify(&state);
+    }
+
+    #[test]
+    fn certify_accepts_dense_admit_history() {
+        let mut state = ClientState::default();
+        let space = state.spaces.entry(SPACE).or_default();
+        space.admits.insert(AdmissionSeq(9), sample_admitted());
+        space.admit_cursors = AdmitCursors {
+            head: AdmissionSeq(9),
+            neck: AdmissionSeq(9),
+            tail: AdmissionSeq(10),
+        };
+        certify(&state);
+    }
+
+    #[test]
+    #[should_panic(expected = "admit log is not dense")]
+    fn certify_rejects_admit_log_gaps() {
+        let mut state = ClientState::default();
+        let space = state.spaces.entry(SPACE).or_default();
+        space.admits.insert(AdmissionSeq(9), sample_admitted());
+        space.admit_cursors = AdmitCursors {
+            head: AdmissionSeq(9),
+            neck: AdmissionSeq(9),
+            tail: AdmissionSeq(11),
+        };
         certify(&state);
     }
 

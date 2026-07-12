@@ -409,11 +409,15 @@ pub async fn pull<S: OrderedStore>(
         .unwrap_or(u64::MAX);
     let through = AdmissionSeq(req.after.0 + available.min(limit));
     let batches = read_admission_interval(space, store, req.after, through).await?;
-    Ok(PullResponse {
+    let response = PullResponse {
         after: req.after,
         through,
         batches,
-    })
+    };
+    response
+        .validate_dense()
+        .expect("server constructed a malformed dense pull");
+    Ok(response)
 }
 
 async fn read_admission_interval<S: OrderedStore>(
