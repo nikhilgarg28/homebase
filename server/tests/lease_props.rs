@@ -247,7 +247,7 @@ proptest! {
                     let resp = block_on(mgr.renew(
                         &store,
                         Timestamp(model.now),
-                        &RenewRequest { device: dev(*device), leases: ids.clone() },
+                        &RenewRequest { device: dev(*device), requested_at: HybridTimestamp::ZERO, leases: ids.clone() },
                     ))
                     .unwrap();
 

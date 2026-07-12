@@ -209,10 +209,10 @@ pub struct HeldLease {
     /// Fresh acquires are not local authority until the effective watermark
     /// for this lease prefix has reached the grant's barrier. Renewals preserve this.
     pub barrier: Option<AdmissionSeq>,
-    /// A release intent has been durably recorded. Retiring leases are
+    /// A release intent has been durably recorded. Forgotten leases are
     /// never local authority, but keep the id so the server release can
     /// be retried after a crash.
-    pub retiring: bool,
+    pub forgotten: bool,
 }
 
 /// One unshipped record in a space's queue, keyed by the `DeviceSeq` it
@@ -508,10 +508,18 @@ pub trait MetaStore {
     /// server and must not be half-remembered here. Records are
     /// identified by **(space, prefix)**: a re-grant of the same prefix
     /// replaces the superseded record (the server holds at most one live
-    /// lease per prefix per device). Resumable, but unconfirmed until
-    /// the next renewal succeeds (the stored deadline is never trusted
-    /// across incarnations).
+    /// lease per prefix per device). Across incarnations, the stored
+    /// client-domain deadline remains conservative through the lease margin.
     fn record_leases(
+        &self,
+        space: SpaceId,
+        leases: &[HeldLease],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Replace one space's complete local lease view in one durable step.
+    /// Used after `list_leases` so repair cannot expose a partially
+    /// reconciled authority set across a crash.
+    fn reconcile_leases(
         &self,
         space: SpaceId,
         leases: &[HeldLease],
@@ -519,13 +527,13 @@ pub trait MetaStore {
 
     /// Release intent: mark held leases unusable locally while retaining
     /// enough information to retry the server release after a crash.
-    fn retire_leases(
+    fn forget_leases(
         &self,
         space: SpaceId,
         ids: &[LeaseId],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Released or refused leases are forgotten, atomically as a batch.
+    /// Remove leases after release acknowledgement or authoritative repair.
     fn drop_leases(
         &self,
         space: SpaceId,
@@ -1152,15 +1160,34 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         self.store.apply(batch).await
     }
 
-    async fn retire_leases(&self, space: SpaceId, ids: &[LeaseId]) -> Result<(), StorageError> {
+    async fn reconcile_leases(
+        &self,
+        space: SpaceId,
+        leases: &[HeldLease],
+    ) -> Result<(), StorageError> {
+        let scan = encode_components(&space_kind(space, SpaceKind::Lease));
+        let mut batch = WriteBatch::new();
+        for (storage_key, _) in collect_scan(self.store.scan_prefix(&scan)).await? {
+            batch.delete(storage_key);
+        }
+        for held in leases {
+            batch.put(lease_key(space, &held.lease.prefix), held.encode());
+        }
+        if !batch.is_empty() {
+            self.store.apply(batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn forget_leases(&self, space: SpaceId, ids: &[LeaseId]) -> Result<(), StorageError> {
         // Records key by prefix, server speaks ids. Same short scan as
-        // drop_leases, but rewrite matching records with `retiring = true`.
+        // drop_leases, but rewrite matching records with `forgotten = true`.
         let scan = encode_components(&space_kind(space, SpaceKind::Lease));
         let mut batch = WriteBatch::new();
         for (storage_key, bytes) in collect_scan(self.store.scan_prefix(&scan)).await? {
             let mut record = HeldLease::decode(&bytes).expect("undecodable lease");
-            if ids.contains(&record.lease.id) && !record.retiring {
-                record.retiring = true;
+            if ids.contains(&record.lease.id) && !record.forgotten {
+                record.forgotten = true;
                 batch.put(storage_key, record.encode());
             }
         }
@@ -1347,7 +1374,7 @@ impl HeldLease {
         out.extend_from_slice(&self.deadline.wall.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.mono.0.to_be_bytes());
         out.extend_from_slice(&self.deadline.lineage.0);
-        out.push(self.retiring as u8);
+        out.push(self.forgotten as u8);
         match self.barrier {
             Some(barrier) => {
                 out.push(1);
@@ -1384,7 +1411,7 @@ impl HeldLease {
             mono: Timestamp(r.u64()?),
             lineage: Lineage(r.bytes16()?),
         };
-        let retiring = match r.u8()? {
+        let forgotten = match r.u8()? {
             0 => false,
             1 => true,
             _ => return None,
@@ -1407,7 +1434,7 @@ impl HeldLease {
             },
             deadline,
             barrier,
-            retiring,
+            forgotten,
         })
     }
 }
@@ -1699,7 +1726,7 @@ pub mod conformance {
             },
             deadline: stamp(1_300),
             barrier: None,
-            retiring: false,
+            forgotten: false,
         }
     }
 
@@ -2107,7 +2134,7 @@ pub mod conformance {
             },
             deadline: stamp(2_000),
             barrier: Some(AdmissionSeq(40)),
-            retiring: false,
+            forgotten: false,
         };
         store
             .record_leases(space, &[sample_lease(), second_lease.clone()])
@@ -2125,7 +2152,7 @@ pub mod conformance {
             },
             deadline: stamp(900),
             barrier: None,
-            retiring: false,
+            forgotten: false,
         };
         store
             .record_leases(link, std::slice::from_ref(&link_lease))
@@ -2194,7 +2221,7 @@ pub mod conformance {
             },
             deadline: stamp(5_000),
             barrier: None,
-            retiring: false,
+            forgotten: false,
         };
         store
             .record_leases(space, std::slice::from_ref(&renewed))
@@ -2213,7 +2240,7 @@ pub mod conformance {
             },
             deadline: stamp(9_000),
             barrier: None,
-            retiring: false,
+            forgotten: false,
         };
         store
             .record_leases(space, std::slice::from_ref(&regrant))
@@ -2226,8 +2253,32 @@ pub mod conformance {
         );
         assert_eq!(state.spaces[&space].leases[&LeaseId(99)], regrant);
 
+        let repaired = HeldLease {
+            lease: Lease {
+                id: LeaseId(100),
+                prefix: key(&[b"db", b"repaired"]),
+                ..sample_lease().lease
+            },
+            deadline: stamp(10_000),
+            barrier: Some(AdmissionSeq(55)),
+            forgotten: false,
+        };
         store
-            .drop_leases(space, &[LeaseId(99), LeaseId(43)])
+            .reconcile_leases(space, std::slice::from_ref(&repaired))
+            .await
+            .unwrap();
+        assert_eq!(
+            audit(store).await.spaces[&space]
+                .leases
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![repaired.clone()],
+            "repair atomically replaces stale and missing local leases"
+        );
+
+        store
+            .drop_leases(space, &[repaired.lease.id])
             .await
             .unwrap();
         assert!(audit(store).await.spaces[&space].leases.is_empty());
@@ -2367,7 +2418,7 @@ mod tests {
             },
             deadline: stamp(1_234),
             barrier: Some(AdmissionSeq(17)),
-            retiring: true,
+            forgotten: true,
         };
         assert_eq!(HeldLease::decode(&lease.encode()), Some(lease));
 
@@ -2597,7 +2648,7 @@ mod tests {
                 // high-water: a stamp the recorded timeline never saw.
                 deadline: stamp(100_000),
                 barrier: None,
-                retiring: false,
+                forgotten: false,
             },
         );
         certify(&state);

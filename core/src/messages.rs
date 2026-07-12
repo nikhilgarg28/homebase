@@ -16,7 +16,7 @@
 //! enforcement on reads and writes is likewise a wire-layer concern; these
 //! types describe kernel semantics for a caller already inside a space.
 
-use crate::clock::HybridTimestamp;
+use crate::clock::{HybridTimestamp, Timestamp};
 use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode};
 use crate::tag::{AdmissionSeq, AdmittedEntry, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, Ver};
@@ -64,6 +64,9 @@ pub struct AcquireResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenewRequest {
     pub device: DeviceId,
+    /// Client-domain send stamp used to reconstruct the renewed deadline
+    /// after local lease-state repair.
+    pub requested_at: HybridTimestamp,
     pub leases: Vec<LeaseId>,
 }
 
@@ -72,6 +75,8 @@ pub struct RenewRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenewGrant {
     pub id: LeaseId,
+    /// Server-domain grant timestamp for this refresh.
+    pub granted_at: Timestamp,
     /// Fresh TTL, counted from this request's send time (asymmetric expiry).
     pub ttl: Duration,
     /// Another device wants an overlapping prefix. Demand-driven stickiness:

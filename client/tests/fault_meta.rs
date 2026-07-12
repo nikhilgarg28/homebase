@@ -141,7 +141,7 @@ async fn run_flushed_crash_seed(seed: u64) {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db)]).await.unwrap();
+        space.ensure(vec![wspec(&db)]).await.unwrap();
         space
             .submit_checked(vec![set(row.clone(), b"survived")], vec![])
             .await
@@ -192,7 +192,7 @@ fn unflushed_commit_is_lost_on_crash() {
                 .await
                 .unwrap();
             let space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db)]).await.unwrap();
+            space.ensure(vec![wspec(&db)]).await.unwrap();
             space
                 .submit_checked(vec![set(row.clone(), b"volatile")], vec![])
                 .await
@@ -225,7 +225,7 @@ fn flushed_rollback_survives_crash_as_one_cursor_marker_transition() {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db)]).await.unwrap();
+        space.ensure(vec![wspec(&db)]).await.unwrap();
         space
             .submit_checked(vec![set(key(&[b"db", b"a"]), b"one")], vec![])
             .await
@@ -325,7 +325,7 @@ fn rollback_marker_ack_drop_recovers_by_trimming_dead_history() {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&key(&[b"db"]))]).await.unwrap();
+        space.ensure(vec![wspec(&key(&[b"db"]))]).await.unwrap();
         space
             .submit_checked(vec![set(key(&[b"db", b"a"]), b"one")], vec![])
             .await
@@ -399,7 +399,7 @@ fn ack_drop_trims_after_server_admitted() {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db)]).await.unwrap();
         let lease = granted.leases[0].id;
         space
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])

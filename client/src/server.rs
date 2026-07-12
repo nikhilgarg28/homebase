@@ -446,6 +446,7 @@ pub mod conformance {
                 &space,
                 RenewRequest {
                     device: dev(1),
+                    requested_at: HybridTimestamp::ZERO,
                     leases: vec![lease],
                 },
             )
@@ -593,6 +594,7 @@ pub mod conformance {
                 &unknown,
                 RenewRequest {
                     device: dev(1),
+                    requested_at: HybridTimestamp::ZERO,
                     leases: vec![],
                 },
             )

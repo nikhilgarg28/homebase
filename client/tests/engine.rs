@@ -6,15 +6,15 @@
 //! deterministic run.
 
 use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, SubmitMode, audit};
+use homebase::meta::{HeldLease, MetaStore, OrderedMetaStore, SubmitMode, audit};
 use homebase::server::ServerHandle;
-use homebase::{Client, ClientError, PushOutcome, SpaceDriverError};
+use homebase::{Client, ClientError, PushOutcome, SpaceDriverError, lease_margin};
 use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
     AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec, Range,
-    RangeAssert, RangeAssertFailure, RangeCut, ReleaseRequest,
+    RangeAssert, RangeAssertFailure, RangeCut, ReleaseRequest, RenewRequest,
 };
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
@@ -663,7 +663,7 @@ fn push_drains_and_groups_same_space_neighbors() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        space.ensure(vec![wspec(&db, 60)]).await.unwrap();
 
         let (a1, a2, a3) = (
             key(&[b"db", b"a1"]),
@@ -753,7 +753,7 @@ fn push_cap_splits_groups() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
         space
             .submit_checked(vec![set(k1.clone(), b"1")], vec![])
@@ -788,7 +788,7 @@ fn push_cap_splits_groups() {
 }
 
 #[test]
-fn acquire_satisfies_covered_specs_locally() {
+fn ensure_satisfies_covered_specs_locally() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -805,7 +805,7 @@ fn acquire_satisfies_covered_specs_locally() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        let first = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let first = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(
             first.barrier, None,
             "no admitted writes means no catch-up barrier"
@@ -814,7 +814,7 @@ fn acquire_satisfies_covered_specs_locally() {
 
         // Asking again changes nothing: same lease, same epoch, no wire
         // grant — and so no new catch-up obligation.
-        let again = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let again = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(again.leases, vec![lease.clone()]);
         assert_eq!(again.barrier, None);
 
@@ -825,7 +825,7 @@ fn acquire_satisfies_covered_specs_locally() {
             mode: LeaseMode::Read,
             ttl: Duration::from_secs(60),
         };
-        let covered = space.acquire(vec![read_spec]).await.unwrap();
+        let covered = space.ensure(vec![read_spec]).await.unwrap();
         assert_eq!(covered.leases, vec![lease.clone()]);
         assert_eq!(covered.barrier, None);
 
@@ -833,7 +833,7 @@ fn acquire_satisfies_covered_specs_locally() {
         // one is acquired, and the answer stays parallel to the specs.
         let other = key(&[b"other"]);
         let mixed = space
-            .acquire(vec![wspec(&db, 60), wspec(&other, 60)])
+            .ensure(vec![wspec(&db, 60), wspec(&other, 60)])
             .await
             .unwrap();
         assert_eq!(mixed.leases[0], lease);
@@ -849,7 +849,7 @@ fn acquire_satisfies_covered_specs_locally() {
         // local window — because the kernel treats a same-device
         // re-acquire of a live lease as contention.
         clock.advance(Duration::from_secs(60));
-        let revived = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let revived = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         assert_eq!(revived.barrier, None);
         assert_eq!(revived.leases[0].id, lease.id, "renewed, not re-granted");
 
@@ -862,6 +862,38 @@ fn acquire_satisfies_covered_specs_locally() {
             client.push().await.unwrap(),
             PushOutcome::Drained { .. }
         ));
+    });
+}
+
+#[test]
+fn ensure_does_not_push_a_nonempty_oplog() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        space
+            .submit_unchecked(vec![set(key(&[b"queued", b"k"]), b"v")], Vec::new())
+            .await
+            .unwrap();
+
+        space
+            .ensure(vec![rspec(&key(&[b"reserved"]), 60)])
+            .await
+            .unwrap();
+        assert_eq!(queued(&mem).await, 1);
+        assert!(
+            fetch(&handle, SPACE, &key(&[b"queued", b"k"]))
+                .await
+                .is_none()
+        );
     });
 }
 
@@ -885,7 +917,7 @@ fn resume_keeps_wall_clock_authority() {
                 .unwrap();
 
             let space = client.space(SPACE).await.unwrap();
-            let granted = space.acquire(vec![wspec(&db, 3_600)]).await.unwrap();
+            let granted = space.ensure(vec![wspec(&db, 3_600)]).await.unwrap();
             space
                 .submit_checked(vec![set(k.clone(), b"v")], vec![])
                 .await
@@ -982,7 +1014,7 @@ fn margin_applies_only_across_incarnations() {
                 .unwrap();
 
             let space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+            space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .submit_checked(vec![set(key(&[b"db", b"k"]), b"v")], vec![])
                 .await
@@ -1051,6 +1083,219 @@ fn margin_applies_only_across_incarnations() {
 }
 
 #[test]
+fn lease_margin_has_ten_millisecond_floor() {
+    assert_eq!(
+        lease_margin(Duration::from_millis(1)),
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        lease_margin(Duration::from_secs(1)),
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        lease_margin(Duration::from_secs(60)),
+        Duration::from_millis(60)
+    );
+}
+
+#[test]
+fn repair_leases_reconciles_and_preserves_forgotten_intent() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(1_000));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PendingEntry {
+                key: key(&[b"db", b"existing"]),
+                value: val(b"foreign"),
+                ver: Ver(1),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        let requested_at = clock.stamp();
+        let mut remote = handle
+            .acquire(
+                &SPACE,
+                AcquireRequest {
+                    device: dev(1),
+                    requested_at,
+                    specs: vec![rspec(&db, 60)],
+                },
+            )
+            .await
+            .unwrap()
+            .leases
+            .remove(0);
+        clock.advance(Duration::from_millis(100));
+        let renewed_at = clock.stamp();
+        let renewal = handle
+            .renew(
+                &SPACE,
+                RenewRequest {
+                    device: dev(1),
+                    requested_at: renewed_at,
+                    leases: vec![remote.id],
+                },
+            )
+            .await
+            .unwrap();
+        remote.requested_at = renewed_at;
+        remote.granted_at = renewal.granted[0].granted_at;
+        remote.ttl = renewal.granted[0].ttl;
+
+        let stale = HeldLease {
+            lease: homebase_core::lease::Lease {
+                id: homebase_core::lease::LeaseId(999),
+                prefix: key(&[b"stale"]),
+                mode: LeaseMode::Read,
+                requested_at,
+                granted_at: Timestamp(0),
+                ttl: Duration::from_secs(60),
+                barrier: AdmissionSeq(0),
+            },
+            deadline: requested_at.saturating_add(Duration::from_secs(60)),
+            barrier: None,
+            forgotten: false,
+        };
+        OrderedMetaStore::new(&mem)
+            .record_leases(SPACE, &[stale])
+            .await
+            .unwrap();
+
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        space
+            .submit_unchecked(Vec::<Mutation>::new(), Vec::new())
+            .await
+            .unwrap();
+        let repaired = space.repair_leases().await.unwrap();
+        assert_eq!(repaired.active, vec![remote.clone()]);
+        assert!(repaired.forgotten.is_empty());
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(state.spaces[&SPACE].oplog.len(), 1);
+        assert_eq!(state.spaces[&SPACE].leases.len(), 1);
+        let held = &state.spaces[&SPACE].leases[&remote.id];
+        assert_eq!(held.deadline, renewed_at.saturating_add(remote.ttl));
+        assert_eq!(
+            state.spaces[&SPACE].watermarks[&Range::Prefix(db.clone())],
+            AdmissionSeq(1)
+        );
+        drop(space);
+        drop(client);
+
+        let offline = |_: &SpaceId| Option::<SpaceHandle>::None;
+        let client = open_client(OrderedMetaStore::new(&mem), &offline, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client
+                .space(SPACE)
+                .await
+                .unwrap()
+                .release_unchecked(&[remote.id])
+                .await,
+            Err(SpaceDriverError::Unavailable { .. })
+        ));
+        drop(client);
+
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let repaired = space.repair_leases().await.unwrap();
+        assert!(repaired.active.is_empty());
+        assert_eq!(repaired.forgotten, vec![remote.id]);
+
+        handle
+            .release(
+                &SPACE,
+                ReleaseRequest {
+                    device: dev(1),
+                    leases: vec![remote.id],
+                },
+            )
+            .await
+            .unwrap();
+        let repaired = space.repair_leases().await.unwrap();
+        assert!(repaired.active.is_empty());
+        assert!(repaired.forgotten.is_empty());
+        assert!(
+            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE]
+                .leases
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn unavailable_repair_preserves_existing_local_authority() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        client
+            .space(SPACE)
+            .await
+            .unwrap()
+            .ensure(vec![rspec(&db, 60)])
+            .await
+            .unwrap();
+        drop(client);
+
+        let offline = |_: &SpaceId| Option::<SpaceHandle>::None;
+        let client = open_client(OrderedMetaStore::new(&mem), &offline, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.space(SPACE).await.unwrap().repair_leases().await,
+            Err(SpaceDriverError::Unavailable { .. })
+        ));
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(state.spaces[&SPACE].leases.len(), 1);
+        assert!(
+            !state.spaces[&SPACE]
+                .leases
+                .values()
+                .next()
+                .unwrap()
+                .forgotten
+        );
+    });
+}
+
+#[test]
 fn suspend_expires_leases_within_a_lineage() {
     block_on(async {
         let mem = MemoryStore::new();
@@ -1068,7 +1313,7 @@ fn suspend_expires_leases_within_a_lineage() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         space
             .submit_checked(vec![set(key(&[b"db", b"k"]), b"v")], vec![])
             .await
@@ -1109,7 +1354,7 @@ fn backward_clock_step_poisons_stored_stamps() {
                 .unwrap();
 
             let space = client.space(SPACE).await.unwrap();
-            space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+            space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             space
                 .submit_checked(vec![set(k.clone(), b"v")], vec![])
                 .await
@@ -1201,7 +1446,7 @@ fn expired_local_lease_does_not_block_unasserted_submission() {
 
         let db = key(&[b"db"]);
         let k = key(&[b"db", b"k"]);
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space
             .submit_checked(vec![set(k.clone(), b"v")], vec![])
@@ -1244,7 +1489,7 @@ fn seq_collision_recovers_a_dead_incarnations_send_exactly_once() {
 
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         let lease = granted.leases[0].id;
         space
             .submit_checked(vec![set(k1.clone(), b"one")], vec![])
@@ -1360,12 +1605,33 @@ fn group_rejection_probes_to_the_faulty_commit() {
             .unwrap();
 
         let space = client.space(SPACE).await.unwrap();
-        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let requested_at = clock.stamp();
+        let lease = handle
+            .acquire(
+                &SPACE,
+                AcquireRequest {
+                    device: dev(1),
+                    requested_at,
+                    specs: vec![wspec(&db, 60)],
+                },
+            )
+            .await
+            .unwrap()
+            .leases
+            .remove(0);
         // Simulate a buggy caller that marks the acquire barrier satisfied
         // without importing the foreign value's ver. The pusher still
         // degrades a group rejection into the faulty solo commit.
         OrderedMetaStore::new(&mem)
-            .advance_watermark(SPACE, &Range::Prefix(db.clone()), AdmissionSeq(1), Ver(0))
+            .record_leases(
+                SPACE,
+                &[HeldLease {
+                    deadline: requested_at.saturating_add(lease.ttl),
+                    lease,
+                    barrier: None,
+                    forgotten: false,
+                }],
+            )
             .await
             .unwrap();
         space
@@ -1453,7 +1719,7 @@ fn a_forked_store_is_fatal() {
             .unwrap();
 
         let space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         let _lease_id = granted.leases[0].id;
         space
             .submit_checked(vec![set(k1.clone(), b"a")], vec![])
@@ -1504,7 +1770,7 @@ fn a_forked_store_is_fatal() {
 }
 
 #[test]
-fn pull_advances_the_watermark_and_dominates_foreign_vers() {
+fn ensure_advances_the_watermark_and_dominates_foreign_vers() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -1536,31 +1802,14 @@ fn pull_advances_the_watermark_and_dominates_foreign_vers() {
             .unwrap();
 
         let space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
-        assert!(matches!(
-            space
-                .submit_checked(
-                    vec![set(k.clone(), b"too-soon")],
-                    vec![RangeAssert {
-                        prefix: db.clone(),
-                        upto: AdmissionSeq(0),
-                    }],
-                )
-                .await
-                .unwrap_err(),
-            SpaceDriverError::RangeAssertAuthority { .. }
-        ));
-
-        // The acquire-barrier discipline: pull to the barrier before
-        // trusting local state. The pull is a snapshot (no cursor yet)
-        // and raises the ver high-water past everything it saw.
-        let pulled = space.pull(Range::Prefix(db.clone())).await.unwrap();
-        assert!(pulled.at >= granted.barrier.unwrap());
-        assert!(matches!(&pulled.ranges[0], RangeCut::Snapshot(entries) if entries.len() == 1));
+        let ensured = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
+        assert_eq!(ensured.barrier, None);
+        // Ensure imports the acquire barrier before returning and raises the
+        // version high-water past every value in that snapshot.
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert_eq!(
-            audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].watermarks
-                [&Range::Prefix(db.clone())],
-            pulled.at
+            state.spaces[&SPACE].watermarks[&Range::Prefix(db.clone())],
+            AdmissionSeq(1)
         );
 
         // Now the same key can be overwritten: the commit stamps above
@@ -1725,7 +1974,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
                 .unwrap();
 
             let space = client.space(SPACE).await.unwrap();
-            let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+            let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
             granted.leases[0].id
         };
 
@@ -1745,7 +1994,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
             SpaceDriverError::Unavailable { .. }
         ));
         let state = audit(&OrderedMetaStore::new(&mem)).await;
-        assert!(state.spaces[&SPACE].leases[&lease_id].retiring);
+        assert!(state.spaces[&SPACE].leases[&lease_id].forgotten);
         assert!(matches!(
             space
                 .submit_checked(
@@ -1760,7 +2009,7 @@ fn pending_release_blocks_checked_assertions_and_retries_explicitly() {
             SpaceDriverError::RangeAssertAuthority { .. }
         ));
 
-        // Reopening does not do hidden server work. The retiring lease is
+        // Reopening does not do hidden server work. The forgotten lease is
         // still remembered but not usable.
         let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
             .await
@@ -1813,7 +2062,7 @@ fn checked_release_preserves_checked_assertion_reservations() {
             .unwrap();
 
         let space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         space
             .submit_checked(
                 vec![set(k, b"queued")],
@@ -1837,7 +2086,7 @@ fn checked_release_preserves_checked_assertion_reservations() {
         ));
         assert!(
             !audit(&OrderedMetaStore::new(&mem)).await.spaces[&SPACE].leases[&granted.leases[0].id]
-                .retiring
+                .forgotten
         );
 
         client.rollback(SPACE, DeviceSeq(1)).await.unwrap();
@@ -1869,7 +2118,7 @@ fn checked_release_ignores_unchecked_assertions() {
             .await
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
-        let granted = space.acquire(vec![rspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![rspec(&db, 60)]).await.unwrap();
         let submission = space
             .submit_unchecked(
                 Vec::<Mutation>::new(),
@@ -1910,7 +2159,7 @@ fn checked_release_accepts_replacement_coverage() {
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
         let acquired = space
-            .acquire(vec![rspec(&db, 60), rspec(&child, 60)])
+            .ensure(vec![rspec(&db, 60), rspec(&child, 60)])
             .await
             .unwrap();
         let parent = acquired
@@ -1950,7 +2199,7 @@ fn unavailable_leaves_the_queue_intact() {
 
         let space = client.space(SPACE).await.unwrap();
         let db = key(&[b"db"]);
-        space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         drop(client);
 
         let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
@@ -1996,7 +2245,7 @@ fn renew_reports_invalid_and_forgets() {
         let space = client.space(SPACE).await.unwrap();
 
         let db = key(&[b"db"]);
-        let granted = space.acquire(vec![wspec(&db, 60)]).await.unwrap();
+        let granted = space.ensure(vec![wspec(&db, 60)]).await.unwrap();
         let lease_id = granted.leases[0].id;
 
         // The SERVER's clock passes the deadline: strict local expiry,

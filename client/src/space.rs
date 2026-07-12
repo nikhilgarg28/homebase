@@ -20,8 +20,8 @@ use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{
-    AcquireRequest, KernelError, LeaseSpec, Range, RangeAssert, RangeCursor, RangeCut,
-    ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
+    AcquireRequest, KernelError, LeaseSpec, ListLeasesRequest, Range, RangeAssert, RangeCursor,
+    RangeCut, ReadAtRequest, ReadAtResponse, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -32,9 +32,10 @@ use std::fmt;
 use std::time::Duration;
 
 pub const DEFAULT_PUSH_CAP: usize = 256;
+const MIN_LEASE_MARGIN: Duration = Duration::from_millis(10);
 
 pub fn lease_margin(ttl: Duration) -> Duration {
-    ttl / 1_000
+    (ttl / 1_000).max(MIN_LEASE_MARGIN)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,9 +123,15 @@ impl fmt::Display for SpaceDriverError {
 impl std::error::Error for SpaceDriverError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Acquired {
+pub struct Ensured {
     pub leases: Vec<Lease>,
     pub barrier: Option<AdmissionSeq>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairedLeases {
+    pub active: Vec<Lease>,
+    pub forgotten: Vec<LeaseId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,16 +333,11 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         Ok(committed)
     }
 
-    pub async fn acquire(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
-        let _permit = self.enter().await?;
-        self.acquire_inner(specs).await
-    }
-
-    async fn acquire_inner(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
+    async fn ensure_inner(&self, specs: Vec<LeaseSpec>) -> Result<Ensured, SpaceDriverError> {
         let specs = self.encode_specs(specs)?;
         let space = self.id;
         if specs.is_empty() {
-            return Ok(Acquired {
+            return Ok(Ensured {
                 leases: vec![],
                 barrier: None,
             });
@@ -351,7 +353,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             }
             if let Some(id) = held
                 .iter()
-                .find(|h| !h.retiring && covers(h, spec) && h.barrier.is_none())
+                .find(|h| !h.forgotten && covers(h, spec) && h.barrier.is_none())
                 .map(|h| h.lease.id)
             {
                 revive.push(id);
@@ -382,7 +384,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .collect();
         if missing.is_empty() {
             let leases = satisfied.into_iter().flatten().collect();
-            return Ok(Acquired {
+            return Ok(Ensured {
                 leases,
                 barrier: self.max_pending_barrier(&held, &specs, &send).await?,
             });
@@ -411,7 +413,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                 lease: lease.clone(),
                 deadline: send.saturating_add(lease.ttl),
                 barrier: pending_barrier(lease.barrier, watermark),
-                retiring: false,
+                forgotten: false,
             });
         }
         self.client.store().record_clock(send.wall).await?;
@@ -425,15 +427,15 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         }
         let existing_barrier = self.max_pending_barrier(&held, &specs, &send).await?;
         let fresh_barrier = fresh.iter().filter_map(|held| held.barrier).max();
-        Ok(Acquired {
+        Ok(Ensured {
             leases: satisfied.into_iter().flatten().collect(),
             barrier: existing_barrier.max(fresh_barrier),
         })
     }
 
-    pub async fn ensure(&self, specs: Vec<LeaseSpec>) -> Result<Acquired, SpaceDriverError> {
+    pub async fn ensure(&self, specs: Vec<LeaseSpec>) -> Result<Ensured, SpaceDriverError> {
         let _permit = self.enter().await?;
-        let acquired = self.acquire_inner(specs).await?;
+        let acquired = self.ensure_inner(specs).await?;
         if acquired.barrier.is_none() {
             return Ok(acquired);
         }
@@ -453,10 +455,78 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             }
         }
 
-        Ok(Acquired {
+        Ok(Ensured {
             leases: acquired.leases,
             barrier: None,
         })
+    }
+
+    /// Rebuild local lease state from the server's complete live view for
+    /// this device. Reconciled grants enter local state before barrier pulls,
+    /// but remain unusable until their individual barriers are satisfied.
+    pub async fn repair_leases(&self) -> Result<RepairedLeases, SpaceDriverError> {
+        let _permit = self.enter().await?;
+        let response = self
+            .client
+            .server()
+            .list_leases(
+                &self.id,
+                ListLeasesRequest {
+                    device: self.device(),
+                },
+            )
+            .await?;
+        let state = self.client.store().load().await?;
+        let local = state.spaces.get(&self.id);
+        let mut reconciled = Vec::with_capacity(response.leases.len());
+        for lease in response.leases {
+            let forgotten = local
+                .and_then(|space| space.leases.get(&lease.id))
+                .is_some_and(|held| held.forgotten);
+            let watermark = self
+                .client
+                .store()
+                .watermark(self.id, &Range::Prefix(lease.prefix.clone()))
+                .await?;
+            reconciled.push(HeldLease {
+                deadline: lease.requested_at.saturating_add(lease.ttl),
+                barrier: pending_barrier(lease.barrier, watermark),
+                lease,
+                forgotten,
+            });
+        }
+        self.client
+            .store()
+            .reconcile_leases(self.id, &reconciled)
+            .await?;
+
+        let mut pulled = Vec::<Key>::new();
+        for held in &reconciled {
+            if held.forgotten || held.barrier.is_none() {
+                continue;
+            }
+            let now = self.client.clock().stamp();
+            if self.lease_live(held, &now)
+                && !self.lease_usable_for_held(held, &now).await?
+                && !pulled.iter().any(|prefix| prefix == &held.lease.prefix)
+            {
+                self.pull_encoded(Range::Prefix(held.lease.prefix.clone()))
+                    .await?;
+                pulled.push(held.lease.prefix.clone());
+            }
+        }
+
+        let now = self.client.clock().stamp();
+        let mut active = Vec::new();
+        let mut forgotten = Vec::new();
+        for held in &reconciled {
+            if held.forgotten {
+                forgotten.push(held.lease.id);
+            } else if self.lease_usable_for_held(held, &now).await? {
+                active.push(held.lease.clone());
+            }
+        }
+        Ok(RepairedLeases { active, forgotten })
     }
 
     pub async fn renew(&self, prefixes: &[Key]) -> Result<RenewResponse, SpaceDriverError> {
@@ -472,7 +542,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         };
         let ids: Vec<LeaseId> = held
             .iter()
-            .filter(|held| !held.retiring)
+            .filter(|held| !held.forgotten)
             .map(|h| h.lease.id)
             .collect();
         self.renew_ids(self.id, &ids, &held).await
@@ -504,7 +574,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         if ids.is_empty() {
             return Ok(());
         }
-        self.client.store().retire_leases(self.id, ids).await?;
+        self.client.store().forget_leases(self.id, ids).await?;
         self.client
             .server()
             .release(
@@ -622,6 +692,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                 &space,
                 RenewRequest {
                     device: self.device(),
+                    requested_at: send,
                     leases: ids.to_vec(),
                 },
             )
@@ -637,6 +708,8 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                         .expect("server renewed a lease the store does not hold")
                         .clone();
                     held.lease.ttl = grant.ttl;
+                    held.lease.requested_at = send;
+                    held.lease.granted_at = grant.granted_at;
                     held.deadline = send.saturating_add(grant.ttl);
                     held
                 })
@@ -790,7 +863,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         now: &HybridTimestamp,
         watermark: Option<AdmissionSeq>,
     ) -> bool {
-        !held.retiring && self.lease_live(held, now) && barrier_satisfied(held.barrier, watermark)
+        !held.forgotten && self.lease_live(held, now) && barrier_satisfied(held.barrier, watermark)
     }
 
     async fn lease_usable_for_held(
@@ -829,7 +902,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         let mut out = None;
         for spec in specs {
             for held in held {
-                if held.retiring
+                if held.forgotten
                     || held.barrier.is_none()
                     || held.deadline.expired(now, lease_margin(held.lease.ttl))
                     || !covers(held, spec)
@@ -868,7 +941,7 @@ pub(crate) async fn live_write_leases<M: MetaStore, C: HybridClock>(
         let watermark = store
             .watermark(space, &Range::Prefix(held.lease.prefix.clone()))
             .await?;
-        if !held.retiring
+        if !held.forgotten
             && !held.deadline.expired(&now, lease_margin(held.lease.ttl))
             && barrier_satisfied(held.barrier, watermark)
         {
@@ -892,7 +965,7 @@ fn pending_barrier_covering<'a>(
     now: &HybridTimestamp,
 ) -> Option<&'a Lease> {
     held.iter()
-        .filter(|held| !held.retiring && held.barrier.is_some())
+        .filter(|held| !held.forgotten && held.barrier.is_some())
         .filter(|held| !held.deadline.expired(now, lease_margin(held.lease.ttl)))
         .find(|held| covers(held, spec))
         .map(|held| &held.lease)

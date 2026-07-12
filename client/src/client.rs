@@ -86,7 +86,7 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
                         lease: held.lease.clone(),
                         deadline: homebase_core::clock::HybridTimestamp::ZERO,
                         barrier: held.barrier,
-                        retiring: held.retiring,
+                        forgotten: held.forgotten,
                     })
                     .collect();
                 if !dead.is_empty() {

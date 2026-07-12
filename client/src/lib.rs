@@ -34,6 +34,6 @@ pub use client::{Client, ClientError, open_offline};
 pub use homebase_core::Mutation;
 pub use server::{Offline, ServerHandle};
 pub use space::{
-    Acquired, DEFAULT_PUSH_CAP, LeaseState, PushOutcome, Space, SpaceDriverError, Submission,
-    lease_margin,
+    DEFAULT_PUSH_CAP, Ensured, LeaseState, PushOutcome, RepairedLeases, Space, SpaceDriverError,
+    Submission, lease_margin,
 };

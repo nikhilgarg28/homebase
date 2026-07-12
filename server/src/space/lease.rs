@@ -144,11 +144,13 @@ impl LeaseManager {
                     let renewed = LeaseRecord {
                         deadline: now.saturating_add(rec.ttl),
                         granted_at: now,
+                        requested_at: req.requested_at,
                         ..rec
                     };
                     self.put_records(&mut batch, &renewed);
                     granted.push(RenewGrant {
                         id,
+                        granted_at: now,
                         ttl: renewed.ttl,
                         contended: self.demand.contains(&id),
                     });
@@ -449,6 +451,7 @@ mod tests {
         let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);
         let lease = acquire_one(&mut mgr, &store, 0, 1, &p, LeaseMode::Write, 50).unwrap();
+        let renewed_at = HybridTimestamp::ZERO.saturating_add(Duration::from_millis(40));
 
         // No demand yet.
         let resp = block_on(mgr.renew(
@@ -456,12 +459,19 @@ mod tests {
             Timestamp(40),
             &RenewRequest {
                 device: dev(1),
+                requested_at: renewed_at,
                 leases: vec![lease.id],
             },
         ))
         .unwrap();
         assert_eq!(resp.granted.len(), 1);
+        assert_eq!(resp.granted[0].granted_at, Timestamp(40));
         assert!(!resp.granted[0].contended);
+        let listed =
+            block_on(mgr.list_leases(&store, Timestamp(40), &ListLeasesRequest { device: dev(1) }))
+                .unwrap();
+        assert_eq!(listed.leases[0].requested_at, renewed_at);
+        assert_eq!(listed.leases[0].granted_at, Timestamp(40));
 
         // A failed acquire registers demand; the holder hears about it.
         let _ = acquire_one(&mut mgr, &store, 60, 2, &p, LeaseMode::Write, 50);
@@ -470,6 +480,7 @@ mod tests {
             Timestamp(80), // would be past the original deadline (50) without renewal
             &RenewRequest {
                 device: dev(1),
+                requested_at: HybridTimestamp::ZERO,
                 leases: vec![lease.id],
             },
         ))
@@ -490,6 +501,7 @@ mod tests {
             Timestamp(10),
             &RenewRequest {
                 device: dev(2),
+                requested_at: HybridTimestamp::ZERO,
                 leases: vec![lease.id],
             },
         ))
@@ -502,6 +514,7 @@ mod tests {
             Timestamp(50),
             &RenewRequest {
                 device: dev(1),
+                requested_at: HybridTimestamp::ZERO,
                 leases: vec![lease.id, LeaseId(999)],
             },
         ))
