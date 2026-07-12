@@ -20,8 +20,8 @@ use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{MemoryStore, OrderedStore, WriteBatch, collect_scan};
 use homebase_core::tag::{
-    AdmissionSeq, AdmittedEntry, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq,
-    DeviceTag, Mutation, Ver,
+    AdmissionSeq, AdmittedEntry, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+    Mutation, OpaqueValue, Ver,
 };
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
@@ -88,7 +88,7 @@ fn wire_entry(device: DeviceId, device_seq: DeviceSeq, entry: PendingEntry) -> D
     DeviceEntry {
         mutation: Mutation::Set {
             key: entry.key,
-            value: Ciphertext(entry.value),
+            value: OpaqueValue(entry.value),
         },
         tag: DeviceTag {
             device,

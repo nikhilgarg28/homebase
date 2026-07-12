@@ -177,6 +177,19 @@ impl ServerHandle for ClientTestServer {
         self.handle.get(req).await
     }
 
+    async fn pull(
+        &self,
+        space: &SpaceId,
+        req: homebase_core::messages::PullRequest,
+    ) -> Result<homebase_core::messages::PullResponse, homebase_core::space::SpaceError> {
+        if *space != self.space {
+            return Err(homebase_core::space::SpaceError::unavailable(
+                "space not served",
+            ));
+        }
+        self.handle.pull(req).await
+    }
+
     async fn list(
         &self,
         space: &SpaceId,

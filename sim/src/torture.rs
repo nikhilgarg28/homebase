@@ -15,8 +15,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
-    DeviceTag, Mutation, Ver,
+    AdmissionSeq, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+    Mutation, OpaqueValue, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
@@ -69,7 +69,7 @@ pub fn put_one(
             entries: vec![DeviceEntry {
                 mutation: Mutation::Set {
                     key: k.clone(),
-                    value: Ciphertext(v.to_vec()),
+                    value: OpaqueValue(v.to_vec()),
                 },
                 tag: DeviceTag {
                     device: dev(device),

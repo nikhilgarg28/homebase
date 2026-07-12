@@ -2,7 +2,7 @@
 //! crashed authority must detect it and resync.
 //!
 //! One writer churns a small key set under its prefix — overwrites and
-//! tombstones, so changelog compaction and delta semantics actually work
+//! tombstones, so exact admission-log delta semantics actually work
 //! for a living — while a reader maintains a replica purely from `read_at`
 //! (snapshot once, deltas after). Crashes roll the authority back to its
 //! last flush; a replica that had already synced past that point now holds
@@ -28,8 +28,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
-    DeviceTag, Mutation, Ver,
+    AdmissionSeq, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
+    Mutation, OpaqueValue, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
@@ -124,7 +124,7 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             state.stamp.set(state.stamp.get() + 1);
             Mutation::Set {
                 key: pool_key(key_index),
-                value: Ciphertext(format!("s{}", state.stamp.get()).into_bytes()),
+                value: OpaqueValue(format!("s{}", state.stamp.get()).into_bytes()),
             }
         };
 

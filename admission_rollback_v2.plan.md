@@ -187,7 +187,7 @@ pub struct Seal {
 ```
 
 - **`scheme`** identifies the sealing/encryption scheme, not the op kind. Initial enum has one variant, `AeadV1 = 0`, with explicit checked conversion to/from the wire `u8`.
-- **Present (`Set`):** `DeviceEntry { mutation: Mutation::Set { key, value: Ciphertext }, tag, seal }`.
+- **Present (`Set`):** `DeviceEntry { mutation: Mutation::Set { key, value: OpaqueValue }, tag, seal }`.
 - **Delete:** `DeviceEntry { mutation: Mutation::Delete { key }, tag, seal }`; AEAD plaintext is `b""`.
 - **Future `DeleteRange`:** same seal machinery over range metadata + prefix (backlog until specified).
 - **Scheme payload:** `Seal.payload` is opaque extension data for future schemes. For `SealScheme::AeadV1`, it must be empty and decoders should reject non-empty payloads.
@@ -213,9 +213,9 @@ pub enum Mutation<T = Vec<u8>> {
     Delete { key: Key },
 }
 pub struct DeviceTag { device: DeviceId, device_seq: DeviceSeq, ver: Ver, cipher_epoch: CipherEpoch }
-pub struct DeviceEntry<T = Ciphertext> { mutation: Mutation<T>, tag: DeviceTag, seal: Seal }
+pub struct DeviceEntry<T = OpaqueValue> { mutation: Mutation<T>, tag: DeviceTag, seal: Seal }
 pub struct AdmissionTag { admission_seq: AdmissionSeq }
-pub struct AdmittedEntry<T = Ciphertext> { device_entry: DeviceEntry<T>, admission: AdmissionTag }
+pub struct AdmittedEntry<T = OpaqueValue> { device_entry: DeviceEntry<T>, admission: AdmissionTag }
 ```
 
 - **`read_at` deltas** emit admitted Delete mutations — replicas observe deletes.
@@ -515,7 +515,7 @@ space.push_until(seq: DeviceSeq) -> PushOutcome
 
 // Ops-only inbound log surface.
 space.pull() -> AdmissionSeq
-space.fetch(range: Range, after: AdmissionSeq) -> RangeFetch
+space.fetch(range: Range, after: AdmissionSeq) -> RangeCut // one-range read_at sugar
 space.admits().iter_from_neck() -> Iterator<AdmittedBatch>
 space.admits().mark_applied(to: AdmissionSeq) -> ()
 space.admits().trim(to: AdmissionSeq) -> ()
@@ -552,7 +552,7 @@ and mutates none of this client state.
 
 - `lease()` mints client `requested_at`, calls the server `acquire` verb directly when needed, records returned leases with local deadlines derived from `lease.requested_at + lease.ttl`, and pulls the complete server log until admit `tail > lease.barrier`. It returns held leases without applying their records.
 - Lease usability is derived, never stored as a pending bit: `held && live && admit_neck > lease.barrier`.
-- Admit-log append atomically advances `tail` and `ver_high`; `mark_applied` atomically advances `neck`. Checked assertions require `neck > upto`. Stateless range fetch changes none of these facts.
+- Admit-log append atomically advances `tail` and `ver_high`; `mark_applied` atomically advances `neck`. Checked assertions require `neck > upto`. Stateless range read changes none of these facts.
 - `lease()` is allowed with non-empty local oplogs; it does not push buffered data first.
 - Every `DeviceOp::Commit` persists a local-only `SubmitMode::{Checked, Unchecked}` field. It is not sent to the server or included in AAD.
 - `unlease_checked()` scans active checked commits and refuses to remove the last live covering reservation for any queued range assertion. Coverage is re-evaluated after excluding the complete unlease set; unchecked commits do not block it. A replacement reservation may preserve server exclusion for an already-validated submission even while `neck <= its barrier`, but it cannot validate a new local check until neck passes that barrier.
@@ -757,7 +757,7 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | B13 Push/ack API | Implement `space.push`, `space.push_until`, `Submission::push`; ack trims data oplog only; rollback emits an empty-entry wire batch | push tests for wait-through, target disposition attribution, stall leaves oplog, ack trim | client docs for two verbs: submit local, push remote |
 | B14 Fork/trim + cumulative checksum | Add per-space persisted confirmed `DeviceChecksum`; server recomputes a cumulative canonical batch hash and requires the expected prior checksum; atomically advance the client checksum with trim; validate all retained intermediate batches during server-ahead catch-up; distinguish fatal fork from lost ack; update engine/torture/equivalence/sim harnesses | exact replay and K-batch lost-ack catch-up; altered/omitted/reordered intermediate batch rejection; divergent same-seq and gap fork rejection; empty rollback-batch chaining; server-state rollback detection; crash atomicity; simulation/equivalence updates; `cargo test --workspace` | DESIGN notes for cumulative checksum, duplicate device identity, catch-up trim, and honest-server threat boundary |
 | B15 Admit-log + DeleteRange design | Keep `live_count`; ratify exact append-only server admissions, per-space client admit `head/neck/tail` in server `AdmissionSeq`, full-log `pull`, stateless arbitrary-range `fetch`, `mark_applied`, trim-through-neck, neck-gated leases, `AdmissionOrder`, full root metadata, range tombstones, and the reference-model method | design review plus point-delete aggregate regressions; `git diff --check` | link `DELETE_RANGE_DESIGN.md`; state that Homebase is an ops/log service with no managed KV application layer |
-| AL1-AL7 Admit-log implementation | Execute the seven independently tested admit-log batches defined in `DELETE_RANGE_DESIGN.md`, then remove the old snapshot/delta/changelog path | tests and docs listed per AL batch | update owning core/server/client module in every batch |
+| AL1-AL7 Admit-log implementation | Execute the seven independently tested admit-log batches defined in `DELETE_RANGE_DESIGN.md`, then remove the old client replication and watermark path; retain `read_at` for stateless range observation | tests and docs listed per AL batch | update owning core/server/client module in every batch |
 | DR1-DR9 DeleteRange implementation | Execute the nine independently tested range-delete batches defined in `DELETE_RANGE_DESIGN.md`; keep public admission rejected through DR7 and enable it only with client integration in DR8 | tests and docs listed per DR batch | update owning module and standalone design in every batch |
 | Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit/snapshot-delta wording and link this plan |
 

@@ -15,7 +15,7 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::{SlateOpenOptions, SlateStore, local_object_store};
@@ -66,7 +66,7 @@ async fn write_marker(
                 entries: vec![DeviceEntry {
                     mutation: Mutation::Set {
                         key: key(&[b"db", b"marker"]),
-                        value: Ciphertext(marker.to_vec()),
+                        value: OpaqueValue(marker.to_vec()),
                     },
                     tag: DeviceTag {
                         device: dev(),
@@ -132,7 +132,7 @@ async fn slate_survives_flush_and_reopen() {
         entry.device_entry.mutation,
         Mutation::Set {
             key: key(&[b"db", b"marker"]),
-            value: Ciphertext(b"after-reopen".to_vec()),
+            value: OpaqueValue(b"after-reopen".to_vec()),
         }
     );
 
@@ -178,7 +178,7 @@ async fn slate_seeded_writes_audit_clean() {
                     entries: vec![DeviceEntry {
                         mutation: Mutation::Set {
                             key: k,
-                            value: Ciphertext(format!("v{seq}").into_bytes()),
+                            value: OpaqueValue(format!("v{seq}").into_bytes()),
                         },
                         tag: DeviceTag {
                             device: dev(),

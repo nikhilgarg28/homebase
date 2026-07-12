@@ -4,7 +4,7 @@
 //! Landed so far:
 //!
 //! - [`server`] — **contract 1 of 3**: [`ServerHandle`], the client's view
-//!   of a server — the seven verbs, space-qualified, exactly the wire
+//!   of a server — the kernel verbs, space-qualified, exactly the wire
 //!   shape. In-process closures and the uninhabited [`Offline`] implement
 //!   it today; the HTTP adapter lands later, gated on
 //!   [`server::conformance`].

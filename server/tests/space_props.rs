@@ -12,8 +12,8 @@
 //! 3. **reads match** — `get` and `list` (including pagination) agree with
 //!    the model's live state, tombstones hidden;
 //! 4. **replica reconstruction** — a snapshot plus any sequence of later
-//!    deltas equals current live state, with deltas ordered by
-//!    `(admission_seq, key)` and each key appearing at most once;
+//!    deltas equals current live state, with every operation retained in
+//!    `AdmissionOrder`;
 //! 5. **aggregate coherence** — after every admitted batch, the stored
 //!    per-prefix aggregates (max admission seq, live count) equal a
 //!    brute-force recomputation from the data records.
@@ -28,7 +28,7 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue,
     Ver,
 };
 use homebase_server::error::Error;
@@ -182,7 +182,7 @@ impl Harness {
         &mut self,
         device: usize,
         device_seq: u64,
-        mutations: Vec<(Mutation<Ciphertext>, Ver)>,
+        mutations: Vec<(Mutation<OpaqueValue>, Ver)>,
     ) -> Result<AdmissionSeq, Error> {
         let response = block_on(self.space.admit(
             &self.store,
@@ -229,7 +229,7 @@ fn check_reads(h: &Harness, model: &Model, device: usize) -> Result<(), TestCase
                     &entry.device_entry.mutation,
                     &Mutation::Set {
                         key: keys[s].clone(),
-                        value: Ciphertext(value.clone()),
+                        value: OpaqueValue(value.clone()),
                     }
                 );
                 prop_assert_eq!(
@@ -369,18 +369,11 @@ fn sync_replica(
                 .collect();
         }
         (Some(since), RangeCut::Delta(entries)) => {
-            // Ordered by (admission_seq, key), each key at most once, all
-            // strictly after the cursor.
-            let positions: Vec<(u64, &Key)> = entries
-                .iter()
-                .map(|e| (e.admission.admission_seq.0, e.key()))
-                .collect();
+            // Exact operation history, ordered by AdmissionOrder and all
+            // strictly after the cursor. Repeated keys are intentional.
+            let positions: Vec<_> = entries.iter().map(|e| e.admission.order()).collect();
             prop_assert!(positions.windows(2).all(|w| w[0] < w[1]), "delta order");
             prop_assert!(entries.iter().all(|e| e.admission.admission_seq > *since));
-            let mut keys: Vec<&Key> = entries.iter().map(|e| e.key()).collect();
-            keys.sort();
-            keys.dedup();
-            prop_assert_eq!(keys.len(), entries.len(), "each key at most once");
 
             for e in entries {
                 match &e.device_entry.mutation {
@@ -436,7 +429,7 @@ proptest! {
                         let mutation = match &value {
                             Some(v) => Mutation::Set {
                                 key: user_key(device, suffix),
-                                value: Ciphertext(v.clone()),
+                                value: OpaqueValue(v.clone()),
                             },
                             None => Mutation::Delete {
                                 key: user_key(device, suffix),
@@ -465,7 +458,7 @@ proptest! {
                     let entries = vec![(
                         Mutation::Set {
                             key: user_key(device, suffix),
-                            value: Ciphertext(b"never-lands".to_vec()),
+                            value: OpaqueValue(b"never-lands".to_vec()),
                         },
                         Ver(current), // equal, not greater → regression
                     )];
@@ -485,7 +478,7 @@ proptest! {
                     let entries = vec![(
                         Mutation::Set {
                             key: user_key(device, suffix),
-                            value: Ciphertext(b"never-lands".to_vec()),
+                            value: OpaqueValue(b"never-lands".to_vec()),
                         },
                         Ver(ver),
                     )];

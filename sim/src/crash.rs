@@ -15,8 +15,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    Ver,
+    CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    OpaqueValue, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_server::storage::OrderedStore;
@@ -140,7 +140,7 @@ pub async fn client(
                 entries: vec![DeviceEntry {
                     mutation: Mutation::Set {
                         key: user_key(d, seq),
-                        value: Ciphertext(value(d, seq)),
+                        value: OpaqueValue(value(d, seq)),
                     },
                     tag: DeviceTag {
                         device: dev(d),
@@ -218,7 +218,7 @@ pub fn phase_oracle<S: OrderedStore>(
                 record.entry.device_entry.mutation,
                 Mutation::Set {
                     key: user_key(ack.device, ack.device_seq),
-                    value: Ciphertext(value(ack.device, ack.device_seq)),
+                    value: OpaqueValue(value(ack.device, ack.device_seq)),
                 },
                 "acked value corrupted: {ack:?} (seed {seed})"
             );

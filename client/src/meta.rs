@@ -115,7 +115,7 @@ use homebase_core::messages::{Range, RangeAssert};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{
-    AdmissionSeq, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation, Ver,
+    AdmissionSeq, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation, OpaqueValue, Ver,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -1664,7 +1664,7 @@ fn decode_entries(r: &mut Reader<'_>) -> Option<Vec<DeviceEntry>> {
                 let len = r.u32()? as usize;
                 Mutation::Set {
                     key,
-                    value: Ciphertext(r.take(len)?.to_vec()),
+                    value: OpaqueValue(r.take(len)?.to_vec()),
                 }
             }
             2 => Mutation::Delete { key },
@@ -1808,7 +1808,7 @@ pub mod conformance {
                 mutation: match mutation {
                     Mutation::Set { key, value } => Mutation::Set {
                         key,
-                        value: Ciphertext(value),
+                        value: OpaqueValue(value),
                     },
                     Mutation::Delete { key } => Mutation::Delete { key },
                 },
@@ -2393,7 +2393,7 @@ mod tests {
         let mutation = match mutation {
             Mutation::Set { key, value } => Mutation::Set {
                 key,
-                value: Ciphertext(value),
+                value: OpaqueValue(value),
             },
             Mutation::Delete { key } => Mutation::Delete { key },
         };

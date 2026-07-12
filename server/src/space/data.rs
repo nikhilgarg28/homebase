@@ -23,43 +23,41 @@
 //!
 //! On admission each client batch takes the next admission seq and the request
 //! writes, atomically:
-//! data records for Set/Delete ops, changelog moves (delete the key's old changelog entry,
-//! insert the new one), per-prefix aggregates along every written key's
-//! prefix path (two distinct-device historical heads + live-key delta; see
+//! immutable admission headers and operations, data records for Set/Delete
+//! ops, per-prefix aggregates along every written key's prefix path (two
+//! distinct-device historical heads + live-key delta; see
 //! [`PrefixMetaRecord`]), the device high water, and the counters.
 //!
 //! # Reads
 //!
-//! `get` and `list` serve current state and hide tombstones. `read_at`
+//! `pull` replays a dense interval of immutable complete batches. `get` and
+//! `list` serve current state and hide tombstones. `read_at`
 //! evaluates all requested ranges at the current admission high water —
 //! trivially untorn, because verbs execute serially — returning either a
 //! snapshot (cursor `None`) or the changes since the cursor, tombstones
-//! included. The one-record-per-key changelog (see [`crate::schema`]) makes
-//! a delta a single seq-ordered scan; each changed key appears exactly once,
-//! already at its final state. The per-prefix aggregates short-circuit both
-//! read shapes: a delta whose prefix has `max_admission_seq() ≤ cursor` and a
-//! snapshot whose prefix has `live_count == 0` return empty without
-//! scanning. (A delta that does have news still walks the whole changelog
-//! past the cursor and filters by prefix; descending the aggregate tree to
-//! skip within the scan is a later refinement.)
+//! included in exact `AdmissionOrder`. The per-prefix aggregates short-circuit
+//! both read shapes: a delta whose prefix has `max_admission_seq() ≤ cursor`
+//! and a snapshot whose prefix has `live_count == 0` return empty without
+//! scanning.
 
 use super::lease::LeaseManager;
 use crate::error::Error;
 use crate::schema::{
-    CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord, changelog_key,
-    changelog_scan_after, changelog_scan_all, counters_key, data_key, data_scan_all, device_key,
-    prefix_meta_key, user_key_from_changelog, user_key_from_data,
+    AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, PrefixMetaRecord,
+    admission_header_key, admission_op_key, admission_op_parts, admission_op_scan, counters_key,
+    data_key, data_scan_all, device_key, prefix_meta_key, user_key_from_data,
 };
 use crate::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, prefix_successor};
 use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
 use homebase_core::messages::{
-    AdmissionRequest, AdmissionResponse, AdmissionResult, GetRequest, GetResponse, KernelError,
-    ListRequest, ListResponse, Range, RangeAssertFailure, RangeCut, ReadAtRequest, ReadAtResponse,
+    AdmissionRequest, AdmissionResponse, AdmissionResult, AdmittedBatch, GetRequest, GetResponse,
+    KernelError, ListRequest, ListResponse, PullRequest, PullResponse, Range, RangeAssertFailure,
+    RangeCut, ReadAtRequest, ReadAtResponse,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceChecksum, DeviceId, DeviceSeq,
+    AdmissionOrder, AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceChecksum, DeviceId, DeviceSeq,
 };
 use std::collections::BTreeMap;
 
@@ -114,15 +112,16 @@ pub async fn admit<S: OrderedStore>(
         .validate_put(store, now, req.device, &req.evidence, &keys)
         .await?;
 
-    // 3. Ver monotonicity + changelog moves. `staged` folds the batch in
-    // order so a later entry for the same key checks against the earlier
-    // one; `old_seqs` remembers each stored key's current changelog slot.
+    // 3. Ver monotonicity + exact log construction. `staged` folds the batch
+    // in order so a later entry for the same key checks against the earlier
+    // one. Log writes accumulate directly in `batch`; any rejection drops it
+    // before the single atomic apply.
     let mut counters = counters(space, store).await?;
     let mut next_admission_seq = AdmissionSeq(counters.admission_high_water + 1);
     let mut results = Vec::with_capacity(req.batches.len());
+    let mut batch = WriteBatch::new();
 
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
-    let mut old_seqs: BTreeMap<Key, AdmissionSeq> = BTreeMap::new();
     let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
     let mut touched_prefix_high: BTreeMap<Vec<u8>, AdmissionSeq> = BTreeMap::new();
     for client_batch in &req.batches {
@@ -136,6 +135,10 @@ pub async fn admit<S: OrderedStore>(
         }
 
         next_checksum = client_batch.checksum(next_checksum, space, req.device);
+        let operation_count =
+            u32::try_from(client_batch.entries.len()).map_err(|_| KernelError::InvalidSeal {
+                reason: "admission batch has too many entries".into(),
+            })?;
 
         let seq = next_admission_seq;
         results.push(AdmissionResult::Applied { admission_seq: seq });
@@ -163,9 +166,6 @@ pub async fn admit<S: OrderedStore>(
                 Some(rec) => Some(rec.entry.ver()),
                 None => {
                     let stored = data(space, store, key).await?;
-                    if let Some(rec) = &stored {
-                        old_seqs.insert(key.clone(), rec.entry.admission.admission_seq);
-                    }
                     was_live.insert(
                         key.clone(),
                         stored
@@ -185,17 +185,22 @@ pub async fn admit<S: OrderedStore>(
                     .into());
                 }
             }
+            let admitted = AdmittedEntry {
+                device_entry: entry.clone(),
+                admission: AdmissionTag {
+                    admission_seq: seq,
+                    op_index,
+                },
+            };
             staged.insert(
                 key.clone(),
                 DataRecord {
-                    entry: AdmittedEntry {
-                        device_entry: entry.clone(),
-                        admission: AdmissionTag {
-                            admission_seq: seq,
-                            op_index,
-                        },
-                    },
+                    entry: admitted.clone(),
                 },
+            );
+            batch.put(
+                admission_op_key(space, seq, op_index, key),
+                DataRecord { entry: admitted }.encode(),
             );
             touched_prefixes.extend(prefix_meta_keys_for_key(space, key));
         }
@@ -205,23 +210,24 @@ pub async fn admit<S: OrderedStore>(
                 .and_modify(|at| *at = (*at).max(seq))
                 .or_insert(seq);
         }
+        batch.put(
+            admission_header_key(space, seq),
+            AdmissionHeaderRecord {
+                device: req.device,
+                device_seq: client_batch.device_seq,
+                checksum: next_checksum,
+                operation_count,
+            }
+            .encode(),
+        );
     }
     counters.admission_high_water = next_admission_seq.0 - 1;
 
-    // Admitted: one atomic batch for data, changelog, aggregates, device,
-    // counters.
-    let mut batch = WriteBatch::new();
+    // Admitted: one atomic batch for exact log, materialized data,
+    // aggregates, device state, checksum, and counters.
     let mut live_deltas: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     for (key, record) in &staged {
-        let bytes = record.encode();
-        batch.put(data_key(space, key), bytes.clone());
-        if let Some(old) = old_seqs.get(key) {
-            batch.delete(changelog_key(space, *old, key));
-        }
-        batch.put(
-            changelog_key(space, record.entry.admission.admission_seq, key),
-            bytes,
-        );
+        batch.put(data_key(space, key), record.encode());
 
         // Aggregate updates along the key's prefix path: every ancestor sees
         // the new max seq; live counts move by the key's net transition
@@ -375,11 +381,99 @@ pub async fn read_at<S: OrderedStore>(
     for range in &req.ranges {
         let cut = match range.since {
             None => RangeCut::Snapshot(snapshot(space, store, &range.range).await?),
-            Some(since) => RangeCut::Delta(delta(space, store, &range.range, since).await?),
+            Some(since) => RangeCut::Delta(delta(space, store, &range.range, since, at).await?),
         };
         ranges.push(cut);
     }
     Ok(ReadAtResponse { at, ranges })
+}
+
+/// Dense full-space replay over complete admitted batches.
+pub async fn pull<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    req: &PullRequest,
+) -> Result<PullResponse, Error> {
+    let high_water = AdmissionSeq(counters(space, store).await?.admission_high_water);
+    if req.after > high_water {
+        return Err(KernelError::AdmissionCursorAhead {
+            after: req.after,
+            high_water,
+        }
+        .into());
+    }
+    let available = high_water.0.saturating_sub(req.after.0);
+    let limit = req
+        .max_batches
+        .map(|limit| u64::try_from(limit).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    let through = AdmissionSeq(req.after.0 + available.min(limit));
+    let batches = read_admission_interval(space, store, req.after, through).await?;
+    Ok(PullResponse {
+        after: req.after,
+        through,
+        batches,
+    })
+}
+
+async fn read_admission_interval<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    after: AdmissionSeq,
+    through: AdmissionSeq,
+) -> Result<Vec<AdmittedBatch>, StorageError> {
+    let mut batches = Vec::with_capacity(through.0.saturating_sub(after.0) as usize);
+    for raw_seq in after.0.saturating_add(1)..=through.0 {
+        let admission_seq = AdmissionSeq(raw_seq);
+        let header = store
+            .get(&admission_header_key(space, admission_seq))
+            .await?
+            .and_then(|bytes| AdmissionHeaderRecord::decode(&bytes))
+            .expect("missing or corrupt admission header below high water");
+        let mut entries = Vec::with_capacity(header.operation_count as usize);
+        let op_prefix = admission_op_scan(space, admission_seq);
+        let mut iter = store.scan_prefix(&op_prefix);
+        while let Some((storage_key, bytes)) = iter.next().await? {
+            let (stored_seq, op_index, key) =
+                admission_op_parts(&storage_key).expect("corrupt admission operation key");
+            assert_eq!(
+                stored_seq, admission_seq,
+                "admission operation in wrong batch"
+            );
+            assert_eq!(op_index as usize, entries.len(), "admission operation gap");
+            let record = DataRecord::decode(key, &bytes).expect("corrupt admission operation");
+            assert_eq!(
+                record.entry.device_entry.tag.device, header.device,
+                "admission operation device disagrees with its header"
+            );
+            assert_eq!(
+                record.entry.device_entry.tag.device_seq, header.device_seq,
+                "admission operation device seq disagrees with its header"
+            );
+            assert_eq!(
+                record.entry.admission.order(),
+                AdmissionOrder {
+                    admission_seq,
+                    op_index,
+                },
+                "admission operation tag disagrees with its storage key"
+            );
+            entries.push(record.entry);
+        }
+        assert_eq!(
+            entries.len(),
+            header.operation_count as usize,
+            "admission header operation count mismatch"
+        );
+        batches.push(AdmittedBatch {
+            admission_seq,
+            device: header.device,
+            device_seq: header.device_seq,
+            checksum: header.checksum,
+            entries,
+        });
+    }
+    Ok(batches)
 }
 
 /// Live entries under `prefix`, key order, tombstones hidden.
@@ -422,14 +516,14 @@ async fn snapshot<S: OrderedStore>(
     Ok(entries)
 }
 
-/// Changes under `prefix` since `since` (exclusive), ascending
-/// `(admission_seq, key)`, tombstones included. Each changed key appears
-/// exactly once, at its current state.
+/// Exact admitted operations under `range` in `(since, at]`, preserving full
+/// `AdmissionOrder` and tombstones. Repeated writes remain repeated.
 async fn delta<S: OrderedStore>(
     space: SpaceId,
     store: &S,
     range: &Range,
     since: AdmissionSeq,
+    at: AdmissionSeq,
 ) -> Result<Vec<AdmittedEntry>, StorageError> {
     if let Range::Prefix(prefix) = range {
         // Aggregate short-circuit: nothing under this prefix since the cursor.
@@ -439,17 +533,14 @@ async fn delta<S: OrderedStore>(
             Some(_) => {}
         }
     }
-    let start = changelog_scan_after(space, since);
-    let end = prefix_successor(&changelog_scan_all(space));
     let mut entries = Vec::new();
-    let mut iter = store.scan(start, end);
-    while let Some((storage_key, bytes)) = iter.next().await? {
-        let key = user_key_from_changelog(&storage_key).expect("corrupt changelog key");
-        if !range.covers_key(&key) {
-            continue;
-        }
-        let rec = DataRecord::decode(key, &bytes).expect("corrupt data record");
-        entries.push(rec.entry);
+    for batch in read_admission_interval(space, store, since, at).await? {
+        entries.extend(
+            batch
+                .entries
+                .into_iter()
+                .filter(|entry| range.covers_key(entry.key())),
+        );
     }
     Ok(entries)
 }

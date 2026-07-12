@@ -24,8 +24,8 @@ use crate::storage::OrderedStore;
 use homebase_core::clock::Timestamp;
 use homebase_core::messages::{
     AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
-    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest, PullResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::SpaceId;
 use lease::LeaseManager;
@@ -95,6 +95,14 @@ impl Space {
         data::admit(self.id, &self.leases, store, now, req).await
     }
 
+    pub async fn pull<S: OrderedStore>(
+        &self,
+        store: &S,
+        req: &PullRequest,
+    ) -> Result<PullResponse, Error> {
+        data::pull(self.id, store, req).await
+    }
+
     pub async fn get<S: OrderedStore>(
         &self,
         store: &S,
@@ -124,20 +132,21 @@ impl Space {
 mod tests {
     use super::*;
     use crate::schema::{DeviceRecord, PrefixMetaRecord, device_key, prefix_meta_key};
-    use crate::storage::{MemoryStore, OrderedStore, WriteBatch};
+    use crate::storage::{MemoryStore, OrderedStore, ScanIter, StorageError, WriteBatch};
     use homebase_core::clock::HybridTimestamp;
     use homebase_core::key::Key;
     use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{
-        AdmissionBatch, AdmissionResult, KernelError, LeaseSpec, Range, RangeAssert, RangeCursor,
-        RangeCut,
+        AdmissionBatch, AdmissionResult, KernelError, LeaseSpec, PullRequest, Range, RangeAssert,
+        RangeCursor, RangeCut,
     };
     use homebase_core::seal::{SEAL_AEAD_TAG_LEN, SEAL_NONCE_LEN, Seal, SealScheme};
     use homebase_core::tag::{
-        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
-        Mutation, Ver,
+        AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+        OpaqueValue, Ver,
     };
     use pollster::block_on;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     const SPACE: SpaceId = SpaceId([5; 16]);
@@ -150,24 +159,24 @@ mod tests {
         Key::from_bytes(components.iter().copied()).unwrap()
     }
 
-    fn put(k: &Key, value: &[u8], ver: u64) -> (Mutation<Ciphertext>, u64) {
+    fn put(k: &Key, value: &[u8], ver: u64) -> (Mutation<OpaqueValue>, u64) {
         (
             Mutation::Set {
                 key: k.clone(),
-                value: Ciphertext(value.to_vec()),
+                value: OpaqueValue(value.to_vec()),
             },
             ver,
         )
     }
 
-    fn del(k: &Key, ver: u64) -> (Mutation<Ciphertext>, u64) {
+    fn del(k: &Key, ver: u64) -> (Mutation<OpaqueValue>, u64) {
         (Mutation::Delete { key: k.clone() }, ver)
     }
 
     fn entries_with_vers(
         device: DeviceId,
         device_seq: u64,
-        mutations: Vec<(Mutation<Ciphertext>, u64)>,
+        mutations: Vec<(Mutation<OpaqueValue>, u64)>,
     ) -> Vec<DeviceEntry> {
         mutations
             .into_iter()
@@ -187,7 +196,7 @@ mod tests {
     fn entry_with_seal(
         device: DeviceId,
         device_seq: u64,
-        mutation: Mutation<Ciphertext>,
+        mutation: Mutation<OpaqueValue>,
         ver: u64,
         seal: Seal,
     ) -> DeviceEntry {
@@ -241,12 +250,44 @@ mod tests {
         (space, store, lease)
     }
 
+    #[derive(Default)]
+    struct FailApplyStore {
+        inner: MemoryStore,
+        fail_next_apply: AtomicBool,
+    }
+
+    impl FailApplyStore {
+        fn fail_next_apply(&self) {
+            self.fail_next_apply.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl OrderedStore for FailApplyStore {
+        fn get(
+            &self,
+            key: &[u8],
+        ) -> impl Future<Output = Result<Option<Vec<u8>>, StorageError>> + Send {
+            self.inner.get(key)
+        }
+
+        fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter {
+            self.inner.scan(start, end)
+        }
+
+        async fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+            if self.fail_next_apply.swap(false, Ordering::SeqCst) {
+                return Err(StorageError("injected apply failure".into()));
+            }
+            self.inner.apply(batch).await
+        }
+    }
+
     fn admit(
         space: &mut Space,
         store: &MemoryStore,
         lease: LeaseId,
         device_seq: u64,
-        mutations: Vec<(Mutation<Ciphertext>, u64)>,
+        mutations: Vec<(Mutation<OpaqueValue>, u64)>,
     ) -> Result<AdmissionResponse, Error> {
         admit_asserting(space, store, lease, device_seq, Vec::new(), mutations)
     }
@@ -257,7 +298,7 @@ mod tests {
         lease: LeaseId,
         device_seq: u64,
         range_asserts: Vec<RangeAssert>,
-        mutations: Vec<(Mutation<Ciphertext>, u64)>,
+        mutations: Vec<(Mutation<OpaqueValue>, u64)>,
     ) -> Result<AdmissionResponse, Error> {
         admit_entries(
             space,
@@ -303,7 +344,7 @@ mod tests {
         device: DeviceId,
         device_seq: u64,
         range_asserts: Vec<RangeAssert>,
-        mutations: Vec<(Mutation<Ciphertext>, u64)>,
+        mutations: Vec<(Mutation<OpaqueValue>, u64)>,
     ) -> AdmissionResponse {
         let expected_checksum = block_on(store.get(&device_key(SPACE, device)))
             .unwrap()
@@ -345,7 +386,7 @@ mod tests {
             entry.device_entry.mutation,
             Mutation::Set {
                 key: k,
-                value: Ciphertext(b"v".to_vec())
+                value: OpaqueValue(b"v".to_vec())
             }
         );
         assert_eq!(entry.admission.admission_seq, AdmissionSeq(1));
@@ -383,7 +424,7 @@ mod tests {
                 1,
                 Mutation::Set {
                     key: k,
-                    value: Ciphertext(b"v".to_vec()),
+                    value: OpaqueValue(b"v".to_vec()),
                 },
                 1,
                 seal,
@@ -558,7 +599,7 @@ mod tests {
             got.entries[0].as_ref().unwrap().device_entry.mutation,
             Mutation::Set {
                 key: k1.clone(),
-                value: Ciphertext(b"v1".to_vec())
+                value: OpaqueValue(b"v1".to_vec())
             }
         );
         let got = block_on(space.get(&store, &GetRequest { keys: vec![k2] })).unwrap();
@@ -864,7 +905,7 @@ mod tests {
             got.entries[0].as_ref().unwrap().device_entry.mutation,
             Mutation::Set {
                 key: k.clone(),
-                value: Ciphertext(b"v2".to_vec())
+                value: OpaqueValue(b"v2".to_vec())
             }
         );
         assert_eq!(got.entries[0].as_ref().unwrap().admission.op_index, 1);
@@ -882,6 +923,216 @@ mod tests {
             err,
             Error::Kernel(KernelError::VerRegression { .. })
         ));
+    }
+
+    #[test]
+    fn admission_log_retains_repeated_keys_and_empty_batches() {
+        let (mut space, store, lease) = setup();
+        let k = key(&[b"db", b"row"]);
+        let first = admit(
+            &mut space,
+            &store,
+            lease,
+            1,
+            vec![put(&k, b"v1", 1), put(&k, b"v2", 2)],
+        )
+        .unwrap();
+        let second = admit(&mut space, &store, lease, 2, vec![]).unwrap();
+
+        let page = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(page.through, AdmissionSeq(2));
+        assert_eq!(page.batches.len(), 2);
+        assert_eq!(page.batches[0].entries.len(), 2);
+        assert_eq!(page.batches[0].entries[0].admission.op_index, 0);
+        assert_eq!(page.batches[0].entries[1].admission.op_index, 1);
+        assert_eq!(page.batches[0].checksum, first.checksum);
+        assert_eq!(page.batches[1].device_seq, DeviceSeq(2));
+        assert_eq!(page.batches[1].checksum, second.checksum);
+        assert!(page.batches[1].entries.is_empty());
+
+        let current = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![k.clone()],
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            &current.entries[0].as_ref().unwrap().device_entry.mutation,
+            Mutation::Set { key, value } if key == &k && value.0 == b"v2"
+        ));
+
+        let history = block_on(space.read_at(
+            &store,
+            &ReadAtRequest {
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db"])),
+                    since: Some(AdmissionSeq(0)),
+                }],
+            },
+        ))
+        .unwrap();
+        let RangeCut::Delta(entries) = &history.ranges[0] else {
+            panic!("expected delta")
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].admission.op_index, 0);
+        assert_eq!(entries[1].admission.op_index, 1);
+    }
+
+    #[test]
+    fn pull_is_dense_and_batch_bounded() {
+        let (mut space, store, lease) = setup();
+        for seq in 1..=3 {
+            let k = key(&[b"db", &[seq as u8]]);
+            admit(&mut space, &store, lease, seq, vec![put(&k, b"v", seq)]).unwrap();
+        }
+
+        let first = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(first.through, AdmissionSeq(2));
+        assert_eq!(
+            first
+                .batches
+                .iter()
+                .map(|batch| batch.admission_seq)
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(1), AdmissionSeq(2)]
+        );
+
+        let second = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: first.through,
+                max_batches: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(second.through, AdmissionSeq(3));
+        assert_eq!(second.batches[0].admission_seq, AdmissionSeq(3));
+
+        let empty = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: second.through,
+                max_batches: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(empty.through, AdmissionSeq(3));
+        assert!(empty.batches.is_empty());
+
+        let ahead = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(4),
+                max_batches: None,
+            },
+        ));
+        assert!(matches!(
+            ahead,
+            Err(Error::Kernel(KernelError::AdmissionCursorAhead {
+                after: AdmissionSeq(4),
+                high_water: AdmissionSeq(3),
+            }))
+        ));
+    }
+
+    #[test]
+    fn read_at_delta_is_exact_sparse_history_at_the_atomic_cut() {
+        let (mut space, store, lease) = setup();
+        let a = key(&[b"db", b"a", b"row"]);
+        let b = key(&[b"db", b"b", b"row"]);
+        admit(&mut space, &store, lease, 1, vec![put(&a, b"a1", 1)]).unwrap();
+        admit(&mut space, &store, lease, 2, vec![put(&b, b"b1", 7)]).unwrap();
+        admit(&mut space, &store, lease, 3, vec![del(&a, 3)]).unwrap();
+
+        let fetched = block_on(space.read_at(
+            &store,
+            &ReadAtRequest {
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db", b"a"])),
+                    since: Some(AdmissionSeq(0)),
+                }],
+            },
+        ))
+        .unwrap();
+        assert_eq!(fetched.at, AdmissionSeq(3));
+        let RangeCut::Delta(operations) = &fetched.ranges[0] else {
+            panic!("expected delta")
+        };
+        assert_eq!(
+            operations
+                .iter()
+                .map(|entry| entry.admission.admission_seq)
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(1), AdmissionSeq(3)]
+        );
+
+        let empty = block_on(space.read_at(
+            &store,
+            &ReadAtRequest {
+                ranges: vec![RangeCursor {
+                    range: Range::Prefix(key(&[b"db", b"missing"])),
+                    since: Some(AdmissionSeq(0)),
+                }],
+            },
+        ))
+        .unwrap();
+        assert_eq!(empty.at, AdmissionSeq(3));
+        assert!(matches!(&empty.ranges[0], RangeCut::Delta(entries) if entries.is_empty()));
+    }
+
+    #[test]
+    fn failed_atomic_apply_exposes_neither_log_nor_materialization() {
+        let mut space = Space::new(SPACE);
+        let store = FailApplyStore::default();
+        let k = key(&[b"db", b"row"]);
+        let request = AdmissionRequest {
+            device: dev(1),
+            expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+            evidence: vec![],
+            batches: vec![AdmissionBatch {
+                device_seq: DeviceSeq(1),
+                range_asserts: vec![],
+                entries: entries_with_vers(dev(1), 1, vec![put(&k, b"v", 1)]),
+            }],
+        };
+
+        store.fail_next_apply();
+        assert!(block_on(space.admit(&store, Timestamp(1), &request)).is_err());
+        let page = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(page.through, AdmissionSeq(0));
+        assert!(page.batches.is_empty());
+        assert!(
+            block_on(space.get(&store, &GetRequest { keys: vec![k] }))
+                .unwrap()
+                .entries[0]
+                .is_none()
+        );
+
+        let retried = block_on(space.admit(&store, Timestamp(1), &request)).unwrap();
+        assert_eq!(retried.applied_admission_seq(0), Some(AdmissionSeq(1)));
     }
 
     #[test]
@@ -1056,7 +1307,7 @@ mod tests {
                 1,
                 Mutation::Set {
                     key: row.clone(),
-                    value: Ciphertext(b"ciphertext".to_vec()),
+                    value: OpaqueValue(b"ciphertext".to_vec()),
                 },
                 1,
                 set_seal.clone(),

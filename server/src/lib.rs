@@ -40,7 +40,7 @@ use storage::OrderedStore;
 ///
 /// - **Registration** ([`create_space`](Server::create_space)) marks a space
 ///   as existing — a directory action. It is deliberately *not* one of the
-///   seven data-plane verbs: it's a tenant-plane operation (token-authorized
+///   kernel data-plane verbs: it's a tenant-plane operation (token-authorized
 ///   and quota-checked at the layer above), and it costs the shard nothing.
 /// - **Actors are lazy** ([`space`](Server::space)): the first touch of a
 ///   registered space builds its [`SpaceActor`] over the shared store and
@@ -116,8 +116,8 @@ mod tests {
     use homebase_core::seal::Seal;
     use homebase_core::space::Space as _;
     use homebase_core::tag::{
-        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
-        Mutation, Ver,
+        AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+        OpaqueValue, Ver,
     };
     use std::cell::Cell;
     use std::pin::Pin;
@@ -192,7 +192,7 @@ mod tests {
                     entries: vec![DeviceEntry {
                         mutation: Mutation::Set {
                             key: key(&[b"db", b"marker"]),
-                            value: Ciphertext(marker.to_vec()),
+                            value: OpaqueValue(marker.to_vec()),
                         },
                         tag: DeviceTag {
                             device: dev(1),

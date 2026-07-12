@@ -1,4 +1,4 @@
-//! The client's view of the server: the seven verbs, space-qualified.
+//! The client's view of the server: the kernel verbs, space-qualified.
 //!
 //! [`ServerHandle`] is deliberately *not* a "transport" or "connector"
 //! abstraction, and it hands out no per-space objects: it exposes the
@@ -30,13 +30,13 @@
 
 use homebase_core::messages::{
     AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
-    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest, PullResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space, SpaceError, SpaceId};
 use std::future::Future;
 
-/// The seven verbs, space-qualified — the client's whole vocabulary for
+/// The kernel verbs, space-qualified — the client's whole vocabulary for
 /// talking to a server. Mirrors [`Space`] exactly, plus the space id per
 /// call; methods are desugared so the futures are `Send`, same as the
 /// core trait.
@@ -70,6 +70,12 @@ pub trait ServerHandle {
         space: &SpaceId,
         req: AdmissionRequest,
     ) -> impl Future<Output = Result<AdmissionResponse, SpaceError>> + Send;
+
+    fn pull(
+        &self,
+        space: &SpaceId,
+        req: PullRequest,
+    ) -> impl Future<Output = Result<PullResponse, SpaceError>> + Send;
 
     fn get(
         &self,
@@ -149,6 +155,13 @@ where
         }
     }
 
+    async fn pull(&self, space: &SpaceId, req: PullRequest) -> Result<PullResponse, SpaceError> {
+        match self(space) {
+            Some(s) => s.pull(req).await,
+            None => Err(SpaceError::unavailable("space not served by this endpoint")),
+        }
+    }
+
     async fn get(&self, space: &SpaceId, req: GetRequest) -> Result<GetResponse, SpaceError> {
         match self(space) {
             Some(s) => s.get(req).await,
@@ -201,6 +214,10 @@ impl Space for UnreachableSpace {
     }
 
     async fn admit(&self, _: AdmissionRequest) -> Result<AdmissionResponse, SpaceError> {
+        match *self {}
+    }
+
+    async fn pull(&self, _: PullRequest) -> Result<PullResponse, SpaceError> {
         match *self {}
     }
 
@@ -263,6 +280,10 @@ impl ServerHandle for Offline {
         match *self {}
     }
 
+    async fn pull(&self, _space: &SpaceId, _req: PullRequest) -> Result<PullResponse, SpaceError> {
+        match *self {}
+    }
+
     async fn get(&self, _space: &SpaceId, _req: GetRequest) -> Result<GetResponse, SpaceError> {
         match *self {}
     }
@@ -293,13 +314,14 @@ pub mod conformance {
     use homebase_core::lease::LeaseMode;
     use homebase_core::messages::{
         AcquireRequest, AdmissionBatch, AdmissionRequest, GetRequest, KernelError, LeaseSpec,
-        ListRequest, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest,
+        ListRequest, PullRequest, Range, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest,
+        RenewRequest,
     };
     use homebase_core::seal::Seal;
     use homebase_core::space::{SpaceError, SpaceId};
     use homebase_core::tag::{
-        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
-        Mutation, Ver,
+        AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+        OpaqueValue, Ver,
     };
     use std::time::Duration;
 
@@ -323,7 +345,7 @@ pub mod conformance {
         DeviceEntry {
             mutation: Mutation::Set {
                 key,
-                value: Ciphertext(value.to_vec()),
+                value: OpaqueValue(value.to_vec()),
             },
             tag: DeviceTag {
                 device,
@@ -347,8 +369,8 @@ pub mod conformance {
         unserved_space_is_a_transport_error(handle, unknown).await;
     }
 
-    /// All seven verbs, end to end, in one space: acquire → put → get /
-    /// list / read_at → renew → release → prefix free again. Also pins
+    /// All kernel verbs, end to end, in one space: acquire → put → replay /
+    /// range fetch / get / list / read_at → renew → release → prefix free again. Also pins
     /// per-space admission sequencing: a fresh space's first batch is
     /// admission 1 behind a barrier of 0.
     pub async fn verbs_roundtrip<T: ServerHandle>(handle: &T, space: SpaceId, marker: &[u8]) {
@@ -396,6 +418,20 @@ pub mod conformance {
             "fresh space: first admission"
         );
 
+        let pulled = handle
+            .pull(
+                &space,
+                PullRequest {
+                    after: AdmissionSeq(0),
+                    max_batches: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pulled.through, AdmissionSeq(1));
+        assert_eq!(pulled.batches.len(), 1);
+        assert_eq!(pulled.batches[0].entries.len(), 1);
+
         let got = handle
             .get(
                 &space,
@@ -409,7 +445,7 @@ pub mod conformance {
             got.entries[0].as_ref().map(|e| &e.device_entry.mutation),
             Some(&Mutation::Set {
                 key: k.clone(),
-                value: Ciphertext(marker.to_vec())
+                value: OpaqueValue(marker.to_vec())
             })
         );
 
@@ -498,7 +534,7 @@ pub mod conformance {
                 got.entries[0].as_ref().map(|e| &e.device_entry.mutation),
                 Some(&Mutation::Set {
                     key: k.clone(),
-                    value: Ciphertext(marker.to_vec()),
+                    value: OpaqueValue(marker.to_vec()),
                 }),
                 "space {space:?} must see only its own write"
             );

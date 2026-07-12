@@ -25,8 +25,8 @@ use homebase_core::messages::{
 use homebase_core::seal::Seal;
 use homebase_core::space::{Space as _, SpaceError, SpaceId};
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    Ver,
+    CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    OpaqueValue, Ver,
 };
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
@@ -161,7 +161,7 @@ async fn client(
                 entries: vec![DeviceEntry {
                     mutation: Mutation::Set {
                         key: counter_key(),
-                        value: Ciphertext(encode(current.0 + 1)),
+                        value: OpaqueValue(encode(current.0 + 1)),
                     },
                     tag: DeviceTag {
                         device: dev(d),
@@ -300,7 +300,7 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
                     record.entry.device_entry.mutation,
                     Mutation::Set {
                         key: counter_key(),
-                        value: Ciphertext(encode(best.value)),
+                        value: OpaqueValue(encode(best.value)),
                     },
                     "acked counter value corrupted (seed {seed})"
                 );

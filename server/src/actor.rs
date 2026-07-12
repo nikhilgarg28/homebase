@@ -30,8 +30,8 @@ use futures_core::Stream;
 use homebase_core::clock::Clock;
 use homebase_core::messages::{
     AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
-    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest, PullResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{Space as SpaceApi, SpaceError, SpaceId};
 use std::pin::Pin;
@@ -58,6 +58,7 @@ enum Command {
     Release(ReleaseRequest, Reply<ReleaseResponse>),
     ListLeases(ListLeasesRequest, Reply<ListLeasesResponse>),
     Admit(AdmissionRequest, Reply<AdmissionResponse>),
+    Pull(PullRequest, Reply<PullResponse>),
     Get(GetRequest, Reply<GetResponse>),
     List(ListRequest, Reply<ListResponse>),
     ReadAt(ReadAtRequest, Reply<ReadAtResponse>),
@@ -113,6 +114,10 @@ impl<S: OrderedStore, C: Clock> SpaceActor<S, C> {
                 }
                 Command::Admit(req, reply) => {
                     let result = self.machine.admit(&*store, now, &req).await;
+                    let _ = reply.send(result.map_err(Into::into));
+                }
+                Command::Pull(req, reply) => {
+                    let result = self.machine.pull(&*store, &req).await;
                     let _ = reply.send(result.map_err(Into::into));
                 }
                 Command::Get(req, reply) => {
@@ -194,6 +199,13 @@ impl SpaceApi for SpaceHandle {
         self.call(move |reply| Command::Admit(req, reply))
     }
 
+    fn pull(
+        &self,
+        req: PullRequest,
+    ) -> impl Future<Output = Result<PullResponse, SpaceError>> + Send {
+        self.call(move |reply| Command::Pull(req, reply))
+    }
+
     fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send {
         self.call(move |reply| Command::Get(req, reply))
     }
@@ -225,8 +237,8 @@ mod tests {
     use homebase_core::messages::{AdmissionBatch, KernelError, LeaseSpec};
     use homebase_core::seal::Seal;
     use homebase_core::tag::{
-        AdmissionSeq, CipherEpoch, Ciphertext, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
-        Mutation, Ver,
+        AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+        OpaqueValue, Ver,
     };
     use std::time::Duration;
 
@@ -271,7 +283,7 @@ mod tests {
                 entries: vec![DeviceEntry {
                     mutation: Mutation::Set {
                         key: k.clone(),
-                        value: Ciphertext(v.to_vec()),
+                        value: OpaqueValue(v.to_vec()),
                     },
                     tag: DeviceTag {
                         device: dev(device),

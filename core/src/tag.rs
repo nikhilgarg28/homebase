@@ -74,18 +74,19 @@ pub struct Ver(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CipherEpoch(pub u64);
 
-/// Opaque encrypted bytes carried by a Set mutation.
+/// Opaque bytes carried by an admitted Set mutation. Clients normally place
+/// ciphertext here; the kernel does not interpret or classify the bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Ciphertext(pub Vec<u8>);
+pub struct OpaqueValue(pub Vec<u8>);
 
-impl AsRef<[u8]> for Ciphertext {
+impl AsRef<[u8]> for OpaqueValue {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
 }
 
 /// A Set or Delete shape. Bare client mutations use plaintext `Vec<u8>`;
-/// device/server entries use [`Ciphertext`].
+/// device/server entries use [`OpaqueValue`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation<T = Vec<u8>> {
     Set { key: Key, value: T },
@@ -119,7 +120,7 @@ pub struct DeviceTag {
 
 /// One complete device-authenticated data mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeviceEntry<T = Ciphertext> {
+pub struct DeviceEntry<T = OpaqueValue> {
     pub mutation: Mutation<T>,
     pub tag: DeviceTag,
     pub seal: Seal,
@@ -153,7 +154,7 @@ impl AdmissionTag {
 
 /// An unchanged device-authenticated entry plus authority metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AdmittedEntry<T = Ciphertext> {
+pub struct AdmittedEntry<T = OpaqueValue> {
     pub device_entry: DeviceEntry<T>,
     pub admission: AdmissionTag,
 }

@@ -24,7 +24,7 @@ does not target arbitrary half-open key intervals.
 - Keep the homebase client ops-only; materialized replica state belongs to its
   consumer.
 - Replicate the complete dense admission log per client space while retaining
-  arbitrary stateless server range fetches.
+  arbitrary stateless server range reads.
 
 ## Non-goals
 
@@ -33,7 +33,7 @@ does not target arbitrary half-open key intervals.
 - Immediate garbage collection of hidden point records.
 - Hiding range-delete events from raw changefeed consumers.
 - Applying pulled mutations to a consumer-owned database inside homebase.
-- Treating a stateless range fetch as client replication progress.
+- Treating a stateless range read as client replication progress.
 - Byzantine-server fork consistency without an external witness.
 
 ## Terminology
@@ -185,7 +185,7 @@ sources. The same effective maximum must be used by:
 
 - `RangeAssert` evaluation.
 - Lease grant barriers.
-- Stateless range-fetch cuts and short-circuit checks.
+- Stateless `read_at` cuts and short-circuit checks.
 - Any future public range-version API.
 
 Earlier range deletes from the submitting device do not invalidate its own
@@ -212,10 +212,9 @@ The proposed solution is a monotonic `max_ver` aggregate:
   under its target range.
 - A later point mutation must exceed both its stored point ver and the newest
   covering range tombstone ver.
-- Stateless range fetches include the effective `max_ver` even when they
-  contain no relevant operations.
 - Stateful full-log pull raises the client's space-local `ver_high` from every
-  captured operation; stateless range fetch does not mutate it.
+  captured operation. Stateless range reads are observational only and do not
+  establish version authority or mutate `ver_high`.
 
 As with admission history, a child query combines its aggregate below the
 query with covering ancestor tombstones:
@@ -357,10 +356,10 @@ transfer. The server verb reads a contiguous interval after one
 rollback batches:
 
 ```rust
-pub struct AdmissionPage<T = Ciphertext> {
+pub struct PullResponse {
     pub after: AdmissionSeq,
     pub through: AdmissionSeq,
-    pub batches: Vec<AdmittedBatch<T>>,
+    pub batches: Vec<AdmittedBatch>,
 }
 ```
 
@@ -370,20 +369,16 @@ retained history. A bounded page may stop before the current server high
 water, but it must contain the complete dense interval it claims. There is no
 snapshot shortcut in the initial protocol.
 
-### Arbitrary range fetch
+### Arbitrary range reads
 
-The server separately supports stateless range fetches. For requested range
-`P` and cursor `after`, it scans the admission log through one atomic cut and
-returns relevant source operations plus the cut:
+The existing `read_at` verb provides stateless range reads. For requested
+range `P` and cursor `after`, its delta path scans the admission log through
+one atomic cut and returns relevant source operations in `RangeCut::Delta`.
+The response's `at` field is the cut, including when the delta is empty.
 
 ```rust
-pub struct RangeFetch<T = Ciphertext> {
-    pub range: Range,
-    pub after: AdmissionSeq,
-    pub through: AdmissionSeq,
-    pub operations: Vec<AdmittedEntry<T>>,
-    pub max_ver: Ver,
-}
+read_at([RangeCursor { range: P, since: Some(after) }])
+    -> ReadAtResponse { at, ranges: [RangeCut::Delta(operations)] }
 ```
 
 A point operation is relevant when `P` covers its key. A DeleteRange `R` is
@@ -397,15 +392,14 @@ The first case clears all of the requested local range. The second clears a
 nested part of it.
 
 The operation remains byte-for-byte the original authenticated admission.
-The range-fetch response also carries the requested scope `P`. A caller that
-materializes only `P` applies a relevant DeleteRange over the
-intersection:
+The request carries the scope `P`. A caller that materializes only `P` applies
+a relevant DeleteRange over the intersection:
 
 ```text
 effect(P, R) = intersection(P, R)
 ```
 
-This scope rule is mandatory. If a range-fetch caller reading `db/a` applied an
+This scope rule is mandatory. If a range-read caller reading `db/a` applied an
 ancestor `DeleteRange(db)` outside its captured scope, it could corrupt
 caller-owned `db/b` state. Homebase does not manufacture a projected
 mutation or new seal; it exposes the authenticated source operation and the
@@ -419,12 +413,12 @@ DeleteRange(db) at 5, Set(db/a) at 6
 Set(db/a) at 5, DeleteRange(db) at 6
 ```
 
-`through` advances even when `operations` is empty. The server's global
-`AdmissionSeq` remains dense, but a range fetch naturally observes gaps
+`at` advances even when `operations` is empty. The server's global
+`AdmissionSeq` remains dense, but a range read naturally observes gaps
 because irrelevant batches are filtered. Callers order returned mutations by
 full `AdmissionOrder`, never by assuming the filtered result is dense.
 
-Range fetch is deliberately outside client replication state. Calling it does
+Range reads are deliberately outside client replication state. Calling one does
 not append the client admit log or change `head`, `neck`, `tail`, `ver_high`,
 lease usability, or checked-assertion readiness. Only a full admission-log
 pull may advance those facts.
@@ -542,7 +536,7 @@ All cursors are exclusive durable positions and satisfy
 
 `pull()` performs one atomic client transition:
 
-1. Read a dense full-space `AdmissionPage` after `tail - 1`.
+1. Read a dense full-space `PullResponse` after `tail - 1`.
 2. Decrypt and authenticate every returned operation and validate batch/order
    density.
 3. Append every complete admitted batch at its server `AdmissionSeq`.
@@ -591,11 +585,11 @@ atomically delete `[neck, tail)` and rewind `tail = neck` so the dense suffix is
 replayed from retained server history. Pulling must apply backpressure when
 `[neck, tail)` exceeds configured record or byte limits.
 
-### Stateless range fetch
+### Stateless range read
 
-`fetch(range, after)` exposes the server's arbitrary `RangeFetch` verb. It
-returns authenticated source operations and the requested scope to its caller
-but performs no MetaStore transition. In particular, it cannot advance admit
+`fetch(range, after)` is client convenience sugar over a one-range `read_at`
+delta. It returns authenticated source operations and the requested scope to
+its caller but performs no MetaStore transition. In particular, it cannot advance admit
 `tail` or `neck`, `ver_high`, leases, or checked-submission readiness.
 
 For DeleteRange, a fetch caller that materializes only the requested range
@@ -605,7 +599,7 @@ original DeleteRange directly.
 
 This decision makes a space the minimum replication and client-log authority
 unit. Future subspace-only replication would require separate subscription
-logs or another cursor model; arbitrary transient range fetch alone does not
+logs or another cursor model; arbitrary transient range read alone does not
 change that boundary.
 
 ### Leasing and admission position
@@ -653,7 +647,7 @@ range assertions remain the correctness check at admission.
 ### Irreducible consumer complexity
 
 An admit-log consumer that materializes state must understand DeleteRange; a
-stateless range-fetch consumer must additionally respect its requested scope.
+stateless range-read consumer must additionally respect its requested scope.
 Expanding a range tombstone into point deletes would destroy scalability.
 Higher-level libraries can hide this from their own application users, while
 Homebase remains an oplog service.
@@ -663,7 +657,7 @@ Homebase remains an oplog service.
 DeleteRange optimizations are accepted only by refinement against a small,
 append-only reference model. The model stores every admitted mutation in
 `AdmissionOrder` and derives visibility, history, versions, counts, conflicts,
-full-log replay, and arbitrary range fetches directly. It deliberately has no
+full-log replay, and arbitrary range reads directly. It deliberately has no
 prefix aggregates, lazy count epochs, or materialized-record shortcuts.
 
 The production implementation is exercised after every randomly generated
@@ -681,10 +675,10 @@ The following laws are permanent tests rather than one-time examples:
 3. **Client replica:** `[head, tail)` contains exactly the retained server
    batches at those `AdmissionSeq` values; full pull never creates a gap,
    duplicate, or translated cursor.
-4. **Range-fetch composition:** fetching `A..B` then `B..C` for one range is
+4. **Range-read composition:** fetching `A..B` then `B..C` for one range is
    state-equivalent to fetching `A..C`; stateless fetch changes no client
    cursor, `ver_high`, lease, or checked-submission state.
-5. **Range projection:** applying a range fetch for `P` never changes caller
+5. **Range projection:** applying a range read for `P` never changes caller
    state outside `P`, including when the source tombstone is an ancestor.
 6. **Batch order:** Set/DeleteRange permutations in one batch match full-log
    replay; splitting a mutation sequence across batches preserves final
@@ -716,7 +710,7 @@ verification builds.
 
 Every future optimization must name its refinement law and fallback. Aggregate
 short-circuiting owns read agreement; paged full pulls own client-replica
-density; range indexes own range-fetch composition; and future server-log GC
+density; range indexes own range-read composition; and future server-log GC
 owns replay for every supported cursor. An optimization without such an
 oracle stays out.
 
@@ -725,7 +719,7 @@ oracle stays out.
 These invariants cover honest protocol participants, crashes, retries,
 concurrency, storage faults surfaced through `OrderedStore`, and corrupted or
 misbound ciphertext detected by AEAD. AEAD authenticates the original
-mutation and range; any stateless range-fetch effect is the deterministic
+mutation and range; any stateless range-read effect is the deterministic
 intersection of that range with the requested range.
 
 They do not prove that a Byzantine server returned a complete admission log,
@@ -798,11 +792,11 @@ requires preserving their version floors. Both are deferred.
 - `get`, `list`, full server-log replay, and the reference model agree.
 - Full client pull reproduces every server batch and empty header at the same
   `AdmissionSeq` without translation.
-- Child range fetch receives the authenticated ancestor tombstone with child
+- Child range read receives the authenticated ancestor tombstone with child
   request scope; caller application leaves siblings unchanged.
-- Parent range fetch receives descendant tombstones.
-- Filtered range fetch preserves delete-before-set and set-before-delete order.
-- A range fetch with no relevant operations still reports its `through` cut
+- Parent range read receives descendant tombstones.
+- Filtered range read preserves delete-before-set and set-before-delete order.
+- A range read with no relevant operations still reports its `at` cut
   but changes no client state.
 - Appending a pull changes admit `tail` but never `neck`; marking applied
   changes only `neck` atomically.
@@ -812,7 +806,7 @@ requires preserving their version floors. Both are deferred.
   `head <= neck <= tail` and never loses pending admissions.
 - Pagination skips hidden records without reducing the visible limit.
 - Bounded full-log pages remain dense and raise `ver_high` only when appended.
-- Arbitrary range fetch before/after pull leaves all three cursors,
+- Arbitrary range read before/after pull leaves all three cursors,
   `ver_high`, leases, and checked readiness unchanged.
 
 ### Counts
@@ -853,20 +847,20 @@ reviewable local commit and includes its own tests and documentation change.
 | Batch | Scope | Tests | Documentation |
 |---|---|---|---|
 | AL1 Admission order | Add `AdmissionOrder { admission_seq, op_index }`; persist `op_index` in admitted point records and assign it from batch entry order. No DeleteRange yet. | Core/schema roundtrips; same-batch point order; workspace migration tests. | Core tag/schema docs distinguish batch barriers from operation order. |
-| AL2 Exact server log | Add append-only server `AdmissionLog` records for existing Set/Delete and write them atomically with materialized data, aggregates, counters, device state, and checksum. Keep the old read path temporarily. | Exact log order; repeated-key history retained; empty admitted batch; fault injection proves log/data atomicity. | Server schema/data docs describe materialization versus replay log. |
-| AL3 Full-log and range-read verbs | Add dense `AdmissionPage` reads for full replay and sparse `RangeFetch` reads for arbitrary Prefix/Full ranges. Existing Set/Delete only. | Dense bounded pages; empty batch headers; range-filtered gaps; empty range result with advancing `through`; both verbs share one atomic cut. | Wire docs separate stateful full replication from stateless range observation. |
+| AL2 Exact server log | Add append-only server `AdmissionLog` records for existing Set/Delete and write them atomically with materialized data, aggregates, counters, device state, and checksum. | Exact log order; repeated-key history retained; empty admitted batch; fault injection proves log/data atomicity. | Server schema/data docs describe materialization versus replay log. |
+| AL3 Full-log and range-read verbs | Add dense bounded `pull` for full replay and make `read_at` deltas scan exact sparse history for arbitrary Prefix/Full ranges. Remove the superseded compacted changelog. Existing Set/Delete only. | Dense bounded pulls; empty batch headers; range-filtered gaps; empty delta with advancing `at`; both reads share one atomic cut. | Wire docs separate stateful full replication from stateless range observation. |
 | AL4 Client admit MetaStore | Add per-space admitted batches keyed by server `AdmissionSeq`, independent `head/neck/tail` in the same domain, and atomic append/mark-applied/trim transitions. Do not route network pulls through it yet. | MetaStore conformance, exact server-seq keys, reopen, illegal gaps/moves, trim-above-neck rejection, empty `1/1/1`, fault injection for every transition. | Meta docs specify both logs, exclusive cursors, and dense replica invariant. |
-| AL5 Client full pull and stateless fetch | Route Set/Delete `pull()` through dense full-log pages: authenticate before append, raise `ver_high` with `tail`, expose iteration, move `neck` on mark-applied, and trim below neck. Expose `fetch(range, after)` without any MetaStore mutation. | Pull retry/paging; crash before/after append/apply/mark/trim; server/client seq identity; ciphertext tamper never appends; range fetch leaves cursors/ver/leases byte-identical. | Client API docs distinguish `pull` from `fetch`. |
+| AL5 Client full pull and stateless fetch | Route Set/Delete `pull()` through dense server pulls: authenticate before append, raise `ver_high` with `tail`, expose iteration, move `neck` on mark-applied, and trim below neck. Expose `fetch(range, after)` as one-range `read_at` sugar without any MetaStore mutation. | Pull retry/paging; crash before/after append/apply/mark/trim; server/client seq identity; ciphertext tamper never appends; range read leaves cursors/ver/leases byte-identical. | Client API docs distinguish `pull` from `fetch`. |
 | AL6 Lease/admit integration | Replace public `ensure` with `lease`; rename release methods to `unlease_checked`/`unlease_unchecked`; make checked submit and lease usability require `neck > barrier`; route acquisition/repair through full pull until `tail > barrier`. | New/reused/renewed lease with captured-but-unapplied barrier; genesis barrier; expiry/unlease before apply; repair/reopen; checked submit blocked until neck passes both barrier and `upto`. | Lease/client docs for one shared `AdmissionSeq` domain. |
-| AL7 Remove old pull model | Delete `RangeCut` snapshot/delta replication, coalesced changelog storage, temporary pull-barrier abstractions, and obsolete watermark transitions. | Workspace tests plus grep/schema checks proving one replication path remains. | Final admit-log API and storage-format cleanup. |
+| AL7 Remove old pull model | Delete temporary pull-barrier abstractions and obsolete replication watermark transitions; retain `read_at` solely as stateless range observation. | Workspace tests plus grep/schema checks proving one replication path remains. | Final admit-log API and storage-format cleanup. |
 | DR1 Core DeleteRange | Add `Mutation::DeleteRange`, range target helpers, admitted range operation encoding, distinct seal AAD kind, and `DeviceChecksum` encoding. Server admission rejects it as unsupported for now. | Core/cipher roundtrips; empty ciphertext; key/range/op-kind tamper; checksum order sensitivity; Full/Prefix encoding. | Core mutation/seal docs. |
-| DR2 Reference model | Build an append-only plaintext oracle for Set/Delete/DeleteRange over a tiny prefix tree, including `AdmissionOrder`, visibility, history, `max_ver`, counts, conflicts, full replay, and stateless range fetch. | Exhaustive short histories and initial randomized commands; no optimized server behavior yet. | Model invariants and refinement-law section. |
+| DR2 Reference model | Build an append-only plaintext oracle for Set/Delete/DeleteRange over a tiny prefix tree, including `AdmissionOrder`, visibility, history, `max_ver`, counts, conflicts, full replay, and stateless range reads. | Exhaustive short histories and initial randomized commands; no optimized server behavior yet. | Model invariants and refinement-law section. |
 | DR3 Tombstone/root storage | Add exact range-tombstone records, covering-ancestor lookup, dedicated full-space root aggregate, and schema codecs. Keep public DeleteRange rejected. | Schema roundtrips; ancestor lookup; Full root; malformed records; storage ordering. | Server schema docs and key layouts. |
 | DR4 Historical metadata and versions | Extend prefix/root metadata with monotonic `max_ver`, top-two history for range events, and `AdmissionOrder` count epochs; migrate existing Set/Delete updates first. | Existing point behavior unchanged; effective ancestor/descendant history; max excluding device; root max/count invariants. | Aggregate docs define historical versus current fields. |
 | DR5 Ordered internal range admission | Implement internal scratch application for mixed point/range mutations, range `ver` fence checks, current tombstone writes, point visibility, bidirectional lease conflicts, authorization checks, and exact server-log append. Keep the public gate closed until counts are correct. | Model differential tests for all same-batch orders; stale ver; parent/child/full overlap; atomic rejection; conflict matrix. | Admission-order and range-conflict docs. |
 | DR6 Lazy live count | Implement lazy subtree resets/materialization and exact ancestor subtraction. Keep the public unsupported gate closed until server replay and client handling also exist. | Model-based count properties; nested resets/revivals; repeated empty deletes; underflow corruption; crash atomicity. | Count-generation algorithm and gated behavior. |
-| DR7 Full replay and range fetch | Include DeleteRange unchanged in dense full-log pages; include relevant authenticated sources in stateless range fetch when either range covers the other. | Full replica gets exact source once; child fetch gets ancestor; parent fetch gets descendant; no sibling point leakage; empty-through after irrelevant writes; both paths equal model. | Full-replay and scoped-fetch DeleteRange contracts. |
-| DR8 Client DeleteRange integration and enablement | Add outgoing sealing/submission, incoming full-log verification, admit-log persistence/iteration, stateless fetch decoding/intersection helper, rollback/recovery, and `ver_high` updates from pull only; then remove the server unsupported gate. | Submit/push/pull roundtrip at identical server seq; fetched range effect never escapes request; fetch leaves client state unchanged; crash/reopen; tampered source rejects before append; public end-to-end admission. | Client cipher/admit-log/fetch docs and public examples. |
+| DR7 Full replay and range reads | Include DeleteRange unchanged in dense pulls; include relevant authenticated sources in stateless `read_at` deltas when either range covers the other. | Full replica gets exact source once; child read gets ancestor; parent read gets descendant; no sibling point leakage; empty delta at a later cut; both paths equal model. | Full-replay and scoped-read DeleteRange contracts. |
+| DR8 Client DeleteRange integration and enablement | Add outgoing sealing/submission, incoming full-log verification, admit-log persistence/iteration, stateless `read_at` decoding/intersection helper, rollback/recovery, and `ver_high` updates from pull only; then remove the server unsupported gate. | Submit/push/pull roundtrip at identical server seq; fetched range effect never escapes request; fetch leaves client state unchanged; crash/reopen; tampered source rejects before append; public end-to-end admission. | Client cipher/admit-log/fetch docs and public examples. |
 | DR9 System torture and audit | Run full randomized server/materialization/log/client differential testing with faults, leases, assertions, duplicate devices, acknowledgement loss, and trim retention. Add recomputation audits for tombstones, metadata, counts, and log order. | Workspace, simulation, equivalence, torture, bounded-history, and seeded fault suites. | Final design conformance notes and deferred GC/checkpoint limits. |
 
 The public DeleteRange path remains hard-rejected through DR7, so no commit
@@ -876,7 +870,7 @@ versions directly instead of carrying compatibility decoders.
 
 ## Open Decisions
 
-1. Final `AdmissionPage` and `RangeFetch` response byte/operation limits.
+1. Final `PullResponse` and `read_at` response byte/operation limits.
 2. Whether the client admit log stores verified ciphertext (preferred) or
    decrypted values; iteration always exposes decrypted operations.
 3. Exact persisted split between range tombstones and prefix aggregate count

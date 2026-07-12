@@ -13,8 +13,8 @@ use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{
-    CipherEpoch, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
-    Ver,
+    CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
+    OpaqueValue, Ver,
 };
 use homebase_server::Server;
 use homebase_server::actor::{SpaceHandle, Spawner};
@@ -59,7 +59,7 @@ fn wire_entry(device: DeviceId, seq: DeviceSeq, key: Key, value: &[u8], ver: Ver
     DeviceEntry {
         mutation: Mutation::Set {
             key,
-            value: Ciphertext(val(value)),
+            value: OpaqueValue(val(value)),
         },
         tag: DeviceTag {
             device,

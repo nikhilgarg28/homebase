@@ -19,7 +19,7 @@ use homebase_core::key::{Key, KeyComponent, KeyError};
 use homebase_core::messages::Range;
 use homebase_core::seal::{Seal, SealScheme};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmittedEntry, Ciphertext, DeviceEntry, DeviceTag, Mutation};
+use homebase_core::tag::{AdmittedEntry, DeviceEntry, DeviceTag, Mutation, OpaqueValue};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -326,7 +326,7 @@ impl SpaceCipher {
                 (
                     Mutation::Set {
                         key,
-                        value: Ciphertext(ciphertext),
+                        value: OpaqueValue(ciphertext),
                     },
                     seal,
                 )

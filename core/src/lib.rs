@@ -8,7 +8,7 @@
 //! - [`clock`] — [`Timestamp`] and the [`Clock`] abstraction: real time for
 //!   servers and clients, hand-cranked time for tests and the sim
 //! - [`messages`] — transport-neutral request/response messages for the
-//!   seven verbs, and [`KernelError`]
+//!   kernel verbs, and [`KernelError`]
 //! - [`seal`] — AEAD seal metadata attached to encrypted value operations
 //! - [`space`] — [`SpaceId`] and the [`Space`] trait, the async verb
 //!   contract every request executes against
@@ -37,6 +37,6 @@ pub use messages::KernelError;
 pub use seal::{Seal, SealPayloadError, SealScheme, UnknownSealScheme};
 pub use space::{Space, SpaceId};
 pub use tag::{
-    AdmissionOrder, AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext,
-    DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    AdmissionOrder, AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum,
+    DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };

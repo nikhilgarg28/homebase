@@ -7,8 +7,9 @@
 
 use crate::messages::{
     AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
-    KernelError, ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, ReadAtRequest,
-    ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    KernelError, ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest,
+    PullResponse, ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest,
+    RenewResponse,
 };
 use std::fmt;
 use std::future::Future;
@@ -75,7 +76,7 @@ impl fmt::Display for SpaceError {
 
 impl std::error::Error for SpaceError {}
 
-/// The seven verbs — the contract between the server's implementation, the
+/// The kernel verbs — the contract between the server's implementation, the
 /// in-process client used by tests and the torture sim, and (later, behind
 /// the wire) the remote client.
 ///
@@ -113,6 +114,11 @@ pub trait Space {
         &self,
         req: AdmissionRequest,
     ) -> impl Future<Output = Result<AdmissionResponse, SpaceError>> + Send;
+
+    fn pull(
+        &self,
+        req: PullRequest,
+    ) -> impl Future<Output = Result<PullResponse, SpaceError>> + Send;
 
     fn get(&self, req: GetRequest) -> impl Future<Output = Result<GetResponse, SpaceError>> + Send;
 

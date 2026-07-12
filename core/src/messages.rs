@@ -1,4 +1,4 @@
-//! Request/response messages for the seven kernel verbs, plus [`KernelError`].
+//! Request/response messages for the kernel verbs, plus [`KernelError`].
 //!
 //! These are the canonical, transport-neutral forms. The wire layer (likely
 //! tonic/gRPC) defines its own generated DTOs and converts to and from these
@@ -6,9 +6,9 @@
 //! lives — so transport details never leak into kernel semantics or
 //! validated types like [`Key`].
 //!
-//! Device-entry bytes are opaque throughout: by the time they reach these
-//! messages they are ciphertext, and the kernel could not interpret them if
-//! it wanted to.
+//! Device-entry values are opaque throughout. Encrypted clients place
+//! ciphertext in them, but the kernel does not classify or interpret the
+//! bytes.
 //!
 //! The verb contract itself is [`Space`](crate::space::Space). A request
 //! executes within exactly one space, selected by the authenticated
@@ -21,8 +21,8 @@ use crate::key::Key;
 use crate::lease::{Lease, LeaseId, LeaseMode};
 use crate::space::SpaceId;
 use crate::tag::{
-    AdmissionSeq, AdmittedEntry, Ciphertext, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
-    Mutation, Ver,
+    AdmissionSeq, AdmittedEntry, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, Mutation,
+    OpaqueValue, Ver,
 };
 use sha2::Digest;
 use std::fmt;
@@ -252,6 +252,41 @@ impl AdmissionResponse {
 }
 
 // ---------------------------------------------------------------------------
+// admission log
+
+/// One durably admitted client batch in the server's exact space history.
+///
+/// `checksum` is the submitting device's cumulative checksum after this
+/// batch. Empty rollback batches have an empty `entries` vector but retain
+/// the rest of their identity here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedBatch {
+    pub admission_seq: AdmissionSeq,
+    pub device: DeviceId,
+    pub device_seq: DeviceSeq,
+    pub checksum: DeviceChecksum,
+    pub entries: Vec<AdmittedEntry>,
+}
+
+/// Reads a dense prefix of the retained server admission log after `after`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    /// Must not exceed the server's current admission high water.
+    pub after: AdmissionSeq,
+    /// Maximum number of complete admitted batches to return. `None` means
+    /// no protocol-level batch limit; `Some(0)` returns an empty page.
+    pub max_batches: Option<usize>,
+}
+
+/// A complete dense server-log interval `(after, through]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullResponse {
+    pub after: AdmissionSeq,
+    pub through: AdmissionSeq,
+    pub batches: Vec<AdmittedBatch>,
+}
+
+// ---------------------------------------------------------------------------
 // get / list
 
 /// Batched point reads.
@@ -264,7 +299,7 @@ pub struct GetRequest {
 /// never-written and tombstoned are indistinguishable here (tombstones
 /// surface only in `read_at` deltas).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetResponse<T = Ciphertext> {
+pub struct GetResponse<T = OpaqueValue> {
     pub entries: Vec<Option<AdmittedEntry<T>>>,
 }
 
@@ -278,7 +313,7 @@ pub struct ListRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListResponse<T = Ciphertext> {
+pub struct ListResponse<T = OpaqueValue> {
     /// Live entries in key order (tombstones excluded).
     pub entries: Vec<AdmittedEntry<T>>,
     /// True when the scan stopped at `limit` with more remaining.
@@ -336,7 +371,7 @@ pub struct ReadAtRequest {
 
 /// Per-range result of a consistent cut: `(S, Δ)` in the design's terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RangeCut<T = Ciphertext> {
+pub enum RangeCut<T = OpaqueValue> {
     /// Full state of the range at the cut (cursor was `None`); live entries
     /// only, key order.
     Snapshot(Vec<AdmittedEntry<T>>),
@@ -346,7 +381,7 @@ pub enum RangeCut<T = Ciphertext> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadAtResponse<T = Ciphertext> {
+pub struct ReadAtResponse<T = OpaqueValue> {
     /// The single admission point at which every range was evaluated —
     /// never a torn multi-range read. Also the caller's next cursor for
     /// all requested ranges.
@@ -398,6 +433,11 @@ pub enum KernelError {
         current_seq: DeviceSeq,
         current: DeviceChecksum,
     },
+    /// A read cursor names history the space has not admitted.
+    AdmissionCursorAhead {
+        after: AdmissionSeq,
+        high_water: AdmissionSeq,
+    },
     /// Outside the token's prefix scope (enforced on reads AND writes).
     /// Reserved for the wire layer; the in-process kernel never emits it.
     Unauthorized { prefix: Key },
@@ -437,6 +477,10 @@ impl fmt::Display for KernelError {
             } => write!(
                 f,
                 "device checksum mismatch at {current_seq:?}: server has {current:?}"
+            ),
+            Self::AdmissionCursorAhead { after, high_water } => write!(
+                f,
+                "admission cursor {after:?} is ahead of server high water {high_water:?}"
             ),
             Self::Unauthorized { prefix } => {
                 write!(f, "token does not cover prefix {prefix:?}")
@@ -484,7 +528,7 @@ mod tests {
         DeviceEntry {
             mutation: Mutation::Set {
                 key: key(&[b"db", name]),
-                value: Ciphertext(name.to_vec()),
+                value: OpaqueValue(name.to_vec()),
             },
             tag: DeviceTag {
                 device,

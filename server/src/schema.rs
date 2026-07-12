@@ -7,22 +7,20 @@
 //!
 //! ```text
 //! (space, Data,          k1, k2, …)             → DataRecord (tag + value)
-//! (space, Changelog,     seq_be, k1, k2, …)     → DataRecord (same bytes)
 //! (space, LeaseByPrefix, depth, p1…pd, id_be)   → LeaseRecord
 //! (space, LeaseById,     id_be)                 → LeaseRecord
 //! (space, Meta,          "counters")            → CountersRecord
 //! (space, Device,        device_id)             → DeviceRecord
 //! (space, PrefixMeta,    depth, p1…pd)          → PrefixMetaRecord
+//! (space, AdmissionLog,  seq_be, Header)         → AdmissionHeaderRecord
+//! (space, AdmissionLog,  seq_be, Op, i_be, k…)   → DataRecord
 //! ```
 //!
-//! **The changelog holds exactly one record per key**, keyed by the
-//! admission seq of the key's *latest* change: a put deletes the key's old
-//! changelog entry (its location is known — the previous data record carries
-//! its admission seq) and inserts the new one, all in the same atomic batch.
-//! A delta since cursor `c` is then a scan of seqs `> c`: every key changed
-//! after `c` appears exactly once, already at its current state (tombstones
-//! included). No garbage collection, no compaction-on-read. The record bytes
-//! duplicate the data record so a delta never needs point lookups.
+//! **AdmissionLog is the immutable replay history.** Every admitted batch has
+//! one header, including empty rollback batches, and every admitted operation
+//! has one entry in stable `(admission_seq, op_index)` order. Materialized
+//! Data and PrefixMeta records may be replaced; AdmissionLog records are never
+//! moved or replaced.
 //!
 //! **PrefixMeta is the durable augmented tree**: per `(depth, prefix)`, the
 //! two greatest historical admission points from distinct devices plus the
@@ -51,8 +49,8 @@ use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::seal::Seal;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{
-    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, Ciphertext, DeviceChecksum,
-    DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, Ver,
+    AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId,
+    DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
 use std::time::Duration;
 
@@ -61,12 +59,12 @@ use std::time::Duration;
 #[repr(u8)]
 pub enum RecordKind {
     Data = 0,
-    Changelog = 1,
     LeaseByPrefix = 2,
     LeaseById = 3,
     Meta = 4,
     Device = 5,
     PrefixMeta = 6,
+    AdmissionLog = 7,
 }
 
 impl RecordKind {
@@ -81,6 +79,10 @@ fn space_component(space: SpaceId) -> KeyComponent {
 
 fn u64_component(v: u64) -> KeyComponent {
     KeyComponent::new(v.to_be_bytes().to_vec()).expect("8-byte component")
+}
+
+fn u32_component(v: u32) -> KeyComponent {
+    KeyComponent::new(v.to_be_bytes().to_vec()).expect("4-byte component")
 }
 
 /// `(space, Data, k1, k2, …)`. Also the scan prefix for data at or under a
@@ -119,37 +121,63 @@ pub fn prefix_meta_scan_all(space: SpaceId) -> Vec<u8> {
     encode_components(&[space_component(space), RecordKind::PrefixMeta.component()])
 }
 
-/// `(space, Changelog, seq_be, k1, k2, …)`
-pub fn changelog_key(space: SpaceId, seq: AdmissionSeq, key: &Key) -> Vec<u8> {
+const ADMISSION_HEADER_COMPONENT: u8 = 0;
+const ADMISSION_OP_COMPONENT: u8 = 1;
+
+fn admission_component(kind: u8) -> KeyComponent {
+    KeyComponent::new(vec![kind]).expect("single-byte admission component")
+}
+
+/// Byte prefix of a space's complete immutable admission log.
+pub fn admission_log_scan_all(space: SpaceId) -> Vec<u8> {
+    encode_components(&[space_component(space), RecordKind::AdmissionLog.component()])
+}
+
+/// `(space, AdmissionLog, admission_seq, Header)`.
+pub fn admission_header_key(space: SpaceId, seq: AdmissionSeq) -> Vec<u8> {
+    encode_components(&[
+        space_component(space),
+        RecordKind::AdmissionLog.component(),
+        u64_component(seq.0),
+        admission_component(ADMISSION_HEADER_COMPONENT),
+    ])
+}
+
+/// `(space, AdmissionLog, admission_seq, Op, op_index, k1, k2, …)`.
+pub fn admission_op_key(space: SpaceId, seq: AdmissionSeq, op_index: u32, key: &Key) -> Vec<u8> {
     let mut components = vec![
         space_component(space),
-        RecordKind::Changelog.component(),
+        RecordKind::AdmissionLog.component(),
         u64_component(seq.0),
+        admission_component(ADMISSION_OP_COMPONENT),
+        u32_component(op_index),
     ];
     components.extend(key.components().iter().cloned());
     encode_components(&components)
 }
 
-/// Byte prefix of a space's whole changelog keyspace.
-pub fn changelog_scan_all(space: SpaceId) -> Vec<u8> {
-    encode_components(&[space_component(space), RecordKind::Changelog.component()])
-}
-
-/// Scan **start** for changelog entries with seq strictly greater than
-/// `since` (pair with [`changelog_scan_all`]'s successor as the end bound).
-pub fn changelog_scan_after(space: SpaceId, since: AdmissionSeq) -> Vec<u8> {
+/// Scan prefix for one admitted batch's operations.
+pub fn admission_op_scan(space: SpaceId, seq: AdmissionSeq) -> Vec<u8> {
     encode_components(&[
         space_component(space),
-        RecordKind::Changelog.component(),
-        u64_component(since.0.saturating_add(1)),
+        RecordKind::AdmissionLog.component(),
+        u64_component(seq.0),
+        admission_component(ADMISSION_OP_COMPONENT),
     ])
 }
 
-/// Recovers the user key from a Changelog storage key (component 2 is the
-/// admission seq; the user key follows).
-pub fn user_key_from_changelog(storage_key: &[u8]) -> Option<Key> {
+/// Recovers `(admission_seq, op_index, user_key)` from an admission op key.
+pub fn admission_op_parts(storage_key: &[u8]) -> Option<(AdmissionSeq, u32, Key)> {
     let components = decode_components(storage_key).ok()?;
-    Key::new(components.get(3..)?.to_vec()).ok()
+    if components.get(3)?.as_bytes() != [ADMISSION_OP_COMPONENT] {
+        return None;
+    }
+    let seq = AdmissionSeq(u64::from_be_bytes(
+        components.get(2)?.as_bytes().try_into().ok()?,
+    ));
+    let op_index = u32::from_be_bytes(components.get(4)?.as_bytes().try_into().ok()?);
+    let key = Key::new(components.get(5..)?.to_vec()).ok()?;
+    Some((seq, op_index, key))
 }
 
 /// `(space, Device, device_id)`
@@ -226,6 +254,42 @@ const COUNTERS_RECORD_VERSION: u8 = 1;
 const DATA_RECORD_VERSION: u8 = 1;
 const DEVICE_RECORD_VERSION: u8 = 1;
 const PREFIX_META_RECORD_VERSION: u8 = 1;
+const ADMISSION_HEADER_RECORD_VERSION: u8 = 1;
+
+/// Durable identity and completeness check for one admitted client batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionHeaderRecord {
+    pub device: DeviceId,
+    pub device_seq: DeviceSeq,
+    pub checksum: DeviceChecksum,
+    pub operation_count: u32,
+}
+
+impl AdmissionHeaderRecord {
+    pub fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 16 + 8 + 32 + 4);
+        out.push(ADMISSION_HEADER_RECORD_VERSION);
+        out.extend_from_slice(&self.device.0);
+        out.extend_from_slice(&self.device_seq.0.to_be_bytes());
+        out.extend_from_slice(&self.checksum.0);
+        out.extend_from_slice(&self.operation_count.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != ADMISSION_HEADER_RECORD_VERSION {
+            return None;
+        }
+        let record = Self {
+            device: DeviceId(r.bytes16()?),
+            device_seq: DeviceSeq(r.u64()?),
+            checksum: DeviceChecksum(r.take(32)?.try_into().ok()?),
+            operation_count: r.u32()?,
+        };
+        r.rest().is_empty().then_some(record)
+    }
+}
 
 /// The full server-side state of one lease grant. Stored identically under
 /// both lease keys so the conflict check never needs a second lookup.
@@ -399,7 +463,7 @@ impl DataRecord {
             0 => Mutation::Delete { key },
             1 => Mutation::Set {
                 key,
-                value: Ciphertext(r.rest().to_vec()),
+                value: OpaqueValue(r.rest().to_vec()),
             },
             _ => return None,
         };
@@ -679,7 +743,7 @@ mod tests {
                 device_entry: DeviceEntry {
                     mutation: Mutation::Set {
                         key: key.clone(),
-                        value: Ciphertext(b"ct".to_vec()),
+                        value: OpaqueValue(b"ct".to_vec()),
                     },
                     tag,
                     seal: Seal::empty_aead_v1(),
@@ -714,6 +778,27 @@ mod tests {
     }
 
     #[test]
+    fn admission_header_and_operation_keys_roundtrip() {
+        let space = SpaceId([8; 16]);
+        let seq = AdmissionSeq(23);
+        let header = AdmissionHeaderRecord {
+            device: DeviceId([4; 16]),
+            device_seq: DeviceSeq(17),
+            checksum: DeviceChecksum([5; 32]),
+            operation_count: 2,
+        };
+        assert_eq!(
+            AdmissionHeaderRecord::decode(&header.encode()),
+            Some(header)
+        );
+
+        let key = Key::from_bytes([&b"db"[..], &b"row"[..]]).unwrap();
+        let storage_key = admission_op_key(space, seq, 1, &key);
+        assert_eq!(admission_op_parts(&storage_key), Some((seq, 1, key)));
+        assert!(storage_key.starts_with(&admission_op_scan(space, seq)));
+    }
+
+    #[test]
     fn device_record_roundtrips() {
         let rec = DeviceRecord {
             last_seq: DeviceSeq(41),
@@ -734,21 +819,6 @@ mod tests {
         assert!(storage.starts_with(&data_key(space, &prefix)));
         let sibling = Key::from_bytes([&b"db"[..], &b"payroll"[..]]).unwrap();
         assert!(!data_key(space, &sibling).starts_with(&data_key(space, &prefix)));
-    }
-
-    #[test]
-    fn changelog_keys_order_by_seq_and_scan_after_excludes_cursor() {
-        let space = SpaceId([1; 16]);
-        let key = Key::from_bytes([&b"k"[..]]).unwrap();
-        let at5 = changelog_key(space, AdmissionSeq(5), &key);
-        let at6 = changelog_key(space, AdmissionSeq(6), &key);
-        assert!(at5 < at6);
-        assert_eq!(user_key_from_changelog(&at6), Some(key));
-
-        let after5 = changelog_scan_after(space, AdmissionSeq(5));
-        assert!(at5 < after5, "cursor's own seq is excluded");
-        assert!(after5 <= at6, "the next seq is included");
-        assert!(at6.starts_with(&changelog_scan_all(space)));
     }
 
     #[test]
