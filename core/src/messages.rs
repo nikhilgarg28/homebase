@@ -466,8 +466,8 @@ pub enum RangeCut<T = OpaqueValue> {
     /// Full state of the range at the cut (cursor was `None`); live entries
     /// only, key order.
     Snapshot(Vec<AdmittedEntry<T>>),
-    /// Changes since the caller's cursor, tombstones included, ascending
-    /// `(admission_seq, key)`.
+    /// Relevant source operations since the caller's cursor, tombstones
+    /// included, in ascending [`AdmissionOrder`](crate::tag::AdmissionOrder).
     Delta(Vec<AdmittedEntry<T>>),
 }
 

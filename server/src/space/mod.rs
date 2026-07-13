@@ -140,8 +140,9 @@ impl Space {
 
 #[cfg(test)]
 mod tests {
+    mod reference;
+
     use super::*;
-    use crate::reference::ReferenceModel;
     use crate::schema::{
         DeviceRecord, PrefixMetaRecord, RangeDeleteRecord, device_key, prefix_meta_key,
         range_delete_key, root_meta_key,
@@ -160,6 +161,7 @@ mod tests {
         Mutation, OpaqueValue, Ver,
     };
     use pollster::block_on;
+    use reference::ReferenceModel;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -402,6 +404,49 @@ mod tests {
                 "wrong effective live count for {range:?}"
             );
         }
+    }
+
+    fn plaintext_entry(entry: &AdmittedEntry) -> AdmittedEntry<Vec<u8>> {
+        let mutation = match &entry.device_entry.mutation {
+            Mutation::Set { key, value } => Mutation::Set {
+                key: key.clone(),
+                value: value.0.clone(),
+            },
+            Mutation::Delete { key } => Mutation::Delete { key: key.clone() },
+            Mutation::DeleteRange { range } => Mutation::DeleteRange {
+                range: range.clone(),
+            },
+        };
+        AdmittedEntry {
+            device_entry: DeviceEntry {
+                mutation,
+                tag: entry.device_entry.tag,
+                seal: entry.device_entry.seal.clone(),
+            },
+            admission: entry.admission,
+        }
+    }
+
+    fn read_delta(
+        space: &Space,
+        store: &impl OrderedStore,
+        range: Range,
+        since: AdmissionSeq,
+    ) -> (AdmissionSeq, Vec<AdmittedEntry>) {
+        let response = block_on(space.read_at(
+            store,
+            &ReadAtRequest {
+                ranges: vec![RangeCursor {
+                    range,
+                    since: Some(since),
+                }],
+            },
+        ))
+        .unwrap();
+        let RangeCut::Delta(entries) = response.ranges.into_iter().next().unwrap() else {
+            panic!("expected delta")
+        };
+        (response.at, entries)
     }
 
     fn admit_as(
@@ -1043,6 +1088,165 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn internal_range_pull_is_dense_bounded_and_exact() {
+        let mut space = Space::new(SPACE);
+        let store = MemoryStore::new();
+        let db = Range::Prefix(key(&[b"db"]));
+        let row = key(&[b"db", b"row"]);
+        let mutations = [
+            vec![
+                put(&row, b"v", 1),
+                (Mutation::DeleteRange { range: db.clone() }, 2),
+            ],
+            vec![],
+            vec![(Mutation::DeleteRange { range: Range::Full }, 3)],
+        ];
+        let batches = mutations
+            .into_iter()
+            .enumerate()
+            .map(|(index, mutations)| {
+                let seq = u64::try_from(index + 1).unwrap();
+                AdmissionBatch {
+                    device_seq: DeviceSeq(seq),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(dev(1), seq, mutations),
+                }
+            })
+            .collect();
+        block_on(space.admit_internal(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+                evidence: vec![],
+                batches,
+            },
+        ))
+        .unwrap();
+
+        let first = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(first.through, AdmissionSeq(2));
+        assert_eq!(first.batches.len(), 2);
+        assert_eq!(first.batches[0].entries.len(), 2);
+        assert!(matches!(
+            &first.batches[0].entries[1].device_entry.mutation,
+            Mutation::DeleteRange { range } if range == &db
+        ));
+        assert!(first.batches[1].entries.is_empty());
+
+        let second = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: first.through,
+                max_batches: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(second.through, AdmissionSeq(3));
+        assert_eq!(second.batches.len(), 1);
+        assert!(matches!(
+            &second.batches[0].entries[0].device_entry.mutation,
+            Mutation::DeleteRange { range: Range::Full }
+        ));
+    }
+
+    #[test]
+    fn scoped_range_deltas_match_reference_for_ancestors_descendants_and_siblings() {
+        let (mut space, store, lease) = setup();
+        let parent = Range::Prefix(key(&[b"db"]));
+        let child = Range::Prefix(key(&[b"db", b"child"]));
+        let sibling = Range::Prefix(key(&[b"db", b"sibling"]));
+        let child_key = key(&[b"db", b"child", b"row"]);
+        let sibling_key = key(&[b"db", b"sibling", b"row"]);
+        let commands = vec![
+            vec![put(&child_key, b"old", 1)],
+            vec![(
+                Mutation::DeleteRange {
+                    range: parent.clone(),
+                },
+                2,
+            )],
+            vec![put(&child_key, b"new", 3)],
+            vec![(
+                Mutation::DeleteRange {
+                    range: child.clone(),
+                },
+                4,
+            )],
+            vec![put(&sibling_key, b"sibling", 5)],
+        ];
+        let mut model = ReferenceModel::default();
+        for (index, mutations) in commands.into_iter().enumerate() {
+            let seq = u64::try_from(index + 1).unwrap();
+            let entries = entries_with_vers(dev(1), seq, mutations.clone());
+            admit_internal_entries(&mut space, &store, lease, seq, entries).unwrap();
+            model.append_batch(
+                dev(1),
+                DeviceSeq(seq),
+                mutations
+                    .into_iter()
+                    .map(|(mutation, ver)| {
+                        let mutation = match mutation {
+                            Mutation::Set { key, value } => Mutation::Set {
+                                key,
+                                value: value.0,
+                            },
+                            Mutation::Delete { key } => Mutation::Delete { key },
+                            Mutation::DeleteRange { range } => Mutation::DeleteRange { range },
+                        };
+                        (mutation, Ver(ver))
+                    })
+                    .collect(),
+            );
+        }
+
+        for query in [
+            parent.clone(),
+            child.clone(),
+            sibling.clone(),
+            Range::Prefix(child_key.clone()),
+            Range::Full,
+        ] {
+            let (at, actual) = read_delta(&space, &store, query.clone(), AdmissionSeq(0));
+            let expected = model.read(&query, Some(AdmissionSeq(0)));
+            assert_eq!(at, expected.at, "cut for {query:?}");
+            let RangeCut::Delta(expected) = expected.cut else {
+                unreachable!()
+            };
+            assert_eq!(
+                actual.iter().map(plaintext_entry).collect::<Vec<_>>(),
+                expected,
+                "sources for {query:?}"
+            );
+        }
+
+        let (_, child_after_first) = read_delta(&space, &store, child.clone(), AdmissionSeq(1));
+        assert_eq!(
+            child_after_first
+                .iter()
+                .map(|entry| entry.admission.admission_seq)
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(2), AdmissionSeq(3), AdmissionSeq(4)]
+        );
+        assert!(matches!(
+            &child_after_first[0].device_entry.mutation,
+            Mutation::DeleteRange { range } if range == &parent
+        ));
+
+        let (at, empty) = read_delta(&space, &store, child, AdmissionSeq(5));
+        assert_eq!(at, AdmissionSeq(5));
+        assert!(empty.is_empty());
     }
 
     #[test]

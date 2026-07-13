@@ -790,13 +790,15 @@ async fn delta<S: OrderedStore>(
     since: AdmissionSeq,
     at: AdmissionSeq,
 ) -> Result<Vec<AdmittedEntry>, StorageError> {
-    if let Range::Prefix(prefix) = range {
-        // Aggregate short-circuit: nothing under this prefix since the cursor.
-        match prefix_meta(space, store, prefix).await? {
-            None => return Ok(Vec::new()),
-            Some(meta) if meta.max_admission_seq() <= since => return Ok(Vec::new()),
-            Some(_) => {}
-        }
+    // Historical aggregates below the query plus exact covering tombstones
+    // prove whether any point or range source can be relevant after `since`.
+    if effective_history(space, store, range)
+        .await?
+        .history
+        .max_admission_seq()
+        <= since
+    {
+        return Ok(Vec::new());
     }
     let mut entries = Vec::new();
     for batch in read_admission_interval(space, store, since, at).await? {
@@ -804,24 +806,13 @@ async fn delta<S: OrderedStore>(
             batch
                 .entries
                 .into_iter()
-                .filter(|entry| range.covers_key(entry.key())),
+                .filter(|entry| mutation_relevant(range, &entry.device_entry.mutation)),
         );
     }
     Ok(entries)
 }
 
 // -- record accessors ---------------------------------------------------------
-
-async fn prefix_meta<S: OrderedStore>(
-    space: SpaceId,
-    store: &S,
-    prefix: &Key,
-) -> Result<Option<PrefixMetaRecord>, StorageError> {
-    Ok(store
-        .get(&prefix_meta_key(space, prefix.components()))
-        .await?
-        .map(|bytes| PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record")))
-}
 
 /// Newest exact tombstone whose Full/Prefix target covers `target`.
 /// The lookup is bounded by user-key depth: one Full read plus one read per

@@ -427,6 +427,20 @@ relevant when:
 R covers P || P covers R
 ```
 
+DR7 implements this predicate directly over each immutable log mutation.
+DeleteRange sources are returned unchanged, including their original Full or
+Prefix target and `AdmissionOrder`; the requested range scopes how the caller
+applies the response, not how the server rewrites authenticated operations.
+The delta empty-short-circuit uses effective history: descendant aggregate
+history plus exact covering ancestor tombstones. This prevents an ancestor
+DeleteRange from being skipped merely because the requested child aggregate
+was left physically untouched by the lazy reset.
+
+Dense `pull` uses the same exact log decoder and returns range operations once
+in their original batch, while retaining empty batches and bounded-page
+density. Public DeleteRange admission remains gated; DR8 completes client
+submission and admit-log handling before opening it.
+
 The first case clears all of the requested local range. The second clears a
 nested part of it.
 

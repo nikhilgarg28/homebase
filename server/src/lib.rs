@@ -22,8 +22,6 @@
 
 pub mod actor;
 pub mod error;
-#[cfg(test)]
-mod reference;
 pub mod schema;
 pub mod space;
 pub mod storage;
