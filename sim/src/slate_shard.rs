@@ -5,7 +5,7 @@ mod imp {
     use crate::fault_object_store::FaultObjectStore;
     use crate::fault_slate::FaultSlateStore;
     use crate::store::FaultConfig;
-    use homebase_server::storage::{SlateOpenOptions, SlateStore};
+    use homebase::storage::{SlateOpenOptions, SlateStore};
     use std::sync::Arc;
     use tempfile::TempDir;
 

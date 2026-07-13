@@ -10,15 +10,15 @@
 //! 3. live records in the store are exactly the model's live leases;
 //! 4. lease ids strictly increase and never recur.
 
+use homebase::schema::{LeaseRecord, lease_by_id_scan, lease_by_prefix_scan_all};
+use homebase::space::lease::LeaseManager;
+use homebase::storage::{MemoryStore, OrderedStore, collect_scan};
 use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::messages::{AcquireRequest, LeaseSpec, ReleaseRequest, RenewRequest};
 use homebase_core::space::SpaceId;
 use homebase_core::tag::DeviceId;
-use homebase_server::schema::{LeaseRecord, lease_by_id_scan, lease_by_prefix_scan_all};
-use homebase_server::space::lease::LeaseManager;
-use homebase_server::storage::{MemoryStore, OrderedStore, collect_scan};
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};

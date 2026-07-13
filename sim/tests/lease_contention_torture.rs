@@ -17,6 +17,7 @@
 //! same read — shows up as a duplicate or regressing value. Reservation and
 //! version rejections are expected retry paths for stale local lease state.
 
+use homebase::actor::{SpaceActor, SpaceHandle};
 use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
@@ -30,7 +31,6 @@ use homebase_core::tag::{
     CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation,
     OpaqueValue, Ver,
 };
-use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
 use homebase_sim::exec::SimExecutor;
 use homebase_sim::seeds;

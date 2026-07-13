@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "multilite"
+version = "0.0.1"
+description = "Multi-writer SQLite with E2EE sync, built on homebase - not ready for use"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.8"
+authors = [{ name = "Nikhil Garg" }]
+
+[project.urls]
+Homepage = "https://github.com/nikhilgarg28/multilite"
+Repository = "https://github.com/nikhilgarg28/multilite"
+"Launch checklist" = "https://github.com/nikhilgarg28/multilite/blob/main/LAUNCH_CHECKLIST.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["multilite"]
+
+[tool.hatch.build.targets.sdist]
+include = ["multilite/", "README.md", "LICENSE"]

@@ -18,20 +18,20 @@
 //! 4. per-prefix and Full-root aggregates equal recomputation from data;
 //! 5. per-device high waters and checksums equal the latest admitted header.
 
-use homebase_core::key::Key;
-use homebase_core::messages::Range;
-use homebase_core::space::SpaceId;
-use homebase_core::tag::{
-    AdmissionOrder, AdmissionSeq, DeviceChecksum, DeviceId, DeviceSeq, Mutation,
-};
-use homebase_server::schema::{
+use homebase::schema::{
     AdmissionHeaderRecord, AdmissionTarget, CountersRecord, DataRecord, DeviceRecord, LeaseRecord,
     PrefixMetaRecord, RangeDeleteRecord, admission_header_key, admission_log_scan_all,
     admission_op_parts, admission_op_scan, counters_key, data_scan_all, device_key,
     lease_by_id_scan, lease_by_prefix_scan_all, prefix_meta_key, prefix_meta_scan_all,
     range_delete_parts, range_delete_scan_all, root_meta_key, user_key_from_data,
 };
-use homebase_server::storage::{OrderedStore, collect_scan};
+use homebase::storage::{OrderedStore, collect_scan};
+use homebase_core::key::Key;
+use homebase_core::messages::Range;
+use homebase_core::space::SpaceId;
+use homebase_core::tag::{
+    AdmissionOrder, AdmissionSeq, DeviceChecksum, DeviceId, DeviceSeq, Mutation,
+};
 use pollster::block_on;
 use std::collections::BTreeMap;
 
@@ -300,13 +300,13 @@ fn visible_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use homebase::schema::{range_delete_key, root_meta_key};
+    use homebase::space::Space;
+    use homebase::storage::{MemoryStore, WriteBatch};
     use homebase_core::clock::Timestamp;
     use homebase_core::messages::{AdmissionBatch, AdmissionRequest};
     use homebase_core::seal::Seal;
     use homebase_core::tag::{CipherEpoch, DeviceEntry, DeviceTag, OpaqueValue, Ver};
-    use homebase_server::schema::{range_delete_key, root_meta_key};
-    use homebase_server::space::Space;
-    use homebase_server::storage::{MemoryStore, WriteBatch};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     const SPACE: SpaceId = SpaceId([8; 16]);

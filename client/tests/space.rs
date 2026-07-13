@@ -1,9 +1,11 @@
-use homebase::cipher::{
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{
     NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
-use homebase::meta::{OrderedMetaStore, audit};
-use homebase::server::ServerHandle;
-use homebase::{Client, PushReceipt};
+use homebase_client::meta::{OrderedMetaStore, audit};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, PushReceipt};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -16,8 +18,6 @@ use homebase_core::messages::{
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, Mutation, Ver};
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
 use std::future::Future;
 use std::pin::Pin;
@@ -508,7 +508,7 @@ fn delete_range_roundtrips_submit_fetch_pull_and_reopen() {
         ));
         let range_receipt = writer_space
             .submit_unchecked(
-                [homebase::Mutation::DeleteRange {
+                [homebase_client::Mutation::DeleteRange {
                     range: Range::Prefix(db.clone()),
                 }],
                 vec![],
@@ -574,7 +574,7 @@ fn delete_range_roundtrips_submit_fetch_pull_and_reopen() {
             assert_eq!(pending.len(), 2);
             assert!(matches!(
                 &pending[1].entries[0].device_entry.mutation,
-                homebase::Mutation::DeleteRange { .. }
+                homebase_client::Mutation::DeleteRange { .. }
             ));
         }
 
@@ -594,7 +594,7 @@ fn delete_range_roundtrips_submit_fetch_pull_and_reopen() {
         assert_eq!(pending.len(), 2);
         assert!(matches!(
             &pending[1].entries[0].device_entry.mutation,
-            homebase::Mutation::DeleteRange { .. }
+            homebase_client::Mutation::DeleteRange { .. }
         ));
     });
 }
@@ -624,7 +624,7 @@ fn pull_authenticates_the_complete_page_before_appending_any_batch() {
             .unwrap();
         writer_space
             .submit_unchecked(
-                [homebase::Mutation::DeleteRange {
+                [homebase_client::Mutation::DeleteRange {
                     range: Range::Prefix(key(&[b"db"])),
                 }],
                 vec![],
@@ -649,11 +649,17 @@ fn pull_authenticates_the_complete_page_before_appending_any_batch() {
         .unwrap();
         reader.attach(&envelope).await.unwrap();
         let error = reader.space(space).await.unwrap().pull().await.unwrap_err();
-        assert!(matches!(error, homebase::SpaceDriverError::Cipher(_)));
+        assert!(matches!(
+            error,
+            homebase_client::SpaceDriverError::Cipher(_)
+        ));
 
         let state = audit(&OrderedMetaStore::new(&reader_store)).await;
         let state = &state.spaces[&space];
-        assert_eq!(state.admit_cursors, homebase::meta::AdmitCursors::default());
+        assert_eq!(
+            state.admit_cursors,
+            homebase_client::meta::AdmitCursors::default()
+        );
         assert!(state.admits.is_empty());
         assert_eq!(state.ver_high, None);
     });

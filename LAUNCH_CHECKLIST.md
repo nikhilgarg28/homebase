@@ -5,8 +5,8 @@ multi-writer explicitly roadmap). Governing rule: **every sentence in the announ
 have a reproducible artifact behind it.** Work top to bottom; nothing ships while a claimed
 item is unchecked.
 
-Product ships as **multilite** (SQLite built on [homebase](./DESIGN.md)). This repo holds
-the homebase kernel; multilite gets its own repo at launch.
+Product ships as **multilite** (SQLite built on [homebase](./DESIGN.md)). This monorepo
+holds the Homebase kernel, Multilite SQL layer, and language skins.
 
 ## 1. Functionality floor (rung 4 + polish)
 

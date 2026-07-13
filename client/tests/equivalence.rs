@@ -1,9 +1,11 @@
 //! pull ⊕ replay(unshipped oplog) ≡ server plaintext after push.
 
-use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{OrderedMetaStore, audit};
-use homebase::server::ServerHandle;
-use homebase::{Client, PushOutcome};
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
+use homebase_client::meta::{OrderedMetaStore, audit};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -13,8 +15,6 @@ use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{
     AdmissionSeq, AdmissionTag, AdmittedEntry, DeviceId, DeviceSeq, Mutation,
 };
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -92,7 +92,7 @@ fn snapshot_from_pull(entries: &[AdmittedEntry<Vec<u8>>]) -> BTreeMap<Key, Optio
 
 fn replay_oplog_plaintext(
     mut view: BTreeMap<Key, Option<Vec<u8>>>,
-    state: &homebase::meta::ClientState,
+    state: &homebase_client::meta::ClientState,
     space: SpaceId,
     device: DeviceId,
 ) -> BTreeMap<Key, Option<Vec<u8>>> {
@@ -199,7 +199,7 @@ fn pull_plus_unshipped_oplog_matches_server_after_push() {
 #[test]
 fn encrypted_pull_plus_oplog_matches_server_after_push() {
     block_on(async {
-        use homebase::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueNonce};
+        use homebase_client::cipher::{NameKey, NonceSource, SpaceEnvelope, SpaceKey, ValueNonce};
 
         #[derive(Clone)]
         struct TestNonceSource {

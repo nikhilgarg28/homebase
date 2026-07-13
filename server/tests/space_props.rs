@@ -19,6 +19,13 @@
 //!    and the Full root equal a
 //!    brute-force recomputation from the data records.
 
+use homebase::error::Error;
+use homebase::schema::{
+    DataRecord, PrefixMetaRecord, data_scan_all, prefix_meta_key, prefix_meta_scan_all,
+    root_meta_key, user_key_from_data,
+};
+use homebase::space::Space;
+use homebase::storage::{MemoryStore, OrderedStore, collect_scan};
 use homebase_core::clock::{HybridTimestamp, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
@@ -32,13 +39,6 @@ use homebase_core::tag::{
     AdmissionOrder, AdmissionSeq, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
     Mutation, OpaqueValue, Ver,
 };
-use homebase_server::error::Error;
-use homebase_server::schema::{
-    DataRecord, PrefixMetaRecord, data_scan_all, prefix_meta_key, prefix_meta_scan_all,
-    root_meta_key, user_key_from_data,
-};
-use homebase_server::space::Space;
-use homebase_server::storage::{MemoryStore, OrderedStore, collect_scan};
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::BTreeMap;

@@ -1,10 +1,12 @@
 //! Client meta over the sim's fault-injecting [`SimStore`]: durability
 //! boundary, crash/reopen, and ack-drop recovery.
 
-use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, SubmitMode, audit, conformance};
-use homebase::server::ServerHandle;
-use homebase::{Client, PushOutcome};
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
+use homebase_client::meta::{MetaStore, OrderedMetaStore, SubmitMode, audit, conformance};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, PushOutcome};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -18,8 +20,6 @@ use homebase_core::tag::{
     AdmissionSeq, AdmissionTag, AdmittedEntry, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId,
     DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use homebase_sim::store::{FaultConfig, SimStore};
 use pollster::block_on;
 use std::future::Future;
@@ -177,7 +177,7 @@ fn admit_log_transitions_are_atomic_across_crash_and_reopen() {
         let meta = OrderedMetaStore::new(sim.clone());
         assert_eq!(
             meta.admit_cursors(SPACE).await.unwrap(),
-            homebase::meta::AdmitCursors::default(),
+            homebase_client::meta::AdmitCursors::default(),
             "an unflushed append vanishes completely"
         );
         assert_eq!(

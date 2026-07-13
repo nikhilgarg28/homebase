@@ -5,6 +5,8 @@
 use crate::check;
 use crate::exec::SimExecutor;
 use crate::store::{FaultConfig, SimStore};
+use homebase::actor::{SpaceActor, SpaceHandle};
+use homebase::storage::OrderedStore;
 use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
@@ -18,8 +20,6 @@ use homebase_core::tag::{
     AdmissionSeq, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
     Mutation, OpaqueValue, Ver,
 };
-use homebase_server::actor::{SpaceActor, SpaceHandle};
-use homebase_server::storage::OrderedStore;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::cell::RefCell;

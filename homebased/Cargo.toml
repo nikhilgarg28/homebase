@@ -1,7 +1,0 @@
-[package]
-name = "homebased"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-description = "The homebase daemon: leased-KV kernel + resolver in one binary (placeholder while under construction)"

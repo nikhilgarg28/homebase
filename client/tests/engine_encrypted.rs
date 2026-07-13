@@ -1,11 +1,13 @@
 //! Encrypted-space crash-resume and ack-drop tortures.
 
-use homebase::cipher::{
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{
     NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
-use homebase::meta::{OrderedMetaStore, audit};
-use homebase::server::ServerHandle;
-use homebase::{Client, Mutation, PushOutcome};
+use homebase_client::meta::{OrderedMetaStore, audit};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, Mutation, PushOutcome};
 use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -15,8 +17,6 @@ use homebase_core::messages::{
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, DeviceSeq};
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
 use std::future::Future;
 use std::pin::Pin;

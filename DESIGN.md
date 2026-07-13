@@ -1,8 +1,8 @@
 # homebase + multilite — a Leased KV Kernel and Multi-Writer SQLite on Top
 
-*One-pager · July 2026 · **multilite** = the product brand ("SQLite with end-to-end encrypted sync") and the monorepo — `github.com/multilite/multilite` — with **homebase** the coordination kernel inside it (crate layout below, in "Naming, repo, and crate layout") · **homestead** = reserved company name; commercial offerings always lead with that cleared brand, never "Homebase <product>" (the HR/labor SaaS mark, Pioneer Works, makes broad kernel-brand marketing a clearance question) · see [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md).*
+*One-pager · July 2026 · **multilite** = the product brand ("SQLite with end-to-end encrypted sync") and the monorepo — `github.com/nikhilgarg28/multilite` — with **homebase** the coordination kernel inside it (crate layout below, in "Naming, repo, and crate layout") · **homestead** = reserved company name; commercial offerings always lead with that cleared brand, never "Homebase <product>" (the HR/labor SaaS mark, Pioneer Works, makes broad kernel-brand marketing a clearance question) · see [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md).*
 
-**Crate layout (target — see "Naming, repo, and crate layout"):** `homebase` = server crate + subcommand binary · `homebase-client` = SDK · `homebase-core` = shared types · `homebase-wire` = protocol · `multilite` = SQL layer · `homebase-sim` = torture rig. The current tree still carries pre-rename names (`server/` = homebase-server, `client/` = homebase); the rename lands as its own batch.
+**Crate layout (see "Naming, repo, and crate layout"):** `homebase` = server crate + subcommand binary · `homebase-client` = SDK · `homebase-core` = shared types · `homebase-wire` = future protocol crate · `multilite` = SQL layer · `homebase-sim` = torture rig. Rust, Python, and npm packages live in the same `github.com/nikhilgarg28/multilite` monorepo.
 
 ## What it is
 
@@ -45,7 +45,7 @@ Prefix-scoped authorization is a transport concern; leases are coordination stat
 
 ## multilite — the SQL layer (where all the smarts live)
 
-**Shipping name: multilite.** The SQLite-on-homebase product ships publicly as **multilite** (multi-writer + lite). During kernel-first development it will live in a sibling repo; this monorepo holds homebase only until multilite splits out. Public announcement scope, artifact gates, and the rusqlite/C-ABI claims are tracked in [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md) — every sentence in the launch post must have a reproducible artifact behind it.
+**Shipping name: multilite.** The SQLite-on-homebase product ships publicly as **multilite** (multi-writer + lite). Its SQL layer and language skins live beside Homebase in this monorepo. Public announcement scope, artifact gates, and the rusqlite/C-ABI claims are tracked in [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md) — every sentence in the launch post must have a reproducible artifact behind it.
 
 **Single-file doctrine (multilite target): a multilite database is a regular SQLite file.** Client identity, per-space submit/admit logs and cursors, version high-water, held leases, and codec cache live in system tables in the same file as application data. A local SQLite transaction can therefore persist user rows and its Homebase submission in one fsync domain; incoming application changes and admit `neck` can likewise advance atomically. Homebase already expresses this durable vocabulary through `MetaStore`, while the current reference implementation stores it over any `OrderedStore`. Each space has independent `DeviceSeq`, `AdmissionSeq`, `DeviceChecksum`, and version domains. An unexpected sequence/checksum divergence is a fatal fork reported to the caller; Homebase does not silently remint identity or requeue ambiguous history.
 
@@ -94,7 +94,7 @@ Each is a thin client library over the same seven verbs — no kernel changes:
 
 ## Naming, packaging, and the OSS boundary (decided July 2026)
 
-**Naming, repo, and crate layout.** The product brand is **multilite** ("SQLite with end-to-end encrypted sync"). The current tree contains `homebase-core` shared types, the `homebase-server` actor/materialization kernel, the `homebase` client SDK, and `homebase-sim`. Future repository, binary, wire, identity, and SQL-layer packaging remains a launch decision; documentation and crate names should describe the current tree until an explicit rename batch lands.
+**Naming, repo, and crate layout.** The product brand and monorepo are **multilite** ("SQLite with end-to-end encrypted sync"). The root `multilite` crate owns the future SQL layer; `homebase` is the actor/materialization server library and binary; `homebase-client` is the client SDK; `homebase-core` contains shared types; and `homebase-sim` is the deterministic test rig. Python and npm skins live under `python/` and `npm/`. A separate `homebase-wire` crate waits until the protocol boundary earns it.
 
 **OSS boundary, topologies, and wire protocol.** The current implementation is transport-neutral: `ServerHandle` covers the same acquire/renew/release/list-leases, admit, pull, get/list, and `read_at` contracts used by in-process tests. A future HTTP adapter should use ordinary middleware-legible requests, with compact bodies for admission and log transfer. There is no `sync` verb or server push channel: clients explicitly push their submit log, pull the dense admission log, and use stateless range fetches when they do not want to mutate replication state. Authentication, hosted tenancy, shard routing, and object-store deployment remain separate future layers.
 

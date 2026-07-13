@@ -20,6 +20,7 @@
 //!   (tombstones invisible, overwrites at final values);
 //! - the usual: full structural audit per phase, seeded replayability.
 
+use homebase::actor::{SpaceActor, SpaceHandle};
 use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{LeaseId, LeaseMode};
@@ -33,7 +34,6 @@ use homebase_core::tag::{
     AdmissionSeq, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
     Mutation, OpaqueValue, Ver,
 };
-use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::check;
 use homebase_sim::exec::SimExecutor;
 use homebase_sim::seeds;

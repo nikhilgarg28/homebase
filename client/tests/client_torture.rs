@@ -1,10 +1,11 @@
 //! Client-layer deterministic simulation: [`Client`] + [`Space`] over
 //! fault-injecting meta, crash/reopen, and multi-task interleaving.
 
-use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{MetaStore, OrderedMetaStore, audit, certify};
-use homebase::server::ServerHandle;
-use homebase::{Client, ClientError, PushOutcome, SpaceDriverError};
+use homebase::actor::{SpaceActor, SpaceHandle};
+use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
+use homebase_client::meta::{MetaStore, OrderedMetaStore, audit, certify};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, ClientError, PushOutcome, SpaceDriverError};
 use homebase_core::clock::{HybridClock, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -15,7 +16,6 @@ use homebase_core::messages::{
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{AdmissionSeq, DeviceId, Mutation};
-use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::seeds;
 use homebase_sim::store::{FaultConfig, SimStore};
 use rand::rngs::StdRng;
@@ -588,7 +588,7 @@ async fn drain_push(
 
 fn replay_oplog(
     mut view: BTreeMap<Key, ModelValue>,
-    state: &homebase::meta::ClientState,
+    state: &homebase_client::meta::ClientState,
 ) -> BTreeMap<Key, ModelValue> {
     let Some(space) = state.spaces.get(&SPACE) else {
         return view;

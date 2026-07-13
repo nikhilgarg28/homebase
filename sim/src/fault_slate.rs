@@ -4,7 +4,7 @@
 #[cfg(feature = "slatedb")]
 mod imp {
     use crate::store::FaultConfig;
-    use homebase_server::storage::{OrderedStore, ScanIter, SlateStore, StorageError, WriteBatch};
+    use homebase::storage::{OrderedStore, ScanIter, SlateStore, StorageError, WriteBatch};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::future::Future;

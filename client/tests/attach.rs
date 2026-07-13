@@ -1,8 +1,8 @@
 //! [`Client::attach`] edge cases and session bookkeeping.
 
-use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource};
-use homebase::meta::OrderedMetaStore;
-use homebase::{Client, ClientError};
+use homebase_client::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource};
+use homebase_client::meta::OrderedMetaStore;
+use homebase_client::{Client, ClientError};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
@@ -20,7 +20,7 @@ fn is_attached_tracks_session_only() {
         let id = envelope.space_id();
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = |_: &SpaceId| None::<homebase_server::actor::SpaceHandle>;
+        let handle = |_: &SpaceId| None::<homebase::actor::SpaceHandle>;
 
         let client = Client::open(
             OrderedMetaStore::new(&mem),
@@ -46,7 +46,7 @@ fn attach_is_idempotent() {
         let id = envelope.space_id();
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = |_: &SpaceId| None::<homebase_server::actor::SpaceHandle>;
+        let handle = |_: &SpaceId| None::<homebase::actor::SpaceHandle>;
 
         let client = Client::open(
             OrderedMetaStore::new(&mem),
@@ -74,7 +74,7 @@ fn attach_rejects_mismatched_envelope_when_codec_present() {
 
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = |_: &SpaceId| None::<homebase_server::actor::SpaceHandle>;
+        let handle = |_: &SpaceId| None::<homebase::actor::SpaceHandle>;
 
         let client = Client::open(
             OrderedMetaStore::new(&mem),
@@ -100,7 +100,7 @@ fn space_without_codec_errors_missing_codec() {
         let id = SpaceId([7; 16]);
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = |_: &SpaceId| None::<homebase_server::actor::SpaceHandle>;
+        let handle = |_: &SpaceId| None::<homebase::actor::SpaceHandle>;
 
         let client = Client::open(
             OrderedMetaStore::new(&mem),
@@ -127,7 +127,7 @@ fn space_lazy_loads_from_codec_without_attach() {
         let id = envelope.space_id();
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
-        let handle = |_: &SpaceId| None::<homebase_server::actor::SpaceHandle>;
+        let handle = |_: &SpaceId| None::<homebase::actor::SpaceHandle>;
 
         {
             let client = Client::open(

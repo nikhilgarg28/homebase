@@ -8,13 +8,13 @@ description = "Deterministic simulation and torture testing for the homebase ker
 
 [dependencies]
 homebase-core.workspace = true
-homebase-server = { workspace = true, default-features = true }
+homebase = { workspace = true, default-features = true }
 rand.workspace = true
 pollster.workspace = true
 
 [features]
 default = ["slatedb"]
-slatedb = ["homebase-server/slatedb", "dep:slatedb", "dep:async-trait", "dep:tokio", "dep:tempfile", "dep:futures-util"]
+slatedb = ["homebase/slatedb", "dep:slatedb", "dep:async-trait", "dep:tokio", "dep:tempfile", "dep:futures-util"]
 
 [dependencies.slatedb]
 version = "0.14.1"

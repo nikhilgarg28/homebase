@@ -2,10 +2,10 @@
 //!
 //! Layer 3 (slatedb + fault object store) lives in `persist_crash_torture.rs`.
 
+use homebase::actor::SpaceActor;
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::messages::GetRequest;
 use homebase_core::space::Space as _;
-use homebase_server::actor::SpaceActor;
 use homebase_sim::crash::{self, SPACE, sim, user_key};
 use homebase_sim::exec::SimExecutor;
 use homebase_sim::seeds;

@@ -6,6 +6,8 @@
 
 #![cfg(feature = "slatedb")]
 
+use homebase::actor::{SpaceActor, SpaceHandle};
+use homebase::storage::{SlateOpenOptions, SlateStore, local_object_store};
 use homebase_core::clock::{HybridTimestamp, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -17,8 +19,6 @@ use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::tag::{
     CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
-use homebase_server::actor::{SpaceActor, SpaceHandle};
-use homebase_server::storage::{SlateOpenOptions, SlateStore, local_object_store};
 use homebase_sim::check;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

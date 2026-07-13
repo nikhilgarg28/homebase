@@ -1,18 +1,29 @@
+[package]
+name = "multilite"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-writer SQLite with E2EE sync, built on homebase - not yet ready for use"
+readme = "README.md"
+exclude = ["/npm", "/python"]
+
 [workspace]
 resolver = "3"
-members = ["core", "server", "client", "sim", "homebased"]
+members = ["core", "server", "client", "sim"]
+default-members = [".", "core", "server", "client", "sim"]
 
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nikhilgarg28/homebase"
+repository = "https://github.com/nikhilgarg28/multilite"
 
 [workspace.dependencies]
 homebase-core = { path = "core", version = "0.1.1" }
 # default-features off at the workspace level so light consumers (the client
 # crate's tests) skip slatedb; sim/server turn it back on where needed.
-homebase-server = { path = "server", version = "0.1.1", default-features = false }
+homebase = { path = "server", version = "0.1.1", default-features = false }
 homebase-sim = { path = "sim", version = "0.1.1", default-features = false }
 rand = "0.9"
 proptest = "1"

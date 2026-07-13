@@ -21,7 +21,7 @@
 //! Seed counts: [`seeds::torture_seed_count`] (default 1000, env
 //! `HOMEBASE_TORTURE_SEEDS`).
 //!
-//! [`OrderedStore`]: homebase_server::storage::OrderedStore
+//! [`OrderedStore`]: homebase::storage::OrderedStore
 
 pub mod check;
 pub mod crash;

@@ -1,1 +1,11 @@
-/target
+/target/
+
+# npm
+npm/node_modules/
+
+# Python
+python/.venv/
+python/dist/
+python/build/
+python/*.egg-info/
+python/**/__pycache__/

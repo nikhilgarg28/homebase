@@ -1,17 +1,17 @@
 //! The ServerHandle conformance suite, driven by the canonical in-process
-//! implementation: a closure over a real `homebase_server::Server` —
+//! implementation: a closure over a real `homebase::Server` —
 //! literally `|id| server.space(id)` — with each space actor running on
 //! its own thread. This is the reference every future implementation
 //! (the gRPC adapter above all) is measured against.
 
-use homebase::server::conformance;
-use homebase::{Offline, ServerHandle};
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::server::conformance;
+use homebase_client::{Offline, ServerHandle};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::messages::GetRequest;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

@@ -963,13 +963,29 @@ dependencies = [
 name = "homebase"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "homebase-core",
+ "pollster",
+ "proptest",
+ "slatedb",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "homebase-client"
+version = "0.1.1"
+dependencies = [
  "chacha20poly1305",
  "futures-channel",
  "getrandom 0.4.3",
  "hkdf",
  "hmac",
+ "homebase",
  "homebase-core",
- "homebase-server",
  "homebase-sim",
  "pollster",
  "rand 0.9.4",
@@ -986,39 +1002,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "homebase-server"
-version = "0.1.1"
-dependencies = [
- "async-trait",
- "futures",
- "futures-channel",
- "futures-core",
- "homebase-core",
- "pollster",
- "proptest",
- "slatedb",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "homebase-sim"
 version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "homebase",
  "homebase-core",
- "homebase-server",
  "pollster",
  "rand 0.9.4",
  "slatedb",
  "tempfile",
  "tokio",
 ]
-
-[[package]]
-name = "homebased"
-version = "0.1.1"
 
 [[package]]
 name = "http"
@@ -1517,6 +1513,10 @@ dependencies = [
  "itertools 0.15.0",
  "parking_lot",
 ]
+
+[[package]]
+name = "multilite"
+version = "0.0.1"
 
 [[package]]
 name = "nix"

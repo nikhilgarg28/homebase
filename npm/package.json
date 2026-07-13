@@ -1,0 +1,16 @@
+{
+  "name": "multilite",
+  "version": "0.0.1",
+  "description": "Multi-writer SQLite with E2EE sync - not ready for use",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikhilgarg28/multilite.git",
+    "directory": "npm"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "index.js",
+  "files": ["index.js", "README.md", "LICENSE"]
+}

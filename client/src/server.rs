@@ -14,7 +14,7 @@
 //! Implementations:
 //! - **in-process**: any closure `|id| server.space(id)` — the blanket
 //!   impl below routes each verb through it, and
-//!   `homebase_server::Server::space` already has exactly the right shape;
+//!   `homebase::Server::space` already has exactly the right shape;
 //! - **none**: [`Offline`], the uninhabited server for clients with no
 //!   server at all — it cannot even be constructed, so the compiler knows
 //!   a serverless client never issues a verb;

@@ -13,7 +13,7 @@
 //! completing, giving the executor interleaving points where a real store
 //! would have IO latency.
 
-use homebase_server::storage::{Op, OrderedStore, ScanIter, StorageError, WriteBatch};
+use homebase::storage::{Op, OrderedStore, ScanIter, StorageError, WriteBatch};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
@@ -231,7 +231,7 @@ impl OrderedStore for SimStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use homebase_server::storage::conformance;
+    use homebase::storage::conformance;
     use pollster::block_on;
 
     #[test]

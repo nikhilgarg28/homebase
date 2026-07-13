@@ -1,10 +1,12 @@
 //! Client-layer integration: multi-space coordination, offline physics,
 //! per-space sequencing, and codec-cache resume.
 
-use homebase::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource};
-use homebase::meta::{OrderedMetaStore, audit};
-use homebase::server::ServerHandle;
-use homebase::{Client, open_offline};
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{NameKey, SpaceEnvelope, SpaceKey, SystemNonceSource};
+use homebase_client::meta::{OrderedMetaStore, audit};
+use homebase_client::server::ServerHandle;
+use homebase_client::{Client, open_offline};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -12,8 +14,6 @@ use homebase_core::messages::{GetRequest, LeaseSpec, Range, RangeCut};
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
 use homebase_core::tag::{AdmissionSeq, AdmittedEntry, DeviceId, DeviceSeq, Mutation};
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
 use std::future::Future;
 use std::pin::Pin;

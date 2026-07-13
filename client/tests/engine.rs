@@ -5,10 +5,14 @@
 //! would have sent. Every recovery path in the pusher's algebra gets a
 //! deterministic run.
 
-use homebase::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase::meta::{HeldLease, MetaStore, OrderedMetaStore, SubmitMode, audit};
-use homebase::server::ServerHandle;
-use homebase::{Client, ClientError, PushOutcome, PushReceipt, SpaceDriverError, lease_margin};
+use homebase::Server;
+use homebase::actor::{SpaceHandle, Spawner};
+use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
+use homebase_client::meta::{HeldLease, MetaStore, OrderedMetaStore, SubmitMode, audit};
+use homebase_client::server::ServerHandle;
+use homebase_client::{
+    Client, ClientError, PushOutcome, PushReceipt, SpaceDriverError, lease_margin,
+};
 use homebase_core::clock::{HybridClock, HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -23,8 +27,6 @@ use homebase_core::tag::{
     AdmissionSeq, AdmittedEntry, CipherEpoch, DeviceEntry, DeviceId, DeviceSeq, DeviceTag,
     Mutation, OpaqueValue, Ver,
 };
-use homebase_server::Server;
-use homebase_server::actor::{SpaceHandle, Spawner};
 use pollster::block_on;
 use std::future::Future;
 use std::pin::Pin;
@@ -291,7 +293,7 @@ fn checked_submit_persists_lease_backed_range_assert() {
         let target = key(&[b"db", b"target"]);
         assert_eq!(
             space.admits().cursors().await.unwrap(),
-            homebase::meta::AdmitCursors {
+            homebase_client::meta::AdmitCursors {
                 head: AdmissionSeq(1),
                 neck: AdmissionSeq(1),
                 tail: AdmissionSeq(2),
@@ -500,7 +502,7 @@ fn child_or_sibling_lease_does_not_cover_range_assert() {
         for prefix in [db, key(&[b"db", b"right"])] {
             let error = space
                 .submit_checked(
-                    Vec::<homebase::Mutation>::new(),
+                    Vec::<homebase_client::Mutation>::new(),
                     vec![RangeAssert {
                         prefix: prefix.clone(),
                         upto: AdmissionSeq(0),
@@ -2190,7 +2192,7 @@ fn lease_captures_the_barrier_and_dominates_foreign_vers() {
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         assert_eq!(
             state.spaces[&SPACE].admit_cursors,
-            homebase::meta::AdmitCursors {
+            homebase_client::meta::AdmitCursors {
                 head: AdmissionSeq(1),
                 neck: AdmissionSeq(1),
                 tail: AdmissionSeq(2),
