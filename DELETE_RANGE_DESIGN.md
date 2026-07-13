@@ -787,6 +787,19 @@ model; rejected lease conflicts and assertions must leave device and admission
 history unchanged. The property runs bounded cases so failures retain a small,
 shrinkable command trace.
 
+DR9c extends the deterministic client crash torture with range-bearing checked
+submissions and durable admit-log maintenance. One ordered model applies point
+and range mutations to acknowledged server state, fetched history, and the
+pending submit log; every pool key is then compared with server visibility so
+a stale value hidden by a range tombstone cannot escape the oracle. Seeded
+actions pull dense history, authenticate pending batches, advance `neck`, and
+trim below it while the MetaStore injects errors, flushes, crashes, and reopens.
+The encrypted lost-ack case additionally admits Set/Set/DeleteRange behind a
+client incarnation, reopens it, reconciles the exact device checksum without a
+second admission, and authenticates, marks, and trims the recovered range
+history. Encrypted admit entries intentionally retain their one-way encoded
+key and range names after value authentication.
+
 The following laws are permanent tests rather than one-time examples:
 
 1. **Read agreement:** `get`, `list`, server log replay, and model visibility

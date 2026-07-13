@@ -9,12 +9,12 @@ use homebase_core::clock::{HybridClock, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AcquireRequest, AdmissionRequest, AdmissionResponse, GetRequest, KernelError, LeaseSpec, Range,
-    RangeCut,
+    AcquireRequest, AdmissionRequest, AdmissionResponse, AdmissionResult, GetRequest, KernelError,
+    LeaseSpec, Range, RangeCut,
 };
 use homebase_core::space::{Space as _, SpaceId};
 use homebase_core::storage::MemoryStore;
-use homebase_core::tag::{AdmissionSeq, DeviceEntry, DeviceId, Mutation};
+use homebase_core::tag::{AdmissionSeq, DeviceId, Mutation};
 use homebase_server::actor::{SpaceActor, SpaceHandle};
 use homebase_sim::seeds;
 use homebase_sim::store::{FaultConfig, SimStore};
@@ -64,11 +64,15 @@ struct Ack {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Coverage {
     tombstones: u32,
+    range_deletes: u32,
     overwrites: u32,
     storage_errors: u32,
     push_stalls: u32,
     commits: u32,
     pushes: u32,
+    pulls: u32,
+    admit_marks: u32,
+    admit_trims: u32,
 }
 
 #[derive(Clone)]
@@ -153,12 +157,11 @@ impl ServerHandle for ClientTestServer {
         }
         let resp = self.handle.admit(req.clone()).await?;
         let mut acks = self.acks.lock().unwrap();
-        for batch in &req.batches {
-            for op in &batch.entries {
-                let (key, value) = op_ack(op);
-                let key_index = pool_index(key);
-                acks.retain(|ack| ack.key_index != key_index);
-                acks.push(Ack { key_index, value });
+        for (batch, result) in req.batches.iter().zip(&resp.results) {
+            if matches!(result, AdmissionResult::Applied { .. }) {
+                for op in &batch.entries {
+                    apply_ack(&mut acks, &op.mutation);
+                }
             }
         }
         Ok(resp)
@@ -217,11 +220,42 @@ impl ServerHandle for ClientTestServer {
     }
 }
 
-fn op_ack(entry: &DeviceEntry) -> (&Key, ModelValue) {
-    match &entry.mutation {
-        Mutation::Set { key, value } => (key, ModelValue::Present(value.0.clone())),
-        Mutation::Delete { key } => (key, ModelValue::Absent),
-        Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
+fn apply_ack(acks: &mut Vec<Ack>, mutation: &Mutation<homebase_core::OpaqueValue>) {
+    match mutation {
+        Mutation::Set { key, value } => {
+            set_ack(acks, pool_index(key), ModelValue::Present(value.0.clone()));
+        }
+        Mutation::Delete { key } => set_ack(acks, pool_index(key), ModelValue::Absent),
+        Mutation::DeleteRange { range } => {
+            for key_index in 0..KEY_POOL {
+                if range.covers_key(&pool_key(key_index)) {
+                    set_ack(acks, key_index, ModelValue::Absent);
+                }
+            }
+        }
+    }
+}
+
+fn set_ack(acks: &mut Vec<Ack>, key_index: u64, value: ModelValue) {
+    acks.retain(|ack| ack.key_index != key_index);
+    acks.push(Ack { key_index, value });
+}
+
+fn apply_mutation<T: AsRef<[u8]>>(view: &mut BTreeMap<Key, ModelValue>, mutation: &Mutation<T>) {
+    match mutation {
+        Mutation::Set { key, value } => {
+            view.insert(key.clone(), ModelValue::Present(value.as_ref().to_vec()));
+        }
+        Mutation::Delete { key } => {
+            view.insert(key.clone(), ModelValue::Absent);
+        }
+        Mutation::DeleteRange { range } => {
+            for (key, value) in view.iter_mut() {
+                if range.covers_key(key) {
+                    *value = ModelValue::Absent;
+                }
+            }
+        }
     }
 }
 
@@ -307,7 +341,7 @@ async fn driver(
         let mut guard = take_client(&slot);
         let client = guard.client.as_mut().expect("client slot empty");
 
-        if rng.random_bool(0.4) {
+        if rng.random_bool(0.35) {
             match client.space(SPACE).await.unwrap().push().await {
                 Ok(PushOutcome::Stalled { .. }) => coverage.borrow_mut().push_stalls += 1,
                 Ok(PushOutcome::Drained { .. }) => {}
@@ -334,8 +368,79 @@ async fn driver(
             continue;
         }
 
+        if rng.random_bool(0.2) {
+            let space = match client.space(SPACE).await {
+                Ok(space) => space,
+                Err(ClientError::Store(_)) => {
+                    coverage.borrow_mut().storage_errors += 1;
+                    finish_client(&slot, guard);
+                    continue;
+                }
+                Err(err) => panic!("unexpected space open: {err:?}"),
+            };
+            match space.pull().await {
+                Ok(_) => {
+                    coverage.borrow_mut().pulls += 1;
+                    match space.admits().cursors().await {
+                        Ok(cursors) if cursors.neck < cursors.tail => {
+                            match space.admits().iter_from_neck().await {
+                                Ok(batches) => {
+                                    assert_eq!(
+                                        batches.first().map(|batch| batch.admission_seq),
+                                        Some(cursors.neck)
+                                    );
+                                    assert_eq!(
+                                        batches.last().map(|batch| batch.admission_seq.0 + 1),
+                                        Some(cursors.tail.0)
+                                    );
+                                    match space.admits().mark_applied(cursors.tail).await {
+                                        Ok(()) => {
+                                            coverage.borrow_mut().admit_marks += 1;
+                                            match space.admits().trim(cursors.tail).await {
+                                                Ok(()) => {
+                                                    coverage.borrow_mut().admit_trims += 1;
+                                                }
+                                                Err(SpaceDriverError::Storage(_)) => {
+                                                    coverage.borrow_mut().storage_errors += 1;
+                                                }
+                                                Err(err) => {
+                                                    panic!("unexpected admit trim failure: {err:?}")
+                                                }
+                                            }
+                                        }
+                                        Err(SpaceDriverError::Storage(_)) => {
+                                            coverage.borrow_mut().storage_errors += 1;
+                                        }
+                                        Err(err) => {
+                                            panic!("unexpected admit mark failure: {err:?}")
+                                        }
+                                    }
+                                }
+                                Err(SpaceDriverError::Storage(_)) => {
+                                    coverage.borrow_mut().storage_errors += 1;
+                                }
+                                Err(err) => panic!("unexpected admit read failure: {err:?}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(SpaceDriverError::Storage(_)) => {
+                            coverage.borrow_mut().storage_errors += 1;
+                        }
+                        Err(err) => panic!("unexpected admit cursor failure: {err:?}"),
+                    }
+                }
+                Err(SpaceDriverError::Storage(_)) => {
+                    coverage.borrow_mut().storage_errors += 1;
+                }
+                Err(err) => panic!("unexpected pull failure: {err:?}"),
+            }
+            finish_client(&slot, guard);
+            continue;
+        }
+
         let key_index = rng.random_range(0..KEY_POOL);
-        let tombstone = rng.random_bool(0.3);
+        let range_delete = rng.random_bool(0.2);
+        let tombstone = !range_delete && rng.random_bool(0.3);
         let ver = state.vers.borrow().get(&key_index).copied().unwrap_or(0) + 1;
         let stamp = rng.random::<u32>();
         let value = if tombstone {
@@ -362,21 +467,32 @@ async fn driver(
             finish_client(&slot, guard);
             continue;
         }
-        let mutation = match value {
-            ModelValue::Present(value) => Mutation::Set {
-                key: pool_key(key_index),
-                value,
-            },
-            ModelValue::Absent => Mutation::Delete {
-                key: pool_key(key_index),
-            },
+        let mutation = if range_delete {
+            let range = if rng.random_bool(0.5) {
+                Range::Prefix(prefix())
+            } else {
+                Range::Prefix(pool_key(key_index))
+            };
+            Mutation::DeleteRange { range }
+        } else {
+            match value {
+                ModelValue::Present(value) => Mutation::Set {
+                    key: pool_key(key_index),
+                    value,
+                },
+                ModelValue::Absent => Mutation::Delete {
+                    key: pool_key(key_index),
+                },
+            }
         };
         match space.submit_checked(vec![mutation], vec![]).await {
             Ok(_) => {
                 state.vers.borrow_mut().insert(key_index, ver);
                 let mut cov = coverage.borrow_mut();
                 cov.commits += 1;
-                if tombstone {
+                if range_delete {
+                    cov.range_deletes += 1;
+                } else if tombstone {
                     cov.tombstones += 1;
                 } else if ver > 1 {
                     cov.overwrites += 1;
@@ -423,7 +539,10 @@ async fn drain_push(
             Ok(PushOutcome::Drained { .. }) => return,
             Ok(PushOutcome::Stalled { at, error, .. }) => {
                 coverage.borrow_mut().push_stalls += 1;
-                if matches!(error, KernelError::VerRegression { .. }) {
+                if matches!(
+                    error,
+                    KernelError::VerRegression { .. } | KernelError::RangeVerRegression { .. }
+                ) {
                     let mut guard = take_client(slot);
                     let client = guard.client.as_mut().unwrap();
                     match client.rollback(SPACE, at).await {
@@ -476,15 +595,7 @@ fn replay_oplog(
     };
     for record in space.oplog.values() {
         for entry in record.entries() {
-            match &entry.mutation {
-                Mutation::Set { key, value } => {
-                    view.insert(key.clone(), ModelValue::Present(value.0.clone()));
-                }
-                Mutation::Delete { key } => {
-                    view.insert(key.clone(), ModelValue::Absent);
-                }
-                Mutation::DeleteRange { .. } => unreachable!("torture does not submit ranges"),
-            }
+            apply_mutation(&mut view, &entry.mutation);
         }
     }
     view
@@ -510,21 +621,15 @@ async fn read_equivalence(
     let entries = match &pulled.cut {
         RangeCut::Snapshot(entries) | RangeCut::Delta(entries) => entries,
     };
-    let mut expected: BTreeMap<Key, ModelValue> = entries
-        .iter()
-        .map(|e| match &e.device_entry.mutation {
-            Mutation::Set { key, value } => (key.clone(), ModelValue::Present(value.clone())),
-            Mutation::Delete { key } => (key.clone(), ModelValue::Absent),
-            Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
-        })
-        .collect();
+    let mut expected = BTreeMap::new();
+    for entry in entries {
+        apply_mutation(&mut expected, &entry.device_entry.mutation);
+    }
     expected = replay_oplog(expected, &state);
-    let expected: BTreeMap<_, _> = expected
-        .into_iter()
-        .filter(|(_, v)| !matches!(v, ModelValue::Absent))
-        .collect();
 
-    for (key, expected_value) in &expected {
+    for key_index in 0..KEY_POOL {
+        let key = pool_key(key_index);
+        let expected_value = expected.get(&key).unwrap_or(&ModelValue::Absent);
         let got = server
             .get(
                 &SPACE,
@@ -535,12 +640,16 @@ async fn read_equivalence(
             .await
             .unwrap()
             .entries
-            .remove(0)
-            .unwrap();
-        let got = match got.device_entry.mutation {
-            Mutation::Set { value, .. } => ModelValue::Present(value.0),
-            Mutation::Delete { .. } => ModelValue::Absent,
-            Mutation::DeleteRange { .. } => unreachable!("DR1 server rejects range deletes"),
+            .remove(0);
+        let got = match got {
+            None => ModelValue::Absent,
+            Some(entry) => match entry.device_entry.mutation {
+                Mutation::Set { value, .. } => ModelValue::Present(value.0),
+                Mutation::Delete { .. } => ModelValue::Absent,
+                Mutation::DeleteRange { .. } => {
+                    panic!("point get returned a range mutation")
+                }
+            },
         };
         assert_eq!(
             got, *expected_value,
@@ -576,9 +685,7 @@ fn phase_oracle(
                 if match &entry.device_entry.mutation {
                     Mutation::Set { value, .. } => ModelValue::Present(value.0.clone()),
                     Mutation::Delete { .. } => ModelValue::Absent,
-                    Mutation::DeleteRange { .. } => {
-                        unreachable!("DR1 server rejects range deletes")
-                    }
+                    Mutation::DeleteRange { .. } => panic!("point get returned a range mutation"),
                 } == ack.value => {}
             (_, got) => {
                 panic!("acked value corrupted: {ack:?} got {got:?} (seed {seed}, phase {phase})")
@@ -663,11 +770,15 @@ fn client_torture_seeds_hold_invariants() {
     for seed in seeds::torture_seeds() {
         let cov = run_seed(seed);
         total.tombstones += cov.tombstones;
+        total.range_deletes += cov.range_deletes;
         total.overwrites += cov.overwrites;
         total.storage_errors += cov.storage_errors;
         total.push_stalls += cov.push_stalls;
         total.commits += cov.commits;
         total.pushes += cov.pushes;
+        total.pulls += cov.pulls;
+        total.admit_marks += cov.admit_marks;
+        total.admit_trims += cov.admit_trims;
     }
     println!(
         "client torture across {} seeds: {total:?}",
@@ -683,7 +794,11 @@ fn client_torture_seeds_hold_invariants() {
         "no storage faults exercised: {total:?}"
     );
     assert!(total.tombstones > 0, "no tombstones: {total:?}");
+    assert!(total.range_deletes > 0, "no range deletes: {total:?}");
     assert!(total.overwrites > 0, "no overwrites: {total:?}");
+    assert!(total.pulls > 0, "no pulls: {total:?}");
+    assert!(total.admit_marks > 0, "no admit marks: {total:?}");
+    assert!(total.admit_trims > 0, "no admit trims: {total:?}");
 }
 
 #[test]

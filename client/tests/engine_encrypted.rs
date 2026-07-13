@@ -276,43 +276,56 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
         let clock = ManualClock::new(Timestamp(0));
         let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), space);
 
-        let client = Client::open(
-            OrderedMetaStore::new(&mem),
-            &handle,
-            &clock,
-            dev(1),
-            TestNonceSource::new(1),
-        )
-        .await
-        .unwrap();
-        client.attach(&envelope).await.unwrap();
-        let space_handle = client.space(space).await.unwrap();
-
         let db = key(&[b"db"]);
         let (k1, k2) = (key(&[b"db", b"k1"]), key(&[b"db", b"k2"]));
-        let granted = space_handle.lease(vec![wspec(&db, 60)]).await.unwrap();
-        let lease = granted[0].id;
-        space_handle
-            .submit_checked(vec![set(k1.clone(), b"one")], vec![])
+        let (device, lease) = {
+            let client = Client::open(
+                OrderedMetaStore::new(&mem),
+                &handle,
+                &clock,
+                dev(1),
+                TestNonceSource::new(1),
+            )
             .await
             .unwrap();
-        space_handle
-            .submit_checked(vec![set(k2.clone(), b"two")], vec![])
-            .await
-            .unwrap();
+            client.attach(&envelope).await.unwrap();
+            let space_handle = client.space(space).await.unwrap();
+
+            let granted = space_handle.lease(vec![wspec(&db, 60)]).await.unwrap();
+            space_handle
+                .submit_checked(vec![set(k1.clone(), b"one")], vec![])
+                .await
+                .unwrap();
+            space_handle
+                .submit_checked(vec![set(k2.clone(), b"two")], vec![])
+                .await
+                .unwrap();
+            space_handle
+                .submit_checked(
+                    vec![Mutation::DeleteRange {
+                        range: Range::Prefix(k1.clone()),
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            (client.device(), granted[0].id)
+        };
 
         let cipher = envelope.open().unwrap();
         let encoded_k1 = cipher.encode_key(&k1).unwrap();
+        let encoded_deleted_range = cipher.encode_range(&Range::Prefix(k1.clone())).unwrap();
         let state = audit(&OrderedMetaStore::new(&mem)).await;
         let oplog = &state.spaces[&space].oplog;
         let seq1 = *oplog.keys().next().unwrap();
         let seq2 = DeviceSeq(seq1.0 + 1);
+        let seq3 = DeviceSeq(seq2.0 + 1);
 
         handle
             .admit(
                 &space,
                 AdmissionRequest {
-                    device: client.device(),
+                    device,
                     expected_checksum: homebase_core::DeviceChecksum::EMPTY,
                     evidence: vec![lease],
                     batches: vec![
@@ -326,28 +339,58 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                             range_asserts: vec![],
                             entries: oplog[&seq2].entries().to_vec(),
                         },
+                        AdmissionBatch {
+                            device_seq: seq3,
+                            range_asserts: vec![],
+                            entries: oplog[&seq3].entries().to_vec(),
+                        },
                     ],
                 },
             )
             .await
             .expect("dead incarnation admitted ciphertext");
 
+        let client = Client::open(
+            OrderedMetaStore::new(&mem),
+            &handle,
+            &clock,
+            dev(9),
+            TestNonceSource::new(99),
+        )
+        .await
+        .unwrap();
+        client.attach(&envelope).await.unwrap();
+        let space_handle = client.space(space).await.unwrap();
+        assert_eq!(client.device(), device);
         assert_eq!(
             space_handle.push().await.unwrap(),
             PushOutcome::Drained {
-                acked_through: Some(seq2)
+                acked_through: Some(seq3)
             }
         );
         assert_eq!(queued(&mem).await, 0);
 
         assert_eq!(
-            value(&fetch_cipher(&handle, space, &envelope, &k1).await),
-            b"one"
-        );
-        assert_eq!(
             value(&fetch_cipher(&handle, space, &envelope, &k2).await),
             b"two"
         );
+
+        assert_eq!(space_handle.pull().await.unwrap(), AdmissionSeq(3));
+        let admitted = space_handle.admits().iter_from_neck().await.unwrap();
+        assert_eq!(admitted.len(), 3);
+        assert!(matches!(
+            &admitted[2].entries[0].device_entry.mutation,
+            Mutation::DeleteRange { range } if range == &encoded_deleted_range
+        ));
+        let tail = space_handle.admits().cursors().await.unwrap().tail;
+        assert_eq!(tail, AdmissionSeq(4));
+        space_handle.admits().mark_applied(tail).await.unwrap();
+        space_handle.admits().trim(tail).await.unwrap();
+        let cursors = space_handle.admits().cursors().await.unwrap();
+        assert_eq!(cursors.head, tail);
+        assert_eq!(cursors.neck, tail);
+        assert_eq!(cursors.tail, tail);
+
         assert!(
             handle
                 .get(
@@ -378,7 +421,7 @@ fn encrypted_ack_drop_recovers_without_double_apply() {
                 .into_iter()
                 .next()
                 .flatten()
-                .is_some()
+                .is_none()
         );
     });
 }
