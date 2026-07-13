@@ -778,6 +778,15 @@ range, prefix, and Full-root materialization must match this reconstruction.
 Dedicated corruption tests prove that independently altering a tombstone or a
 lazy aggregate is detected.
 
+DR9b adds a seeded public-engine differential workload over the same reference
+model. Two devices generate grouped Set/Delete/DeleteRange batches, valid and
+stale range assertions, and overlapping lease acquire/release commands. After
+every command, production `get`, exact full pull, scoped range deltas,
+effective live counts, and effective version maxima must equal the append-only
+model; rejected lease conflicts and assertions must leave device and admission
+history unchanged. The property runs bounded cases so failures retain a small,
+shrinkable command trace.
+
 The following laws are permanent tests rather than one-time examples:
 
 1. **Read agreement:** `get`, `list`, server log replay, and model visibility

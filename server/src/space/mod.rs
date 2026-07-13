@@ -130,6 +130,7 @@ impl Space {
 
 #[cfg(test)]
 mod tests {
+    mod randomized;
     mod reference;
 
     use super::*;
