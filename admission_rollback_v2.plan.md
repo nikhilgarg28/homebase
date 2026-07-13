@@ -4,37 +4,37 @@ overview: Consolidated rebuild plan — original admission/rollback model plus p
 todos:
   - id: p0-baseline
     content: "Phase 0: Confirm baseline — 2 committed test commits on main; stash WIP; workspace green"
-    status: pending
+    status: completed
   - id: p1-core-types
     content: "Phase 1: Core wire + oplog types — Seal, Mutation Set/Delete, DeviceEntry/AdmittedEntry, RangeAssert, data-only AdmissionBatch, LeaseKind, ListLeases, DeviceOp/Cursors; lease verbs stay separate"
-    status: pending
+    status: completed
   - id: p2-drop-epoch
     content: "Phase 2: Remove lease Epoch — split DeviceTag from AdmissionTag; keep LeaseId evidence diagnostic-only; record encode v2; sim audit"
-    status: pending
+    status: completed
   - id: p3-server-admission
     content: "Phase 3: Server admission rewrite — multi-batch all-or-nothing, asserts, sequential data ops, writes allowed unless conflicting active lease"
-    status: pending
+    status: completed
   - id: p4-meta-rollback
     content: "Phase 4: Client meta — per-space oplogs/ver_high, rollback(to), head/neck/tail persisted, forgotten lease release intents, certify [neck,tail), reserve_batch only, drop discard_from"
-    status: pending
+    status: completed
   - id: p5-data-submit
     content: "Phase 5: Data-only Space::submit_checked/submit_unchecked + lease API — stamp Set/Delete vers, build DeviceEntry values; expose lease()+unlease_checked/unlease_unchecked, no public acquire()"
-    status: pending
+    status: completed
   - id: p6-push-ack
     content: "Phase 6: Push + ack — PushOptions, disk head/neck/tail only, push_until wait-through, Submission::push sugar, data-only ack, Fork trim vs rollback"
-    status: pending
+    status: completed
   - id: p7-submit-push-api
     content: "Phase 7: Submit/push ergonomics — submit_checked/submit_unchecked, push/push_until, Submission::push attribution sugar, caller-driven rollback"
-    status: pending
+    status: completed
   - id: p8-tests
     content: "Phase 8: Tests — rollback.rs, engine/torture/equivalence/sim updates; client/tests/common helpers"
-    status: pending
+    status: completed
   - id: p9-aggregates
     content: "Phase 9 (optional): Prefix aggregates — keep live_count correct for real Delete; DeleteRange prep"
-    status: pending
+    status: completed
   - id: p10-docs
     content: "Phase 10: DESIGN.md + module docs — admission, submit policies, data batch API, lease reservations"
-    status: pending
+    status: completed
   - id: backlog-verify
     content: "Backlog: verify feature for meta/server conformance + audit (not certify at open)"
     status: pending
@@ -673,23 +673,14 @@ Build on committed test harness (Phase 0).
 
 ---
 
-## Phase 9 — Prefix aggregates + range delete prep (optional, staged)
+## Phase 9 — Prefix aggregates + range deletion (completed)
 
-Seal + explicit `Delete` land in Phases 1/3/5. Phase 9 is follow-on kernel cleanup and `DeleteRange` prep.
-
-### Stage A — Keep `live_count` correct
-
-- Do **not** drop `live_count`. Real `Mutation::Delete` entries give the kernel enough information to maintain it correctly.
-- Update prefix aggregate tests for present → delete, delete → present, repeated delete, and zero-length present values.
-- Snapshot may keep the `live_count == 0` fast-path because deleted rows are server-visible and counted out of liveness.
-
-### Stage B — `DeleteRange` (when specified)
-
-- New `Mutation::DeleteRange { prefix, ... }` shape carried by a sealed `DeviceEntry` — the seal uses the same `{ scheme, nonce, aead, payload }` shape with AEAD plaintext `b""` or specified range metadata, and AAD bound to op kind plus anonymized prefix/range descriptor.
-- Admission: range delete is rejected only when an active incompatible lease conflicts with the target prefix/range; single ver bump or per-key vers TBD at design time.
-- Prefix aggregate maintenance must remain exact under `DeleteRange`; define and test the `live_count` update strategy before landing the op.
-
-**Exit:** server props updated; cipher delete + delete-range roundtrip tests.
+`live_count` remains exact for point deletes and uses lazy subtree-reset epochs
+for DeleteRange. Range mutations carry the standard `Seal`, authenticate empty
+plaintext with a distinct operation kind and encoded range target, receive one
+space-local Lamport `Ver`, and conflict with overlapping foreign leases in both
+ancestor and descendant directions. The exact implementation and refinement
+laws are recorded in [`DELETE_RANGE_DESIGN.md`](./DELETE_RANGE_DESIGN.md).
 
 ---
 
@@ -716,7 +707,6 @@ Items from conversation + `TODO.md` — **not** scheduled in v2 rebuild unless y
 
 - Human/admin lease takeover flow — later explicit feature, not pre-deadline stealing.
 - **Space certification / auth mode** at space creation.
-- **`DeleteRange`** — after single-key Delete + Seal stable (Phase 9B or new phase).
 
 ### Leasing / correctness model (TODO OCC notes)
 
@@ -761,6 +751,10 @@ Each batch should be reviewable as one commit. Every batch includes the listed t
 | AL1-AL7 Admit-log implementation | Execute the seven independently tested admit-log batches defined in `DELETE_RANGE_DESIGN.md`, then remove the old client replication and watermark path; retain `read_at` for stateless range observation | tests and docs listed per AL batch | update owning core/server/client module in every batch |
 | DR1-DR9 DeleteRange implementation | Execute the nine independently tested range-delete batches defined in `DELETE_RANGE_DESIGN.md`; keep public admission rejected through DR7 and enable it only with client integration in DR8 | tests and docs listed per DR batch | update owning module and standalone design in every batch |
 | Final docs sweep | Align `DESIGN.md`, `LAUNCH_CHECKLIST.md`, and module docs with landed behavior | documentation build/checks plus full workspace tests | remove stale Sync/epoch/await_commit/snapshot-delta wording and link this plan |
+
+**Implementation status:** B0-B15, AL1-AL7, DR1-DR9, and the final docs
+sweep are complete. Remaining items below are explicitly deferred backlog, not
+unfinished work in this rebuild.
 
 Suggested commit messages: `batch NN: <short description>`. Promote optional or backlog work only by adding a new batch with its own tests/docs row.
 

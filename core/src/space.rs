@@ -37,14 +37,14 @@ impl fmt::Debug for SpaceId {
 /// can be honest about both:
 ///
 /// - [`Kernel`](SpaceError::Kernel): a semantic rejection — the space is
-///   healthy and *decided* no (contended, fenced, regression…). Meaningful
+///   healthy and *decided* no (contended, assertion failure, regression…). Meaningful
 ///   to the caller; retry per that error's own rules.
 /// - [`Unavailable`](SpaceError::Unavailable): the space could not serve
 ///   the request at all — storage fault, shutdown mid-request, dead
 ///   mailbox. Says nothing about the request's validity. Reads may be
 ///   retried blindly; a retried `admit` that was actually admitted
-///   before the failure is caught by the `device_seq` replay fence, so
-///   clients treat that rejection as "already applied".
+///   before the failure is reconciled through the device sequence and
+///   cumulative checksum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpaceError {
     Kernel(KernelError),

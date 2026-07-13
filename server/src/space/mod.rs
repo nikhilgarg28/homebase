@@ -1,19 +1,14 @@
-//! One space: the complete verb state machine, and (eventually) the
-//! client-facing facade.
+//! One space: the complete server verb state machine.
 //!
 //! [`Space`] composes the lease table ([`lease::LeaseManager`]) with the
-//! data plane ([`data`]) over one [`OrderedStore`]. Every verb takes an
+//! deterministic data plane over one [`OrderedStore`]. Every verb takes an
 //! explicit `now` and applies at most one atomic write batch, so the whole
 //! machine is deterministic under the sim and its counters/leases/data
 //! commit or vanish together.
 //!
-//! The module is laid out for its future shape: `lease` and `data` stay
-//! deterministic internals (explicit `now`, store passed in, verbs one at a
-//! time), while this file is where `Space` will grow ownership of a store, a
-//! [`Clock`](homebase_core::clock::Clock), and request serialization, and
-//! implement the async [`Space` trait](homebase_core::space::Space). The
-//! struct and the trait deliberately share a name: this is *the*
-//! implementation of that contract.
+//! The `lease` and `data` modules remain deterministic internals (explicit
+//! `now`, store passed in, verbs one at a time), while this facade composes
+//! them into the actor-owned space state machine.
 
 pub mod lease;
 

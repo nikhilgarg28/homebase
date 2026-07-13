@@ -38,7 +38,7 @@ pub const FAULTS: FaultConfig = FaultConfig {
     max_latency_yields: 3,
 };
 
-/// Object-store-level faults only; [`FaultSlateStore`] handles yields + flush.
+/// Object-store-level faults only; `FaultSlateStore` handles yields + flush.
 #[cfg(feature = "slatedb")]
 pub const SLATE_OS_FAULTS: FaultConfig = FAULTS;
 
@@ -313,7 +313,7 @@ pub mod sim {
     }
 }
 
-/// Layer 3: real [`SlateStore`] over a fault-injecting object store.
+/// Layer 3: real `SlateStore` over a fault-injecting object store.
 #[cfg(feature = "slatedb")]
 pub mod slate {
     use super::*;

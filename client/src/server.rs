@@ -18,7 +18,7 @@
 //! - **none**: [`Offline`], the uninhabited server for clients with no
 //!   server at all — it cannot even be constructed, so the compiler knows
 //!   a serverless client never issues a verb;
-//! - **remote**: the gRPC channel adapter lands with the transport-adapters
+//! - **remote**: a future HTTP adapter implements the same contract
 //!   batch, gated on [`conformance`]: observationally identical to
 //!   in-process, or it doesn't merge.
 //!
@@ -303,7 +303,7 @@ impl ServerHandle for Offline {
 
 pub mod conformance {
     //! Reusable [`ServerHandle`] conformance: any implementation — the
-    //! in-process closure today, the gRPC adapter later — must pass
+    //! in-process closure today, a remote adapter later — must pass
     //! [`run_all`] against a fresh kernel. This is the transport-adapter
     //! batch's merge gate: remote must be observationally identical to
     //! in-process, and this suite is the definition of "observationally".

@@ -607,7 +607,8 @@ impl DataRecord {
 
 /// Latest materialized tombstone at one exact Full/Prefix target.
 ///
-/// The target is encoded in the storage key and supplied to [`decode`], while
+/// The target is encoded in the storage key and supplied to
+/// [`RangeDeleteRecord::decode`], while
 /// the value preserves the original authenticated device metadata and exact
 /// server-assigned operation order.
 #[derive(Clone, Debug, PartialEq, Eq)]

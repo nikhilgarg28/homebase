@@ -1,7 +1,7 @@
 //! Request/response messages for the kernel verbs, plus [`KernelError`].
 //!
-//! These are the canonical, transport-neutral forms. The wire layer (likely
-//! tonic/gRPC) defines its own generated DTOs and converts to and from these
+//! These are the canonical, transport-neutral forms. A future wire layer
+//! defines its own DTOs and converts to and from these
 //! at the boundary — which is also where prefix-scoped token enforcement
 //! lives — so transport details never leak into kernel semantics or
 //! validated types like [`Key`].
@@ -213,9 +213,9 @@ fn hash_bytes(hash: &mut sha2::Sha256, bytes: &[u8]) {
 
 /// Atomic admission request (request = transaction; torn requests impossible).
 ///
-/// Admission requires: no Set/Delete key overlaps a live foreign lease
-/// reservation, every Set/Delete has a valid [`Seal`], and every Set/Delete
-/// satisfies per-key `Ver` monotonicity.
+/// Admission requires: no mutation target overlaps a live foreign lease
+/// reservation, every mutation has a valid [`crate::seal::Seal`], and every point or range
+/// mutation satisfies its applicable `Ver` monotonicity rule.
 /// Presented lease ids are diagnostic evidence only. Any violation rejects
 /// the whole batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -451,10 +451,9 @@ pub struct RangeCursor {
 
 /// Atomic consistent cut: all ranges evaluated at one admission point.
 ///
-/// This is also the replication feed that drives shapes — each shape polls
-/// its own ranges at its own cursors, and the augmented range-max tree
-/// answers "anything new under this prefix since my cursor?" without a
-/// scan. Cursors are client-owned state.
+/// This is a stateless observation API: callers own range cursors and may use
+/// the returned cut without changing the client's durable admit-log state.
+/// Stateful replication uses [`PullRequest`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadAtRequest {
     pub ranges: Vec<RangeCursor>,
@@ -505,12 +504,11 @@ pub enum KernelError {
     /// granted. Retained for lease verbs and diagnostics; put admission does
     /// not treat evidence ids as authority.
     LeaseInvalid { lease: LeaseId },
-    /// Legacy coverage error. Reservation conflicts now use [`Contended`].
+    /// Legacy coverage error. Reservation conflicts now use
+    /// [`KernelError::Contended`].
     NotCovered { key: Key },
     /// A mutation seal is malformed for its declared scheme.
     InvalidSeal { reason: String },
-    /// Range deletes are understood by the protocol but not yet admitted by
-    /// this server implementation.
     /// One or more range watermarks did not match the server-visible prefix
     /// high water.
     RangeAssertFailed { failures: Vec<RangeAssertFailure> },

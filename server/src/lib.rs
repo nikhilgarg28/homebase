@@ -3,7 +3,7 @@
 //! Layering, outermost in:
 //!
 //! - [`Server`] — owns one shard: the shared [`storage::OrderedStore`], the
-//!   [`Clock`](homebase_core::clock::Clock), and the `SpaceId` →
+//!   [`Clock`], and the `SpaceId` →
 //!   [`actor::SpaceHandle`] table. Routes requests and spawns space actors
 //!   lazily on first touch. Token verification (token → `SpaceId` + prefix
 //!   scope) sits at the wire layer above this.

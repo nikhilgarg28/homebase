@@ -1,4 +1,4 @@
-//! [`OrderedStore`] wrapper around [`SlateStore`] with SimStore-style yields,
+//! `OrderedStore` wrapper around `SlateStore` with SimStore-style yields,
 //! apply-time error injection, and probabilistic flush (durability boundary).
 
 #[cfg(feature = "slatedb")]

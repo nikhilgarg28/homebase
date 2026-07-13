@@ -107,7 +107,7 @@ impl SimExecutor {
         self.tasks.iter().any(|slot| slot.is_some())
     }
 
-    /// Like [`run_until_stalled`], but yields to tokio between steps so
+    /// Like [`Self::run_until_stalled`], but yields to tokio between steps so
     /// real async IO (slatedb) can complete while preserving seeded
     /// interleaving among sim tasks.
     #[cfg(feature = "slatedb")]

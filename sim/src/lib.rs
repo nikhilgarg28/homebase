@@ -12,7 +12,7 @@
 //!   every legal interleaving of actors and clients is reachable, and each
 //!   is replayable.
 //! - [`store::SimStore`] — Layer 1 [`OrderedStore`]: seeded fault injection,
-//!   explicit durability boundary, [`SimStore::crash`].
+//!   explicit durability boundary, [`store::SimStore::crash`].
 //! - [`slate_shard::SlateShard`] — Layer 3: real slatedb over a fault-injecting
 //!   local object store with checkpointed power loss.
 //! - [`crash`] — parameterized crash-restart torture shared by Layer 1 and 3.
