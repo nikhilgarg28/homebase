@@ -9,6 +9,8 @@
 //! acknowledged-but-lost state. The reader detects it by the only signal
 //! the protocol gives: the cut regressing below its cursor (`at < since`),
 //! and answers with a full resync.
+//! The final phase disables injected storage faults so every seed must
+//! demonstrate convergence after the preceding faulted phases.
 //!
 //! Oracles:
 //! - every delta is well-formed: ascending `(admission_seq, key)`, each key
@@ -165,7 +167,15 @@ async fn writer(handle: SpaceHandle, state: WriterState, coverage: Rc<RefCell<Co
             Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
                 state.next_seq.set(current.0 + 1);
             }
-            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch { .. })) => return,
+            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch {
+                current_seq,
+                current,
+            })) => {
+                // This direct-kernel harness rebases after simulated authority
+                // rollback; the production client reports an actual fork.
+                state.next_seq.set(current_seq.0 + 1);
+                state.checksum.set(current);
+            }
             // An unacked write to this key survived a crash; the rejection
             // itself tells us the authoritative ver.
             Err(SpaceError::Kernel(KernelError::VerRegression { current, .. })) => {
@@ -288,7 +298,11 @@ fn run_seed(seed: u64) -> (Vec<(Key, Vec<u8>)>, Coverage) {
     let replica = Replica::default();
 
     for phase in 0..PHASES {
-        store.set_config(FAULTS);
+        store.set_config(if phase == PHASES - 1 {
+            FaultConfig::NONE
+        } else {
+            FAULTS
+        });
         let mut exec = SimExecutor::new(master.random());
         let (actor, handle) = SpaceActor::new(SPACE, Arc::new(store.clone()), Arc::clone(&clock));
         let actor_task = exec.spawn(actor.run());

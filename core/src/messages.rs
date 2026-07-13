@@ -496,6 +496,11 @@ pub enum KernelError {
         /// to reveal it. Purely advisory backoff guidance.
         retry_after: Option<Duration>,
     },
+    /// A range write overlaps a live foreign lease reservation.
+    RangeContended {
+        range: Range,
+        retry_after: Option<Duration>,
+    },
     /// The presented lease id is not live: expired, released, or never
     /// granted. Retained for lease verbs and diagnostics; put admission does
     /// not treat evidence ids as authority.
@@ -513,6 +518,12 @@ pub enum KernelError {
     /// Per-key version monotonicity violated.
     VerRegression {
         key: Key,
+        current: Ver,
+        attempted: Ver,
+    },
+    /// A range mutation did not exceed every version affecting its target.
+    RangeVerRegression {
+        range: Range,
         current: Ver,
         attempted: Ver,
     },
@@ -547,6 +558,10 @@ impl fmt::Display for KernelError {
                 Some(d) => write!(f, "prefix {prefix:?} is contended (retry in ~{d:?})"),
                 None => write!(f, "prefix {prefix:?} is contended"),
             },
+            Self::RangeContended { range, retry_after } => match retry_after {
+                Some(d) => write!(f, "range {range:?} is contended (retry in ~{d:?})"),
+                None => write!(f, "range {range:?} is contended"),
+            },
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
             Self::InvalidSeal { reason } => write!(f, "invalid seal: {reason}"),
@@ -561,6 +576,14 @@ impl fmt::Display for KernelError {
             } => write!(
                 f,
                 "ver regression on {key:?}: attempted {attempted:?} ≤ current {current:?}"
+            ),
+            Self::RangeVerRegression {
+                range,
+                current,
+                attempted,
+            } => write!(
+                f,
+                "ver regression on {range:?}: attempted {attempted:?} ≤ current {current:?}"
             ),
             Self::DeviceSeqRegression { current, attempted } => write!(
                 f,

@@ -7,6 +7,8 @@
 //! voluntarily (clean handoff) and sometimes just lose the lease to TTL
 //! expiry or a crash. Stale holders may write when no foreign reservation is
 //! live, but must retry on reservation or version fences.
+//! The final phase disables injected storage faults so every seed must
+//! demonstrate forward progress after the preceding faulted phases.
 //!
 //! **The mutual-exclusion oracle:** each increment writes `read value + 1`
 //! while exclusively holding the lease, so across every device and every
@@ -215,7 +217,16 @@ async fn client(
             Err(SpaceError::Kernel(KernelError::DeviceSeqRegression { current, .. })) => {
                 state.next_seq.set(current.0 + 1);
             }
-            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch { .. })) => return,
+            Err(SpaceError::Kernel(KernelError::DeviceChecksumMismatch {
+                current_seq,
+                current,
+            })) => {
+                // This direct-kernel harness deliberately survives authority
+                // rollback so later phases can keep exercising contention.
+                // The production client reports this condition as a fork.
+                state.next_seq.set(current_seq.0 + 1);
+                state.checksum.set(current);
+            }
             Err(SpaceError::Unavailable { .. }) => return,
             Err(SpaceError::Kernel(err)) => {
                 panic!("mutual exclusion breached: {err:?} at device {d}")
@@ -240,7 +251,11 @@ fn run_seed(seed: u64) -> (Vec<Ack>, Coverage) {
         .collect();
 
     for phase in 0..PHASES {
-        store.set_config(FAULTS);
+        store.set_config(if phase == PHASES - 1 {
+            FaultConfig::NONE
+        } else {
+            FAULTS
+        });
         let mut exec = SimExecutor::new(master.random());
         let (actor, handle) = SpaceActor::new(SPACE, Arc::new(store.clone()), Arc::clone(&clock));
         let actor_task = exec.spawn(actor.run());

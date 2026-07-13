@@ -24,6 +24,7 @@ use homebase_core::messages::{
     AcquireRequest, KernelError, ListLeasesRequest, ListLeasesResponse, ReleaseRequest, RenewGrant,
     RenewRequest, RenewResponse,
 };
+use homebase_core::range::Range;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId};
 use std::collections::BTreeSet;
@@ -227,8 +228,24 @@ impl LeaseManager {
         _evidence: &[LeaseId],
         keys: &[Key],
     ) -> Result<(), Error> {
+        self.validate_writes(store, now, device, _evidence, keys, &[])
+            .await
+    }
+
+    /// Reservation checks for a mixed point/range write set. Point writes
+    /// conflict only with leases that cover the exact key; range writes
+    /// conflict with leases in either overlap direction.
+    pub async fn validate_writes<S: OrderedStore>(
+        &self,
+        store: &S,
+        now: Timestamp,
+        device: DeviceId,
+        _evidence: &[LeaseId],
+        keys: &[Key],
+        ranges: &[Range],
+    ) -> Result<(), Error> {
         for key in keys {
-            let (live, _) = self.overlapping(store, now, key).await?;
+            let live = self.covering(store, now, key).await?;
             if live.iter().any(|rec| rec.device != device) {
                 return Err(KernelError::Contended {
                     prefix: key.clone(),
@@ -237,7 +254,58 @@ impl LeaseManager {
                 .into());
             }
         }
+        for range in ranges {
+            let live = match range {
+                Range::Full => self.all_live(store, now).await?,
+                Range::Prefix(prefix) => self.overlapping(store, now, prefix).await?.0,
+            };
+            if live.iter().any(|rec| rec.device != device) {
+                return Err(KernelError::RangeContended {
+                    range: range.clone(),
+                    retry_after: None,
+                }
+                .into());
+            }
+        }
         Ok(())
+    }
+
+    async fn covering<S: OrderedStore>(
+        &self,
+        store: &S,
+        now: Timestamp,
+        key: &Key,
+    ) -> Result<Vec<LeaseRecord>, StorageError> {
+        let components = key.components();
+        let mut live = Vec::new();
+        for depth in 1..=components.len() {
+            let scan = lease_by_prefix_scan(self.space, depth, &components[..depth]);
+            let mut iter = store.scan_prefix(&scan);
+            while let Some((_, value)) = iter.next().await? {
+                let rec = LeaseRecord::decode(&value).expect("corrupt lease record");
+                if rec.is_live(now) {
+                    live.push(rec);
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    async fn all_live<S: OrderedStore>(
+        &self,
+        store: &S,
+        now: Timestamp,
+    ) -> Result<Vec<LeaseRecord>, StorageError> {
+        let mut live = Vec::new();
+        let scan = lease_by_id_scan(self.space);
+        let mut iter = store.scan_prefix(&scan);
+        while let Some((_, value)) = iter.next().await? {
+            let rec = LeaseRecord::decode(&value).expect("corrupt lease record");
+            if rec.is_live(now) {
+                live.push(rec);
+            }
+        }
+        Ok(live)
     }
 
     /// All lease records whose prefix overlaps `prefix` (ancestor, exact, or
@@ -617,6 +685,76 @@ mod tests {
             )),
             Err(Error::Kernel(KernelError::Contended { .. }))
         ));
+    }
+
+    #[test]
+    fn point_ignores_descendant_lease_but_range_conflicts_bidirectionally() {
+        let mut mgr = LeaseManager::new(SPACE);
+        let store = MemoryStore::new();
+        let child = key(&[b"db", b"row", b"child"]);
+        acquire_one(&mut mgr, &store, 0, 2, &child, LeaseMode::Write, 100).unwrap();
+        let point = key(&[b"db", b"row"]);
+
+        block_on(mgr.validate_put(
+            &store,
+            Timestamp(1),
+            dev(1),
+            &[],
+            std::slice::from_ref(&point),
+        ))
+        .unwrap();
+        assert!(matches!(
+            block_on(mgr.validate_writes(
+                &store,
+                Timestamp(1),
+                dev(1),
+                &[],
+                &[],
+                &[Range::Prefix(point.clone())],
+            )),
+            Err(Error::Kernel(KernelError::RangeContended { .. }))
+        ));
+        assert!(matches!(
+            block_on(mgr.validate_writes(&store, Timestamp(1), dev(1), &[], &[], &[Range::Full],)),
+            Err(Error::Kernel(KernelError::RangeContended {
+                range: Range::Full,
+                ..
+            }))
+        ));
+
+        let mut ancestor_mgr = LeaseManager::new(SPACE);
+        let ancestor_store = MemoryStore::new();
+        let parent = key(&[b"db"]);
+        acquire_one(
+            &mut ancestor_mgr,
+            &ancestor_store,
+            0,
+            2,
+            &parent,
+            LeaseMode::Write,
+            100,
+        )
+        .unwrap();
+        assert!(matches!(
+            block_on(ancestor_mgr.validate_writes(
+                &ancestor_store,
+                Timestamp(1),
+                dev(1),
+                &[],
+                &[],
+                &[Range::Prefix(child.clone())],
+            )),
+            Err(Error::Kernel(KernelError::RangeContended { .. }))
+        ));
+        block_on(ancestor_mgr.validate_writes(
+            &ancestor_store,
+            Timestamp(1),
+            dev(1),
+            &[],
+            &[],
+            &[Range::Prefix(key(&[b"other"]))],
+        ))
+        .unwrap();
     }
 
     #[test]

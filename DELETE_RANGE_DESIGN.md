@@ -135,6 +135,13 @@ The admission scratch model must therefore retain ordered point and range
 events. It cannot reduce the request to a `BTreeMap<Key, final_point_state>`
 before evaluating visibility and count deltas.
 
+DR5 implements this as a gated mixed-mutation engine. It retains staged point
+records, exact range tombstones, and the ordered admitted events needed for
+point and range version fences. It writes materialization, immutable log
+entries, historical aggregates, device state, checksum, and counters in one
+batch. Public admission still rejects DeleteRange because DR6 has not yet
+made range-driven `live_count` resets exact.
+
 Required ordered cases include:
 
 - Multiple overlapping DeleteRange mutations.
@@ -464,6 +471,13 @@ than a representative-key workaround.
 Presented lease ids remain diagnostic evidence, not admission authority.
 Writes without a lease remain admissible only when no live foreign
 reservation overlaps.
+
+The DR5 kernel validator distinguishes point coverage from range overlap: a
+point write checks only lease prefixes that cover that exact key, while a
+range write checks ancestors and descendants. Full checks every live lease.
+Prefix-scoped capability authorization remains at the wire layer above the
+in-process kernel, where connection/token scope is available; the private DR5
+admission path does not manufacture a representative key for Full.
 
 A capability/token must authorize the entire deleted range. Authorization of
 one contained key is insufficient.

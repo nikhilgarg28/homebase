@@ -16,7 +16,7 @@
 //! (space, Device,        device_id)             → DeviceRecord
 //! (space, PrefixMeta,    depth, p1…pd)          → PrefixMetaRecord
 //! (space, AdmissionLog,  seq_be, Header)         → AdmissionHeaderRecord
-//! (space, AdmissionLog,  seq_be, Op, i_be, k…)   → DataRecord
+//! (space, AdmissionLog,  seq_be, Op, i_be, target…) → point/range record
 //! ```
 //!
 //! **AdmissionLog is the immutable replay history.** Every admitted batch has
@@ -196,6 +196,9 @@ pub fn covering_range_delete_keys(space: SpaceId, target: &Range) -> Vec<Vec<u8>
 
 const ADMISSION_HEADER_COMPONENT: u8 = 0;
 const ADMISSION_OP_COMPONENT: u8 = 1;
+const ADMISSION_POINT_TARGET: u8 = 0;
+const ADMISSION_FULL_TARGET: u8 = 1;
+const ADMISSION_PREFIX_TARGET: u8 = 2;
 
 fn admission_component(kind: u8) -> KeyComponent {
     KeyComponent::new(vec![kind]).expect("single-byte admission component")
@@ -216,7 +219,14 @@ pub fn admission_header_key(space: SpaceId, seq: AdmissionSeq) -> Vec<u8> {
     ])
 }
 
-/// `(space, AdmissionLog, admission_seq, Op, op_index, k1, k2, …)`.
+/// Target encoded in one immutable admission-operation key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionTarget {
+    Point(Key),
+    Range(Range),
+}
+
+/// `(space, AdmissionLog, admission_seq, Op, op_index, Point, k1, k2, …)`.
 pub fn admission_op_key(space: SpaceId, seq: AdmissionSeq, op_index: u32, key: &Key) -> Vec<u8> {
     let mut components = vec![
         space_component(space),
@@ -224,8 +234,33 @@ pub fn admission_op_key(space: SpaceId, seq: AdmissionSeq, op_index: u32, key: &
         u64_component(seq.0),
         admission_component(ADMISSION_OP_COMPONENT),
         u32_component(op_index),
+        admission_component(ADMISSION_POINT_TARGET),
     ];
     components.extend(key.components().iter().cloned());
+    encode_components(&components)
+}
+
+/// Immutable admission-operation key for a Full or Prefix range target.
+pub fn admission_range_op_key(
+    space: SpaceId,
+    seq: AdmissionSeq,
+    op_index: u32,
+    range: &Range,
+) -> Vec<u8> {
+    let mut components = vec![
+        space_component(space),
+        RecordKind::AdmissionLog.component(),
+        u64_component(seq.0),
+        admission_component(ADMISSION_OP_COMPONENT),
+        u32_component(op_index),
+    ];
+    match range {
+        Range::Full => components.push(admission_component(ADMISSION_FULL_TARGET)),
+        Range::Prefix(prefix) => {
+            components.push(admission_component(ADMISSION_PREFIX_TARGET));
+            components.extend(prefix.components().iter().cloned());
+        }
+    }
     encode_components(&components)
 }
 
@@ -239,8 +274,8 @@ pub fn admission_op_scan(space: SpaceId, seq: AdmissionSeq) -> Vec<u8> {
     ])
 }
 
-/// Recovers `(admission_seq, op_index, user_key)` from an admission op key.
-pub fn admission_op_parts(storage_key: &[u8]) -> Option<(AdmissionSeq, u32, Key)> {
+/// Recovers the exact point/range target from an admission operation key.
+pub fn admission_op_parts(storage_key: &[u8]) -> Option<(AdmissionSeq, u32, AdmissionTarget)> {
     let components = decode_components(storage_key).ok()?;
     if components.get(3)?.as_bytes() != [ADMISSION_OP_COMPONENT] {
         return None;
@@ -249,8 +284,18 @@ pub fn admission_op_parts(storage_key: &[u8]) -> Option<(AdmissionSeq, u32, Key)
         components.get(2)?.as_bytes().try_into().ok()?,
     ));
     let op_index = u32::from_be_bytes(components.get(4)?.as_bytes().try_into().ok()?);
-    let key = Key::new(components.get(5..)?.to_vec()).ok()?;
-    Some((seq, op_index, key))
+    let target_kind = components.get(5)?.as_bytes();
+    if target_kind.len() != 1 {
+        return None;
+    }
+    let suffix = components.get(6..)?.to_vec();
+    let target = match target_kind[0] {
+        ADMISSION_POINT_TARGET => AdmissionTarget::Point(Key::new(suffix).ok()?),
+        ADMISSION_FULL_TARGET if suffix.is_empty() => AdmissionTarget::Range(Range::Full),
+        ADMISSION_PREFIX_TARGET => AdmissionTarget::Range(Range::Prefix(Key::new(suffix).ok()?)),
+        _ => return None,
+    };
+    Some((seq, op_index, target))
 }
 
 /// `(space, Device, device_id)`
@@ -817,8 +862,16 @@ impl PrefixMetaRecord {
         ver: Ver,
         count_epoch: AdmissionOrder,
     ) {
+        self.observe_history(device, admission_seq, ver);
+        self.materialize_count_at(count_epoch);
+    }
+
+    pub fn observe_history(&mut self, device: DeviceId, admission_seq: AdmissionSeq, ver: Ver) {
         self.history.observe(device, admission_seq);
         self.max_ver = self.max_ver.max(ver);
+    }
+
+    pub fn materialize_count_at(&mut self, count_epoch: AdmissionOrder) {
         self.count_epoch = self.count_epoch.max(count_epoch);
     }
 
@@ -1232,8 +1285,23 @@ mod tests {
 
         let key = Key::from_bytes([&b"db"[..], &b"row"[..]]).unwrap();
         let storage_key = admission_op_key(space, seq, 1, &key);
-        assert_eq!(admission_op_parts(&storage_key), Some((seq, 1, key)));
+        assert_eq!(
+            admission_op_parts(&storage_key),
+            Some((seq, 1, AdmissionTarget::Point(key)))
+        );
         assert!(storage_key.starts_with(&admission_op_scan(space, seq)));
+
+        let range = Range::Prefix(Key::from_bytes([&b"db"[..]]).unwrap());
+        let storage_key = admission_range_op_key(space, seq, 2, &range);
+        assert_eq!(
+            admission_op_parts(&storage_key),
+            Some((seq, 2, AdmissionTarget::Range(range)))
+        );
+        let storage_key = admission_range_op_key(space, seq, 3, &Range::Full);
+        assert_eq!(
+            admission_op_parts(&storage_key),
+            Some((seq, 3, AdmissionTarget::Range(Range::Full)))
+        );
     }
 
     #[test]

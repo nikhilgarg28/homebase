@@ -95,6 +95,16 @@ impl Space {
         data::admit(self.id, &self.leases, store, now, req).await
     }
 
+    #[cfg(test)]
+    async fn admit_internal<S: OrderedStore>(
+        &mut self,
+        store: &S,
+        now: Timestamp,
+        req: &AdmissionRequest,
+    ) -> Result<AdmissionResponse, Error> {
+        data::admit_internal(self.id, &self.leases, store, now, req).await
+    }
+
     pub async fn pull<S: OrderedStore>(
         &self,
         store: &S,
@@ -131,6 +141,7 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference::ReferenceModel;
     use crate::schema::{
         DeviceRecord, PrefixMetaRecord, RangeDeleteRecord, device_key, prefix_meta_key,
         range_delete_key, root_meta_key,
@@ -149,6 +160,7 @@ mod tests {
         Mutation, OpaqueValue, Ver,
     };
     use pollster::block_on;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -349,6 +361,33 @@ mod tests {
                 batches: vec![AdmissionBatch {
                     device_seq: DeviceSeq(device_seq),
                     range_asserts,
+                    entries,
+                }],
+            },
+        ))
+    }
+
+    fn admit_internal_entries(
+        space: &mut Space,
+        store: &MemoryStore,
+        lease: LeaseId,
+        device_seq: u64,
+        entries: Vec<DeviceEntry>,
+    ) -> Result<AdmissionResponse, Error> {
+        let expected_checksum = block_on(store.get(&device_key(SPACE, dev(1))))
+            .unwrap()
+            .map(|bytes| DeviceRecord::decode(&bytes).unwrap().checksum)
+            .unwrap_or_default();
+        block_on(space.admit_internal(
+            store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum,
+                evidence: vec![lease],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(device_seq),
+                    range_asserts: vec![],
                     entries,
                 }],
             },
@@ -592,6 +631,341 @@ mod tests {
         let k = key(&[b"db", b"after-rejection"]);
         let response = admit(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
         assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(1)));
+    }
+
+    #[test]
+    fn internal_mixed_pairs_refine_reference_visibility_and_exact_log_order() {
+        fn mutation(kind: u8, value: u8) -> Mutation<OpaqueValue> {
+            match kind {
+                0 => Mutation::Set {
+                    key: key(&[b"db", b"a"]),
+                    value: OpaqueValue(vec![value]),
+                },
+                1 => Mutation::Set {
+                    key: key(&[b"db", b"b"]),
+                    value: OpaqueValue(vec![value]),
+                },
+                2 => Mutation::Delete {
+                    key: key(&[b"db", b"a"]),
+                },
+                3 => Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                },
+                4 => Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db", b"a"])),
+                },
+                5 => Mutation::DeleteRange { range: Range::Full },
+                _ => unreachable!(),
+            }
+        }
+        fn plaintext(mutation: Mutation<OpaqueValue>) -> Mutation<Vec<u8>> {
+            match mutation {
+                Mutation::Set { key, value } => Mutation::Set {
+                    key,
+                    value: value.0,
+                },
+                Mutation::Delete { key } => Mutation::Delete { key },
+                Mutation::DeleteRange { range } => Mutation::DeleteRange { range },
+            }
+        }
+        fn visible(model: &ReferenceModel) -> BTreeMap<Key, Vec<u8>> {
+            model
+                .list_at(&Range::Full, model.high_water())
+                .into_iter()
+                .map(|entry| match entry.device_entry.mutation {
+                    Mutation::Set { key, value } => (key, value),
+                    Mutation::Delete { .. } | Mutation::DeleteRange { .. } => unreachable!(),
+                })
+                .collect()
+        }
+
+        for first in 0..6 {
+            for second in 0..6 {
+                let (mut space, store, lease) = setup();
+                let mutations = [mutation(first, 1), mutation(second, 2)];
+                let entries = entries_with_vers(
+                    dev(1),
+                    1,
+                    vec![(mutations[0].clone(), 1), (mutations[1].clone(), 2)],
+                );
+                admit_internal_entries(&mut space, &store, lease, 1, entries.clone()).unwrap();
+
+                let mut model = ReferenceModel::default();
+                model.append_batch(
+                    dev(1),
+                    DeviceSeq(1),
+                    vec![
+                        (plaintext(mutations[0].clone()), Ver(1)),
+                        (plaintext(mutations[1].clone()), Ver(2)),
+                    ],
+                );
+                let listed = block_on(space.list(
+                    &store,
+                    &ListRequest {
+                        prefix: key(&[b"db"]),
+                        start_after: None,
+                        limit: None,
+                    },
+                ))
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| match entry.device_entry.mutation {
+                    Mutation::Set { key, value } => (key, value.0),
+                    Mutation::Delete { .. } | Mutation::DeleteRange { .. } => unreachable!(),
+                })
+                .collect::<BTreeMap<_, _>>();
+                assert_eq!(listed, visible(&model), "ordered pair {first}, {second}");
+
+                let pulled = block_on(space.pull(
+                    &store,
+                    &PullRequest {
+                        after: AdmissionSeq(0),
+                        max_batches: None,
+                    },
+                ))
+                .unwrap();
+                assert_eq!(pulled.batches.len(), 1);
+                assert_eq!(
+                    pulled.batches[0]
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.device_entry.mutation)
+                        .collect::<Vec<_>>(),
+                    entries
+                        .iter()
+                        .map(|entry| &entry.mutation)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn internal_range_and_point_version_fences_reject_atomically() {
+        let (mut space, store, lease) = setup();
+        let row = key(&[b"db", b"row"]);
+        admit(&mut space, &store, lease, 1, vec![put(&row, b"old", 10)]).unwrap();
+
+        let stale_range = entries_with_vers(
+            dev(1),
+            2,
+            vec![(
+                Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                },
+                10,
+            )],
+        );
+        assert!(matches!(
+            admit_internal_entries(&mut space, &store, lease, 2, stale_range),
+            Err(Error::Kernel(KernelError::RangeVerRegression {
+                current: Ver(10),
+                attempted: Ver(10),
+                ..
+            }))
+        ));
+
+        let valid_range = entries_with_vers(
+            dev(1),
+            2,
+            vec![(
+                Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                },
+                11,
+            )],
+        );
+        admit_internal_entries(&mut space, &store, lease, 2, valid_range).unwrap();
+        assert!(
+            block_on(space.get(
+                &store,
+                &GetRequest {
+                    keys: vec![row.clone()]
+                }
+            ))
+            .unwrap()
+            .entries[0]
+                .is_none()
+        );
+
+        let stale_revive = entries_with_vers(
+            dev(1),
+            3,
+            vec![(
+                Mutation::Set {
+                    key: row.clone(),
+                    value: OpaqueValue(b"stale".to_vec()),
+                },
+                11,
+            )],
+        );
+        assert!(matches!(
+            admit_internal_entries(&mut space, &store, lease, 3, stale_revive),
+            Err(Error::Kernel(KernelError::VerRegression {
+                current: Ver(11),
+                attempted: Ver(11),
+                ..
+            }))
+        ));
+        let valid_revive = entries_with_vers(
+            dev(1),
+            3,
+            vec![(
+                Mutation::Set {
+                    key: row.clone(),
+                    value: OpaqueValue(b"new".to_vec()),
+                },
+                12,
+            )],
+        );
+        admit_internal_entries(&mut space, &store, lease, 3, valid_revive).unwrap();
+        assert!(
+            block_on(space.get(&store, &GetRequest { keys: vec![row] }))
+                .unwrap()
+                .entries[0]
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn internal_mixed_rejection_discards_the_entire_staged_prefix() {
+        let (mut space, store, lease) = setup();
+        let row = key(&[b"db", b"row"]);
+        let rejected = entries_with_vers(
+            dev(1),
+            1,
+            vec![
+                (
+                    Mutation::Set {
+                        key: row.clone(),
+                        value: OpaqueValue(b"staged".to_vec()),
+                    },
+                    2,
+                ),
+                (
+                    Mutation::DeleteRange {
+                        range: Range::Prefix(key(&[b"db"])),
+                    },
+                    1,
+                ),
+            ],
+        );
+        assert!(matches!(
+            admit_internal_entries(&mut space, &store, lease, 1, rejected),
+            Err(Error::Kernel(KernelError::RangeVerRegression {
+                current: Ver(2),
+                attempted: Ver(1),
+                ..
+            }))
+        ));
+        assert!(
+            block_on(space.get(
+                &store,
+                &GetRequest {
+                    keys: vec![row.clone()]
+                }
+            ))
+            .unwrap()
+            .entries[0]
+                .is_none()
+        );
+        let pull = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(pull.through, AdmissionSeq(0));
+        assert!(pull.batches.is_empty());
+
+        let accepted = entries_with_vers(
+            dev(1),
+            1,
+            vec![
+                (
+                    Mutation::Set {
+                        key: row,
+                        value: OpaqueValue(b"staged".to_vec()),
+                    },
+                    2,
+                ),
+                (
+                    Mutation::DeleteRange {
+                        range: Range::Prefix(key(&[b"db"])),
+                    },
+                    3,
+                ),
+            ],
+        );
+        let response = admit_internal_entries(&mut space, &store, lease, 1, accepted).unwrap();
+        assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(1)));
+    }
+
+    #[test]
+    fn internally_admitted_range_history_invalidates_parent_and_child_assertions() {
+        let mut space = Space::new(SPACE);
+        let store = MemoryStore::new();
+        let deleted = Range::Prefix(key(&[b"db", b"child"]));
+        let request = AdmissionRequest {
+            device: dev(2),
+            expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+            evidence: vec![],
+            batches: vec![AdmissionBatch {
+                device_seq: DeviceSeq(1),
+                range_asserts: vec![],
+                entries: entries_with_vers(
+                    dev(2),
+                    1,
+                    vec![(
+                        Mutation::DeleteRange {
+                            range: deleted.clone(),
+                        },
+                        1,
+                    )],
+                ),
+            }],
+        };
+        block_on(space.admit_internal(&store, Timestamp(1), &request)).unwrap();
+
+        let response = block_on(space.admit(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+                evidence: vec![],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(1),
+                    range_asserts: vec![
+                        RangeAssert {
+                            prefix: key(&[b"db"]),
+                            upto: AdmissionSeq(0),
+                        },
+                        RangeAssert {
+                            prefix: key(&[b"db", b"child", b"grandchild"]),
+                            upto: AdmissionSeq(0),
+                        },
+                    ],
+                    entries: vec![],
+                }],
+            },
+        ))
+        .unwrap();
+        let AdmissionResult::Failed {
+            error: KernelError::RangeAssertFailed { failures },
+        } = &response.results[0]
+        else {
+            panic!("range assertions unexpectedly passed")
+        };
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.actual == AdmissionSeq(1))
+        );
     }
 
     #[test]

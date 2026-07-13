@@ -1,7 +1,8 @@
 //! Parameterized crash-restart torture: Layer 1 ([`sim`]) and Layer 3 ([`slate`]).
 //!
 //! Same clients, oracles, and recovery paths; backends differ only in store
-//! factory and crash primitive.
+//! factory and crash primitive. The first three phases inject faults and
+//! crash; the final fault-free phase proves recovery can make forward progress.
 
 use crate::check;
 use crate::exec::SimExecutor;
@@ -257,7 +258,11 @@ pub mod sim {
         let devices = device_states(&mut master);
 
         for phase in 0..PHASES {
-            store.set_config(FAULTS);
+            store.set_config(if phase == PHASES - 1 {
+                FaultConfig::NONE
+            } else {
+                FAULTS
+            });
             let mut exec = SimExecutor::new(master.random());
             let (actor, handle) =
                 SpaceActor::new(SPACE, Arc::new(store.clone()), Arc::clone(&clock));
@@ -322,7 +327,11 @@ pub mod slate {
         let devices = device_states(&mut master);
 
         for phase in 0..PHASES {
-            shard.set_faults(FAULTS);
+            if phase == PHASES - 1 {
+                shard.disable_faults();
+            } else {
+                shard.set_faults(FAULTS);
+            }
             let store = shard.store();
             let (actor, handle) = SpaceActor::new(SPACE, store, Arc::clone(&clock));
             let actor_task = tokio::spawn(actor.run());

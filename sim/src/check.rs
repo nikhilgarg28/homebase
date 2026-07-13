@@ -23,10 +23,11 @@ use homebase_core::key::Key;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionOrder, AdmissionSeq, DeviceChecksum, DeviceId, DeviceSeq};
 use homebase_server::schema::{
-    AdmissionHeaderRecord, CountersRecord, DataRecord, DeviceRecord, LeaseRecord, PrefixMetaRecord,
-    admission_header_key, admission_log_scan_all, admission_op_parts, admission_op_scan,
-    counters_key, data_scan_all, device_key, lease_by_id_scan, lease_by_prefix_scan_all,
-    prefix_meta_key, prefix_meta_scan_all, root_meta_key, user_key_from_data,
+    AdmissionHeaderRecord, AdmissionTarget, CountersRecord, DataRecord, DeviceRecord, LeaseRecord,
+    PrefixMetaRecord, admission_header_key, admission_log_scan_all, admission_op_parts,
+    admission_op_scan, counters_key, data_scan_all, device_key, lease_by_id_scan,
+    lease_by_prefix_scan_all, prefix_meta_key, prefix_meta_scan_all, root_meta_key,
+    user_key_from_data,
 };
 use homebase_server::storage::{OrderedStore, collect_scan};
 use pollster::block_on;
@@ -83,12 +84,15 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
 
         let mut operation_count = 0u32;
         for (storage_key, bytes) in scan_all(store, &admission_op_scan(space, admission_seq)) {
-            let (stored_seq, op_index, key) =
+            let (stored_seq, op_index, target) =
                 admission_op_parts(&storage_key).expect("undecodable admission operation key");
             assert_eq!(stored_seq, admission_seq, "operation under wrong header");
             assert_eq!(op_index, operation_count, "admission operation gap");
+            let AdmissionTarget::Point(key) = target else {
+                panic!("public DR5 gate admitted a range operation")
+            };
             let record = DataRecord::decode(key.clone(), &bytes)
-                .expect("undecodable admission operation record");
+                .expect("undecodable point admission operation record");
             assert_eq!(
                 record.entry.admission.order(),
                 AdmissionOrder {
