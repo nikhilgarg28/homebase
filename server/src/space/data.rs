@@ -26,10 +26,10 @@
 //! On admission each client batch takes the next admission seq and the request
 //! writes, atomically:
 //! immutable admission headers and point/range operations, point data, exact
-//! range tombstones, the Full root plus per-prefix historical aggregates, the
-//! device high water, and counters. Range count resets are intentionally
-//! deferred to DR6, so the public entrypoint rejects DeleteRange while tests
-//! exercise the same engine through a private gate.
+//! range tombstones, the Full root plus per-prefix historical/count
+//! aggregates, the device high water, and counters. Lazy range count resets
+//! are implemented in the private engine; the public entrypoint remains gated
+//! until replay and client handling are complete.
 //!
 //! # Reads
 //!
@@ -39,8 +39,7 @@
 //! trivially untorn, because verbs execute serially — returning either a
 //! snapshot (cursor `None`) or the changes since the cursor, tombstones
 //! included in exact `AdmissionOrder`. Historical aggregates may short-circuit
-//! a delta whose prefix has `max_admission_seq() ≤ cursor`; count-based
-//! snapshot short-circuiting resumes after DR6 makes lazy resets exact.
+//! a delta whose prefix has `max_admission_seq() ≤ cursor`.
 
 use super::lease::LeaseManager;
 use crate::error::Error;
@@ -165,8 +164,7 @@ async fn admit_impl<S: OrderedStore>(
     let mut staged: BTreeMap<Key, DataRecord> = BTreeMap::new();
     let mut staged_ranges: BTreeMap<Range, RangeDeleteRecord> = BTreeMap::new();
     let mut staged_events: Vec<AdmittedEntry> = Vec::new();
-    let mut was_live: BTreeMap<Key, bool> = BTreeMap::new();
-    let mut touched_aggregates: BTreeMap<Vec<u8>, AggregateTouch> = BTreeMap::new();
+    let mut staged_aggregates: BTreeMap<Vec<u8>, PrefixMetaRecord> = BTreeMap::new();
     for client_batch in &req.batches {
         let failures = range_assert_failures(space, store, req.device, client_batch).await?;
         if !failures.is_empty() {
@@ -221,13 +219,13 @@ async fn admit_impl<S: OrderedStore>(
                     } else {
                         data(space, store, key).await?
                     };
-                    if !was_live.contains_key(key) {
-                        let visible = match &stored {
-                            Some(record) => point_record_visible(space, store, record).await?,
-                            None => false,
-                        };
-                        was_live.insert(key.clone(), visible);
-                    }
+                    let prior_live = point_record_visible_with_events(
+                        space,
+                        store,
+                        staged.get(key).or(stored.as_ref()),
+                        &staged_events,
+                    )
+                    .await?;
                     let mut current_ver = staged
                         .get(key)
                         .map(|record| record.entry.ver())
@@ -256,6 +254,19 @@ async fn admit_impl<S: OrderedStore>(
                         }
                         .into());
                     }
+                    apply_point_count(
+                        space,
+                        store,
+                        &mut staged_aggregates,
+                        &staged_events,
+                        req.device,
+                        key,
+                        seq,
+                        ver,
+                        order,
+                        (entry.mutation.is_set() as i64) - (prior_live as i64),
+                    )
+                    .await?;
                     staged.insert(
                         key.clone(),
                         DataRecord {
@@ -269,12 +280,6 @@ async fn admit_impl<S: OrderedStore>(
                         }
                         .encode(),
                     );
-                    for meta_key in aggregate_keys_for_key(space, key) {
-                        touched_aggregates
-                            .entry(meta_key)
-                            .or_insert_with(AggregateTouch::empty)
-                            .observe(seq, ver, order, true);
-                    }
                 }
                 Mutation::DeleteRange { range } => {
                     let effective = effective_history(space, store, range).await?;
@@ -298,6 +303,18 @@ async fn admit_impl<S: OrderedStore>(
                         }
                         .into());
                     }
+                    apply_range_count(
+                        space,
+                        store,
+                        &mut staged_aggregates,
+                        &staged_events,
+                        req.device,
+                        range,
+                        seq,
+                        ver,
+                        order,
+                    )
+                    .await?;
                     if let Some(record) = staged_ranges.get_mut(range) {
                         record.observe(admitted.clone());
                     } else {
@@ -313,12 +330,6 @@ async fn admit_impl<S: OrderedStore>(
                         admission_range_op_key(space, seq, op_index, range),
                         RangeDeleteRecord::new(admitted.clone()).encode(),
                     );
-                    for meta_key in aggregate_keys_for_range(space, range) {
-                        touched_aggregates
-                            .entry(meta_key)
-                            .or_insert_with(AggregateTouch::empty)
-                            .observe(seq, ver, order, false);
-                    }
                 }
             }
             staged_events.push(admitted);
@@ -338,17 +349,8 @@ async fn admit_impl<S: OrderedStore>(
 
     // Admitted: one atomic batch for exact log, materialized data,
     // aggregates, device state, checksum, and counters.
-    let mut live_deltas: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     for (key, record) in &staged {
         batch.put(data_key(space, key), record.encode());
-
-        // Aggregate updates along the key's prefix path: every ancestor sees
-        // the new max seq; live counts move by the key's net transition
-        // across the whole batch (absent→present +1, present→absent −1).
-        let delta = (record.entry.device_entry.mutation.is_set() as i64) - (was_live[key] as i64);
-        for meta_key in aggregate_keys_for_key(space, key) {
-            *live_deltas.entry(meta_key).or_insert(0) += delta;
-        }
     }
     for (range, record) in &staged_ranges {
         batch.put(
@@ -356,24 +358,8 @@ async fn admit_impl<S: OrderedStore>(
             record.encode(),
         );
     }
-    for meta_key in touched_aggregates.keys() {
-        live_deltas.entry(meta_key.clone()).or_insert(0);
-    }
-    for (meta_key, delta) in live_deltas {
-        let mut updated = match store.get(&meta_key).await? {
-            Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record"),
-            None => PrefixMetaRecord::empty(),
-        };
-        let touch = touched_aggregates[&meta_key];
-        updated.observe_history(req.device, touch.admission_seq, touch.max_ver);
-        if let Some(count_epoch) = touch.count_epoch {
-            updated.materialize_count_at(count_epoch);
-        }
-        updated.live_count = updated
-            .live_count
-            .checked_add_signed(delta)
-            .expect("live count underflow: aggregates diverged from data records");
-        batch.put(meta_key, updated.encode());
+    for (meta_key, record) in staged_aggregates {
+        batch.put(meta_key, record.encode());
     }
     batch.put(
         device_key(space, req.device),
@@ -429,50 +415,145 @@ fn failed_response(
     }
 }
 
-#[derive(Clone, Copy)]
-struct AggregateTouch {
-    admission_seq: AdmissionSeq,
-    max_ver: homebase_core::tag::Ver,
-    count_epoch: Option<AdmissionOrder>,
+fn aggregate_path(space: SpaceId, range: &Range) -> Vec<(Range, Vec<u8>)> {
+    let mut path = vec![(Range::Full, root_meta_key(space))];
+    let Range::Prefix(prefix) = range else {
+        return path;
+    };
+    let components = prefix.components();
+    path.extend((1..=components.len()).map(|depth| {
+        let node = Range::Prefix(
+            Key::from_bytes(
+                components[..depth]
+                    .iter()
+                    .map(|component| component.as_bytes().to_vec()),
+            )
+            .expect("a prefix of a valid key is valid"),
+        );
+        let key = prefix_meta_key(space, &components[..depth]);
+        (node, key)
+    }));
+    path
 }
 
-impl AggregateTouch {
-    fn empty() -> Self {
-        Self {
-            admission_seq: AdmissionSeq(0),
-            max_ver: homebase_core::tag::Ver(0),
-            count_epoch: None,
+async fn load_aggregate<S: OrderedStore>(
+    store: &S,
+    staged: &mut BTreeMap<Vec<u8>, PrefixMetaRecord>,
+    key: &[u8],
+) -> Result<(), StorageError> {
+    if !staged.contains_key(key) {
+        let record = match store.get(key).await? {
+            Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt prefix meta record"),
+            None => PrefixMetaRecord::empty(),
+        };
+        staged.insert(key.to_vec(), record);
+    }
+    Ok(())
+}
+
+async fn newest_covering_reset<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    target: &Range,
+    staged_events: &[AdmittedEntry],
+) -> Result<Option<AdmissionOrder>, StorageError> {
+    let stored = covering_range_delete(space, store, target)
+        .await?
+        .map(|record| record.entry.admission.order());
+    Ok(staged_events
+        .iter()
+        .filter_map(|entry| match &entry.device_entry.mutation {
+            Mutation::DeleteRange { range } if range.covers_range(target) => {
+                Some(entry.admission.order())
+            }
+            Mutation::Set { .. } | Mutation::Delete { .. } | Mutation::DeleteRange { .. } => None,
+        })
+        .fold(stored, |newest, order| {
+            Some(newest.map_or(order, |current| current.max(order)))
+        }))
+}
+
+async fn materialize_aggregate<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    staged: &mut BTreeMap<Vec<u8>, PrefixMetaRecord>,
+    staged_events: &[AdmittedEntry],
+    target: &Range,
+    key: &[u8],
+) -> Result<(), StorageError> {
+    load_aggregate(store, staged, key).await?;
+    if let Some(reset) = newest_covering_reset(space, store, target, staged_events).await? {
+        let record = staged.get_mut(key).expect("aggregate was loaded");
+        if record.count_epoch < reset {
+            record.live_count = 0;
+            record.count_epoch = reset;
         }
     }
+    Ok(())
+}
 
-    fn observe(
-        &mut self,
-        admission_seq: AdmissionSeq,
-        ver: homebase_core::tag::Ver,
-        order: AdmissionOrder,
-        materialize_count: bool,
-    ) {
-        self.admission_seq = self.admission_seq.max(admission_seq);
-        self.max_ver = self.max_ver.max(ver);
-        if materialize_count {
-            self.count_epoch = Some(self.count_epoch.map_or(order, |current| current.max(order)));
+#[allow(clippy::too_many_arguments)]
+async fn apply_point_count<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    staged: &mut BTreeMap<Vec<u8>, PrefixMetaRecord>,
+    staged_events: &[AdmittedEntry],
+    device: DeviceId,
+    key: &Key,
+    seq: AdmissionSeq,
+    ver: Ver,
+    order: AdmissionOrder,
+    delta: i64,
+) -> Result<(), StorageError> {
+    for (target, meta_key) in aggregate_path(space, &Range::Prefix(key.clone())) {
+        materialize_aggregate(space, store, staged, staged_events, &target, &meta_key).await?;
+        let record = staged.get_mut(&meta_key).expect("aggregate was loaded");
+        record.observe_history(device, seq, ver);
+        record.live_count = record
+            .live_count
+            .checked_add_signed(delta)
+            .expect("live count underflow: aggregates diverged from visible point state");
+        record.materialize_count_at(order);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_range_count<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    staged: &mut BTreeMap<Vec<u8>, PrefixMetaRecord>,
+    staged_events: &[AdmittedEntry],
+    device: DeviceId,
+    range: &Range,
+    seq: AdmissionSeq,
+    ver: Ver,
+    order: AdmissionOrder,
+) -> Result<(), StorageError> {
+    let path = aggregate_path(space, range);
+    for (target, meta_key) in &path {
+        materialize_aggregate(space, store, staged, staged_events, target, meta_key).await?;
+    }
+    let target_key = &path.last().expect("aggregate path has Full root").1;
+    let removed = staged
+        .get(target_key)
+        .expect("target aggregate was loaded")
+        .live_count;
+    for (index, (_, meta_key)) in path.iter().enumerate() {
+        let record = staged.get_mut(meta_key).expect("aggregate was loaded");
+        record.observe_history(device, seq, ver);
+        if index + 1 == path.len() {
+            record.live_count = 0;
+            record.count_epoch = order;
+        } else {
+            record.live_count = record
+                .live_count
+                .checked_sub(removed)
+                .expect("live count underflow: range count exceeds ancestor count");
+            record.materialize_count_at(order);
         }
     }
-}
-
-fn aggregate_keys_for_key(space: SpaceId, key: &Key) -> Vec<Vec<u8>> {
-    let components = key.components();
-    let mut keys = Vec::with_capacity(components.len() + 1);
-    keys.push(root_meta_key(space));
-    keys.extend((1..=components.len()).map(|depth| prefix_meta_key(space, &components[..depth])));
-    keys
-}
-
-fn aggregate_keys_for_range(space: SpaceId, range: &Range) -> Vec<Vec<u8>> {
-    match range {
-        Range::Full => vec![root_meta_key(space)],
-        Range::Prefix(prefix) => aggregate_keys_for_key(space, prefix),
-    }
+    Ok(())
 }
 
 fn mutation_relevant<T>(query: &Range, mutation: &Mutation<T>) -> bool {
@@ -669,6 +750,9 @@ async fn snapshot<S: OrderedStore>(
     store: &S,
     range: &Range,
 ) -> Result<Vec<AdmittedEntry>, StorageError> {
+    if effective_live_count(space, store, range).await? == 0 {
+        return Ok(Vec::new());
+    }
     let Range::Prefix(prefix) = range else {
         let base = data_scan_all(space);
         let mut entries = Vec::new();
@@ -796,6 +880,23 @@ async fn point_record_visible<S: OrderedStore>(
         .is_none_or(|delete| record.entry.admission.order() > delete.entry.admission.order()))
 }
 
+async fn point_record_visible_with_events<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    record: Option<&DataRecord>,
+    staged_events: &[AdmittedEntry],
+) -> Result<bool, StorageError> {
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    if !record.entry.device_entry.mutation.is_set() {
+        return Ok(false);
+    }
+    let target = Range::Prefix(record.entry.key().clone());
+    let newest_reset = newest_covering_reset(space, store, &target, staged_events).await?;
+    Ok(newest_reset.is_none_or(|reset| record.entry.admission.order() > reset))
+}
+
 /// Historical facts relevant to one range: all events below it from the
 /// aggregate plus exact ancestor tombstones that cover it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -837,6 +938,34 @@ pub(crate) async fn effective_history<S: OrderedStore>(
         effective.max_ver = effective.max_ver.max(record.max_ver);
     }
     Ok(effective)
+}
+
+/// Current logical live count under `target`. A descendant aggregate may
+/// remain physically stale after an ancestor DeleteRange; its count is zero
+/// until a later point mutation materializes it beyond that reset.
+pub(crate) async fn effective_live_count<S: OrderedStore>(
+    space: SpaceId,
+    store: &S,
+    target: &Range,
+) -> Result<u64, StorageError> {
+    let aggregate_key = match target {
+        Range::Full => root_meta_key(space),
+        Range::Prefix(prefix) => prefix_meta_key(space, prefix.components()),
+    };
+    let aggregate = match store.get(&aggregate_key).await? {
+        Some(bytes) => PrefixMetaRecord::decode(&bytes).expect("corrupt aggregate record"),
+        None => PrefixMetaRecord::empty(),
+    };
+    let reset = covering_range_delete(space, store, target)
+        .await?
+        .map(|record| record.entry.admission.order());
+    Ok(
+        if reset.is_some_and(|reset| aggregate.count_epoch < reset) {
+            0
+        } else {
+            aggregate.live_count
+        },
+    )
 }
 
 async fn data<S: OrderedStore>(

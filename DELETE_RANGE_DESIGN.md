@@ -297,6 +297,21 @@ For each node on the point key's prefix path:
    epoch.
 3. Apply the point's net visibility delta.
 
+DR6 implements these transitions in admission-order scratch state rather than
+as an end-of-request net delta. Each touched aggregate is loaded at most once
+into the scratch map, logically materialized against the newest persisted or
+earlier-in-request covering tombstone, and updated immediately. DeleteRange
+sets its exact target to zero and subtracts that target's effective count from
+strict ancestors with checked arithmetic; descendants remain physically
+untouched. The scratch aggregate records are committed atomically with point
+materialization, range tombstones, the exact log, device state, checksum, and
+counters. Snapshot reads use the same effective-count rule for their empty
+subtree short circuit.
+
+The implementation remains behind the public unsupported gate through DR7;
+server replay and client integration must understand range operations before
+the gate can open.
+
 The point's previous visibility is computed against covering tombstones, not
 only from whether its retained point record is a Set.
 

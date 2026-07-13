@@ -394,6 +394,16 @@ mod tests {
         ))
     }
 
+    fn assert_effective_counts(store: &impl OrderedStore, expected: &[(Range, u64)]) {
+        for (range, count) in expected {
+            assert_eq!(
+                block_on(data::effective_live_count(SPACE, store, range)).unwrap(),
+                *count,
+                "wrong effective live count for {range:?}"
+            );
+        }
+    }
+
     fn admit_as(
         space: &mut Space,
         store: &MemoryStore,
@@ -716,6 +726,18 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>();
                 assert_eq!(listed, visible(&model), "ordered pair {first}, {second}");
+                for range in [
+                    Range::Full,
+                    Range::Prefix(key(&[b"db"])),
+                    Range::Prefix(key(&[b"db", b"a"])),
+                    Range::Prefix(key(&[b"db", b"b"])),
+                ] {
+                    assert_eq!(
+                        block_on(data::effective_live_count(SPACE, &store, &range)).unwrap(),
+                        model.live_count(&range, model.high_water()),
+                        "ordered pair {first}, {second}, range {range:?}"
+                    );
+                }
 
                 let pulled = block_on(space.pull(
                     &store,
@@ -739,6 +761,288 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lazy_counts_handle_nested_resets_revivals_and_hidden_point_deletes() {
+        let (mut space, store, lease) = setup();
+        let db = Range::Prefix(key(&[b"db"]));
+        let child = Range::Prefix(key(&[b"db", b"child"]));
+        let outside = Range::Prefix(key(&[b"outside"]));
+        let a = key(&[b"db", b"a"]);
+        let b = key(&[b"db", b"child", b"b"]);
+        let c = key(&[b"outside", b"c"]);
+
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            1,
+            entries_with_vers(
+                dev(1),
+                1,
+                vec![put(&a, b"a", 1), put(&b, b"b", 2), put(&c, b"c", 3)],
+            ),
+        )
+        .unwrap();
+        assert_effective_counts(
+            &store,
+            &[(Range::Full, 3), (db.clone(), 2), (child.clone(), 1)],
+        );
+
+        for (seq, ver) in [(2, 4), (3, 5)] {
+            admit_internal_entries(
+                &mut space,
+                &store,
+                lease,
+                seq,
+                entries_with_vers(
+                    dev(1),
+                    seq,
+                    vec![(
+                        Mutation::DeleteRange {
+                            range: child.clone(),
+                        },
+                        ver,
+                    )],
+                ),
+            )
+            .unwrap();
+            assert_effective_counts(
+                &store,
+                &[(Range::Full, 2), (db.clone(), 1), (child.clone(), 0)],
+            );
+        }
+
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            4,
+            entries_with_vers(dev(1), 4, vec![put(&b, b"revived", 6)]),
+        )
+        .unwrap();
+        assert_effective_counts(
+            &store,
+            &[(Range::Full, 3), (db.clone(), 2), (child.clone(), 1)],
+        );
+
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            5,
+            entries_with_vers(
+                dev(1),
+                5,
+                vec![(Mutation::DeleteRange { range: db.clone() }, 7)],
+            ),
+        )
+        .unwrap();
+        assert_effective_counts(
+            &store,
+            &[
+                (Range::Full, 1),
+                (db.clone(), 0),
+                (child.clone(), 0),
+                (outside, 1),
+            ],
+        );
+
+        // The retained point Set is already hidden, so a later point Delete
+        // advances history without decrementing any count.
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            6,
+            entries_with_vers(dev(1), 6, vec![del(&b, 8)]),
+        )
+        .unwrap();
+        assert_effective_counts(
+            &store,
+            &[(Range::Full, 1), (db.clone(), 0), (child.clone(), 0)],
+        );
+
+        let revived = key(&[b"db", b"child", b"new"]);
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            7,
+            entries_with_vers(dev(1), 7, vec![put(&revived, b"new", 9)]),
+        )
+        .unwrap();
+        assert_effective_counts(
+            &store,
+            &[(Range::Full, 2), (db.clone(), 1), (child.clone(), 1)],
+        );
+
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            8,
+            entries_with_vers(
+                dev(1),
+                8,
+                vec![(Mutation::DeleteRange { range: Range::Full }, 10)],
+            ),
+        )
+        .unwrap();
+        assert_effective_counts(&store, &[(Range::Full, 0), (db, 0), (child, 0)]);
+    }
+
+    #[test]
+    fn failed_range_reset_exposes_neither_count_nor_tombstone() {
+        let mut space = Space::new(SPACE);
+        let store = FailApplyStore::default();
+        let row = key(&[b"db", b"row"]);
+        let first = block_on(space.admit_internal(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+                evidence: vec![],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(1),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(dev(1), 1, vec![put(&row, b"v", 1)]),
+                }],
+            },
+        ))
+        .unwrap();
+        let db = Range::Prefix(key(&[b"db"]));
+        assert_effective_counts(&store, &[(Range::Full, 1), (db.clone(), 1)]);
+
+        store.fail_next_apply();
+        let failed = block_on(space.admit_internal(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: first.checksum,
+                evidence: vec![],
+                batches: vec![AdmissionBatch {
+                    device_seq: DeviceSeq(2),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(
+                        dev(1),
+                        2,
+                        vec![(Mutation::DeleteRange { range: db.clone() }, 2)],
+                    ),
+                }],
+            },
+        ));
+        assert!(matches!(failed, Err(Error::Storage(_))));
+        assert_effective_counts(&store, &[(Range::Full, 1), (db.clone(), 1)]);
+        assert!(
+            block_on(store.get(&range_delete_key(SPACE, &db)))
+                .unwrap()
+                .is_none()
+        );
+
+        let pulled = block_on(space.pull(
+            &store,
+            &PullRequest {
+                after: AdmissionSeq(0),
+                max_batches: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(pulled.through, AdmissionSeq(1));
+        assert_eq!(pulled.batches.len(), 1);
+    }
+
+    #[test]
+    fn lazy_counts_preserve_order_across_coalesced_client_batches() {
+        let mut space = Space::new(SPACE);
+        let store = MemoryStore::new();
+        let db = Range::Prefix(key(&[b"db"]));
+        let a = key(&[b"db", b"a"]);
+        let b = key(&[b"db", b"b"]);
+        let mutations = [
+            Mutation::Set {
+                key: a.clone(),
+                value: OpaqueValue(b"a".to_vec()),
+            },
+            Mutation::DeleteRange { range: db.clone() },
+            Mutation::Set {
+                key: b.clone(),
+                value: OpaqueValue(b"b".to_vec()),
+            },
+        ];
+        let batches = mutations
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, mutation)| {
+                let seq = u64::try_from(index + 1).unwrap();
+                AdmissionBatch {
+                    device_seq: DeviceSeq(seq),
+                    range_asserts: vec![],
+                    entries: entries_with_vers(dev(1), seq, vec![(mutation, seq)]),
+                }
+            })
+            .collect();
+        let response = block_on(space.admit_internal(
+            &store,
+            Timestamp(1),
+            &AdmissionRequest {
+                device: dev(1),
+                expected_checksum: homebase_core::DeviceChecksum::EMPTY,
+                evidence: vec![],
+                batches,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            (0..3)
+                .map(|index| response.applied_admission_seq(index))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(AdmissionSeq(1)),
+                Some(AdmissionSeq(2)),
+                Some(AdmissionSeq(3)),
+            ]
+        );
+        assert_effective_counts(&store, &[(Range::Full, 1), (db, 1)]);
+        let got = block_on(space.get(&store, &GetRequest { keys: vec![a, b] })).unwrap();
+        assert!(got.entries[0].is_none());
+        assert!(got.entries[1].is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "live count underflow: range count exceeds ancestor count")]
+    fn range_count_underflow_is_detected_as_corruption() {
+        let (mut space, store, lease) = setup();
+        let db_key = key(&[b"db"]);
+        let mut child = PrefixMetaRecord::empty();
+        child.live_count = 1;
+        let mut corrupt = WriteBatch::new();
+        corrupt.put(root_meta_key(SPACE), PrefixMetaRecord::empty().encode());
+        corrupt.put(prefix_meta_key(SPACE, db_key.components()), child.encode());
+        block_on(store.apply(corrupt)).unwrap();
+
+        admit_internal_entries(
+            &mut space,
+            &store,
+            lease,
+            1,
+            entries_with_vers(
+                dev(1),
+                1,
+                vec![(
+                    Mutation::DeleteRange {
+                        range: Range::Prefix(db_key),
+                    },
+                    1,
+                )],
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
