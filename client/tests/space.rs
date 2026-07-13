@@ -1,9 +1,9 @@
-use homebase::Client;
 use homebase::cipher::{
     NameKey, NonceSource, SpaceEnvelope, SpaceKey, SystemNonceSource, ValueNonce,
 };
 use homebase::meta::{OrderedMetaStore, audit};
 use homebase::server::ServerHandle;
+use homebase::{Client, PushReceipt};
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
@@ -140,11 +140,12 @@ impl<H: ServerHandle + Sync> ServerHandle for TamperPull<H> {
 
     async fn pull(&self, space: &SpaceId, req: PullRequest) -> Result<PullResponse, SpaceError> {
         let mut response = self.inner.pull(space, req).await?;
-        if let Some(entry) = response
+        let range_entry = response
             .batches
-            .first_mut()
-            .and_then(|batch| batch.entries.first_mut())
-        {
+            .iter_mut()
+            .flat_map(|batch| &mut batch.entries)
+            .find(|entry| entry.device_entry.mutation.is_delete_range());
+        if let Some(entry) = range_entry {
             entry.device_entry.seal.aead[0] ^= 1;
         }
         Ok(response)
@@ -469,6 +470,136 @@ fn stateless_fetch_leaves_all_client_state_unchanged() {
 }
 
 #[test]
+fn delete_range_roundtrips_submit_fetch_pull_and_reopen() {
+    block_on(async {
+        let envelope = encrypted_envelope();
+        let space = envelope.space_id();
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[space]);
+        let db = key(&[b"db"]);
+        let child = key(&[b"db", b"child"]);
+        let row = key(&[b"db", b"child", b"row"]);
+
+        let writer_store = MemoryStore::new();
+        let writer_clock = ManualClock::new(Timestamp(0));
+        let writer = Client::open(
+            OrderedMetaStore::new(&writer_store),
+            &handle,
+            &writer_clock,
+            dev(1),
+            TestNonceSource::new(1),
+        )
+        .await
+        .unwrap();
+        writer.attach(&envelope).await.unwrap();
+        let writer_space = writer.space(space).await.unwrap();
+        let set_receipt = writer_space
+            .submit_unchecked([set(row, b"value")], vec![])
+            .await
+            .unwrap()
+            .push()
+            .await
+            .unwrap();
+        assert!(matches!(
+            set_receipt,
+            PushReceipt::Applied {
+                admission_seq: Some(AdmissionSeq(1)),
+                ..
+            }
+        ));
+        let range_receipt = writer_space
+            .submit_unchecked(
+                [homebase::Mutation::DeleteRange {
+                    range: Range::Prefix(db.clone()),
+                }],
+                vec![],
+            )
+            .await
+            .unwrap()
+            .push()
+            .await
+            .unwrap();
+        assert!(matches!(
+            range_receipt,
+            PushReceipt::Applied {
+                admission_seq: Some(AdmissionSeq(2)),
+                ..
+            }
+        ));
+
+        let reader_store = MemoryStore::new();
+        {
+            let reader_clock = ManualClock::new(Timestamp(0));
+            let reader = Client::open(
+                OrderedMetaStore::new(&reader_store),
+                &handle,
+                &reader_clock,
+                dev(2),
+                SystemNonceSource,
+            )
+            .await
+            .unwrap();
+            reader.attach(&envelope).await.unwrap();
+            let reader_space = reader.space(space).await.unwrap();
+
+            let before_fetch = audit(&OrderedMetaStore::new(&reader_store)).await;
+            let fetched = reader_space
+                .fetch(Range::Prefix(child.clone()), AdmissionSeq(0))
+                .await
+                .unwrap();
+            let RangeCut::Delta(entries) = &fetched.cut else {
+                panic!("expected range delta")
+            };
+            let source = entries
+                .iter()
+                .find_map(|entry| entry.device_entry.mutation.range())
+                .expect("ancestor range source");
+            let encoded_child = envelope
+                .open()
+                .unwrap()
+                .encode_range(&Range::Prefix(child))
+                .unwrap();
+            assert_eq!(fetched.delete_range_effect(source), Some(encoded_child));
+            assert_eq!(
+                audit(&OrderedMetaStore::new(&reader_store)).await,
+                before_fetch,
+                "stateless fetch must not advance ver or admit cursors"
+            );
+
+            assert_eq!(reader_space.pull().await.unwrap(), AdmissionSeq(2));
+            let pulled_state = audit(&OrderedMetaStore::new(&reader_store)).await;
+            let pulled_space = &pulled_state.spaces[&space];
+            assert_eq!(pulled_space.ver_high, Some(Ver(2)));
+            assert_eq!(pulled_space.admit_cursors.tail, AdmissionSeq(3));
+            let pending = reader_space.admits().iter_from_neck().await.unwrap();
+            assert_eq!(pending.len(), 2);
+            assert!(matches!(
+                &pending[1].entries[0].device_entry.mutation,
+                homebase::Mutation::DeleteRange { .. }
+            ));
+        }
+
+        let reopened_clock = ManualClock::new(Timestamp(0));
+        let reopened = Client::open(
+            OrderedMetaStore::new(&reader_store),
+            &handle,
+            &reopened_clock,
+            dev(9),
+            SystemNonceSource,
+        )
+        .await
+        .unwrap();
+        reopened.attach(&envelope).await.unwrap();
+        let reopened_space = reopened.space(space).await.unwrap();
+        let pending = reopened_space.admits().iter_from_neck().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            &pending[1].entries[0].device_entry.mutation,
+            homebase::Mutation::DeleteRange { .. }
+        ));
+    });
+}
+
+#[test]
 fn pull_authenticates_the_complete_page_before_appending_any_batch() {
     block_on(async {
         let envelope = encrypted_envelope();
@@ -489,6 +620,15 @@ fn pull_authenticates_the_complete_page_before_appending_any_batch() {
         let writer_space = writer.space(space).await.unwrap();
         writer_space
             .submit_unchecked([set(key(&[b"db", b"row"]), b"secret")], vec![])
+            .await
+            .unwrap();
+        writer_space
+            .submit_unchecked(
+                [homebase::Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                }],
+                vec![],
+            )
             .await
             .unwrap();
         writer_space.push().await.unwrap();

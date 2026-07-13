@@ -29,6 +29,19 @@ impl Range {
         self.covers_range(other) || other.covers_range(self)
     }
 
+    /// The shared subtree of two overlapping hierarchical ranges. Because
+    /// ranges are only Full or tuple prefixes, an intersection is always the
+    /// narrower operand rather than a newly synthesized shape.
+    pub fn intersection(&self, other: &Range) -> Option<Range> {
+        if self.covers_range(other) {
+            Some(other.clone())
+        } else if other.covers_range(self) {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+
     /// Stable encoding used by checksums, local storage, and AEAD AAD.
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -79,6 +92,18 @@ mod tests {
         assert!(parent.overlaps(&child));
         assert!(child.overlaps(&parent));
         assert!(!parent.overlaps(&sibling));
+    }
+
+    #[test]
+    fn intersection_returns_the_narrower_overlapping_range() {
+        let parent = Range::Prefix(key(&[b"db"]));
+        let child = Range::Prefix(key(&[b"db", b"child"]));
+        let sibling = Range::Prefix(key(&[b"other"]));
+
+        assert_eq!(Range::Full.intersection(&child), Some(child.clone()));
+        assert_eq!(parent.intersection(&child), Some(child.clone()));
+        assert_eq!(child.intersection(&parent), Some(child));
+        assert_eq!(parent.intersection(&sibling), None);
     }
 
     #[test]

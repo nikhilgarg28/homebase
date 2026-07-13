@@ -95,16 +95,6 @@ impl Space {
         data::admit(self.id, &self.leases, store, now, req).await
     }
 
-    #[cfg(test)]
-    async fn admit_internal<S: OrderedStore>(
-        &mut self,
-        store: &S,
-        now: Timestamp,
-        req: &AdmissionRequest,
-    ) -> Result<AdmissionResponse, Error> {
-        data::admit_internal(self.id, &self.leases, store, now, req).await
-    }
-
     pub async fn pull<S: OrderedStore>(
         &self,
         store: &S,
@@ -369,7 +359,7 @@ mod tests {
         ))
     }
 
-    fn admit_internal_entries(
+    fn admit_range_entries(
         space: &mut Space,
         store: &MemoryStore,
         lease: LeaseId,
@@ -380,7 +370,7 @@ mod tests {
             .unwrap()
             .map(|bytes| DeviceRecord::decode(&bytes).unwrap().checksum)
             .unwrap_or_default();
-        block_on(space.admit_internal(
+        block_on(space.admit(
             store,
             Timestamp(1),
             &AdmissionRequest {
@@ -666,9 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_range_is_rejected_without_advancing_device_or_admission_state() {
+    fn delete_range_is_publicly_admitted_with_dense_state() {
         let (mut space, store, lease) = setup();
-        let err = admit(
+        let deleted = admit(
             &mut space,
             &store,
             lease,
@@ -680,16 +670,22 @@ mod tests {
                 1,
             )],
         )
-        .unwrap_err();
-        assert_eq!(err, Error::Kernel(KernelError::DeleteRangeUnsupported));
+        .unwrap();
+        assert_eq!(deleted.applied_admission_seq(0), Some(AdmissionSeq(1)));
 
-        let k = key(&[b"db", b"after-rejection"]);
-        let response = admit(&mut space, &store, lease, 1, vec![put(&k, b"v", 1)]).unwrap();
-        assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(1)));
+        let k = key(&[b"db", b"after-range"]);
+        let response = admit(&mut space, &store, lease, 2, vec![put(&k, b"v", 2)]).unwrap();
+        assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(2)));
+        assert!(
+            block_on(space.get(&store, &GetRequest { keys: vec![k] }))
+                .unwrap()
+                .entries[0]
+                .is_some()
+        );
     }
 
     #[test]
-    fn internal_mixed_pairs_refine_reference_visibility_and_exact_log_order() {
+    fn public_mixed_pairs_refine_reference_visibility_and_exact_log_order() {
         fn mutation(kind: u8, value: u8) -> Mutation<OpaqueValue> {
             match kind {
                 0 => Mutation::Set {
@@ -743,7 +739,7 @@ mod tests {
                     1,
                     vec![(mutations[0].clone(), 1), (mutations[1].clone(), 2)],
                 );
-                admit_internal_entries(&mut space, &store, lease, 1, entries.clone()).unwrap();
+                admit_range_entries(&mut space, &store, lease, 1, entries.clone()).unwrap();
 
                 let mut model = ReferenceModel::default();
                 model.append_batch(
@@ -818,7 +814,7 @@ mod tests {
         let b = key(&[b"db", b"child", b"b"]);
         let c = key(&[b"outside", b"c"]);
 
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -836,7 +832,7 @@ mod tests {
         );
 
         for (seq, ver) in [(2, 4), (3, 5)] {
-            admit_internal_entries(
+            admit_range_entries(
                 &mut space,
                 &store,
                 lease,
@@ -859,7 +855,7 @@ mod tests {
             );
         }
 
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -872,7 +868,7 @@ mod tests {
             &[(Range::Full, 3), (db.clone(), 2), (child.clone(), 1)],
         );
 
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -896,7 +892,7 @@ mod tests {
 
         // The retained point Set is already hidden, so a later point Delete
         // advances history without decrementing any count.
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -910,7 +906,7 @@ mod tests {
         );
 
         let revived = key(&[b"db", b"child", b"new"]);
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -923,7 +919,7 @@ mod tests {
             &[(Range::Full, 2), (db.clone(), 1), (child.clone(), 1)],
         );
 
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -943,7 +939,7 @@ mod tests {
         let mut space = Space::new(SPACE);
         let store = FailApplyStore::default();
         let row = key(&[b"db", b"row"]);
-        let first = block_on(space.admit_internal(
+        let first = block_on(space.admit(
             &store,
             Timestamp(1),
             &AdmissionRequest {
@@ -962,7 +958,7 @@ mod tests {
         assert_effective_counts(&store, &[(Range::Full, 1), (db.clone(), 1)]);
 
         store.fail_next_apply();
-        let failed = block_on(space.admit_internal(
+        let failed = block_on(space.admit(
             &store,
             Timestamp(1),
             &AdmissionRequest {
@@ -1031,7 +1027,7 @@ mod tests {
                 }
             })
             .collect();
-        let response = block_on(space.admit_internal(
+        let response = block_on(space.admit(
             &store,
             Timestamp(1),
             &AdmissionRequest {
@@ -1071,7 +1067,7 @@ mod tests {
         corrupt.put(prefix_meta_key(SPACE, db_key.components()), child.encode());
         block_on(store.apply(corrupt)).unwrap();
 
-        admit_internal_entries(
+        admit_range_entries(
             &mut space,
             &store,
             lease,
@@ -1091,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_range_pull_is_dense_bounded_and_exact() {
+    fn public_range_pull_is_dense_bounded_and_exact() {
         let mut space = Space::new(SPACE);
         let store = MemoryStore::new();
         let db = Range::Prefix(key(&[b"db"]));
@@ -1116,7 +1112,7 @@ mod tests {
                 }
             })
             .collect();
-        block_on(space.admit_internal(
+        block_on(space.admit(
             &store,
             Timestamp(1),
             &AdmissionRequest {
@@ -1190,7 +1186,7 @@ mod tests {
         for (index, mutations) in commands.into_iter().enumerate() {
             let seq = u64::try_from(index + 1).unwrap();
             let entries = entries_with_vers(dev(1), seq, mutations.clone());
-            admit_internal_entries(&mut space, &store, lease, seq, entries).unwrap();
+            admit_range_entries(&mut space, &store, lease, seq, entries).unwrap();
             model.append_batch(
                 dev(1),
                 DeviceSeq(seq),
@@ -1250,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_range_and_point_version_fences_reject_atomically() {
+    fn public_range_and_point_version_fences_reject_atomically() {
         let (mut space, store, lease) = setup();
         let row = key(&[b"db", b"row"]);
         admit(&mut space, &store, lease, 1, vec![put(&row, b"old", 10)]).unwrap();
@@ -1266,7 +1262,7 @@ mod tests {
             )],
         );
         assert!(matches!(
-            admit_internal_entries(&mut space, &store, lease, 2, stale_range),
+            admit_range_entries(&mut space, &store, lease, 2, stale_range),
             Err(Error::Kernel(KernelError::RangeVerRegression {
                 current: Ver(10),
                 attempted: Ver(10),
@@ -1284,7 +1280,7 @@ mod tests {
                 11,
             )],
         );
-        admit_internal_entries(&mut space, &store, lease, 2, valid_range).unwrap();
+        admit_range_entries(&mut space, &store, lease, 2, valid_range).unwrap();
         assert!(
             block_on(space.get(
                 &store,
@@ -1309,7 +1305,7 @@ mod tests {
             )],
         );
         assert!(matches!(
-            admit_internal_entries(&mut space, &store, lease, 3, stale_revive),
+            admit_range_entries(&mut space, &store, lease, 3, stale_revive),
             Err(Error::Kernel(KernelError::VerRegression {
                 current: Ver(11),
                 attempted: Ver(11),
@@ -1327,7 +1323,7 @@ mod tests {
                 12,
             )],
         );
-        admit_internal_entries(&mut space, &store, lease, 3, valid_revive).unwrap();
+        admit_range_entries(&mut space, &store, lease, 3, valid_revive).unwrap();
         assert!(
             block_on(space.get(&store, &GetRequest { keys: vec![row] }))
                 .unwrap()
@@ -1337,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_mixed_rejection_discards_the_entire_staged_prefix() {
+    fn public_mixed_rejection_discards_the_entire_staged_prefix() {
         let (mut space, store, lease) = setup();
         let row = key(&[b"db", b"row"]);
         let rejected = entries_with_vers(
@@ -1360,7 +1356,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            admit_internal_entries(&mut space, &store, lease, 1, rejected),
+            admit_range_entries(&mut space, &store, lease, 1, rejected),
             Err(Error::Kernel(KernelError::RangeVerRegression {
                 current: Ver(2),
                 attempted: Ver(1),
@@ -1408,12 +1404,12 @@ mod tests {
                 ),
             ],
         );
-        let response = admit_internal_entries(&mut space, &store, lease, 1, accepted).unwrap();
+        let response = admit_range_entries(&mut space, &store, lease, 1, accepted).unwrap();
         assert_eq!(response.applied_admission_seq(0), Some(AdmissionSeq(1)));
     }
 
     #[test]
-    fn internally_admitted_range_history_invalidates_parent_and_child_assertions() {
+    fn publicly_admitted_range_history_invalidates_parent_and_child_assertions() {
         let mut space = Space::new(SPACE);
         let store = MemoryStore::new();
         let deleted = Range::Prefix(key(&[b"db", b"child"]));
@@ -1436,7 +1432,7 @@ mod tests {
                 ),
             }],
         };
-        block_on(space.admit_internal(&store, Timestamp(1), &request)).unwrap();
+        block_on(space.admit(&store, Timestamp(1), &request)).unwrap();
 
         let response = block_on(space.admit(
             &store,

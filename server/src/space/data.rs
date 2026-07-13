@@ -27,9 +27,8 @@
 //! writes, atomically:
 //! immutable admission headers and point/range operations, point data, exact
 //! range tombstones, the Full root plus per-prefix historical/count
-//! aggregates, the device high water, and counters. Lazy range count resets
-//! are implemented in the private engine; the public entrypoint remains gated
-//! until replay and client handling are complete.
+//! aggregates, the device high water, and counters. Set, Delete, and
+//! DeleteRange share this public admission path.
 //!
 //! # Reads
 //!
@@ -72,18 +71,7 @@ pub async fn admit<S: OrderedStore>(
     now: Timestamp,
     req: &AdmissionRequest,
 ) -> Result<AdmissionResponse, Error> {
-    admit_impl(space, leases, store, now, req, false).await
-}
-
-#[cfg(test)]
-pub(crate) async fn admit_internal<S: OrderedStore>(
-    space: SpaceId,
-    leases: &LeaseManager,
-    store: &S,
-    now: Timestamp,
-    req: &AdmissionRequest,
-) -> Result<AdmissionResponse, Error> {
-    admit_impl(space, leases, store, now, req, true).await
+    admit_impl(space, leases, store, now, req).await
 }
 
 async fn admit_impl<S: OrderedStore>(
@@ -92,7 +80,6 @@ async fn admit_impl<S: OrderedStore>(
     store: &S,
     now: Timestamp,
     req: &AdmissionRequest,
-    allow_delete_range: bool,
 ) -> Result<AdmissionResponse, Error> {
     // 1. Confirm the exact device history before validating a new suffix.
     // A lost acknowledgement must remain reconcilable even if leases or
@@ -126,16 +113,6 @@ async fn admit_impl<S: OrderedStore>(
         }
         first = false;
         last_device_seq = client_batch.device_seq;
-    }
-
-    if !allow_delete_range
-        && req
-            .batches
-            .iter()
-            .flat_map(|batch| &batch.entries)
-            .any(|entry| entry.mutation.is_delete_range())
-    {
-        return Err(KernelError::DeleteRangeUnsupported.into());
     }
 
     // 2. Reservation conflicts over data entries; an empty batch is a no-op.

@@ -308,9 +308,10 @@ materialization, range tombstones, the exact log, device state, checksum, and
 counters. Snapshot reads use the same effective-count rule for their empty
 subtree short circuit.
 
-The implementation remains behind the public unsupported gate through DR7;
-server replay and client integration must understand range operations before
-the gate can open.
+The implementation remained behind the public unsupported gate through DR7.
+DR8 opens the shared admission path after client submission, authenticated
+pull/fetch, durable admit-log, recovery, and scoped-effect handling all support
+range operations.
 
 The point's previous visibility is computed against covering tombstones, not
 only from whether its retained point record is a Set.
@@ -438,8 +439,8 @@ was left physically untouched by the lazy reset.
 
 Dense `pull` uses the same exact log decoder and returns range operations once
 in their original batch, while retaining empty batches and bounded-page
-density. Public DeleteRange admission remains gated; DR8 completes client
-submission and admit-log handling before opening it.
+density. DR8 removes the former private/public admission split after client
+submission and admit-log handling become range-aware.
 
 The first case clears all of the requested local range. The second clears a
 nested part of it.
@@ -662,6 +663,15 @@ For DeleteRange, a fetch caller that materializes only the requested range
 applies the intersection of source range and requested range. The client
 admit-log consumer sees the complete space log and therefore applies the
 original DeleteRange directly.
+
+DR8 validates every fetched source against the encoded request scope before
+returning it. [`FetchedRange::delete_range_effect`] computes the deterministic
+intersection in the same encoded name domain as returned operations while the
+original authenticated source remains unchanged. Fetch performs no MetaStore
+transition; dense pull authenticates the complete page before atomically
+appending range-bearing batches and raising the space-local `ver_high`.
+
+[`FetchedRange::delete_range_effect`]: client/src/space.rs
 
 This decision makes a space the minimum replication and client-log authority
 unit. Future subspace-only replication would require separate subscription

@@ -539,7 +539,7 @@ impl DataRecord {
             Mutation::Set { value, .. } => value.0.len(),
             Mutation::Delete { .. } => 0,
             Mutation::DeleteRange { .. } => {
-                panic!("unsupported DeleteRange cannot be stored as point data")
+                panic!("DeleteRange cannot be stored as point data")
             }
         };
         let tag = self.entry.device_entry.tag;
@@ -561,7 +561,7 @@ impl DataRecord {
                 out.extend_from_slice(&value.0);
             }
             Mutation::DeleteRange { .. } => {
-                unreachable!("DeleteRange was rejected before point-data encoding")
+                unreachable!("DeleteRange is encoded in range-tombstone storage")
             }
         }
         out

@@ -24,10 +24,10 @@ use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionOrder, AdmissionSeq, DeviceChecksum, DeviceId, DeviceSeq};
 use homebase_server::schema::{
     AdmissionHeaderRecord, AdmissionTarget, CountersRecord, DataRecord, DeviceRecord, LeaseRecord,
-    PrefixMetaRecord, admission_header_key, admission_log_scan_all, admission_op_parts,
-    admission_op_scan, counters_key, data_scan_all, device_key, lease_by_id_scan,
-    lease_by_prefix_scan_all, prefix_meta_key, prefix_meta_scan_all, root_meta_key,
-    user_key_from_data,
+    PrefixMetaRecord, RangeDeleteRecord, admission_header_key, admission_log_scan_all,
+    admission_op_parts, admission_op_scan, counters_key, data_scan_all, device_key,
+    lease_by_id_scan, lease_by_prefix_scan_all, prefix_meta_key, prefix_meta_scan_all,
+    root_meta_key, user_key_from_data,
 };
 use homebase_server::storage::{OrderedStore, collect_scan};
 use pollster::block_on;
@@ -88,22 +88,29 @@ pub fn audit<S: OrderedStore>(space: SpaceId, store: &S) -> StoreAudit {
                 admission_op_parts(&storage_key).expect("undecodable admission operation key");
             assert_eq!(stored_seq, admission_seq, "operation under wrong header");
             assert_eq!(op_index, operation_count, "admission operation gap");
-            let AdmissionTarget::Point(key) = target else {
-                panic!("public DR5 gate admitted a range operation")
+            let entry = match target {
+                AdmissionTarget::Point(key) => {
+                    let record = DataRecord::decode(key.clone(), &bytes)
+                        .expect("undecodable point admission operation record");
+                    replayed.insert(key, record.clone());
+                    record.entry
+                }
+                AdmissionTarget::Range(range) => {
+                    RangeDeleteRecord::decode(range, &bytes)
+                        .expect("undecodable range admission operation record")
+                        .entry
+                }
             };
-            let record = DataRecord::decode(key.clone(), &bytes)
-                .expect("undecodable point admission operation record");
             assert_eq!(
-                record.entry.admission.order(),
+                entry.admission.order(),
                 AdmissionOrder {
                     admission_seq,
                     op_index,
                 },
                 "operation tag diverges from log position"
             );
-            assert_eq!(record.entry.device_entry.tag.device, header.device);
-            assert_eq!(record.entry.device_entry.tag.device_seq, header.device_seq);
-            replayed.insert(key, record);
+            assert_eq!(entry.device_entry.tag.device, header.device);
+            assert_eq!(entry.device_entry.tag.device_seq, header.device_seq);
             operation_count += 1;
             expected_record_count += 1;
         }

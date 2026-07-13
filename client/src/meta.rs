@@ -2395,7 +2395,9 @@ pub mod conformance {
             batches: vec![admitted_batch(
                 1,
                 9,
-                vec![set(key(&[b"db", b"remote"]), b"observed")],
+                vec![Mutation::DeleteRange {
+                    range: Range::Prefix(key(&[b"db"])),
+                }],
             )],
         };
         store.append_admits(space, &observed).await.unwrap();

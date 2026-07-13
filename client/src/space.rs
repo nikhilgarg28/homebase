@@ -155,9 +155,21 @@ pub struct RepairedLeases {
 /// One authenticated stateless range observation and its next cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchedRange<T = Vec<u8>> {
+    /// Caller-requested range in the application's name domain.
     pub range: Range,
     pub at: AdmissionSeq,
     pub cut: RangeCut<T>,
+    /// Request scope in the same encoded name domain as returned operations.
+    encoded_scope: Range,
+}
+
+impl<T> FetchedRange<T> {
+    /// Effective range of an authenticated DeleteRange source within this
+    /// fetch. The result is in the same encoded name domain as `cut`; the
+    /// original source operation remains unchanged and carries its seal.
+    pub fn delete_range_effect(&self, source: &Range) -> Option<Range> {
+        self.encoded_scope.intersection(source)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -755,6 +767,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
     ) -> Result<FetchedRange, SpaceDriverError> {
         let _permit = self.enter().await?;
         let encoded_range = self.cipher().encode_range(&range)?;
+        let encoded_scope = encoded_range.clone();
         let response = self
             .client
             .server()
@@ -786,7 +799,14 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .await
             .map_err(coordination_unavailable)?
             .map_err(SpaceDriverError::from)?;
-        Ok(FetchedRange { range, at, cut })
+        validate_fetched_cut(&encoded_scope, &cut)
+            .map_err(|reason| SpaceDriverError::MalformedResponse { reason })?;
+        Ok(FetchedRange {
+            range,
+            at,
+            cut,
+            encoded_scope,
+        })
     }
 
     async fn enter(
@@ -1140,8 +1160,106 @@ fn open_range_cut(cipher: &SpaceCipher, cut: RangeCut) -> Result<RangeCut<Vec<u8
     }
 }
 
+fn validate_fetched_cut<T>(scope: &Range, cut: &RangeCut<T>) -> Result<(), String> {
+    let entries = match cut {
+        RangeCut::Snapshot(entries) => {
+            for entry in entries {
+                match &entry.device_entry.mutation {
+                    Mutation::Set { key, .. } if scope.covers_key(key) => {}
+                    Mutation::Set { .. }
+                    | Mutation::Delete { .. }
+                    | Mutation::DeleteRange { .. } => {
+                        return Err(
+                            "range snapshot contains an out-of-scope or non-live operation".into(),
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+        RangeCut::Delta(entries) => entries,
+    };
+    for entry in entries {
+        let relevant = match &entry.device_entry.mutation {
+            Mutation::Set { key, .. } | Mutation::Delete { key } => scope.covers_key(key),
+            Mutation::DeleteRange { range } => scope.overlaps(range),
+        };
+        if !relevant {
+            return Err("range delta contains an out-of-scope operation".into());
+        }
+    }
+    Ok(())
+}
+
 fn coordination_unavailable(error: crate::coordination::CoordinationError) -> SpaceDriverError {
     SpaceDriverError::Unavailable {
         reason: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use homebase_core::seal::Seal;
+    use homebase_core::tag::{AdmissionTag, AdmittedEntry, OpaqueValue, Ver};
+
+    fn key(parts: &[&[u8]]) -> Key {
+        Key::from_bytes(parts.iter().copied()).unwrap()
+    }
+
+    fn entry(mutation: Mutation<OpaqueValue>) -> AdmittedEntry {
+        AdmittedEntry {
+            device_entry: homebase_core::tag::DeviceEntry {
+                mutation,
+                tag: DeviceTag {
+                    device: DeviceId([1; 16]),
+                    device_seq: DeviceSeq(1),
+                    ver: Ver(1),
+                    cipher_epoch: CipherEpoch(0),
+                },
+                seal: Seal::empty_aead_v1(),
+            },
+            admission: AdmissionTag {
+                admission_seq: AdmissionSeq(1),
+                op_index: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn fetched_cut_rejects_sources_outside_its_scope() {
+        let scope = Range::Prefix(key(&[b"db", b"child"]));
+        let ancestor = entry(Mutation::DeleteRange {
+            range: Range::Prefix(key(&[b"db"])),
+        });
+        assert!(validate_fetched_cut(&scope, &RangeCut::Delta(vec![ancestor])).is_ok());
+
+        let sibling_point = entry(Mutation::Delete {
+            key: key(&[b"db", b"sibling", b"row"]),
+        });
+        assert!(validate_fetched_cut(&scope, &RangeCut::Delta(vec![sibling_point])).is_err());
+        let sibling_range = entry(Mutation::DeleteRange {
+            range: Range::Prefix(key(&[b"db", b"sibling"])),
+        });
+        assert!(validate_fetched_cut(&scope, &RangeCut::Delta(vec![sibling_range])).is_err());
+    }
+
+    #[test]
+    fn fetched_range_projects_delete_to_requested_intersection() {
+        let scope = Range::Prefix(key(&[b"db", b"child"]));
+        let fetched = FetchedRange::<Vec<u8>> {
+            range: scope.clone(),
+            at: AdmissionSeq(1),
+            cut: RangeCut::Delta(Vec::new()),
+            encoded_scope: scope.clone(),
+        };
+        assert_eq!(
+            fetched.delete_range_effect(&Range::Prefix(key(&[b"db"]))),
+            Some(scope)
+        );
+        assert_eq!(
+            fetched.delete_range_effect(&Range::Prefix(key(&[b"other"]))),
+            None
+        );
     }
 }

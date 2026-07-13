@@ -511,7 +511,6 @@ pub enum KernelError {
     InvalidSeal { reason: String },
     /// Range deletes are understood by the protocol but not yet admitted by
     /// this server implementation.
-    DeleteRangeUnsupported,
     /// One or more range watermarks did not match the server-visible prefix
     /// high water.
     RangeAssertFailed { failures: Vec<RangeAssertFailure> },
@@ -565,7 +564,6 @@ impl fmt::Display for KernelError {
             Self::LeaseInvalid { lease } => write!(f, "lease {lease:?} is not live"),
             Self::NotCovered { key } => write!(f, "key {key:?} not covered by any presented lease"),
             Self::InvalidSeal { reason } => write!(f, "invalid seal: {reason}"),
-            Self::DeleteRangeUnsupported => write!(f, "DeleteRange is not supported yet"),
             Self::RangeAssertFailed { failures } => {
                 write!(f, "{} range assert(s) failed", failures.len())
             }

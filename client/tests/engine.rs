@@ -1806,6 +1806,87 @@ fn group_rejection_probes_to_the_faulty_commit() {
 }
 
 #[test]
+fn stale_delete_range_rolls_back_without_poisoning_later_submissions() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let db = key(&[b"db"]);
+        let foreign = key(&[b"db", b"foreign"]);
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PendingEntry {
+                key: foreign.clone(),
+                value: val(b"foreign"),
+                ver: Ver(100),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let stale = space
+            .submit_unchecked(
+                vec![Mutation::DeleteRange {
+                    range: Range::Prefix(db),
+                }],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale.push().await.unwrap(),
+            PushReceipt::Failed {
+                seq: DeviceSeq(1),
+                error: KernelError::RangeVerRegression {
+                    current: Ver(100),
+                    attempted: Ver(1),
+                    ..
+                },
+            }
+        ));
+
+        client.rollback(SPACE, DeviceSeq(1)).await.unwrap();
+        assert_eq!(
+            space.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(2))
+            }
+        );
+        let outside = key(&[b"outside", b"row"]);
+        let accepted = space
+            .submit_unchecked(vec![set(outside.clone(), b"ok")], vec![])
+            .await
+            .unwrap();
+        assert!(matches!(
+            accepted.push().await.unwrap(),
+            PushReceipt::Applied {
+                seq: DeviceSeq(3),
+                admission_seq: Some(_),
+            }
+        ));
+        assert_eq!(
+            entry_value(&fetch(&handle, SPACE, &foreign).await.unwrap()),
+            b"foreign"
+        );
+        assert_eq!(
+            entry_value(&fetch(&handle, SPACE, &outside).await.unwrap()),
+            b"ok"
+        );
+    });
+}
+
+#[test]
 fn submission_push_stops_at_target_and_attributes_later_failure() {
     block_on(async {
         let mem = MemoryStore::new();
