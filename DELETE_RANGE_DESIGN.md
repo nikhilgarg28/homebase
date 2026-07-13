@@ -767,6 +767,17 @@ command and compared with that model. Commands include multiple devices,
 mixed batches, Set/Delete/DeleteRange at parent/child/full ranges, assertions,
 lease acquire/renew/unlease/expiry, pull/fetch/mark/trim, crashes, and reopen.
 
+DR9a strengthens the simulation store audit before adding those workloads. It
+replays the immutable admission log to reconstruct exact point records and
+exact-target range tombstones. For aggregates it deliberately does not repeat
+the lazy subtraction algorithm: after each source operation it brute-force
+scans replayed visibility for only the aggregate nodes that operation touches,
+thereby reconstructing historical heads, `max_ver`, physical `live_count`, and
+`count_epoch`, including intentionally stale descendant records. Stored point,
+range, prefix, and Full-root materialization must match this reconstruction.
+Dedicated corruption tests prove that independently altering a tombstone or a
+lazy aggregate is detected.
+
 The following laws are permanent tests rather than one-time examples:
 
 1. **Read agreement:** `get`, `list`, server log replay, and model visibility
