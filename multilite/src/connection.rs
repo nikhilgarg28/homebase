@@ -1,6 +1,54 @@
 use crate::{Error, Params, Result};
+use parking_lot::ReentrantMutex;
 use rusqlite::{Connection, Row, Statement};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Serialized ownership of Multilite's one SQLite connection.
+///
+/// Access is reentrant on the owning thread because Homebase metadata writes
+/// must join an outer SQLite operation on this same connection. Other threads
+/// remain serialized by the mutex.
+#[derive(Clone)]
+pub(crate) struct ConnectionOwner {
+    inner: Arc<ConnectionState>,
+}
+
+struct ConnectionState {
+    connection: ReentrantMutex<Connection>,
+    next_savepoint: AtomicU64,
+}
+
+impl ConnectionOwner {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::new(Connection::open(path)?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self> {
+        Ok(Self::new(Connection::open_in_memory()?))
+    }
+
+    pub(crate) fn new(connection: Connection) -> Self {
+        Self {
+            inner: Arc::new(ConnectionState {
+                connection: ReentrantMutex::new(connection),
+                next_savepoint: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub(crate) fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> T) -> T {
+        let connection = self.inner.connection.lock();
+        operation(&connection)
+    }
+
+    pub(crate) fn next_savepoint_name(&self, prefix: &str) -> String {
+        let next = self.inner.next_savepoint.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{next}")
+    }
+}
 
 /// A Multilite-owned SQLite connection.
 ///

@@ -1620,7 +1620,10 @@ dependencies = [
 name = "multilite"
 version = "0.0.1"
 dependencies = [
+ "homebase-client",
  "homebase-core",
+ "parking_lot",
+ "pollster",
  "rusqlite",
  "sha2",
  "tempfile",

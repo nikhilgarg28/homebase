@@ -1,5 +1,6 @@
 use std::fmt;
 
+use homebase_core::storage::StorageError;
 use rusqlite::types::{FromSqlError, Type};
 
 /// An error returned by Multilite's SQLite-facing API.
@@ -20,6 +21,8 @@ pub enum Error {
     },
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
+    /// Durable Homebase metadata storage failed.
+    Storage(StorageError),
 }
 
 impl fmt::Display for Error {
@@ -41,6 +44,7 @@ impl fmt::Display for Error {
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
+            Self::Storage(error) => write!(f, "metadata storage error: {error}"),
         }
     }
 }
@@ -53,6 +57,7 @@ impl std::error::Error for Error {
             Self::ValueConversion(error) => Some(error),
             Self::UnexpectedValueType { .. } => None,
             Self::CaptureInvariant(_) => None,
+            Self::Storage(error) => Some(error),
         }
     }
 }
@@ -60,6 +65,12 @@ impl std::error::Error for Error {
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
+    }
+}
+
+impl From<StorageError> for Error {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 

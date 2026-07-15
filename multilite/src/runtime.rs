@@ -8,13 +8,13 @@
     )
 )]
 
-use std::cell::Cell;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthContext, Authorization, PreUpdateCase};
 
+use crate::connection::ConnectionOwner;
 use crate::{Error, Result};
 
 /// Why Multilite is executing SQL on its owned connection.
@@ -47,52 +47,51 @@ pub(crate) trait HookPolicy: Send + 'static {
 
 /// A SQLite connection with scoped execution modes and attributed hook events.
 pub(crate) struct RuntimeConnection<P: HookPolicy> {
-    connection: Connection,
+    owner: ConnectionOwner,
     state: Arc<Mutex<HookState<P>>>,
-    next_savepoint: Cell<u64>,
 }
 
 impl<P: HookPolicy> RuntimeConnection<P> {
     pub(crate) fn open(path: impl AsRef<Path>, policy: P) -> Result<Self> {
-        Self::new(Connection::open(path)?, policy)
+        Self::new(ConnectionOwner::open(path)?, policy)
     }
 
     #[cfg(test)]
     pub(crate) fn open_in_memory(policy: P) -> Result<Self> {
-        Self::new(Connection::open_in_memory()?, policy)
+        Self::new(ConnectionOwner::open_in_memory()?, policy)
     }
 
-    fn new(connection: Connection, policy: P) -> Result<Self> {
+    fn new(owner: ConnectionOwner, policy: P) -> Result<Self> {
         let state = Arc::new(Mutex::new(HookState::new(policy)));
 
         let authorizer_state = Arc::clone(&state);
-        connection.authorizer(Some(move |context: AuthContext<'_>| {
-            let mut state = lock(&authorizer_state);
-            let mode = state.mode();
-            state.policy.authorize(mode, context)
-        }))?;
+        owner.with_connection(|connection| {
+            connection.authorizer(Some(move |context: AuthContext<'_>| {
+                let mut state = lock(&authorizer_state);
+                let mode = state.mode();
+                state.policy.authorize(mode, context)
+            }))
+        })?;
 
         let preupdate_state = Arc::clone(&state);
-        connection.preupdate_hook(Some(
-            move |_action, database: &str, table: &str, update: &PreUpdateCase| {
-                let mut state = lock(&preupdate_state);
-                if state.callback_error.is_some() {
-                    return;
-                }
-                let mode = state.mode();
-                match state.policy.preupdate(mode, database, table, update) {
-                    Ok(Some(event)) => state.events.push(event),
-                    Ok(None) => {}
-                    Err(error) => state.callback_error = Some(error),
-                }
-            },
-        ))?;
+        owner.with_connection(|connection| {
+            connection.preupdate_hook(Some(
+                move |_action, database: &str, table: &str, update: &PreUpdateCase| {
+                    let mut state = lock(&preupdate_state);
+                    if state.callback_error.is_some() {
+                        return;
+                    }
+                    let mode = state.mode();
+                    match state.policy.preupdate(mode, database, table, update) {
+                        Ok(Some(event)) => state.events.push(event),
+                        Ok(None) => {}
+                        Err(error) => state.callback_error = Some(error),
+                    }
+                },
+            ))
+        })?;
 
-        Ok(Self {
-            connection,
-            state,
-            next_savepoint: Cell::new(0),
-        })
+        Ok(Self { owner, state })
     }
 
     /// Run one atomic unit and return only the events captured by that unit.
@@ -105,7 +104,7 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         let event_checkpoint = self.event_count();
         let savepoint = SavepointGuard::begin(self, event_checkpoint)?;
 
-        let operation_result = self.with_mode(mode, || operation(&self.connection));
+        let operation_result = self.with_mode(mode, || self.owner.with_connection(operation));
         if let Some(error) = self.take_callback_error() {
             savepoint.rollback()?;
             return Err(error);
@@ -125,7 +124,9 @@ impl<P: HookPolicy> RuntimeConnection<P> {
 
     fn control_sql(&self, sql: &str) -> Result<()> {
         self.with_mode(ExecutionMode::InternalMetadata, || {
-            self.connection.execute_batch(sql).map_err(Into::into)
+            self.owner
+                .with_connection(|connection| connection.execute_batch(sql))
+                .map_err(Into::into)
         })
     }
 
@@ -139,9 +140,11 @@ impl<P: HookPolicy> RuntimeConnection<P> {
     }
 
     fn next_savepoint_name(&self) -> String {
-        let next = self.next_savepoint.get();
-        self.next_savepoint.set(next.wrapping_add(1));
-        format!("_mt_runtime_{next}")
+        self.owner.next_savepoint_name("_mt_runtime")
+    }
+
+    pub(crate) fn owner(&self) -> ConnectionOwner {
+        self.owner.clone()
     }
 
     fn event_count(&self) -> usize {

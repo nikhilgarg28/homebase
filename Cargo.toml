@@ -10,6 +10,7 @@ license = "Apache-2.0"
 repository = "https://github.com/nikhilgarg28/multilite"
 
 [workspace.dependencies]
+homebase-client = { path = "client", version = "0.1.1" }
 homebase-core = { path = "core", version = "0.1.1" }
 # default-features off at the workspace level so light consumers (the client
 # crate's tests) skip slatedb; sim/server turn it back on where needed.
@@ -18,6 +19,7 @@ homebase-sim = { path = "sim", version = "0.1.1", default-features = false }
 rand = "0.9"
 proptest = "1"
 pollster = "0.4"
+parking_lot = "0.12"
 futures-channel = "0.3"
 futures-core = "0.3"
 futures = "0.3"

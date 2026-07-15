@@ -321,6 +321,17 @@ Tests:
 - reopen loads and certifies the complete homebase client state;
 - injected SQLite errors leave no partial `WriteBatch`.
 
+Implementation result: `ConnectionOwner` serializes the one rusqlite
+connection with a thread-reentrant mutex, which satisfies Homebase's `Sync`
+store boundary while allowing ready metadata futures to re-enter an ambient
+runtime operation on the same thread. `SqliteOrderedStore` keeps schema
+initialization explicit for Batch 7, snapshots scans eagerly, and wraps every
+non-empty `WriteBatch` in a uniquely named savepoint. Consecutive puts and
+deletes are grouped into bounded multi-row statements without reordering mixed
+runs. Both conformance suites pass; file-backed tests also prove that a domain
+row and metadata transition commit or roll back together and retain that
+result after reopen.
+
 ### Batch 7: file bootstrap schema
 
 Define the one-file/one-space lifecycle and initialize `items` plus

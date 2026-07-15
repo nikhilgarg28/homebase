@@ -4,6 +4,7 @@
 
 mod connection;
 mod error;
+mod metastore;
 mod runtime;
 mod v1;
 mod value;
