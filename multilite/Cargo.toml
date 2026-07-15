@@ -1,0 +1,14 @@
+[package]
+name = "multilite"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-writer SQLite with E2EE sync, built on homebase - not yet ready for use"
+readme = "README.md"
+
+[dependencies]
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+tempfile.workspace = true

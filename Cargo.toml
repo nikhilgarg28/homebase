@@ -1,17 +1,7 @@
-[package]
-name = "multilite"
-version = "0.0.1"
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-description = "Multi-writer SQLite with E2EE sync, built on homebase - not yet ready for use"
-readme = "README.md"
-exclude = ["/npm", "/python"]
-
 [workspace]
 resolver = "3"
-members = ["core", "server", "client", "sim"]
-default-members = [".", "core", "server", "client", "sim"]
+members = ["core", "server", "client", "sim", "multilite"]
+default-members = ["core", "server", "client", "sim", "multilite"]
 
 [workspace.package]
 version = "0.1.1"
