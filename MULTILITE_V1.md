@@ -4,6 +4,12 @@ Working design note. This is the deliberately small first executable shape for
 multilite: enough real SQLite, local metadata, optimistic sync, and repair
 machinery to prove the loop, without taking on general SQLite replication yet.
 
+V1 is a pre-release implementation boundary, not a compatibility promise.
+There are no released Multilite files and no external users; its schema and
+encodings may be replaced freely before the first supported release. Code tied
+to this design lives under `multilite/src/v1/` so it can evolve or disappear
+without muddying the generic SQLite-facing machinery.
+
 ## V1 shape
 
 V1 is a normal SQLite file with one built-in synced table shape, the existing

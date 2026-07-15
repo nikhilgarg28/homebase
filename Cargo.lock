@@ -1541,7 +1541,9 @@ dependencies = [
 name = "multilite"
 version = "0.0.1"
 dependencies = [
+ "homebase-core",
  "rusqlite",
+ "sha2",
  "tempfile",
 ]
 

@@ -9,6 +9,7 @@
 //!   servers and clients, hand-cranked time for tests and the sim
 //! - [`messages`] — transport-neutral request/response messages for the
 //!   kernel verbs, and [`KernelError`]
+//! - [`reader`] — bounded reads over encoded byte records
 //! - [`seal`] — AEAD seal metadata attached to encrypted value operations
 //! - [`space`] — [`SpaceId`] and the [`Space`] trait, the async verb
 //!   contract every request executes against
@@ -26,6 +27,7 @@ pub mod key;
 pub mod lease;
 pub mod messages;
 pub mod range;
+pub mod reader;
 pub mod seal;
 pub mod space;
 pub mod storage;

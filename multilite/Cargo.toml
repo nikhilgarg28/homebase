@@ -8,7 +8,9 @@ description = "Multi-writer SQLite with E2EE sync, built on homebase - not yet r
 readme = "README.md"
 
 [dependencies]
+homebase-core.workspace = true
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

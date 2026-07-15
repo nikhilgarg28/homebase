@@ -3,17 +3,13 @@ use crate::{Error, Result, Type, Value, ValueRef};
 /// Copy a borrowed SQLite value into its owned representation.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "consumed by Batch 4 V1 item extraction")
+    allow(dead_code, reason = "consumed by Batch 5 SQLite hook capture")
 )]
 pub(crate) fn owned_value(value: ValueRef<'_>) -> Result<Value> {
     Value::try_from(value).map_err(Error::ValueConversion)
 }
 
 /// Return a value's text, requiring SQLite's TEXT storage class.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by Batch 4 V1 item extraction")
-)]
 pub(crate) fn require_text(value: &Value) -> Result<&str> {
     match value {
         Value::Text(text) => Ok(text),
@@ -22,10 +18,6 @@ pub(crate) fn require_text(value: &Value) -> Result<&str> {
 }
 
 /// Return a value's bytes, requiring SQLite's BLOB storage class.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by Batch 4 V1 item extraction")
-)]
 pub(crate) fn require_blob(value: &Value) -> Result<&[u8]> {
     match value {
         Value::Blob(bytes) => Ok(bytes),
@@ -33,10 +25,6 @@ pub(crate) fn require_blob(value: &Value) -> Result<&[u8]> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by Batch 4 V1 item extraction")
-)]
 fn unexpected_type(expected: Type, actual: &Value) -> Error {
     Error::UnexpectedValueType {
         expected,

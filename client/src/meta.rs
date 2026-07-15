@@ -111,6 +111,7 @@ use homebase_core::key::{Key, KeyComponent, decode_components, encode_components
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{AdmittedBatch, PullResponse, RangeAssert};
 use homebase_core::range::Range;
+use homebase_core::reader::Reader;
 use homebase_core::space::SpaceId;
 use homebase_core::storage::{OrderedStore, ScanIter, StorageError, WriteBatch, collect_scan};
 use homebase_core::tag::{
@@ -1933,56 +1934,6 @@ fn u64_at(components: &[KeyComponent], index: usize, what: &str) -> u64 {
             .try_into()
             .unwrap_or_else(|_| panic!("{what} must be 8 bytes")),
     )
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        let b = *self.bytes.get(self.pos)?;
-        self.pos += 1;
-        Some(b)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        let slice = self.bytes.get(self.pos..self.pos + 4)?;
-        self.pos += 4;
-        Some(u32::from_be_bytes(slice.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        let slice = self.bytes.get(self.pos..self.pos + 8)?;
-        self.pos += 8;
-        Some(u64::from_be_bytes(slice.try_into().unwrap()))
-    }
-
-    fn bytes16(&mut self) -> Option<[u8; 16]> {
-        let slice = self.bytes.get(self.pos..self.pos + 16)?;
-        self.pos += 16;
-        Some(slice.try_into().unwrap())
-    }
-
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let slice = self.bytes.get(self.pos..self.pos.checked_add(len)?)?;
-        self.pos += len;
-        Some(slice)
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.bytes[self.pos..]
-    }
-
-    /// For fixed-shape records: trailing garbage is corruption, not slack.
-    fn end(&self) -> Option<()> {
-        (self.pos == self.bytes.len()).then_some(())
-    }
 }
 
 // ---------------------------------------------------------------------------

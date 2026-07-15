@@ -4,6 +4,7 @@
 
 mod connection;
 mod error;
+mod v1;
 mod value;
 
 pub use connection::{MultiliteConnection, MultiliteStatement};

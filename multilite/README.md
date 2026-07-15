@@ -12,5 +12,9 @@ Multilite re-exports rusqlite's `params`, `Params`, `ToSql`, `FromSql`, `Type`,
 SQLite parameter and conversion ecosystem rather than translating through a
 Multilite-specific value model.
 
+V1 item identities use a versioned, length-delimited canonical frame. Their
+Homebase keys are fixed namespace components plus a domain-separated SHA-256
+digest, so empty or large SQLite keys do not inherit Homebase component limits.
+
 See the [monorepo README](../README.md) and
 [V1 plan](../MULTILITE_V1.md) for the current architecture and build sequence.
