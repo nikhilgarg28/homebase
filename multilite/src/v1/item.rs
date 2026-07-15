@@ -85,7 +85,7 @@ impl ItemKey {
 
 /// The complete plaintext carried by a V1 Homebase `Set`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ItemInsert {
+pub(super) struct ItemInsert {
     key: ItemKey,
     payload: Vec<u8>,
 }
@@ -98,7 +98,7 @@ impl ItemInsert {
         }
     }
 
-    fn from_values(collection: &Value, id: &Value, payload: &Value) -> Result<Self> {
+    pub(super) fn from_values(collection: &Value, id: &Value, payload: &Value) -> Result<Self> {
         Ok(Self {
             key: ItemKey::new(require_text(collection)?, require_blob(id)?),
             payload: require_blob(payload)?.to_vec(),

@@ -18,6 +18,8 @@ pub enum Error {
         /// Storage class carried by the value.
         actual: Type,
     },
+    /// A SQLite hook observed a state that violates its capture contract.
+    CaptureInvariant(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -36,6 +38,9 @@ impl fmt::Display for Error {
                     "unexpected SQLite value type: expected {expected}, got {actual}"
                 )
             }
+            Self::CaptureInvariant(message) => {
+                write!(f, "SQLite capture invariant failed: {message}")
+            }
         }
     }
 }
@@ -47,6 +52,7 @@ impl std::error::Error for Error {
             Self::PreparedWrite => None,
             Self::ValueConversion(error) => Some(error),
             Self::UnexpectedValueType { .. } => None,
+            Self::CaptureInvariant(_) => None,
         }
     }
 }

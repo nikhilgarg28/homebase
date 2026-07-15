@@ -293,6 +293,13 @@ If preupdate support is unavailable in the selected SQLite build, explicit
 wrapper logging can be the V1 fallback, but the spike should make that choice
 explicit.
 
+Spike result: the bundled SQLite build supports preupdate capture and V1 uses
+it. The reusable runtime rolls hook failures, operation errors, and panics back
+through an internal savepoint while discarding their captured events. Enabling
+the rusqlite feature currently requires libclang at build time through
+`libsqlite3-sys`; this is accepted for the pre-release implementation and must
+be reconsidered as part of distribution work.
+
 ### Batch 6: SQLite ordered store and homebase metadata
 
 Implement `SqliteOrderedStore` over `_mt_meta_kv` on the same SQLite connection

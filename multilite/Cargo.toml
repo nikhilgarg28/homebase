@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 homebase-core.workspace = true
-rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "preupdate_hook"] }
 sha2.workspace = true
 
 [dev-dependencies]

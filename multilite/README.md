@@ -16,5 +16,10 @@ V1 item identities use a versioned, length-delimited canonical frame. Their
 Homebase keys are fixed namespace components plus a domain-separated SHA-256
 digest, so empty or large SQLite keys do not inherit Homebase component limits.
 
+V1 uses SQLite's preupdate hook to capture inserted values before a statement
+commits. Rusqlite enables that API through build-time bindings, so the current
+Rust build requires libclang; packaging may revisit that tradeoff before the
+first supported release.
+
 See the [monorepo README](../README.md) and
 [V1 plan](../MULTILITE_V1.md) for the current architecture and build sequence.
