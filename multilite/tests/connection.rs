@@ -1,5 +1,5 @@
-use multilite::{Error, MultiliteConnection};
-use rusqlite::{ErrorCode, params};
+use multilite::{Error, MultiliteConnection, params};
+use rusqlite::ErrorCode;
 
 #[test]
 fn execute_and_query_roundtrip_across_reopen() {

@@ -203,7 +203,7 @@ Tests:
 - bind parameters;
 - convert SQLite errors into multilite errors without losing useful detail.
 
-### Batch 3: adopt the rusqlite type surface
+### Batch 3: SQLite type and value machinery
 
 Use rusqlite's value and conversion ecosystem rather than inventing a competing
 public value system:
@@ -213,13 +213,29 @@ pub use rusqlite::{params, Params, ToSql};
 pub use rusqlite::types::{FromSql, Type, Value, ValueRef};
 ```
 
-Define internal helpers for copying and validating V1 values:
+Define generic internal helpers for copying owned SQLite values and requiring a
+particular SQLite storage class:
 
 ```rust
 fn owned_value(v: ValueRef<'_>) -> Result<Value>;
 fn require_text(v: &Value) -> Result<&str>;
 fn require_blob(v: &Value) -> Result<&[u8]>;
 ```
+
+These helpers know about SQLite values and Multilite errors, but not about the
+V1 `items` schema, collections, item identities, or homebase keys.
+
+Tests:
+
+- `ValueRef -> Value` copying preserves null, integer, real, text, and blob;
+- text and blob validation accepts the matching storage class and rejects all
+  other storage classes with useful expected/actual type details;
+- the public API accepts normal rusqlite params and `FromSql` conversions;
+- rusqlite conversion errors retain their original detail.
+
+### Batch 4: V1 item identity and codec
+
+Build the V1 item model on top of the generic SQLite value machinery.
 
 Define the V1 logical structs:
 
@@ -242,18 +258,14 @@ bytes.
 
 Tests:
 
-- `ValueRef -> Value` copying preserves null, integer, real, text, and blob for
-  supported cases;
 - V1 extraction accepts `collection TEXT`, `id BLOB`, and `payload BLOB`;
 - wrong storage classes are rejected for V1 inserts;
 - empty and large collection/id values map to valid fixed-size homebase keys;
 - distinct logical keys have distinct canonical frames and pinned digest
   vectors;
-- `ItemInsert` round-trips and rejects malformed or unknown-version frames;
-- the public API still accepts normal rusqlite params and `FromSql`
-  conversions.
+- `ItemInsert` round-trips and rejects malformed or unknown-version frames.
 
-### Batch 4: SQLite runtime hooks spike
+### Batch 5: SQLite runtime hooks spike
 
 Prove the low-level SQLite machinery V1 needs:
 
@@ -275,7 +287,7 @@ If preupdate support is unavailable in the selected SQLite build, explicit
 wrapper logging can be the V1 fallback, but the spike should make that choice
 explicit.
 
-### Batch 5: SQLite ordered store and homebase metadata
+### Batch 6: SQLite ordered store and homebase metadata
 
 Implement `SqliteOrderedStore` over `_mt_meta_kv` on the same SQLite connection
 used for `items`, then compose it with the existing `OrderedMetaStore`. Reads
@@ -296,7 +308,7 @@ Tests:
 - reopen loads and certifies the complete homebase client state;
 - injected SQLite errors leave no partial `WriteBatch`.
 
-### Batch 6: file bootstrap schema
+### Batch 7: file bootstrap schema
 
 Define the one-file/one-space lifecycle and initialize `items` plus
 `_mt_meta_kv`:
@@ -318,7 +330,7 @@ Tests:
 - stock SQLite reads `items`;
 - `PRAGMA integrity_check` passes.
 
-### Batch 7: SQL surface gate
+### Batch 8: SQL surface gate
 
 Allow only:
 
@@ -351,7 +363,7 @@ Tests:
 - metadata cannot be read or written through the public API;
 - rejected statements leave no mutation behind.
 
-### Batch 8: capture INSERT to homebase submit log
+### Batch 9: capture INSERT to homebase submit log
 
 Wrap each accepted insert:
 
@@ -380,7 +392,7 @@ Tests:
 - reopen sees the unpushed submit log;
 - injected failures cannot produce row-without-log or log-without-row.
 
-### Batch 9: homebase admission integration
+### Batch 10: homebase admission integration
 
 Use the existing homebase server unchanged. Verify Multilite's append-only OCC
 mapping end to end:
@@ -408,7 +420,7 @@ Tests:
 - a raw assertion-free Homebase Set can bypass the append-only convention,
   documenting the V1 trust boundary.
 
-### Batch 10: push
+### Batch 11: push
 
 Delegate to the existing homebase push path. Successful acknowledgement trims
 the admitted submit-log prefix and advances its checksum. The expected
@@ -432,7 +444,7 @@ Tests:
 - submitting after rejection makes that rejection handle stale;
 - unavailable and ambiguous outcomes cannot be passed to repair.
 
-### Batch 11: pull and apply
+### Batch 12: pull and apply
 
 Use homebase `pull` to append complete dense batches to the durable admit log,
 then apply plaintext `ItemInsert` records from admit `neck` in admission and
@@ -458,7 +470,7 @@ Tests:
   advancing admit neck;
 - disjoint foreign rows still apply while local submissions are pending.
 
-### Batch 12: explicit rejected-tail rollback repair
+### Batch 13: explicit rejected-tail rollback repair
 
 `push()` itself never repairs. Given a current definitive `PushRejection`, the
 application explicitly calls `repair(rejection)`. V1 offers no keep/rebase or
@@ -503,7 +515,7 @@ Tests:
 - after a crash before repair, re-push produces a fresh rejection and repair
   converges; after a committed repair, the old handle is stale and harmless.
 
-### Batch 13: end-to-end fault and fidelity matrix
+### Batch 14: end-to-end fault and fidelity matrix
 
 Run the full V1 scenario suite over two or more clients.
 

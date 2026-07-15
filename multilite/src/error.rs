@@ -1,5 +1,7 @@
 use std::fmt;
 
+use rusqlite::types::{FromSqlError, Type};
+
 /// An error returned by Multilite's SQLite-facing API.
 #[derive(Debug)]
 pub enum Error {
@@ -7,6 +9,15 @@ pub enum Error {
     Sqlite(rusqlite::Error),
     /// V1 prepared statements are read-only; writes must use `execute`.
     PreparedWrite,
+    /// A borrowed SQLite value could not be copied into its owned form.
+    ValueConversion(FromSqlError),
+    /// A value did not have the required SQLite storage class.
+    UnexpectedValueType {
+        /// Storage class required by the operation.
+        expected: Type,
+        /// Storage class carried by the value.
+        actual: Type,
+    },
 }
 
 impl fmt::Display for Error {
@@ -15,6 +26,15 @@ impl fmt::Display for Error {
             Self::Sqlite(error) => write!(f, "sqlite error: {error}"),
             Self::PreparedWrite => {
                 f.write_str("prepared statements are read-only; use execute for writes")
+            }
+            Self::ValueConversion(error) => {
+                write!(f, "could not copy SQLite value: {error}")
+            }
+            Self::UnexpectedValueType { expected, actual } => {
+                write!(
+                    f,
+                    "unexpected SQLite value type: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -25,6 +45,8 @@ impl std::error::Error for Error {
         match self {
             Self::Sqlite(error) => Some(error),
             Self::PreparedWrite => None,
+            Self::ValueConversion(error) => Some(error),
+            Self::UnexpectedValueType { .. } => None,
         }
     }
 }

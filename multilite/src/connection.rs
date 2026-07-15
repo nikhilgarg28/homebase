@@ -1,5 +1,5 @@
-use crate::{Error, Result};
-use rusqlite::{Connection, Params, Row, Statement};
+use crate::{Error, Params, Result};
+use rusqlite::{Connection, Row, Statement};
 use std::path::Path;
 
 /// A Multilite-owned SQLite connection.

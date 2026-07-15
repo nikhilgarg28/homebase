@@ -4,6 +4,9 @@
 
 mod connection;
 mod error;
+mod value;
 
 pub use connection::{MultiliteConnection, MultiliteStatement};
 pub use error::{Error, Result};
+pub use rusqlite::types::{FromSql, Type, Value, ValueRef};
+pub use rusqlite::{Params, ToSql, params};
