@@ -39,3 +39,5 @@ Add bucketing/padding to key components & values before encrypting
 Relax the constraint that there can be at most 16 components
 
 admit log level checksum?
+
+use uuid indirection for key components - better rotation

@@ -15,7 +15,8 @@ use std::future::{Future, ready};
 use crate::Result as MultiliteResult;
 use crate::connection::ConnectionOwner;
 
-const META_TABLE: &str = "_mt_meta_kv";
+pub(crate) const META_TABLE: &str = "__multilite__meta";
+const META_TABLE_PREFIX: &str = META_TABLE;
 // Stay below SQLite's historical 999-variable default as well as modern
 // bundled builds with substantially higher limits.
 const MAX_BIND_PARAMETERS: usize = 900;
@@ -44,6 +45,56 @@ impl SqliteOrderedStore {
                 ) WITHOUT ROWID"
             ))
         })?;
+        Ok(())
+    }
+
+    /// Return whether the metadata store exists, rejecting its reserved
+    /// namespace if it contains anything other than the one known table.
+    pub(crate) fn is_initialized(connection: &Connection) -> MultiliteResult<bool> {
+        let tables = metadata_tables(connection)?;
+        match tables.as_slice() {
+            [] => Ok(false),
+            [table] if table == META_TABLE => Ok(true),
+            _ => Err(crate::Error::InvalidDatabase(
+                "metadata table namespace contains unexpected tables",
+            )),
+        }
+    }
+
+    pub(crate) fn validate(connection: &Connection) -> MultiliteResult<()> {
+        if !Self::is_initialized(connection)? {
+            return Err(crate::Error::InvalidDatabase("metadata table is missing"));
+        }
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({META_TABLE})"))?;
+        let columns = statement
+            .query_map((), |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, u32>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = vec![
+            (String::from("key"), String::from("BLOB"), true, 1),
+            (String::from("value"), String::from("BLOB"), true, 0),
+        ];
+        if columns != expected {
+            return Err(crate::Error::InvalidDatabase(
+                "metadata table schema does not match the ordered store",
+            ));
+        }
+        let schema_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [META_TABLE],
+            |row| row.get(0),
+        )?;
+        if !schema_sql.to_ascii_uppercase().contains("WITHOUT ROWID") {
+            return Err(crate::Error::InvalidDatabase(
+                "metadata table must use WITHOUT ROWID",
+            ));
+        }
         Ok(())
     }
 
@@ -97,7 +148,7 @@ impl SqliteOrderedStore {
         }
 
         self.owner.with_connection(|connection| {
-            let name = self.owner.next_savepoint_name("_mt_store");
+            let name = self.owner.next_savepoint_name("__multilite__store");
             connection
                 .execute_batch(&format!("SAVEPOINT {name}"))
                 .map_err(storage_error)?;
@@ -115,6 +166,18 @@ impl SqliteOrderedStore {
             }
         })
     }
+}
+
+fn metadata_tables(connection: &Connection) -> MultiliteResult<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_schema
+         WHERE type = 'table'
+           AND substr(name, 1, length(?1)) = ?1
+         ORDER BY name",
+    )?;
+    Ok(statement
+        .query_map([META_TABLE_PREFIX], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn apply_ops(connection: &Connection, batch: WriteBatch) -> StoreResult<()> {
@@ -270,6 +333,25 @@ mod tests {
     fn ordered_meta_store_passes_complete_conformance() {
         let store = SqliteOrderedStore::open_in_memory().unwrap();
         block_on(meta_conformance::run_all(&OrderedMetaStore::new(store)));
+    }
+
+    #[test]
+    fn initialized_store_validates_its_schema_and_reserved_namespace() {
+        let store = SqliteOrderedStore::open_in_memory().unwrap();
+        store.owner.with_connection(|connection| {
+            assert!(SqliteOrderedStore::is_initialized(connection).unwrap());
+            SqliteOrderedStore::validate(connection).unwrap();
+
+            connection
+                .execute_batch("CREATE TABLE __multilite__meta_future (value BLOB NOT NULL)")
+                .unwrap();
+            assert!(matches!(
+                SqliteOrderedStore::validate(connection),
+                Err(Error::InvalidDatabase(
+                    "metadata table namespace contains unexpected tables"
+                ))
+            ));
+        });
     }
 
     #[test]
@@ -430,7 +512,7 @@ mod tests {
             connection
                 .execute_batch(
                     "CREATE TRIGGER reject_bad_metadata
-                     BEFORE INSERT ON _mt_meta_kv WHEN NEW.key = x'626164'
+                     BEFORE INSERT ON __multilite__meta WHEN NEW.key = x'626164'
                      BEGIN SELECT RAISE(ABORT, 'injected'); END",
                 )
                 .unwrap();

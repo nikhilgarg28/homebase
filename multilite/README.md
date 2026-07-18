@@ -4,8 +4,32 @@ Rust library for multi-writer SQLite with end-to-end encrypted sync, built on
 the Homebase coordination kernel.
 
 **Not ready for production use.** The current surface is a small,
-rusqlite-shaped connection wrapper. Schema ownership, mutation capture,
-metadata, and synchronization land in subsequent V1 batches.
+rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
+Homebase metadata. Mutation capture and synchronization land in subsequent V1
+batches.
+
+`MultiliteConnection::open` is the single file-lifecycle verb. Internally it
+first opens and commits a general Multilite database containing identity and
+Homebase metadata, then a temporary V1 wrapper initializes or validates its
+own local schema in a separate resumable transaction. A crash or V1 migration
+failure can leave valid general state without V1 tables; the next open retains
+the same database and device identities and retries V1 from its recorded
+version. The wrapper is intended to disappear as general Multilite absorbs the
+supported SQL surface.
+
+A new database without options mints a public `DatabaseId` and local device
+identity. Another replica is initialized by passing the first file's opaque,
+versioned `ReplicaInvitation` through `OpenOptions`; an invitation supplied for
+existing general state is an identity constraint and can never replace its
+identity. Each database owns a Homebase client and uses an offline endpoint by
+default; `OpenOptions::server` supplies an explicit `ServerHandle`.
+
+V1 invitations and space envelopes are plaintext scaffolding. The stable API
+is designed for a later encrypted default: a fresh open will mint the final
+Homebase name and value keys, derive `DatabaseId` from the name key, and retain
+the envelope locally. The invitation format can then carry or unlock that
+envelope without changing `open` or `OpenOptions`. See the V1 plan's opening
+and identity evolution section for the intended key-provider and sync path.
 
 Multilite re-exports rusqlite's `params`, `Params`, `ToSql`, `FromSql`, `Type`,
 `Value`, and `ValueRef` interfaces. Applications can therefore use the normal
@@ -21,7 +45,8 @@ commits. Rusqlite enables that API through build-time bindings, so the current
 Rust build requires libclang; packaging may revisit that tradeoff before the
 first supported release.
 
-Homebase client state is stored in the same SQLite file under `_mt_meta_kv`.
+Homebase client state is stored in the same SQLite file under
+`__multilite__meta`.
 The ordered-store adapter executes synchronously under a serialized,
 thread-reentrant connection owner: other threads cannot use the connection
 concurrently, while metadata operations can join the outer SQLite savepoint
@@ -29,6 +54,11 @@ that is already running on the owning thread. Range scans eagerly own their
 snapshot and retain neither a SQLite statement nor the connection lock.
 Consecutive metadata puts and deletes are issued as bounded multi-row SQL
 statements while preserving the original `WriteBatch` operation order.
+V1 separately owns `__multilite__v1_schema`, a one-row local migration ledger.
+Absence of that table means V1 version zero. Migration `0 -> 1` creates both
+the ledger and `items` atomically; a committed general database therefore
+remains safely retryable if V1 initialization has not happened yet. The
+`__multilite__` table namespace is reserved for library-owned state.
 
 See the [monorepo README](../README.md) and
 [V1 plan](../MULTILITE_V1.md) for the current architecture and build sequence.

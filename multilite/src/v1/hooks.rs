@@ -84,7 +84,7 @@ mod tests {
                         payload BLOB NOT NULL,
                         PRIMARY KEY (collection, id)
                     );
-                    CREATE TABLE _mt_meta_probe (value BLOB NOT NULL);",
+                    CREATE TABLE __multilite__probe (value BLOB NOT NULL);",
                 )?;
                 Ok(())
             })
@@ -234,7 +234,7 @@ mod tests {
 
         let (_, internal) = runtime
             .run(ExecutionMode::InternalMetadata, |connection| {
-                connection.execute("INSERT INTO _mt_meta_probe VALUES (x'01')", ())?;
+                connection.execute("INSERT INTO __multilite__probe VALUES (x'01')", ())?;
                 Ok(())
             })
             .unwrap();

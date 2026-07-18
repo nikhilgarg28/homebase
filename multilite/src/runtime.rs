@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthContext, Authorization, PreUpdateCase};
 
-use crate::connection::ConnectionOwner;
+use crate::connection::{ConnectionOwner, ConnectionSavepoint};
 use crate::{Error, Result};
 
 /// Why Multilite is executing SQL on its owned connection.
@@ -102,32 +102,30 @@ impl<P: HookPolicy> RuntimeConnection<P> {
     ) -> Result<(T, Vec<P::Event>)> {
         let _operation_guard = OperationGuard::enter(Arc::clone(&self.state))?;
         let event_checkpoint = self.event_count();
-        let savepoint = SavepointGuard::begin(self, event_checkpoint)?;
-
-        let operation_result = self.with_mode(mode, || self.owner.with_connection(operation));
-        if let Some(error) = self.take_callback_error() {
-            savepoint.rollback()?;
-            return Err(error);
-        }
-
-        let value = match operation_result {
-            Ok(value) => value,
-            Err(error) => {
-                savepoint.rollback()?;
-                return Err(error);
+        let event_guard = EventGuard::new(self, event_checkpoint);
+        let name = self.owner.next_savepoint_name("__multilite__runtime");
+        let value = self.owner.with_connection(|connection| {
+            let savepoint = self.with_mode(ExecutionMode::InternalMetadata, || {
+                ConnectionSavepoint::begin(connection, name)
+            })?;
+            let operation_result = self.with_mode(mode, || operation(connection));
+            let result = match self.take_callback_error() {
+                Some(error) => Err(error),
+                None => operation_result,
+            };
+            match result {
+                Ok(value) => {
+                    self.with_mode(ExecutionMode::InternalMetadata, || savepoint.release())?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    self.with_mode(ExecutionMode::InternalMetadata, || savepoint.rollback())?;
+                    Err(error)
+                }
             }
-        };
-
-        savepoint.release()?;
+        })?;
+        event_guard.commit();
         Ok((value, self.split_events(event_checkpoint)))
-    }
-
-    fn control_sql(&self, sql: &str) -> Result<()> {
-        self.with_mode(ExecutionMode::InternalMetadata, || {
-            self.owner
-                .with_connection(|connection| connection.execute_batch(sql))
-                .map_err(Into::into)
-        })
     }
 
     fn with_mode<T>(
@@ -137,10 +135,6 @@ impl<P: HookPolicy> RuntimeConnection<P> {
     ) -> Result<T> {
         let _guard = ModeGuard::enter(Arc::clone(&self.state), mode);
         operation()
-    }
-
-    fn next_savepoint_name(&self) -> String {
-        self.owner.next_savepoint_name("_mt_runtime")
     }
 
     pub(crate) fn owner(&self) -> ConnectionOwner {
@@ -219,51 +213,32 @@ impl<P: HookPolicy> Drop for OperationGuard<P> {
     }
 }
 
-struct SavepointGuard<'a, P: HookPolicy> {
+struct EventGuard<'a, P: HookPolicy> {
     runtime: &'a RuntimeConnection<P>,
-    name: String,
-    event_checkpoint: usize,
+    checkpoint: usize,
     active: bool,
 }
 
-impl<'a, P: HookPolicy> SavepointGuard<'a, P> {
-    fn begin(runtime: &'a RuntimeConnection<P>, event_checkpoint: usize) -> Result<Self> {
-        let name = runtime.next_savepoint_name();
-        runtime.control_sql(&format!("SAVEPOINT {name}"))?;
-        Ok(Self {
+impl<'a, P: HookPolicy> EventGuard<'a, P> {
+    fn new(runtime: &'a RuntimeConnection<P>, checkpoint: usize) -> Self {
+        Self {
             runtime,
-            name,
-            event_checkpoint,
+            checkpoint,
             active: true,
-        })
+        }
     }
 
-    fn release(mut self) -> Result<()> {
-        self.runtime
-            .control_sql(&format!("RELEASE {}", self.name))?;
+    fn commit(mut self) {
         self.active = false;
-        Ok(())
-    }
-
-    fn rollback(mut self) -> Result<()> {
-        self.runtime
-            .control_sql(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name))?;
-        self.runtime.truncate_events(self.event_checkpoint);
-        self.active = false;
-        Ok(())
     }
 }
 
-impl<P: HookPolicy> Drop for SavepointGuard<'_, P> {
+impl<P: HookPolicy> Drop for EventGuard<'_, P> {
     fn drop(&mut self) {
-        if !self.active {
-            return;
+        if self.active {
+            self.runtime.truncate_events(self.checkpoint);
+            let _ = self.runtime.take_callback_error();
         }
-        let _ = self
-            .runtime
-            .control_sql(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name));
-        self.runtime.truncate_events(self.event_checkpoint);
-        let _ = self.runtime.take_callback_error();
     }
 }
 

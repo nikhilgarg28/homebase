@@ -78,11 +78,11 @@ authorized raw homebase client can bypass Multilite's exact-key assertion and
 issue an ordinary `Set`; server-side space policies against such clients are
 post-V1 work.
 
-One Multilite file is exactly one homebase space. Creating a file mints its
-space id and device id. Reopening preserves both. Joining another replica uses
-a small database descriptor containing the plaintext space id and mints a new
-device id for the new file. V1 uses a plaintext `SpaceEnvelope`; encryption and
-credential delivery remain post-V1.
+One Multilite file is exactly one homebase space. Opening a missing or empty
+file mints its space id and device id; reopening preserves both. Another
+replica opens a fresh file with an opaque, versioned `ReplicaInvitation` and
+mints a new device id. V1 invitations carry the plaintext database id and use a
+plaintext `SpaceEnvelope`; encryption and credential delivery remain post-V1.
 
 ## Item wire identity
 
@@ -113,16 +113,20 @@ homebase submission are atomic.
 
 ## Local metadata table
 
-All multilite-owned tables in the SQLite file use the `_mt_meta_` prefix. The
-prefix is reserved; user SQL may not read, create, alter, or write these tables
-through the public multilite connection.
+All multilite-owned tables in the SQLite file use the `__multilite__` prefix,
+which is reserved from public SQL. General Homebase state uses
+`__multilite__meta`; temporary V1 format state uses
+`__multilite__v1_schema`. The metadata adapter additionally reserves every
+table name beginning with `__multilite__meta` and rejects unknown entries in
+that subnamespace. User SQL may not read, create, alter, or write any
+`__multilite__` table through the public connection.
 
 V1 uses the complete existing homebase `MetaStore` state rather than a reduced
 parallel schema. The first implementation is an SQLite-backed `OrderedStore`
 over one table:
 
 ```sql
-CREATE TABLE _mt_meta_kv (
+CREATE TABLE __multilite__meta (
   key   BLOB PRIMARY KEY,
   value BLOB NOT NULL
 ) WITHOUT ROWID;
@@ -302,11 +306,11 @@ be reconsidered as part of distribution work.
 
 ### Batch 6: SQLite ordered store and homebase metadata
 
-Implement `SqliteOrderedStore` over `_mt_meta_kv` on the same SQLite connection
-used for `items`, then compose it with the existing `OrderedMetaStore`. Reads
-and writes execute synchronously while holding the connection owner; returned
-futures are ready, and scans own a snapshot rather than retaining a SQLite
-statement or lock.
+Implement `SqliteOrderedStore` over `__multilite__meta` on the same SQLite
+connection used for `items`, then compose it with the existing
+`OrderedMetaStore`. Reads and writes execute synchronously while holding the
+connection owner; returned futures are ready, and scans own a snapshot rather
+than retaining a SQLite statement or lock.
 
 Every `WriteBatch` uses a savepoint so it composes with an ambient statement or
 repair transaction. Do not add a second Multilite oplog, pushed bit, pull
@@ -334,25 +338,88 @@ result after reopen.
 
 ### Batch 7: file bootstrap schema
 
-Define the one-file/one-space lifecycle and initialize `items` plus
-`_mt_meta_kv`:
+Define the one-file/one-space lifecycle and layer temporary V1 over a general
+Multilite database:
 
-- `create` mints a plaintext space descriptor and a device identity;
-- `join` creates another file for an existing descriptor and mints a distinct
-  device identity;
-- `open` reopens an initialized file and rejects a conflicting descriptor;
-- each connection is wired to the existing homebase client and server handle.
+- general database open initializes or validates `__multilite__meta`, identity,
+  and the Homebase client, then commits;
+- the V1 connection wrapper runs its local schema migration before public open
+  returns;
+- a fresh open without options mints a database id and device identity;
+- a `ReplicaInvitation` initializes another file with the same database id and
+  a distinct device identity;
+- an invitation supplied for initialized general state must match its identity;
+- each database is wired to the existing homebase client and server handle.
 
-Bootstrap is one SQLite transaction and is idempotent after success.
+General open and each V1 migration are separate SQLite transactions. General
+open is complete before V1 begins; the intermediate base-only state is valid,
+durable, and not exposed to application SQL because the wrapper has not yet
+returned.
 
 Tests:
 
-- fresh open creates all required tables;
-- create, reopen, and join preserve the space/device identity rules;
-- reopen is a schema no-op;
-- the metadata store works after bootstrap;
-- stock SQLite reads `items`;
-- `PRAGMA integrity_check` passes.
+- general genesis, reopen, and invited replica opens preserve identity rules;
+- interrupted general initialization rolls back completely;
+- interrupted V1 initialization preserves general identity and retries from
+  version zero;
+- invitations round-trip and conflicting invitations are rejected;
+- the general database can adopt an ordinary SQLite user schema without V1
+  knowledge;
+- V1 rejects incompatible user schemas after general adoption;
+- V1 reopen is a schema no-op and malformed or newer versions are rejected;
+- stock SQLite reads `items` and `PRAGMA integrity_check` passes.
+
+Implementation result: root `database` machinery owns `DatabaseId`,
+`ReplicaInvitation`, `OpenOptions`, general classification,
+`__multilite__meta`, the
+Homebase client, and identity tests. It can add general metadata alongside an
+ordinary SQLite user schema without knowing any V1 tables. `v1::Connection` is
+a thin temporary wrapper: after general open commits, `v1::schema` reads its
+local `__multilite__v1_schema` ledger and applies the required migration in a
+second savepoint. Absence of the ledger means version zero; migration `0 -> 1`
+creates the ledger, its singleton version row, and `items` atomically. Version
+1 always validates both table shapes, malformed states are rejected, and a
+version newer than the library is reported explicitly.
+
+If the process dies or V1 migration fails after general open,
+`__multilite__meta`,
+the database id, device id, clock state, and plaintext space envelope remain
+valid. The next open reloads them and retries V1; it never remints identity. A
+V1 failure against an existing ordinary user schema likewise leaves only the
+general adoption committed. Public SQL, the metadata store, and the wrapper
+share one thread-reentrant `ConnectionOwner`; prepared reads retain SQL and
+eagerly reprepare under that owner instead of borrowing a second connection.
+As the general SQL implementation grows, behavior moves from the V1 wrapper
+into the root database until the wrapper and `__multilite__v1_schema` can be
+deleted.
+
+#### Opening and identity evolution
+
+The `open(path)` shape is intended to survive the transition from plaintext V1
+to encrypted synchronization:
+
+1. In V1, a fresh open mints a random `DatabaseId` and stores a plaintext
+   `SpaceEnvelope`. The invitation contains only that public id.
+2. Before a supported encrypted release, a fresh open will instead mint the
+   final Homebase `NameKey` and initial `SpaceKey`, derive `DatabaseId` from the
+   name key, and store the envelope locally. Local submit-log entries will use
+   that final cipher even when no server is configured.
+3. The versioned `ReplicaInvitation` will grow to carry or unlock the same
+   envelope for another device. `DatabaseId` remains public and is not by
+   itself sufficient to initialize an encrypted replica.
+4. `OpenOptions` can add a key provider, wrapped-envelope source, server route,
+   credentials, and SQLite opening flags without changing the default
+   `open(path)` call. Supplying options to an initialized file verifies or
+   unlocks its stored identity; it never silently replaces it.
+5. A configurable server router may later allow an already-open, offline
+   connection to attach synchronization. Until then, reopening with a server
+   option preserves the durable submit log and all file identity.
+
+The database must not use a placeholder name key or space id. `SpaceId` scopes
+all Homebase metadata and participates in the device checksum, while the name
+key determines anonymized mutation targets. Changing either after local writes
+requires a full atomic migration and is not part of ordinary linking. Value-key
+rotation instead adds a cipher epoch and retains old keys for old entries.
 
 ### Batch 8: SQL surface gate
 
@@ -369,7 +436,7 @@ Reject:
 - explicit `BEGIN`/`COMMIT`/`ROLLBACK`;
 - write PRAGMAs;
 - `ATTACH`;
-- writes to `_mt_meta_` tables through the public connection.
+- writes to `__multilite__` tables through the public connection.
 
 Prepared statements are read-only. Public execution also rejects conflict
 clauses (`OR REPLACE`, `OR IGNORE`, and UPSERT), `RETURNING`, multi-row insert,

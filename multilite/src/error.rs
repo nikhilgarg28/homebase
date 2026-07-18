@@ -1,5 +1,6 @@
 use std::fmt;
 
+use homebase_client::ClientError;
 use homebase_core::storage::StorageError;
 use rusqlite::types::{FromSqlError, Type};
 
@@ -23,6 +24,28 @@ pub enum Error {
     CaptureInvariant(&'static str),
     /// Durable Homebase metadata storage failed.
     Storage(StorageError),
+    /// The file violates the one-space Multilite schema or metadata contract.
+    InvalidDatabase(&'static str),
+    /// The caller supplied an invitation for a different database.
+    DatabaseIdMismatch {
+        /// Space identity supplied by the caller.
+        expected: [u8; 16],
+        /// Space identity stored in the file.
+        actual: [u8; 16],
+    },
+    /// Replica onboarding material has an unknown or malformed encoding.
+    InvalidReplicaInvitation,
+    /// The local V1 schema was created by a newer unsupported implementation.
+    UnsupportedV1SchemaVersion {
+        /// Version stored in the local V1 schema ledger.
+        found: u64,
+        /// Newest V1 schema version understood by this implementation.
+        supported: u64,
+    },
+    /// Operating-system randomness was unavailable while minting identity.
+    Entropy(String),
+    /// The embedded Homebase client failed to initialize.
+    Client(ClientError),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +68,20 @@ impl fmt::Display for Error {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
             Self::Storage(error) => write!(f, "metadata storage error: {error}"),
+            Self::InvalidDatabase(message) => write!(f, "invalid Multilite database: {message}"),
+            Self::DatabaseIdMismatch { expected, actual } => write!(
+                f,
+                "database id mismatch: expected {}, found {}",
+                hex_id(expected),
+                hex_id(actual)
+            ),
+            Self::InvalidReplicaInvitation => f.write_str("invalid Multilite replica invitation"),
+            Self::UnsupportedV1SchemaVersion { found, supported } => write!(
+                f,
+                "V1 schema version {found} is newer than supported version {supported}"
+            ),
+            Self::Entropy(message) => write!(f, "could not mint database identity: {message}"),
+            Self::Client(error) => write!(f, "homebase client error: {error}"),
         }
     }
 }
@@ -58,6 +95,12 @@ impl std::error::Error for Error {
             Self::UnexpectedValueType { .. } => None,
             Self::CaptureInvariant(_) => None,
             Self::Storage(error) => Some(error),
+            Self::InvalidDatabase(_)
+            | Self::DatabaseIdMismatch { .. }
+            | Self::InvalidReplicaInvitation
+            | Self::UnsupportedV1SchemaVersion { .. }
+            | Self::Entropy(_) => None,
+            Self::Client(error) => Some(error),
         }
     }
 }
@@ -72,6 +115,16 @@ impl From<StorageError> for Error {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+impl From<ClientError> for Error {
+    fn from(error: ClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
