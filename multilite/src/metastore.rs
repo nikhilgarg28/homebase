@@ -172,7 +172,7 @@ fn metadata_tables(connection: &Connection) -> MultiliteResult<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT name FROM sqlite_schema
          WHERE type = 'table'
-           AND substr(name, 1, length(?1)) = ?1
+           AND substr(name, 1, length(?1)) = ?1 COLLATE NOCASE
          ORDER BY name",
     )?;
     Ok(statement
@@ -343,7 +343,7 @@ mod tests {
             SqliteOrderedStore::validate(connection).unwrap();
 
             connection
-                .execute_batch("CREATE TABLE __multilite__meta_future (value BLOB NOT NULL)")
+                .execute_batch("CREATE TABLE __MULTILITE__meta_future (value BLOB NOT NULL)")
                 .unwrap();
             assert!(matches!(
                 SqliteOrderedStore::validate(connection),

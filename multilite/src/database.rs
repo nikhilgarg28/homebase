@@ -1,5 +1,7 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod sql;
+
 use std::path::Path;
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
@@ -10,10 +12,12 @@ use homebase_core::clock::{Lineage, SystemHybridClock};
 use homebase_core::space::SpaceId;
 use homebase_core::tag::DeviceId;
 use pollster::block_on;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
+use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
@@ -129,6 +133,32 @@ impl<H: ServerHandle> OpenOptions<H> {
 
 pub(crate) type DatabaseClient<H> =
     Client<OrderedMetaStore<SqliteOrderedStore>, H, SystemHybridClock, SystemNonceSource>;
+pub(crate) type DatabaseRuntime<P> = RuntimeConnection<DatabaseHooks<P>>;
+
+pub(crate) struct DatabaseHooks<P> {
+    format: P,
+}
+
+impl<P: HookPolicy> HookPolicy for DatabaseHooks<P> {
+    type Event = P::Event;
+
+    fn authorize(&mut self, mode: ExecutionMode, context: AuthContext<'_>) -> Authorization {
+        match authorize_database(mode, &context) {
+            Authorization::Allow => self.format.authorize(mode, context),
+            decision => decision,
+        }
+    }
+
+    fn preupdate(
+        &mut self,
+        mode: ExecutionMode,
+        database: &str,
+        table: &str,
+        update: &PreUpdateCase,
+    ) -> Result<Option<Self::Event>> {
+        self.format.preupdate(mode, database, table, update)
+    }
+}
 
 /// An opened general Multilite database, without a temporary format wrapper.
 pub(crate) struct Database<H: ServerHandle> {
@@ -161,20 +191,35 @@ impl<H: ServerHandle> Database<H> {
         self.client.device().0
     }
 
-    pub(crate) fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
-        self.owner
-            .with_connection(|connection| connection.execute(sql, params))
-            .map_err(Into::into)
+    pub(crate) fn runtime<P: HookPolicy>(&self, format: P) -> Result<DatabaseRuntime<P>> {
+        RuntimeConnection::new(self.owner.clone(), DatabaseHooks { format })
     }
 
-    pub(crate) fn prepare(&self, sql: &str) -> Result<Statement> {
-        let readonly = self.owner.with_connection(|connection| {
+    pub(crate) fn execute<P: HookPolicy, Q: Params>(
+        &self,
+        runtime: &DatabaseRuntime<P>,
+        sql: &str,
+        params: Q,
+    ) -> Result<(usize, Vec<P::Event>)> {
+        sql::validate_execute(sql)?;
+        runtime.run(ExecutionMode::Public, |connection| {
+            Ok(connection.execute(sql, params)?)
+        })
+    }
+
+    pub(crate) fn prepare<P: HookPolicy>(
+        &self,
+        runtime: &DatabaseRuntime<P>,
+        sql: &str,
+    ) -> Result<Statement> {
+        runtime.run(ExecutionMode::Public, |connection| {
             let statement = connection.prepare(sql)?;
-            Ok::<_, rusqlite::Error>(statement.readonly())
+            if statement.readonly() {
+                Ok(())
+            } else {
+                Err(Error::PreparedWrite)
+            }
         })?;
-        if !readonly {
-            return Err(Error::PreparedWrite);
-        }
         Ok(Statement {
             owner: self.owner.clone(),
             sql: sql.to_owned(),
@@ -193,6 +238,76 @@ impl<H: ServerHandle> Database<H> {
     ) -> Result<T> {
         self.owner.with_savepoint(prefix, operation)
     }
+}
+
+fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authorization {
+    if mode != ExecutionMode::Public {
+        return Authorization::Allow;
+    }
+
+    match context.action {
+        AuthAction::Select | AuthAction::Function { .. } | AuthAction::Recursive => {
+            Authorization::Allow
+        }
+        AuthAction::Read { table_name, .. } => authorize_read(context.database_name, table_name),
+        AuthAction::CreateTable { table_name } => {
+            authorize_user_table(context.database_name, table_name)
+        }
+        AuthAction::CreateIndex {
+            index_name,
+            table_name,
+        } if index_name.starts_with("sqlite_autoindex_") => {
+            authorize_user_table(context.database_name, table_name)
+        }
+        AuthAction::Insert { table_name } if is_schema_table(table_name) => {
+            authorize_main(context.database_name)
+        }
+        AuthAction::Update { table_name, .. } if is_schema_table(table_name) => {
+            authorize_main(context.database_name)
+        }
+        AuthAction::Insert { table_name } => {
+            authorize_user_table(context.database_name, table_name)
+        }
+        _ => Authorization::Deny,
+    }
+}
+
+fn authorize_read(database: Option<&str>, table: &str) -> Authorization {
+    if is_schema_table(table) {
+        authorize_main(database)
+    } else {
+        authorize_user_table(database, table)
+    }
+}
+
+fn authorize_user_table(database: Option<&str>, table: &str) -> Authorization {
+    if is_main(database) && !has_multilite_prefix(table) {
+        Authorization::Allow
+    } else {
+        Authorization::Deny
+    }
+}
+
+fn authorize_main(database: Option<&str>) -> Authorization {
+    if is_main(database) {
+        Authorization::Allow
+    } else {
+        Authorization::Deny
+    }
+}
+
+fn is_main(database: Option<&str>) -> bool {
+    matches!(database, None | Some("main"))
+}
+
+fn is_schema_table(table: &str) -> bool {
+    table.eq_ignore_ascii_case("sqlite_master") || table.eq_ignore_ascii_case("sqlite_schema")
+}
+
+fn has_multilite_prefix(table: &str) -> bool {
+    table
+        .get(.."__multilite__".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
 }
 
 /// A read-only prepared statement owned by a Multilite database.
@@ -350,6 +465,67 @@ mod tests {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
     use super::*;
+
+    struct NoopFormat;
+
+    impl HookPolicy for NoopFormat {
+        type Event = ();
+
+        fn authorize(&mut self, _mode: ExecutionMode, _context: AuthContext<'_>) -> Authorization {
+            Authorization::Allow
+        }
+
+        fn preupdate(
+            &mut self,
+            _mode: ExecutionMode,
+            _database: &str,
+            _table: &str,
+            _update: &PreUpdateCase,
+        ) -> Result<Option<Self::Event>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("sql-surface.sqlite")).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+
+        assert!(matches!(
+            database.execute(
+                &runtime,
+                "CREATE TABLE rejected (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+                (),
+            ),
+            Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"))
+        ));
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE accepted (id INTEGER PRIMARY KEY, value TEXT)",
+                (),
+            )
+            .unwrap();
+        assert!(
+            database
+                .execute(
+                    &runtime,
+                    "CREATE TABLE __multilite__rejected (value TEXT)",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .prepare(&runtime, "SELECT value FROM __multilite__meta")
+                .is_err()
+        );
+        assert!(matches!(
+            database.execute(&runtime, "DELETE FROM accepted", ()),
+            Err(Error::UnsupportedSql(_))
+        ));
+    }
 
     #[test]
     fn identity_invitation_and_device_rules_survive_reopen() {

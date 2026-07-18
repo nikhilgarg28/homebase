@@ -287,22 +287,23 @@ Prove the low-level SQLite machinery V1 needs:
 
 Tests:
 
-- authorizer denies a selected unsupported statement;
+- database authorizer denies a selected unsupported statement;
 - hook observes an `items` insert and captures values as rusqlite `Value`s;
 - savepoint rollback removes the row;
-- internal metadata, remote apply, and repair are not captured or rejected by
-  the public authorizer.
+- internal metadata, remote apply, and repair bypass public authorization and
+  are not captured.
 
 If preupdate support is unavailable in the selected SQLite build, explicit
 wrapper logging can be the V1 fallback, but the spike should make that choice
 explicit.
 
-Spike result: the bundled SQLite build supports preupdate capture and V1 uses
-it. The reusable runtime rolls hook failures, operation errors, and panics back
-through an internal savepoint while discarding their captured events. Enabling
-the rusqlite feature currently requires libclang at build time through
-`libsqlite3-sys`; this is accepted for the pre-release implementation and must
-be reconsidered as part of distribution work.
+Spike result: the bundled SQLite build supports preupdate capture. The general
+database owns public authorization, while V1's format hook only captures
+`items` inserts. The reusable runtime rolls hook failures, operation errors,
+and panics back through an internal savepoint while discarding their captured
+events. Enabling the rusqlite feature currently requires libclang at build
+time through `libsqlite3-sys`; this is accepted for the pre-release
+implementation and must be reconsidered as part of distribution work.
 
 ### Batch 6: SQLite ordered store and homebase metadata
 
@@ -425,46 +426,86 @@ rotation instead adds a cipher epoch and retains old keys for old entries.
 
 Allow only:
 
+- persistent `CREATE TABLE` in the main database;
 - `SELECT`;
-- `INSERT INTO items`.
+- `INSERT` into any non-reserved main-database table, including multi-row and
+  `INSERT ... SELECT` forms.
 
 Reject:
 
 - `UPDATE`;
 - `DELETE`;
-- DDL;
+- DDL other than `CREATE TABLE`;
+- `AUTOINCREMENT` and schema-level `ON CONFLICT` policies;
 - explicit `BEGIN`/`COMMIT`/`ROLLBACK`;
-- write PRAGMAs;
-- `ATTACH`;
-- writes to `__multilite__` tables through the public connection.
+- explicit savepoints;
+- all PRAGMAs;
+- `ATTACH`/`DETACH` and temporary objects;
+- reads or writes of `__multilite__` tables through the public connection.
 
-Prepared statements are read-only. Public execution also rejects conflict
-clauses (`OR REPLACE`, `OR IGNORE`, and UPSERT), `RETURNING`, multi-row insert,
-`INSERT ... SELECT`, multiple statements, TEMP writes, `VACUUM`, `ANALYZE`,
-and `REINDEX`. Internal metadata/apply/repair statements run under the internal
-connection mode and remain allowed.
+Prepared statements are read-only. Public execution rejects `REPLACE`, every
+`INSERT OR ...` conflict policy, every `ON CONFLICT` UPSERT form, multiple
+statements, `VACUUM`, `ANALYZE`, and `REINDEX`. A conflict form is rejected
+explicitly rather than interpreted as an insert, because it may update,
+delete, or silently suppress a row. Internal metadata/apply/repair statements
+run under the internal connection mode and remain allowed.
 
-Use SQLite authorizer first. Add minimal wrapper classification only where the
-authorizer cannot express a V1 rule clearly.
+Use the SQLite authorizer for runtime object/action access. Parse each public
+execution with SQLite's grammar-derived AST to enforce statement shape and
+syntax-level rules the authorizer cannot distinguish.
 
 Tests:
 
-- accepted `SELECT` and `INSERT` work;
+- accepted `CREATE TABLE`, `SELECT`, and single- or multi-row `INSERT` work on
+  arbitrary user tables;
+- `AUTOINCREMENT` and schema-level conflict policies are rejected before any
+  schema mutation;
 - unsupported SQL matrix returns clean errors;
 - metadata cannot be read or written through the public API;
 - rejected statements leave no mutation behind.
 
-### Batch 9: capture INSERT to homebase submit log
+Implementation result: `Database` wraps every format hook in its own mandatory
+public policy. `Database::execute` applies the grammar-derived AST gate, and
+the database authorizer admits only the action graph needed for the three
+verbs, including SQLite's internal catalog writes and implicit indexes for
+`CREATE TABLE`; the `__multilite__` namespace is reserved case-insensitively.
+The AST gate admits only one plain `CREATE TABLE` or `INSERT` execution and
+rejects `AUTOINCREMENT`, schema conflict policies, `REPLACE`, `INSERT OR ...`,
+UPSERT, and `RETURNING` before SQLite mutates the file. Prepared SQL is
+authorized as public and must be read-only before a reusable statement handle
+is returned. V1 adds only its local migration ledger, validation of `items`,
+and preupdate capture of `items` inserts; it does not own the public SQL
+surface.
+
+### Batch 9a: general schema and row identity
+
+Replace the temporary `ItemKey`/`ItemInsert` assumptions with canonical forms
+for arbitrary user tables. This batch decides and pins:
+
+- whether `CREATE TABLE` is synchronized or replicas must receive matching
+  schema through an explicit out-of-band contract;
+- stable table identity and schema fingerprinting;
+- row identity for explicit, composite, integer-primary-key, and rowid-backed
+  tables;
+- canonical column identity, order, storage classes, and value framing;
+- the Homebase key and exact-range assertion derived for each logical row.
+
+The result must make a schema mismatch detectable before remote row apply and
+must not derive durable identity from SQLite names that can later become
+ambiguous. Golden-vector and malformed-frame tests pin every representation.
+
+### Batch 9b: capture INSERT to homebase submit log
 
 Wrap each accepted insert:
 
 ```text
 SAVEPOINT multilite_stmt
 execute INSERT
-hook captures exactly one items insert
-read admit neck N and verify the captured key is locally new
-encode ItemInsert and derive its hashed homebase key
-homebase submit_unchecked(Set, exact-key assert upto N - 1)
+hook captures every inserted user row in SQLite operation order
+resolve each row against the canonical schema and identity model
+read admit neck N and verify each captured key is locally new
+encode row inserts and derive their homebase keys
+homebase submit_unchecked(all Sets, exact-key asserts upto N - 1)
 RELEASE
 ```
 
@@ -475,11 +516,11 @@ the statement savepoint.
 
 Tests:
 
-- one insert creates one row and one homebase submit-log entry atomically;
-- the entry is a versioned `ItemInsert` Set with an exact-key assertion at the
-  applied admit cut;
+- one insert creates its rows and one homebase submit-log commit atomically;
+- the commit contains one versioned row Set per inserted row, with exact-key
+  assertions at the applied admit cut;
 - duplicate primary key writes no submission;
-- multi-row insert is rejected and rolled back;
+- multi-row and `INSERT ... SELECT` preserve SQLite row order in one commit;
 - reopen sees the unpushed submit log;
 - injected failures cannot produce row-without-log or log-without-row.
 
@@ -488,7 +529,7 @@ Tests:
 Use the existing homebase server unchanged. Verify Multilite's append-only OCC
 mapping end to end:
 
-- the hashed item key is the Set key and exact range-assert prefix;
+- the canonical row key is the Set key and exact range-assert prefix;
 - disjoint exact-key assertions do not conflict;
 - a foreign winner after the submitter's applied cut fails the stale
   assertion;
@@ -503,7 +544,8 @@ cipher without moving any cursor.
 Tests:
 
 - disjoint inserts admit;
-- concurrent duplicate logical keys reject one conforming Multilite client;
+- concurrent inserts of the same logical row reject one conforming Multilite
+  client;
 - retry of the same device sequence is idempotent;
 - admission order is stable;
 - the active-submission view returns plaintext commits and rollback markers
@@ -538,14 +580,13 @@ Tests:
 ### Batch 12: pull and apply
 
 Use homebase `pull` to append complete dense batches to the durable admit log,
-then apply plaintext `ItemInsert` records from admit `neck` in admission and
-operation order under internal capture suppression. Each applied batch and
-the corresponding `mark_applied` transition commit in the same SQLite
-transaction.
+then apply plaintext row-insert records from admit `neck` in admission and
+operation order under internal capture suppression. Each applied batch and the
+corresponding `mark_applied` transition commit in the same SQLite transaction.
 
 An existing row is idempotent only when the admitted entry is this file's own
 already-materialized `(device, device_seq)` submission, as in a lost-ack path.
-If a foreign admitted item collides with any active local submission, apply
+If a foreign admitted row collides with any active local submission, apply
 stops before that admission, leaves admit `neck` unchanged, and reports that
 push/explicit repair is required. Admit `tail` may continue to capture later
 batches without claiming they are applied.
@@ -566,28 +607,28 @@ Tests:
 `push()` itself never repairs. Given a current definitive `PushRejection`, the
 application explicitly calls `repair(rejection)`. V1 offers no keep/rebase or
 selective retry strategy: repair rolls back the complete active submit-log
-window and restores `items` to admitted state.
+window and restores user tables to admitted state.
 
 Repair first validates that the rejection still identifies the active head and
 pulls all currently available admitted history. It decodes the active suffix
 for the return value. Then one SQLite transaction:
 
 ```text
-delete every speculative item represented by the active suffix
+delete every speculative row represented by the active suffix
 apply unapplied admitted batches in exact order
 homebase rollback the active submit-log window
 advance admit neck through the applied batches
 commit
 ```
 
-The returned repair outcome contains the rolled-back `ItemInsert` values for
+The returned repair outcome contains the rolled-back logical row inserts for
 application inspection or later manual resubmission, but rollback is the only
 V1 state transition. If validation no longer matches, repair refuses and the
 caller must push again. A crash before the transaction leaves the rejection
 retryable; a crash during it exposes either the entire old state or the entire
 repaired state.
 
-For append-only V1:
+For append-only rows:
 
 - if the server has a winner for the key, keep/apply the winner;
 - otherwise delete the local speculative row;
@@ -624,55 +665,44 @@ Tests:
 Each extension should relax one V1 constraint or add one clear user-facing
 capability.
 
-1. **User-created collections/tables.** Let apps create named logical tables
-   instead of using only `items.collection`.
-2. **General `CREATE TABLE`.** Support ordinary SQLite rowid tables.
-3. **UUID schema tags and name-to-tag catalogs.** Decouple stable storage
-   identity from SQL names.
-4. **Column-tagged row frames.** Make row values robust to rename/add/drop
-   column evolution.
-5. **Multi-column scalar row values.** Sync normal SQLite columns rather than
-   one opaque payload.
-6. **Additional primary key shapes.** Add text, integer, rowid/IPK, and
-   composite key support.
-7. **Transactions and atomic multi-row batches.** Let several writes sync as
+1. **Transactions and atomic multi-statement batches.** Let several statements sync as
    one atomic admission batch.
-8. **`UPDATE`.** Capture and ship after-images for changing rows.
-9. **`DELETE` and tombstones.** Remove rows and preserve delete history.
-10. **Secondary indexes.** Maintain derived index keys and local/index sync
+2. **`UPDATE`.** Capture and ship after-images for changing rows.
+3. **`DELETE` and tombstones.** Remove rows and preserve delete history.
+4. **Secondary indexes.** Maintain derived index keys and local/index sync
     metadata.
-11. **Unique constraints and witness keys.** Enforce uniqueness across devices.
-12. **Foreign keys.** Add dependency tracking and parent/child validation.
-13. **CHECK, NOT NULL, defaults, generated columns.** Expand SQLite constraint
+5. **Unique constraints and witness keys.** Enforce uniqueness across devices.
+6. **Foreign keys.** Add dependency tracking and parent/child validation.
+7. **CHECK, NOT NULL, defaults, generated columns.** Expand SQLite constraint
     fidelity.
-14. **ALTER TABLE migrations.** Support additive and rename schema evolution.
-15. **DROP TABLE / DROP COLUMN.** Use range delete, schema-history
+8. **ALTER TABLE migrations.** Support additive and rename schema evolution.
+9. **DROP TABLE / DROP COLUMN.** Use range delete, schema-history
     materialization, or row rewrite.
-16. **Named/idempotent migrations.** Let app startup migrations run safely on
+10. **Named/idempotent migrations.** Let app startup migrations run safely on
     multiple devices.
-17. **Existing SQLite adoption.** Turn supported vanilla SQLite files into
+11. **Existing SQLite adoption.** Turn supported vanilla SQLite files into
     multilite files.
-18. **Large database snapshotting.** Avoid doubling large files during
+12. **Large database snapshotting.** Avoid doubling large files during
     adoption.
-19. **Encryption.** Encrypt keys, schema records, and values so the server sees
+13. **Encryption.** Encrypt keys, schema records, and values so the server sees
     only opaque data.
-20. **Formal leases.** Add explicit lease acquisition/renewal semantics.
-21. **Device fencing / single-active-writer lifecycle.** Add WhatsApp-like
+14. **Formal leases.** Add explicit lease acquisition/renewal semantics.
+15. **Device fencing / single-active-writer lifecycle.** Add WhatsApp-like
     takeover for one active writer at a time.
-22. **Coarse range asserts.** Validate broad data/schema prefixes at admission.
-23. **Table-level multi-writer mode.** Allow concurrent writers on independent
+16. **Coarse range asserts.** Validate broad data/schema prefixes at admission.
+17. **Table-level multi-writer mode.** Allow concurrent writers on independent
     tables.
-24. **Row/prefix optimistic multi-writer mode.** Allow concurrent writers on
+18. **Row/prefix optimistic multi-writer mode.** Allow concurrent writers on
     disjoint rows or prefixes.
-25. **Precise read/predicate capture.** Capture reads and write predicates for
+19. **Precise read/predicate capture.** Capture reads and write predicates for
     finer serializability.
-26. **Rollback repair for rejected speculative tails.** Generalize V1 repair
+20. **Rollback repair for rejected speculative tails.** Generalize V1 repair
     beyond append-only inserts.
-27. **Partial replication / shapes.** Sync only selected collections, tables, or
+21. **Partial replication / shapes.** Sync only selected collections, tables, or
     query shapes.
-28. **Online index builds.** Add `Building -> Ready` index state and resumable
+22. **Online index builds.** Add `Building -> Ready` index state and resumable
     backfill.
-29. **Views.** Support schema-only views and eventually dependency-aware view
+23. **Views.** Support schema-only views and eventually dependency-aware view
     writes where applicable.
 30. **Triggers.** Capture trigger side effects and assert trigger dependencies.
 31. **Expression and partial indexes.** Add deterministic expression/predicate

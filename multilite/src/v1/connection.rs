@@ -4,9 +4,10 @@ use std::path::Path;
 
 use homebase_client::ServerHandle;
 
+use super::hooks::V1Hooks;
 use super::schema;
 use crate::database::{
-    Database, DatabaseId, OfflineServer, OpenOptions, ReplicaInvitation, Statement,
+    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, ReplicaInvitation, Statement,
 };
 use crate::{Params, Result};
 
@@ -16,6 +17,7 @@ where
     H: ServerHandle,
 {
     database: Database<H>,
+    runtime: DatabaseRuntime<V1Hooks>,
 }
 
 impl Connection<OfflineServer> {
@@ -35,7 +37,8 @@ impl<H: ServerHandle> Connection<H> {
 
     fn finish_open(database: Database<H>) -> Result<Self> {
         schema::open(&database)?;
-        Ok(Self { database })
+        let runtime = database.runtime(V1Hooks)?;
+        Ok(Self { database, runtime })
     }
 
     /// Database identity shared by every replica of this file's space.
@@ -55,11 +58,12 @@ impl<H: ServerHandle> Connection<H> {
 
     /// Execute one SQLite statement directly.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
-        self.database.execute(sql, params)
+        let (changed, _captured) = self.database.execute(&self.runtime, sql, params)?;
+        Ok(changed)
     }
 
     /// Prepare one read-only statement.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
-        self.database.prepare(sql)
+        self.database.prepare(&self.runtime, sql)
     }
 }

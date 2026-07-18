@@ -1,4 +1,4 @@
-//! V1 authorization and preupdate capture policy.
+//! V1 `items` preupdate capture policy.
 
 #![cfg_attr(
     not(test),
@@ -8,7 +8,7 @@
     )
 )]
 
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
+use rusqlite::hooks::{AuthContext, Authorization, PreUpdateCase};
 
 use super::item::ItemInsert;
 use crate::runtime::{ExecutionMode, HookPolicy};
@@ -20,22 +20,8 @@ pub(super) struct V1Hooks;
 impl HookPolicy for V1Hooks {
     type Event = ItemInsert;
 
-    fn authorize(&mut self, mode: ExecutionMode, context: AuthContext<'_>) -> Authorization {
-        if mode != ExecutionMode::Public {
-            return Authorization::Allow;
-        }
-
-        match context.action {
-            AuthAction::CreateTable { .. }
-            | AuthAction::Delete {
-                table_name: "items",
-            }
-            | AuthAction::Update {
-                table_name: "items",
-                ..
-            } => Authorization::Deny,
-            _ => Authorization::Allow,
-        }
+    fn authorize(&mut self, _mode: ExecutionMode, _context: AuthContext<'_>) -> Authorization {
+        Authorization::Allow
     }
 
     fn preupdate(
@@ -84,6 +70,7 @@ mod tests {
                         payload BLOB NOT NULL,
                         PRIMARY KEY (collection, id)
                     );
+                    CREATE TABLE application_data (value TEXT NOT NULL);
                     CREATE TABLE __multilite__probe (value BLOB NOT NULL);",
                 )?;
                 Ok(())
@@ -102,17 +89,16 @@ mod tests {
     }
 
     #[test]
-    fn public_authorizer_denies_unsupported_mutation() {
+    fn v1_capture_ignores_non_items_tables() {
         let runtime = runtime();
-        let error = runtime
+        let (_, captured) = runtime
             .run(ExecutionMode::Public, |connection| {
-                connection.execute("DELETE FROM items", ())?;
+                connection.execute("INSERT INTO application_data VALUES ('local')", ())?;
                 Ok(())
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, Error::Sqlite(_)));
-        assert_eq!(item_count(&runtime), 0);
+        assert!(captured.is_empty());
     }
 
     #[test]

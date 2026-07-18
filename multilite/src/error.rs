@@ -11,6 +11,8 @@ pub enum Error {
     Sqlite(rusqlite::Error),
     /// V1 prepared statements are read-only; writes must use `execute`.
     PreparedWrite,
+    /// The statement uses SQL outside Multilite's current public surface.
+    UnsupportedSql(&'static str),
     /// A borrowed SQLite value could not be copied into its owned form.
     ValueConversion(FromSqlError),
     /// A value did not have the required SQLite storage class.
@@ -55,6 +57,7 @@ impl fmt::Display for Error {
             Self::PreparedWrite => {
                 f.write_str("prepared statements are read-only; use execute for writes")
             }
+            Self::UnsupportedSql(message) => write!(f, "unsupported SQL: {message}"),
             Self::ValueConversion(error) => {
                 write!(f, "could not copy SQLite value: {error}")
             }
@@ -90,7 +93,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
-            Self::PreparedWrite => None,
+            Self::PreparedWrite | Self::UnsupportedSql(_) => None,
             Self::ValueConversion(error) => Some(error),
             Self::UnexpectedValueType { .. } => None,
             Self::CaptureInvariant(_) => None,

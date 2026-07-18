@@ -61,7 +61,7 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         Self::new(ConnectionOwner::open_in_memory()?, policy)
     }
 
-    fn new(owner: ConnectionOwner, policy: P) -> Result<Self> {
+    pub(crate) fn new(owner: ConnectionOwner, policy: P) -> Result<Self> {
         let state = Arc::new(Mutex::new(HookState::new(policy)));
 
         let authorizer_state = Arc::clone(&state);

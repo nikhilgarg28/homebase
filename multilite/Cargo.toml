@@ -9,12 +9,14 @@ readme = "README.md"
 
 [dependencies]
 getrandom = "0.3"
+fallible-iterator.workspace = true
 homebase-client.workspace = true
 homebase-core.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "preupdate_hook"] }
 sha2.workspace = true
+sqlite3-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
