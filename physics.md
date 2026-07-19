@@ -424,37 +424,6 @@ longer retain all locally applied batches. The application must:
 Checked submission proves local lease/cursor authority, not business-logic
 correctness. Unchecked submission skips even that local proof.
 
-### Rebase analysis
-
-`Space::analyze_rebase(from..to)` is a read-only comparison of the active
-submit window `[submit.neck, submit.tail)` with one caller-selected retained
-admit interval `[from, to)`. For each local device sequence, it reports the
-existing range assertions for which a newer foreign admission in that interval
-affects the asserted prefix. Point Set/Delete affects an assertion when its key
-is below the prefix. DeleteRange affects it when the two hierarchical ranges
-overlap, including an ancestor delete that covers the asserted prefix.
-
-The analysis uses no other conflict signal. It does not infer dependencies
-from local mutation targets, versions, leases, submit mode, or application
-operation types. A submission with no range assertions is therefore clean by
-definition. An observed admission of the same local device sequence caps that
-submission's replay window: later foreign history cannot retroactively make
-an already-admitted assertion fail.
-
-Analysis performs no network I/O, decrypts no value, and moves no submit or
-admit cursor. The requested interval must lie inside the retained
-`[admit.head, admit.tail)` window. The result includes that interval and both
-observed cursor triples so a higher layer can detect a stale decision before
-mutating application state.
-
-Homebase assigns no reconciliation meaning to the selected interval or admit
-`neck`. The caller owns continuity, overlap, application, and frontier policy.
-For example, Multilite may analyze its unapplied `[neck, tail)` interval, apply
-that exact interval, and advance `neck` only after atomically verifying the
-returned snapshots. Another application may maintain a separate frontier.
-Homebase cannot discover an undeclared dependency or prove that an assertion
-was truthful against history outside the requested interval.
-
 ## 10. Pull and the admit log
 
 Server pull returns complete admitted batches for a dense interval:
@@ -503,22 +472,20 @@ new application progress.
 ### Multilite rebase
 
 Multilite `rebase()` reconciles only the fetched interval that existed when it
-started. It snapshots `[admit.neck, admit.tail)`, authenticates and decodes that
-exact dense interval, and asks Homebase to analyze the same interval against
-the active submit window. Any malformed Multilite operation fails before local
-application. Any range-assert conflict returns an opaque conflict handle and
-changes neither SQLite nor Homebase metadata.
+started. It first snapshots both cursor triples and refuses to proceed unless
+`submit.neck == submit.tail`; all range assertions are evaluated by the server
+during the push that establishes this empty window. Rebase then authenticates
+and decodes exactly `[admit.neck, admit.tail)`. Any malformed Multilite
+operation fails before local application.
 
-On a clean analysis, Multilite opens one SQLite savepoint, verifies that both
-submit and admit cursor snapshots are unchanged, applies foreign operations in
-admission order, and skips materialization for authenticated operations from
-the local device. Those operations were materialized atomically with their
-submission, and their current SQLite state may already include effects from a
-later speculative suffix. Only then does rebase advance admit `neck` to the
-snapshotted `tail` in that same savepoint. Internal apply mode bypasses public
-SQL capture. A DDL, metadata, or commit failure rolls back both application
-changes and cursor movement. `rebase()` performs no pull and no implicit
-rollback of speculative local work.
+Multilite opens one SQLite savepoint, verifies that both submit and admit cursor
+snapshots are unchanged, applies foreign operations in admission order, and
+skips materialization for authenticated operations from the local device.
+Those operations were materialized atomically before their successful push.
+Only then does rebase advance admit `neck` to the snapshotted `tail` in that
+same savepoint. Internal apply mode bypasses public SQL capture. A DDL,
+metadata, or commit failure rolls back both application changes and cursor
+movement. `rebase()` performs no pull, push, or implicit rollback.
 
 ### Application obligation
 

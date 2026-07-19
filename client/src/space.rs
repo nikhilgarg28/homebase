@@ -29,17 +29,14 @@
 
 use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
 use crate::client::Client;
-use crate::meta::{
-    AdmitCursors, Committed, DeviceOp, HeldLease, MetaStore, OplogCursors, SubmitMode,
-};
+use crate::meta::{AdmitCursors, Committed, HeldLease, MetaStore, SubmitMode};
 use crate::server::ServerHandle;
 use homebase_core::clock::{HybridClock, HybridTimestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::{Lease, LeaseId, LeaseMode};
 use homebase_core::messages::{
     AcquireRequest, AdmittedBatch, KernelError, LeaseSpec, ListLeasesRequest, PullRequest, Range,
-    RangeAssert, RangeAssertFailure, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest,
-    RenewRequest, RenewResponse,
+    RangeAssert, RangeCursor, RangeCut, ReadAtRequest, ReleaseRequest, RenewRequest, RenewResponse,
 };
 use homebase_core::space::{SpaceError, SpaceId};
 use homebase_core::storage::StorageError;
@@ -201,31 +198,6 @@ pub enum PushOutcome {
         error: KernelError,
         acked_through: Option<DeviceSeq>,
     },
-}
-
-/// Read-only comparison of the active submit log with a retained admit range.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RebaseAnalysis {
-    pub submit_cursors: OplogCursors,
-    pub admit_cursors: AdmitCursors,
-    pub admit_range: SeqRange<AdmissionSeq>,
-    pub conflicts: Vec<RebaseConflict>,
-}
-
-impl RebaseAnalysis {
-    pub fn is_clean(&self) -> bool {
-        self.conflicts.is_empty()
-    }
-}
-
-/// Range assertions from one local submission invalidated by new history.
-///
-/// Failure prefixes remain in the space's encoded name domain, matching the
-/// durable submit/admit logs and server diagnostics.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RebaseConflict {
-    pub device_seq: DeviceSeq,
-    pub failures: Vec<RangeAssertFailure>,
 }
 
 /// The disposition of the exact submission passed to [`Submission::push`].
@@ -427,70 +399,6 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
         seq: DeviceSeq,
     ) -> Result<PushOutcome, crate::client::ClientError> {
         Ok(self.client.push_space(self.id, Some(seq)).await?.outcome)
-    }
-
-    /// Compare active local assertions with foreign admissions in `[from, to)`.
-    ///
-    /// This performs no network I/O, opens no values, and moves no cursor.
-    /// Local mutations without range assertions declare no dependency and
-    /// therefore cannot conflict in this analysis. The caller owns the
-    /// meaning and continuity of the selected retained admit interval.
-    pub async fn analyze_rebase(
-        &self,
-        admit_range: SeqRange<AdmissionSeq>,
-    ) -> Result<RebaseAnalysis, SpaceDriverError> {
-        let _permit = self.enter().await?;
-        let submit_cursors = self.client.store().oplog_cursors(self.id).await?;
-        let admit_cursors = self.client.store().admit_cursors(self.id).await?;
-
-        if admit_range.start > admit_range.end
-            || admit_range.start < admit_cursors.head
-            || admit_range.end > admit_cursors.tail
-        {
-            return Err(SpaceDriverError::AdmitRangeUnavailable {
-                from: admit_range.start,
-                to: admit_range.end,
-                head: admit_cursors.head,
-                tail: admit_cursors.tail,
-            });
-        }
-
-        if submit_cursors.neck == submit_cursors.tail || admit_range.is_empty() {
-            return Ok(RebaseAnalysis {
-                submit_cursors,
-                admit_cursors,
-                admit_range,
-                conflicts: Vec::new(),
-            });
-        }
-
-        let submit_through = DeviceSeq(submit_cursors.tail.0.checked_sub(1).ok_or_else(|| {
-            SpaceDriverError::MalformedResponse {
-                reason: "local submit tail cannot be zero".into(),
-            }
-        })?);
-        let admit_through = AdmissionSeq(admit_range.end.0.checked_sub(1).ok_or_else(|| {
-            SpaceDriverError::MalformedResponse {
-                reason: "rebase range end cannot be zero".into(),
-            }
-        })?);
-        let submissions = self
-            .client
-            .store()
-            .oplog(self.id, submit_cursors.neck, submit_through)
-            .await?;
-        let admissions = self
-            .client
-            .store()
-            .admitted_batches(self.id, admit_range.start, admit_through)
-            .await?;
-
-        Ok(RebaseAnalysis {
-            submit_cursors,
-            admit_cursors,
-            admit_range,
-            conflicts: rebase_conflicts(self.device(), &submissions, &admissions),
-        })
     }
 
     async fn encode_submission(
@@ -1358,51 +1266,6 @@ fn mutation_affects_range<T>(mutation: &Mutation<T>, scope: &Range) -> bool {
     }
 }
 
-fn rebase_conflicts(
-    device: DeviceId,
-    submissions: &[(DeviceSeq, DeviceOp)],
-    admissions: &[AdmittedBatch],
-) -> Vec<RebaseConflict> {
-    let mut conflicts = Vec::new();
-    for (device_seq, submission) in submissions {
-        let own_admission = admissions
-            .iter()
-            .find(|batch| batch.device == device && batch.device_seq == *device_seq)
-            .map(|batch| batch.admission_seq);
-        let mut failures = Vec::new();
-        for assertion in submission.range_asserts() {
-            let scope = Range::Prefix(assertion.prefix.clone());
-            let actual = admissions
-                .iter()
-                .filter(|batch| batch.device != device)
-                .filter(|batch| batch.admission_seq > assertion.upto)
-                .filter(|batch| own_admission.is_none_or(|own| batch.admission_seq < own))
-                .filter(|batch| {
-                    batch
-                        .entries
-                        .iter()
-                        .any(|entry| mutation_affects_range(&entry.device_entry.mutation, &scope))
-                })
-                .map(|batch| batch.admission_seq)
-                .max();
-            if let Some(actual) = actual {
-                failures.push(RangeAssertFailure {
-                    prefix: assertion.prefix.clone(),
-                    upto: assertion.upto,
-                    actual,
-                });
-            }
-        }
-        if !failures.is_empty() {
-            conflicts.push(RebaseConflict {
-                device_seq: *device_seq,
-                failures,
-            });
-        }
-    }
-    conflicts
-}
-
 fn coordination_unavailable(error: crate::coordination::CoordinationError) -> SpaceDriverError {
     SpaceDriverError::Unavailable {
         reason: error.to_string(),
@@ -1413,7 +1276,7 @@ fn coordination_unavailable(error: crate::coordination::CoordinationError) -> Sp
 mod tests {
     use super::*;
     use homebase_core::seal::Seal;
-    use homebase_core::tag::{AdmissionTag, AdmittedEntry, DeviceChecksum, OpaqueValue, Ver};
+    use homebase_core::tag::{AdmissionTag, AdmittedEntry, OpaqueValue, Ver};
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
@@ -1436,48 +1299,6 @@ mod tests {
                 op_index: 0,
             },
         }
-    }
-
-    fn admitted(
-        admission_seq: u64,
-        device: DeviceId,
-        device_seq: u64,
-        mutations: Vec<Mutation<OpaqueValue>>,
-    ) -> AdmittedBatch {
-        let entries = mutations
-            .into_iter()
-            .enumerate()
-            .map(|(op_index, mutation)| AdmittedEntry {
-                device_entry: homebase_core::tag::DeviceEntry {
-                    mutation,
-                    tag: DeviceTag {
-                        device,
-                        device_seq: DeviceSeq(device_seq),
-                        ver: Ver(admission_seq),
-                        cipher_epoch: CipherEpoch(0),
-                    },
-                    seal: Seal::empty_aead_v1(),
-                },
-                admission: AdmissionTag {
-                    admission_seq: AdmissionSeq(admission_seq),
-                    op_index: op_index as u32,
-                },
-            })
-            .collect();
-        AdmittedBatch {
-            admission_seq: AdmissionSeq(admission_seq),
-            device,
-            device_seq: DeviceSeq(device_seq),
-            checksum: DeviceChecksum::EMPTY,
-            entries,
-        }
-    }
-
-    fn asserted(seq: u64, assertions: Vec<RangeAssert>) -> (DeviceSeq, DeviceOp) {
-        (
-            DeviceSeq(seq),
-            DeviceOp::commit_with_asserts(Vec::new(), assertions, SubmitMode::Unchecked),
-        )
     }
 
     #[test]
@@ -1514,224 +1335,6 @@ mod tests {
         assert_eq!(
             fetched.delete_range_effect(&Range::Prefix(key(&[b"other"]))),
             None
-        );
-    }
-
-    #[test]
-    fn rebase_analysis_uses_only_asserted_foreign_history() {
-        let local = DeviceId([1; 16]);
-        let foreign = DeviceId([2; 16]);
-        let db = key(&[b"db"]);
-        let submissions = vec![
-            asserted(
-                1,
-                vec![RangeAssert {
-                    prefix: db.clone(),
-                    upto: AdmissionSeq(1),
-                }],
-            ),
-            asserted(2, Vec::new()),
-        ];
-        let admissions = vec![
-            admitted(
-                2,
-                local,
-                99,
-                vec![Mutation::Delete {
-                    key: key(&[b"db", b"own"]),
-                }],
-            ),
-            admitted(
-                3,
-                foreign,
-                1,
-                vec![Mutation::Delete {
-                    key: key(&[b"other", b"row"]),
-                }],
-            ),
-            admitted(
-                4,
-                foreign,
-                2,
-                vec![Mutation::Set {
-                    key: key(&[b"db", b"row"]),
-                    value: OpaqueValue(vec![1]),
-                }],
-            ),
-        ];
-
-        assert_eq!(
-            rebase_conflicts(local, &submissions, &admissions),
-            vec![RebaseConflict {
-                device_seq: DeviceSeq(1),
-                failures: vec![RangeAssertFailure {
-                    prefix: db,
-                    upto: AdmissionSeq(1),
-                    actual: AdmissionSeq(4),
-                }],
-            }]
-        );
-    }
-
-    #[test]
-    fn rebase_analysis_returns_all_failures_and_treats_upto_as_inclusive() {
-        let local = DeviceId([1; 16]);
-        let foreign = DeviceId([2; 16]);
-        let exact = key(&[b"db", b"exact"]);
-        let db = key(&[b"db"]);
-        let other = key(&[b"other"]);
-        let submissions = vec![asserted(
-            1,
-            vec![
-                RangeAssert {
-                    prefix: exact.clone(),
-                    upto: AdmissionSeq(2),
-                },
-                RangeAssert {
-                    prefix: db.clone(),
-                    upto: AdmissionSeq(0),
-                },
-                RangeAssert {
-                    prefix: other.clone(),
-                    upto: AdmissionSeq(0),
-                },
-            ],
-        )];
-        let admissions = vec![
-            admitted(2, foreign, 1, vec![Mutation::Delete { key: exact }]),
-            admitted(
-                3,
-                foreign,
-                2,
-                vec![Mutation::Delete {
-                    key: key(&[b"other", b"row"]),
-                }],
-            ),
-            admitted(
-                4,
-                foreign,
-                3,
-                vec![Mutation::DeleteRange {
-                    range: Range::Prefix(key(&[b"db", b"changed"])),
-                }],
-            ),
-        ];
-
-        assert_eq!(
-            rebase_conflicts(local, &submissions, &admissions),
-            vec![RebaseConflict {
-                device_seq: DeviceSeq(1),
-                failures: vec![
-                    RangeAssertFailure {
-                        prefix: db,
-                        upto: AdmissionSeq(0),
-                        actual: AdmissionSeq(4),
-                    },
-                    RangeAssertFailure {
-                        prefix: other,
-                        upto: AdmissionSeq(0),
-                        actual: AdmissionSeq(3),
-                    },
-                ],
-            }]
-        );
-    }
-
-    #[test]
-    fn rebase_analysis_detects_overlapping_range_deletes() {
-        let local = DeviceId([1; 16]);
-        let foreign = DeviceId([2; 16]);
-        let child = key(&[b"db", b"child"]);
-        let submissions = vec![asserted(
-            1,
-            vec![RangeAssert {
-                prefix: child.clone(),
-                upto: AdmissionSeq(0),
-            }],
-        )];
-        let admissions = vec![
-            admitted(
-                1,
-                foreign,
-                1,
-                vec![Mutation::DeleteRange {
-                    range: Range::Prefix(key(&[b"db"])),
-                }],
-            ),
-            admitted(
-                2,
-                foreign,
-                2,
-                vec![Mutation::DeleteRange {
-                    range: Range::Prefix(key(&[b"db", b"child", b"grandchild"])),
-                }],
-            ),
-            admitted(
-                3,
-                foreign,
-                3,
-                vec![Mutation::DeleteRange {
-                    range: Range::Prefix(key(&[b"db", b"sibling"])),
-                }],
-            ),
-        ];
-
-        assert_eq!(
-            rebase_conflicts(local, &submissions, &admissions)[0].failures[0],
-            RangeAssertFailure {
-                prefix: child,
-                upto: AdmissionSeq(0),
-                actual: AdmissionSeq(2),
-            }
-        );
-    }
-
-    #[test]
-    fn own_admission_caps_a_submissions_rebase_window() {
-        let local = DeviceId([1; 16]);
-        let foreign = DeviceId([2; 16]);
-        let db = key(&[b"db"]);
-        let submissions = vec![asserted(
-            7,
-            vec![RangeAssert {
-                prefix: db.clone(),
-                upto: AdmissionSeq(0),
-            }],
-        )];
-        let admissions = vec![
-            admitted(1, local, 7, Vec::new()),
-            admitted(2, foreign, 1, vec![Mutation::Delete { key: db }]),
-        ];
-
-        assert!(rebase_conflicts(local, &submissions, &admissions).is_empty());
-    }
-
-    #[test]
-    fn full_delete_range_affects_every_asserted_prefix() {
-        let local = DeviceId([1; 16]);
-        let foreign = DeviceId([2; 16]);
-        let prefix = key(&[b"any", b"prefix"]);
-        let submissions = vec![asserted(
-            1,
-            vec![RangeAssert {
-                prefix: prefix.clone(),
-                upto: AdmissionSeq(0),
-            }],
-        )];
-        let admissions = vec![admitted(
-            1,
-            foreign,
-            1,
-            vec![Mutation::DeleteRange { range: Range::Full }],
-        )];
-
-        assert_eq!(
-            rebase_conflicts(local, &submissions, &admissions)[0].failures[0],
-            RangeAssertFailure {
-                prefix,
-                upto: AdmissionSeq(0),
-                actual: AdmissionSeq(1),
-            }
         );
     }
 }

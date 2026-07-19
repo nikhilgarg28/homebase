@@ -13,7 +13,7 @@ mod value;
 pub use database::Statement as MultiliteStatement;
 pub use database::{
     DatabaseId, OfflineServer, OpenOptions, PullOutcome, PushOutcome, PushRejection,
-    RebaseConflict, ReplicaInvitation,
+    ReplicaInvitation,
 };
 pub use error::{Error, Result};
 pub use rusqlite::types::{FromSql, Type, Value, ValueRef};

@@ -7,13 +7,12 @@ use homebase_client::cipher::{
 };
 use homebase_client::meta::{OrderedMetaStore, audit};
 use homebase_client::server::ServerHandle;
-use homebase_client::{Client, Mutation, PushOutcome, RebaseConflict};
+use homebase_client::{Client, Mutation, PushOutcome};
 use homebase_core::clock::{HybridTimestamp, Lineage, ManualClock, Timestamp};
 use homebase_core::key::Key;
 use homebase_core::lease::LeaseMode;
 use homebase_core::messages::{
-    AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec, Range, RangeAssert,
-    RangeAssertFailure, RangeCut,
+    AdmissionBatch, AdmissionRequest, GetRequest, LeaseSpec, Range, RangeCut,
 };
 use homebase_core::space::SpaceId;
 use homebase_core::storage::MemoryStore;
@@ -133,78 +132,6 @@ async fn queued(mem: &MemoryStore) -> usize {
         .values()
         .map(|space| space.oplog.len())
         .sum()
-}
-
-#[test]
-fn encrypted_rebase_analysis_compares_the_shared_encoded_name_domain() {
-    block_on(async {
-        let envelope = SpaceEnvelope::mint(NameKey([16; 32]), SpaceKey([17; 32]));
-        let space = envelope.space_id();
-        let local_store = MemoryStore::new();
-        let foreign_store = MemoryStore::new();
-        let local_clock = ManualClock::new(Timestamp(0));
-        let foreign_clock = ManualClock::new(Timestamp(0));
-        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), space);
-
-        let local = Client::open(
-            OrderedMetaStore::new(&local_store),
-            &handle,
-            &local_clock,
-            dev(1),
-            TestNonceSource::new(1),
-        )
-        .await
-        .unwrap();
-        local.attach(&envelope).await.unwrap();
-        let local_space = local.space(space).await.unwrap();
-        let db = key(&[b"db"]);
-        local_space
-            .submit_unchecked(
-                vec![set(key(&[b"db", b"local"]), b"local")],
-                vec![RangeAssert {
-                    prefix: db.clone(),
-                    upto: AdmissionSeq(0),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let foreign = Client::open(
-            OrderedMetaStore::new(&foreign_store),
-            &handle,
-            &foreign_clock,
-            dev(2),
-            TestNonceSource::new(50),
-        )
-        .await
-        .unwrap();
-        foreign.attach(&envelope).await.unwrap();
-        let foreign_space = foreign.space(space).await.unwrap();
-        foreign_space
-            .submit_unchecked(vec![set(key(&[b"db", b"foreign"]), b"foreign")], vec![])
-            .await
-            .unwrap();
-        foreign_space.push().await.unwrap();
-
-        local_space.pull().await.unwrap();
-        let cursors = local_space.admits().cursors().await.unwrap();
-        let analysis = local_space
-            .analyze_rebase(cursors.neck..cursors.tail)
-            .await
-            .unwrap();
-        let encoded_db = envelope.open().unwrap().encode_key(&db).unwrap();
-        assert_eq!(
-            analysis.conflicts,
-            vec![RebaseConflict {
-                device_seq: DeviceSeq(1),
-                failures: vec![RangeAssertFailure {
-                    prefix: encoded_db,
-                    upto: AdmissionSeq(0),
-                    actual: AdmissionSeq(1),
-                }],
-            }]
-        );
-    });
 }
 
 #[test]

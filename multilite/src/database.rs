@@ -29,8 +29,6 @@ use crate::{Error, Params, Result};
 use self::operation::MultiliteOp;
 use self::store::DatabaseMetaStore;
 
-pub use self::rebase::RebaseConflict;
-
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
 /// Result of fetching this database's available server admissions.
@@ -993,7 +991,26 @@ mod tests {
     }
 
     #[test]
-    fn rebase_rejects_cursor_changes_between_analysis_and_apply() {
+    fn rebase_rejects_pending_submission_even_without_fetched_admissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("pending-rebase.sqlite")).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        let before = client_state(&database);
+
+        assert!(matches!(
+            database.rebase(&runtime),
+            Err(Error::RebasePendingSubmissions)
+        ));
+        assert_eq!(client_state(&database), before);
+        assert!(table_exists(&database, "notes"));
+        assert_eq!(pending_ops(&database).len(), 1);
+    }
+
+    #[test]
+    fn rebase_rejects_cursor_changes_between_snapshot_and_apply() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
         let source = Database::open_with(
@@ -1022,7 +1039,7 @@ mod tests {
         replica.pull().unwrap();
 
         let error = replica
-            .rebase_after_plan(&replica_runtime, || {
+            .rebase_after_snapshot(&replica_runtime, || {
                 source.execute(
                     &source_runtime,
                     "CREATE TABLE second_remote (id INTEGER PRIMARY KEY)",
@@ -1115,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn rebase_conflict_returns_a_stable_handle_without_mutation() {
+    fn rebase_requires_an_empty_submit_log_without_mutation() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
         let first = Database::open_with(
@@ -1153,15 +1170,10 @@ mod tests {
         let before = client_state(&second);
         let before_sql = table_sql(&second, "notes").unwrap();
 
-        let Error::RebaseConflict(conflict) = second.rebase(&second_runtime).unwrap_err() else {
-            panic!("same-name rebase returned the wrong failure")
-        };
-        assert_eq!(conflict.database_id, second.database_id());
-        assert_eq!(conflict.device_id, second.client.device());
-        assert_eq!(conflict.admitted_from(), 1);
-        assert_eq!(conflict.admitted_to_exclusive(), 2);
-        assert_eq!(conflict.conflicts().len(), 1);
-        assert_eq!(conflict.conflicts()[0].device_seq, DeviceSeq(1));
+        assert!(matches!(
+            second.rebase(&second_runtime),
+            Err(Error::RebasePendingSubmissions)
+        ));
         assert_eq!(client_state(&second), before);
         assert_eq!(table_sql(&second, "notes").unwrap(), before_sql);
         assert_eq!(pending_ops(&second).len(), 1);
@@ -1211,45 +1223,6 @@ mod tests {
             Err(Error::InvalidMultiliteOp(_))
         ));
         assert_eq!(client_state(&replica), before);
-    }
-
-    #[test]
-    fn own_admission_does_not_overwrite_newer_local_materialization() {
-        let directory = tempfile::tempdir().unwrap();
-        let server = server();
-        let database = Database::open_with(
-            directory.path().join("own-mismatch.sqlite"),
-            OpenOptions::new().server(router(Arc::clone(&server))),
-        )
-        .unwrap();
-        assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
-        database
-            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        assert_eq!(database.push().unwrap(), PushOutcome::Drained);
-        database.pull().unwrap();
-        // This stands in for a later speculative drop-and-recreate, which the
-        // current restricted SQL surface does not support yet.
-        database.with_connection(|connection| {
-            connection
-                .execute_batch(
-                    "DROP TABLE notes;
-                     CREATE TABLE notes (id INTEGER PRIMARY KEY, payload BLOB)",
-                )
-                .unwrap();
-        });
-        database.rebase(&runtime).unwrap();
-
-        assert!(
-            table_sql(&database, "notes")
-                .unwrap()
-                .contains("payload BLOB")
-        );
-        let state = client_state(&database);
-        let cursors = state.spaces[&database.database_id().space_id()].admit_cursors;
-        assert_eq!(cursors.neck, AdmissionSeq(2));
-        assert_eq!(cursors.tail, AdmissionSeq(2));
     }
 
     #[test]

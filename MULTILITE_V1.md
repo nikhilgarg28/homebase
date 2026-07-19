@@ -161,8 +161,9 @@ When V1 is complete, these tests should pass:
   losing device repairs only after an explicit call that rolls back its active
   suffix.
 - Let device B pull device A's winning duplicate before B pushes; verify pull
-  captures the admission but apply stops before the conflict until B explicitly
-  pushes and repairs.
+  captures the admission but rebase refuses while B's submit log is nonempty;
+  B must explicitly push, roll back the rejected suffix, and push its marker
+  before applying the winner.
 - Restart a client with unpushed local inserts and verify the local submit log
   resumes correctly.
 - Simulate lost acknowledgements and verify re-push is idempotent.
@@ -578,33 +579,14 @@ a same-name range-assert rejection, unavailable transport, complete Homebase
 `MetaStore` conformance, and an injected pending-cleanup failure that rolls
 back `neck` movement before a server-ahead retry converges.
 
-### Batch 11: Homebase rebase analysis
+### Batch 11: submit cursor observation
 
-Add a read-only Homebase client operation that compares unapplied admitted
-history with the active local submission window. It uses admitted keys and the
-submissions' existing range assertions to identify which local device
-sequences can no longer be replayed over the new admit cut. It moves no cursor
-and does not interpret Multilite operations.
-
-Implementation result: `Space::analyze_rebase(from..to)` point-reads both
-cursor triples, scans the active submit window and exactly that retained admit
-interval, and returns the interval and observed cursors with
-per-device-sequence `RangeAssertFailure`s. Range assertions are the sole
-dependency declaration. Foreign Set/Delete descendants and overlapping
-DeleteRanges invalidate them; own-device history, admissions at or below
-`upto`, and unasserted submissions do not. If the same local sequence is
-already present in the selected interval, its admission caps the history
-relevant to replay. Analysis performs no network I/O, decryption, or cursor
-transition and assigns no implicit meaning to admit `neck`; callers own
-interval continuity and application policy. The `MetaStore` contract now has a symmetric
-`oplog_cursors(space)` point read, and Multilite uses it instead of loading the
-entire client state when recording a push rejection.
-
-Tests cover point and range overlap, sibling exclusion, inclusive `upto`, all
-failures and their order, own-device exclusion, the already-admitted retry
-case, unasserted submissions, explicit empty and unavailable intervals,
-encrypted name-domain agreement, cursor immutability, and both reference and
-joined-store conformance.
+The `MetaStore` contract gained a symmetric `oplog_cursors(space)` point read,
+which Multilite uses to snapshot rebase state and record push rejections
+without loading the entire client state. The initially built client-side
+`analyze_rebase` operation was removed when V1 adopted the stronger
+push-before-rebase invariant: queued range assertions now have exactly one
+evaluator, the server admission path.
 
 ### Batch 12: CREATE TABLE pull
 
@@ -628,41 +610,40 @@ admit log unchanged.
 ### Batch 13: CREATE TABLE rebase
 
 Multilite `rebase` snapshots `[admit.neck, admit.tail)`, decodes and validates
-those admitted operations, asks Homebase to analyze that exact interval, and
-returns an error without mutation when a conflict exists. Otherwise it applies
-foreign table creations in admission order, treats authenticated own admissions
-as materialization no-ops, rechecks the returned submit/admit cursor snapshots,
-and advances admit `neck` in the same SQLite transaction. Own operations were
-already materialized atomically with submission; comparing an older admission
-to current SQLite state would incorrectly reject a later speculative rewrite.
-Internal apply mode suppresses local capture.
+those admitted operations, and requires `submit.neck == submit.tail` before it
+can apply them. Range assertions were already evaluated by the server while
+draining that submit window. Rebase applies foreign table creations in
+admission order, treats authenticated own admissions as materialization
+no-ops, rechecks both submit/admit cursor snapshots, and advances admit `neck`
+in the same SQLite transaction. Internal apply mode suppresses local capture.
 
 Implementation result: `MultiliteConnection::rebase()` performs exactly that
 local operation and never pulls or repairs implicitly. Homebase now exposes
 authenticated `admits().iter(from..to)` with exact retained-range and density
 checks; `iter_from_neck()` shares the implementation. Multilite decodes every
-operation before opening its apply transaction. A conflict returns
-`Error::RebaseConflict` with an opaque snapshot-bound handle for later explicit
-rollback. On a clean interval, foreign DDL, own-operation skipping, cursor
-rechecks, and exclusive admit-`neck` advancement commit in one SQLite
-savepoint. Reserved Multilite table names are rejected by operation validation
-itself because remote apply intentionally bypasses the public authorizer.
+operation before opening its apply transaction. Pending submissions return
+`Error::RebasePendingSubmissions` without changing either log or SQLite. With
+an empty submit log, foreign DDL, own-operation skipping, cursor rechecks, and
+exclusive admit-`neck` advancement commit in one SQLite savepoint. Reserved
+Multilite table names are rejected by operation validation itself because
+remote apply intentionally bypasses the public authorizer.
 
 Tests cover empty rebase, two-device foreign/own convergence and reopen,
-same-name conflict without mutation, malformed admitted operations, mismatched
-own admission preserving newer local materialization, exact admit-range access,
-cursor movement between planning and apply, and failure of later remote DDL
-rolling back earlier DDL and cursor movement.
+pending-submit rejection without mutation, malformed admitted operations,
+exact admit-range access, cursor movement between snapshot and apply, and
+failure of later remote DDL rolling back earlier DDL and cursor movement.
 
 ### Batch 14: explicit CREATE TABLE rollback
 
-Given a current rejection or rebase conflict, explicit `rollback` validates
-that the pending and Homebase windows have not changed. In one SQLite
-transaction it runs reject effects for the speculative suffix in reverse
-order, applies the admitted schema history in forward order, records the
-Homebase rollback marker, advances admit `neck`, and retires the corresponding
-pending records. Rollback is the only V1 conflict-repair strategy; `push` and
-`rebase` never invoke it implicitly.
+`push` is the only range-assert evaluator. Its ordered probing durably trims
+every accepted prefix before returning a definitive `PushRejection`, so the
+remaining active submit window is exactly the conservative suffix to discard.
+Explicit `rollback(rejection)` validates the database, device, and observed
+submit window, then in one SQLite transaction runs every remaining reject
+effect in reverse device order, invokes Homebase's existing whole-active-window
+rollback transition, and retires those pending records. The resulting empty
+rollback marker must be pushed before `rebase` can proceed. Unavailable or
+ambiguous push errors still produce no rollback authority.
 
 ### Batch 15: CREATE TABLE fault and convergence matrix
 

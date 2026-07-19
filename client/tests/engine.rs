@@ -623,7 +623,7 @@ fn unchecked_submit_bypasses_local_assert_gate() {
 }
 
 #[test]
-fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
+fn exact_admit_ranges_are_dense_bounded_and_read_only() {
     block_on(async {
         let mem = MemoryStore::new();
         let clock = ManualClock::new(Timestamp(0));
@@ -637,20 +637,6 @@ fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
             .unwrap();
         let space = client.space(SPACE).await.unwrap();
         let db = key(&[b"db"]);
-        space
-            .submit_unchecked(
-                vec![set(key(&[b"db", b"local"]), b"local")],
-                vec![RangeAssert {
-                    prefix: db.clone(),
-                    upto: AdmissionSeq(0),
-                }],
-            )
-            .await
-            .unwrap();
-        space
-            .submit_unchecked(vec![set(key(&[b"db", b"unasserted"]), b"local")], vec![])
-            .await
-            .unwrap();
 
         foreign_put(
             &handle,
@@ -658,64 +644,58 @@ fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
             dev(2),
             &db,
             vec![PendingEntry {
-                key: key(&[b"db", b"foreign"]),
-                value: val(b"foreign"),
+                key: key(&[b"db", b"first"]),
+                value: val(b"first"),
                 ver: Ver(1),
             }],
             DeviceSeq(1),
         )
         .await;
-        assert_eq!(space.pull().await.unwrap(), AdmissionSeq(1));
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(3),
+            &db,
+            vec![PendingEntry {
+                key: key(&[b"db", b"second"]),
+                value: val(b"second"),
+                ver: Ver(2),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        assert_eq!(space.pull().await.unwrap(), AdmissionSeq(2));
 
         let before = audit(&OrderedMetaStore::new(&mem)).await;
-        let before_space = &before.spaces[&SPACE];
-        let analyzed_range = before_space.admit_cursors.neck..before_space.admit_cursors.tail;
-        let admitted = space.admits().iter(analyzed_range.clone()).await.unwrap();
-        assert_eq!(admitted.len(), 1);
-        assert_eq!(admitted[0].admission_seq, AdmissionSeq(1));
-        let analysis = space.analyze_rebase(analyzed_range.clone()).await.unwrap();
-        assert_eq!(analysis.submit_cursors, before_space.cursors);
-        assert_eq!(analysis.admit_cursors, before_space.admit_cursors);
-        assert_eq!(analysis.admit_range, analyzed_range);
-        assert_eq!(
-            analysis.conflicts,
-            vec![homebase_client::RebaseConflict {
-                device_seq: DeviceSeq(1),
-                failures: vec![RangeAssertFailure {
-                    prefix: db,
-                    upto: AdmissionSeq(0),
-                    actual: AdmissionSeq(1),
-                }],
-            }]
-        );
-
-        let empty = space
-            .analyze_rebase(before_space.admit_cursors.tail..before_space.admit_cursors.tail)
+        let cursors = before.spaces[&SPACE].admit_cursors;
+        let admitted = space
+            .admits()
+            .iter(cursors.neck..cursors.tail)
             .await
             .unwrap();
-        assert!(empty.is_clean());
-        assert!(matches!(
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|batch| batch.admission_seq)
+                .collect::<Vec<_>>(),
+            vec![AdmissionSeq(1), AdmissionSeq(2)]
+        );
+        assert!(
             space
-                .analyze_rebase(
-                    before_space.admit_cursors.head
-                        ..AdmissionSeq(before_space.admit_cursors.tail.0 + 1),
-                )
-                .await,
-            Err(SpaceDriverError::AdmitRangeUnavailable { .. })
-        ));
+                .admits()
+                .iter(cursors.tail..cursors.tail)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             space
                 .admits()
-                .iter(
-                    before_space.admit_cursors.head
-                        ..AdmissionSeq(before_space.admit_cursors.tail.0 + 1),
-                )
+                .iter(cursors.head..AdmissionSeq(cursors.tail.0 + 1))
                 .await,
             Err(SpaceDriverError::AdmitRangeUnavailable { .. })
         ));
-
-        let after = audit(&OrderedMetaStore::new(&mem)).await;
-        assert_eq!(after, before);
+        assert_eq!(audit(&OrderedMetaStore::new(&mem)).await, before);
     });
 }
 
