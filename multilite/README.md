@@ -5,14 +5,24 @@ the Homebase coordination kernel.
 
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
-Homebase metadata. Public SQL currently permits persistent `CREATE TABLE`,
-read-only prepared `SELECT`, and `INSERT` against non-reserved tables. Other
-verbs, caller-owned transactions, conflict clauses, attached databases, and
+Homebase metadata. Public SQL currently permits a restricted persistent
+`CREATE TABLE`, read-only prepared `SELECT`, and `INSERT` against non-reserved
+tables. A table must use the initial four declared types and exactly one inline
+primary key; richer constraints and schema forms remain rejected. Other verbs,
+caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
-General mutation capture and synchronization land in subsequent V1 batches.
+The internal operation layer can translate restricted table creation to and
+from its complete Homebase log-and-revision-cell envelope. Local capture,
+submission, pull, rebase, and rollback land in subsequent batches.
 The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.
+
+Each translated table creation contains immutable UUID identities and exact
+SQL. Its Homebase form contains an immutable operation record plus table and
+canonical-name revision cells, with those cells also serving as range-assert
+scopes. The inverse translation verifies the complete envelope and checks that
+the stored SQL projects to the same structured operation.
 
 `MultiliteConnection::open` is the single file-lifecycle verb. Internally it
 first opens and commits a general Multilite database containing identity and

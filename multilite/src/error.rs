@@ -46,6 +46,8 @@ pub enum Error {
     },
     /// Operating-system randomness was unavailable while minting identity.
     Entropy(String),
+    /// A Multilite operation was malformed or contradicted its SQL.
+    InvalidMultiliteOp(String),
     /// The embedded Homebase client failed to initialize.
     Client(ClientError),
 }
@@ -84,6 +86,9 @@ impl fmt::Display for Error {
                 "V1 schema version {found} is newer than supported version {supported}"
             ),
             Self::Entropy(message) => write!(f, "could not mint database identity: {message}"),
+            Self::InvalidMultiliteOp(message) => {
+                write!(f, "invalid Multilite operation: {message}")
+            }
             Self::Client(error) => write!(f, "homebase client error: {error}"),
         }
     }
@@ -102,7 +107,8 @@ impl std::error::Error for Error {
             | Self::DatabaseIdMismatch { .. }
             | Self::InvalidReplicaInvitation
             | Self::UnsupportedV1SchemaVersion { .. }
-            | Self::Entropy(_) => None,
+            | Self::Entropy(_)
+            | Self::InvalidMultiliteOp(_) => None,
             Self::Client(error) => Some(error),
         }
     }

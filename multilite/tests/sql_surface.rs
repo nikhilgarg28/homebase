@@ -9,7 +9,7 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
     db.execute(
         "CREATE TABLE notes (
             id INTEGER PRIMARY KEY,
-            body TEXT NOT NULL UNIQUE
+            body TEXT NOT NULL
         )",
         (),
     )

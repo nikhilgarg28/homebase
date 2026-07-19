@@ -1630,6 +1630,7 @@ dependencies = [
  "sha2",
  "sqlite3-parser",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

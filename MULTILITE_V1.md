@@ -13,8 +13,10 @@ without muddying the generic SQLite-facing machinery.
 ## V1 shape
 
 V1 is a normal SQLite file with one built-in synced table shape, the existing
-homebase kernel and client, and optimistic append-only sync. There is no user
-DDL. multilite owns one logical table:
+homebase kernel and client, and optimistic append-only sync. The general
+database layer now accepts a deliberately restricted `CREATE TABLE`, and its
+operation layer defines the Homebase representation; the temporary V1 row-sync
+layer still owns one logical table:
 
 ```sql
 CREATE TABLE items (
@@ -30,8 +32,8 @@ application data in `payload` (JSON, msgpack, protobuf, etc.). The only
 supported write is `INSERT` of a new `(collection, id, payload)` row. Reads are
 ordinary local SQLite `SELECT`s through a rusqlite-like API. There are no
 updates, deletes, transactions, secondary indexes, foreign keys, triggers,
-migrations, encryption, partial replication, leases, device fencing, or user
-schema management.
+migrations, encryption, partial replication, leases, device fencing, or schema
+evolution beyond initial table creation.
 
 All local inserts are accepted optimistically and appended to homebase's local
 submit log as unchecked submits. Each insert internally carries an exact-key
@@ -55,10 +57,9 @@ V1 proves:
 - unpushed work survives restart;
 - push, pull, apply, idempotent retry, conflict rejection, and repair converge.
 
-V1 does not need UUID schema tags, column-tagged row frames, public range
-asserts, vtable machinery, or SQL DDL interception yet. Exact-key range asserts
-are an internal OCC mechanism, not part of the Multilite API. V1 still uses
-versioned logical records and future-compatible names where cheap.
+Schema mutations and their table/column identities now use UUIDs, while row
+frames remain the next layer. Range assertions are still internal OCC
+machinery rather than part of the Multilite SQL API.
 
 ## Layering and trust boundary
 
@@ -469,30 +470,53 @@ public policy. `Database::execute` applies the grammar-derived AST gate, and
 the database authorizer admits only the action graph needed for the three
 verbs, including SQLite's internal catalog writes and implicit indexes for
 `CREATE TABLE`; the `__multilite__` namespace is reserved case-insensitively.
-The AST gate admits only one plain `CREATE TABLE` or `INSERT` execution and
-rejects `AUTOINCREMENT`, schema conflict policies, `REPLACE`, `INSERT OR ...`,
+The AST gate admits only one restricted `CREATE TABLE` or `INSERT` execution
+and rejects `AUTOINCREMENT`, schema conflict policies, `REPLACE`, `INSERT OR ...`,
 UPSERT, and `RETURNING` before SQLite mutates the file. Prepared SQL is
 authorized as public and must be read-only before a reusable statement handle
 is returned. V1 adds only its local migration ledger, validation of `items`,
 and preupdate capture of `items` inserts; it does not own the public SQL
 surface.
 
-### Batch 9a: general schema and row identity
+### Batch 9a: restricted schema operations
 
-Replace the temporary `ItemKey`/`ItemInsert` assumptions with canonical forms
-for arbitrary user tables. This batch decides and pins:
+The first synchronized schema slice accepts only an unqualified persistent
+table with explicit `INTEGER`, `REAL`, `TEXT`, or `BLOB` columns, exactly one
+inline primary key, and optional `NOT NULL`. A non-`INTEGER` primary key must
+also be `NOT NULL`. It rejects `IF NOT EXISTS`, `AS SELECT`, table constraints,
+named constraints, `UNIQUE`, `CHECK`, defaults, collations, generated columns,
+foreign keys, sized or custom type names, ordering/conflict clauses, `STRICT`,
+`WITHOUT ROWID`, and `AUTOINCREMENT`. Later batches can add each omitted
+semantic deliberately.
 
-- whether `CREATE TABLE` is synchronized or replicas must receive matching
-  schema through an explicit out-of-band contract;
-- stable table identity and schema fingerprinting;
-- row identity for explicit, composite, integer-primary-key, and rowid-backed
-  tables;
-- canonical column identity, order, storage classes, and value framing;
-- the Homebase key and exact-range assertion derived for each logical row.
+`MultiliteOp::CreateTable` carries UUID-shaped mutation, table, and column ids.
+Its tagged frame stores the exact SQL plus the structured table definition.
+Lowering one operation produces:
 
-The result must make a schema mismatch detectable before remote row apply and
-must not derive durable identity from SQLite names that can later become
-ambiguous. Golden-vector and malformed-frame tests pin every representation.
+```text
+(multilite, schema, log, mutation_uuid)                       -> mutation frame
+(multilite, schema, scopes, tables, table_uuid)               -> mutation_uuid
+(multilite, schema, scopes, table-names, encoded_name)        -> mutation_uuid
+```
+
+The immutable UUID log and mutable revision cells are separate layers. The
+Homebase admission log supplies total replay order; revision cells identify
+the latest mutation touching a coordination scope. Short canonical names use
+`name-` followed by at most 250 UTF-8 bytes. Longer names use `hash-` followed
+by a raw, domain-separated SHA-256 digest. The complete spelling remains in
+the mutation value and is protected whenever the space uses encryption.
+
+The table and name revision cells become exact `RangeAssert` prefixes when the
+lowered operation is bound to a local applied cut. Independently minted tables
+with the same canonical name will therefore race on the name cell, while
+disjoint names can admit independently once capture is wired in.
+
+The reverse translation accepts only a complete authenticated three-entry
+Homebase envelope. It verifies UUID-v4 ids, log and revision keys and values,
+and that the literal SQL projects to the same structured `MultiliteOp`. This
+batch does not submit or apply the operation. Tests pin tagged-frame
+roundtrips, malformed frames and envelopes, key shape, short/long names, and
+SQL/structure agreement.
 
 ### Batch 9b: capture INSERT to homebase submit log
 

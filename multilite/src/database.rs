@@ -1,5 +1,7 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod operation;
+mod schema;
 mod sql;
 
 use std::path::Path;

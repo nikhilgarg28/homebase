@@ -35,8 +35,11 @@ fn execute_and_query_roundtrip_across_reopen() {
 fn query_map_supports_normal_rusqlite_parameters_and_conversions() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("params.sqlite")).unwrap();
-    db.execute("CREATE TABLE values_v1 (id INTEGER, payload BLOB)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE values_v1 (id INTEGER PRIMARY KEY, payload BLOB)",
+        (),
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO values_v1 (id, payload) VALUES (?1, ?2)",
         params![11_i64, b"payload"],
@@ -59,8 +62,11 @@ fn query_map_supports_normal_rusqlite_parameters_and_conversions() {
 fn prepare_rejects_writes_without_mutating() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("readonly.sqlite")).unwrap();
-    db.execute("CREATE TABLE values_v1 (value INTEGER)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE values_v1 (id INTEGER PRIMARY KEY, value INTEGER)",
+        (),
+    )
+    .unwrap();
 
     let error = match db.prepare("INSERT INTO values_v1 (value) VALUES (1)") {
         Ok(_) => panic!("write statement unexpectedly prepared"),
