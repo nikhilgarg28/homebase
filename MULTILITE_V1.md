@@ -540,6 +540,18 @@ only retires the pending record; rejection removes the speculative table.
 Suffix rollback executes reject effects in reverse device order. Journal
 updates join the same SQLite transaction as submission and materialization.
 
+Implementation result: `__multilite__pending` stores the assigned sequence and
+one opaque, versioned record frame containing the local `MultiliteOp` plus
+repeated accept and reject effects. The frame repeats its `DeviceSeq`; loading
+verifies that it matches the fixed-width big-endian row key, which preserves
+numeric order without constraining Homebase's `u64` domain to SQLite's signed
+integer range. The initial acceptance list is empty and the rejection list is
+`[DropTable(exact_name)]`. General database bootstrap creates and validates
+this table with the Homebase metastore; partial initialization is invalid.
+Tests cover codec and ordered roundtrip, malformed rows, mismatched sequence
+keys, namespace lookalikes, reopen recovery, and failure after Homebase
+submission but before pending insertion.
+
 ### Batch 10: CREATE TABLE push
 
 Expose Multilite `push` as a thin policy layer over Homebase push. A definitive

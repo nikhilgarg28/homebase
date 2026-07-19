@@ -1,6 +1,7 @@
 //! General Multilite database identity and Homebase lifecycle.
 
 mod operation;
+mod pending;
 mod schema;
 mod sql;
 
@@ -240,8 +241,9 @@ impl<H: ServerHandle> Database<H> {
         runtime.run(ExecutionMode::Public, |connection| {
             let changed = connection.execute(sql, params)?;
             runtime.with_internal_metadata(|| {
-                block_on(space.submit_unchecked(mutations, assertions))
+                let submission = block_on(space.submit_unchecked(mutations, assertions))
                     .map_err(ClientError::from)?;
+                pending::insert(connection, submission.seq, &operation)?;
                 Ok(())
             })?;
             Ok(changed)
@@ -408,6 +410,7 @@ fn initialize<H: ServerHandle>(
         None => DatabaseId::from_bytes(mint_id()?),
     };
     SqliteOrderedStore::initialize(owner)?;
+    owner.with_connection(pending::initialize)?;
     let store = OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone()));
     let client = block_on(Client::open(
         store,
@@ -426,6 +429,7 @@ fn reopen<H: ServerHandle>(
     server: H,
     lineage: Lineage,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
+    owner.with_connection(pending::load)?;
     let store = OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone()));
     let state = block_on(store.load())?;
     if state.device.is_none() {
@@ -479,11 +483,18 @@ enum DatabaseState {
 }
 
 fn classify(connection: &Connection) -> Result<DatabaseState> {
-    if SqliteOrderedStore::is_initialized(connection)? {
-        SqliteOrderedStore::validate(connection)?;
-        Ok(DatabaseState::Initialized)
-    } else {
-        Ok(DatabaseState::Fresh)
+    let metadata = SqliteOrderedStore::is_initialized(connection)?;
+    let pending = pending::is_initialized(connection)?;
+    match (metadata, pending) {
+        (false, false) => Ok(DatabaseState::Fresh),
+        (true, true) => {
+            SqliteOrderedStore::validate(connection)?;
+            pending::validate(connection)?;
+            Ok(DatabaseState::Initialized)
+        }
+        _ => Err(Error::InvalidDatabase(
+            "general metadata tables are only partially initialized",
+        )),
     }
 }
 
@@ -549,6 +560,10 @@ mod tests {
         })
     }
 
+    fn pending_ops<H: ServerHandle>(database: &Database<H>) -> Vec<pending::PendingOp> {
+        database.with_connection(pending::load).unwrap()
+    }
+
     #[test]
     fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -589,6 +604,16 @@ mod tests {
         );
         assert_eq!(range_asserts[0].prefix, *entries[1].key());
         assert_eq!(range_asserts[1].prefix, *entries[2].key());
+        let pending = pending_ops(&database);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, DeviceSeq(1));
+        assert!(pending[0].on_accept.is_empty());
+        assert_eq!(
+            pending[0].on_reject,
+            [pending::Effect::DropTable {
+                name: "notes".into()
+            }]
+        );
 
         drop(runtime);
         drop(database);
@@ -602,6 +627,7 @@ mod tests {
             space.oplog.get(&DeviceSeq(1)),
             Some(DeviceOp::Commit { .. })
         ));
+        assert_eq!(pending_ops(&reopened), pending);
     }
 
     #[test]
@@ -630,6 +656,44 @@ mod tests {
                 .is_err()
         );
         assert!(!table_exists(&database, "rolled_back"));
+
+        let state = client_state(&database);
+        let space = state.spaces.get(&database_id.space_id()).unwrap();
+        assert_eq!(
+            space.cursors,
+            homebase_client::meta::OplogCursors::default()
+        );
+        assert!(space.oplog.is_empty());
+        assert!(pending_ops(&database).is_empty());
+    }
+
+    #[test]
+    fn failed_pending_insert_rolls_back_the_table_and_homebase_submission() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("atomic-pending.sqlite")).unwrap();
+        let database_id = database.database_id();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_pending_insert
+                     BEFORE INSERT ON __multilite__pending
+                     BEGIN SELECT RAISE(ABORT, 'injected pending failure'); END",
+                )
+                .unwrap();
+        });
+
+        assert!(
+            database
+                .execute(
+                    &runtime,
+                    "CREATE TABLE rolled_back_pending (id INTEGER PRIMARY KEY)",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(!table_exists(&database, "rolled_back_pending"));
+        assert!(pending_ops(&database).is_empty());
 
         let state = client_state(&database);
         let space = state.spaces.get(&database_id.space_id()).unwrap();

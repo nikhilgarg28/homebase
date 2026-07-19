@@ -177,12 +177,25 @@ impl CreateTable {
         from_homebase_inner(batch)
     }
 
-    fn encode(&self) -> Vec<u8> {
+    /// Encode this complete schema operation for local durable state.
+    pub fn encode(&self) -> Vec<u8> {
         let mut frame = vec![SCHEMA_FRAME_VERSION];
         put_field(&mut frame, TAG_MUTATION_ID, &self.mutation_id.0);
         put_field(&mut frame, TAG_SQL, self.sql.as_bytes());
         put_field(&mut frame, TAG_CREATE_TABLE, &encode_create_table(self));
         frame
+    }
+
+    /// Decode and validate one complete locally stored schema operation.
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
+        let created = decode_frame(frame)?;
+        validate_literal_sql(&created)?;
+        Ok(created)
+    }
+
+    /// Return the exact SQLite spelling of the created table name.
+    pub fn table_name(&self) -> &str {
+        self.name.value()
     }
 }
 
@@ -492,11 +505,10 @@ fn from_homebase_inner(
     else {
         return Err(SchemaCodecError::InvalidBatch);
     };
-    let created = decode_frame(frame)?;
+    let created = CreateTable::decode(frame)?;
     if admitted_log_key != &log_key(created.mutation_id) {
         return Err(SchemaCodecError::InvalidBatch);
     }
-    validate_literal_sql(&created)?;
     validate_revision_entry(
         table_entry,
         &table_scope_key(created.table_id),

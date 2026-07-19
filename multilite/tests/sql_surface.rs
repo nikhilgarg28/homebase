@@ -180,7 +180,7 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
         .unwrap();
     assert_eq!(
         statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
-        [2]
+        [3]
     );
 }
 

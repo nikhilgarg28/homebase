@@ -4,8 +4,10 @@ use homebase_client::ServerHandle;
 use rusqlite::Connection;
 
 use crate::database::Database;
-use crate::metastore::META_TABLE;
 use crate::{Error, Result};
+
+#[cfg(test)]
+use crate::metastore::META_TABLE;
 
 const VERSION_TABLE: &str = "__multilite__v1_schema";
 const ITEMS_TABLE: &str = "items";
@@ -138,11 +140,11 @@ fn user_tables(connection: &Connection) -> Result<Vec<String>> {
         "SELECT name FROM sqlite_schema
          WHERE type = 'table'
            AND name NOT LIKE 'sqlite_%'
-           AND name != ?1
+           AND substr(name, 1, length('__multilite__')) != '__multilite__' COLLATE NOCASE
          ORDER BY name",
     )?;
     Ok(statement
-        .query_map([META_TABLE], |row| row.get(0))?
+        .query_map((), |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

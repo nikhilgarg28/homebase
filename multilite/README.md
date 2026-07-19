@@ -13,9 +13,10 @@ caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation to and from
 its complete Homebase log-and-revision-cell envelope. Local `CREATE TABLE` and
-its Homebase submission now commit in one SQLite savepoint. Push, pending
-effects, pull, rebase, and rollback land in subsequent batches before INSERT
-is connected to synchronization.
+its Homebase submission now commit in one SQLite savepoint together with a
+pending-effects row keyed by the assigned device sequence. Push, pull, rebase,
+and rollback land in subsequent batches before INSERT is connected to
+synchronization.
 The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.
@@ -65,6 +66,11 @@ first supported release.
 
 Homebase client state is stored in the same SQLite file under
 `__multilite__meta`.
+Speculative Multilite operations and their explicit acceptance/rejection
+effects are stored under `__multilite__pending`; this is a local disposition
+journal, not a second operation log. Its versioned record codec stores repeated
+effect lists: the initial CREATE TABLE acceptance list is empty, while its
+rejection list drops the speculative table.
 The ordered-store adapter executes synchronously under a serialized,
 thread-reentrant connection owner: other threads cannot use the connection
 concurrently, while metadata operations can join the outer SQLite savepoint
