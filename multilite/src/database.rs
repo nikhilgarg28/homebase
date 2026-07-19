@@ -9,10 +9,10 @@ use std::path::Path;
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase_client::meta::{MetaStore, OrderedMetaStore};
 use homebase_client::server::UnreachableSpace;
-use homebase_client::{Client, ServerHandle};
+use homebase_client::{Client, ClientError, ServerHandle};
 use homebase_core::clock::{Lineage, SystemHybridClock};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::DeviceId;
+use homebase_core::tag::{AdmissionSeq, DeviceId};
 use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
@@ -21,6 +21,8 @@ use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
+
+use self::operation::MultiliteOp;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -203,9 +205,46 @@ impl<H: ServerHandle> Database<H> {
         sql: &str,
         params: Q,
     ) -> Result<(usize, Vec<P::Event>)> {
-        sql::validate_execute(sql)?;
+        match sql::validate_execute(sql)? {
+            sql::ValidatedExecute::Insert => runtime.run(ExecutionMode::Public, |connection| {
+                Ok(connection.execute(sql, params)?)
+            }),
+            sql::ValidatedExecute::CreateTable(table) => {
+                self.execute_create_table(runtime, sql, params, table)
+            }
+        }
+    }
+
+    fn execute_create_table<P: HookPolicy, Q: Params>(
+        &self,
+        runtime: &DatabaseRuntime<P>,
+        sql: &str,
+        params: Q,
+        table: schema::CreateTableSpec,
+    ) -> Result<(usize, Vec<P::Event>)> {
+        let operation = MultiliteOp::create_table(sql, table);
+        let (space, upto) = block_on(async {
+            let space = self.client.space(self.database_id.space_id()).await?;
+            let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
+            let upto = AdmissionSeq(
+                cursors
+                    .neck
+                    .0
+                    .checked_sub(1)
+                    .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
+            );
+            Ok::<_, Error>((space, upto))
+        })?;
+        let (mutations, assertions) = operation.to_homebase().at(upto);
+
         runtime.run(ExecutionMode::Public, |connection| {
-            Ok(connection.execute(sql, params)?)
+            let changed = connection.execute(sql, params)?;
+            runtime.with_internal_metadata(|| {
+                block_on(space.submit_unchecked(mutations, assertions))
+                    .map_err(ClientError::from)?;
+                Ok(())
+            })?;
+            Ok(changed)
         })
     }
 
@@ -463,7 +502,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use homebase_client::meta::{ClientState, DeviceOp, SubmitMode};
     use homebase_client::server::offline_router;
+    use homebase_core::tag::DeviceSeq;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
     use super::*;
@@ -486,6 +527,117 @@ mod tests {
         ) -> Result<Option<Self::Event>> {
             Ok(None)
         }
+    }
+
+    fn client_state<H: ServerHandle>(database: &Database<H>) -> ClientState {
+        let store = OrderedMetaStore::new(SqliteOrderedStore::new(database.owner.clone()));
+        block_on(store.load()).unwrap()
+    }
+
+    fn table_exists<H: ServerHandle>(database: &Database<H>, table: &str) -> bool {
+        database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema
+                         WHERE type = 'table' AND name = ?1 COLLATE NOCASE
+                     )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captured-schema.sqlite");
+        let database = Database::open(&path).unwrap();
+        let database_id = database.database_id();
+        let runtime = database.runtime(NoopFormat).unwrap();
+
+        let (_changed, captured) = database
+            .execute(
+                &runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )
+            .unwrap();
+        assert!(captured.is_empty());
+        assert!(table_exists(&database, "notes"));
+
+        let state = client_state(&database);
+        let space = state.spaces.get(&database_id.space_id()).unwrap();
+        assert_eq!(space.cursors.tail, DeviceSeq(2));
+        let DeviceOp::Commit {
+            entries,
+            range_asserts,
+            submit_mode,
+            ..
+        } = space.oplog.get(&DeviceSeq(1)).unwrap()
+        else {
+            panic!("captured schema operation was not a commit")
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(range_asserts.len(), 2);
+        assert_eq!(*submit_mode, SubmitMode::Unchecked);
+        assert!(
+            range_asserts
+                .iter()
+                .all(|assertion| assertion.upto == AdmissionSeq(0))
+        );
+        assert_eq!(range_asserts[0].prefix, *entries[1].key());
+        assert_eq!(range_asserts[1].prefix, *entries[2].key());
+
+        drop(runtime);
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(table_exists(&reopened, "notes"));
+        let state = client_state(&reopened);
+        let space = state.spaces.get(&database_id.space_id()).unwrap();
+        assert_eq!(space.cursors.tail, DeviceSeq(2));
+        assert!(matches!(
+            space.oplog.get(&DeviceSeq(1)),
+            Some(DeviceOp::Commit { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_schema_submission_rolls_back_the_created_table_and_oplog() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("atomic-schema.sqlite")).unwrap();
+        let database_id = database.database_id();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_schema_submission
+                     BEFORE INSERT ON __multilite__meta
+                     BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+                )
+                .unwrap();
+        });
+
+        assert!(
+            database
+                .execute(
+                    &runtime,
+                    "CREATE TABLE rolled_back (id INTEGER PRIMARY KEY)",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(!table_exists(&database, "rolled_back"));
+
+        let state = client_state(&database);
+        let space = state.spaces.get(&database_id.space_id()).unwrap();
+        assert_eq!(
+            space.cursors,
+            homebase_client::meta::OplogCursors::default()
+        );
+        assert!(space.oplog.is_empty());
     }
 
     #[test]

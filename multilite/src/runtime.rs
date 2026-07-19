@@ -137,6 +137,15 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         operation()
     }
 
+    /// Run metadata work inside the caller's active SQLite savepoint.
+    ///
+    /// This is public only within the private `runtime` module boundary; it
+    /// lets database operations join their Homebase metadata transition to
+    /// the same local atomic unit without exposing raw SQLite ownership.
+    pub fn with_internal_metadata<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_mode(ExecutionMode::InternalMetadata, operation)
+    }
+
     pub(crate) fn owner(&self) -> ConnectionOwner {
         self.owner.clone()
     }

@@ -11,9 +11,11 @@ tables. A table must use the initial four declared types and exactly one inline
 primary key; richer constraints and schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
-The internal operation layer can translate restricted table creation to and
-from its complete Homebase log-and-revision-cell envelope. Local capture,
-submission, pull, rebase, and rollback land in subsequent batches.
+The internal operation layer translates restricted table creation to and from
+its complete Homebase log-and-revision-cell envelope. Local `CREATE TABLE` and
+its Homebase submission now commit in one SQLite savepoint. Push, pending
+effects, pull, rebase, and rollback land in subsequent batches before INSERT
+is connected to synchronization.
 The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.

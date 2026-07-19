@@ -518,171 +518,84 @@ batch does not submit or apply the operation. Tests pin tagged-frame
 roundtrips, malformed frames and envelopes, key shape, short/long names, and
 SQL/structure agreement.
 
-### Batch 9b: capture INSERT to homebase submit log
+### Batch 9b: atomically capture CREATE TABLE
 
-Wrap each accepted insert:
+Executing a validated table creation first mints its `MultiliteOp`, reads the
+current applied admit cut `N - 1`, and lowers the operation with table-id and
+canonical-name assertions at that cut. One SQLite savepoint then performs both
+the local DDL and `homebase submit_unchecked`. The `SqliteOrderedStore` joins
+the active savepoint, so the SQLite schema and submit log cannot diverge. No
+network work occurs inside this unit.
 
-```text
-SAVEPOINT multilite_stmt
-execute INSERT
-hook captures every inserted user row in SQLite operation order
-resolve each row against the canonical schema and identity model
-read admit neck N and verify each captured key is locally new
-encode row inserts and derive their homebase keys
-homebase submit_unchecked(all Sets, exact-key asserts upto N - 1)
-RELEASE
-```
+Tests prove that the table and three-entry submission survive reopen together,
+that the two revision assertions use the applied admit cut, and that an
+injected metadata failure rolls back both the DDL and submit-log transition.
 
-The homebase `MetaStore::commit` joins the statement savepoint through
-`SqliteOrderedStore`. If capture validation, encoding, reservation, or commit
-fails, roll back the row and metadata together. No network work occurs inside
-the statement savepoint.
+### Batch 9c: pending CREATE TABLE effects
 
-Tests:
+Add a local Multilite pending-effects journal keyed by the Homebase
+`DeviceSeq`. It records the logical operation plus explicit accept and reject
+behavior without adding another operation log. For `CreateTable`, acceptance
+only retires the pending record; rejection removes the speculative table.
+Suffix rollback executes reject effects in reverse device order. Journal
+updates join the same SQLite transaction as submission and materialization.
 
-- one insert creates its rows and one homebase submit-log commit atomically;
-- the commit contains one versioned row Set per inserted row, with exact-key
-  assertions at the applied admit cut;
-- duplicate primary key writes no submission;
-- multi-row and `INSERT ... SELECT` preserve SQLite row order in one commit;
-- reopen sees the unpushed submit log;
-- injected failures cannot produce row-without-log or log-without-row.
+### Batch 10: CREATE TABLE push
 
-### Batch 10: homebase admission integration
+Expose Multilite `push` as a thin policy layer over Homebase push. A definitive
+acknowledged prefix finalizes its pending effects immediately at push time. A
+stalled schema range assertion returns a rejection bound to the observed active
+submit window but performs no rollback. Unavailable or ambiguous outcomes are
+retryable and never authorize repair.
 
-Use the existing homebase server unchanged. Verify Multilite's append-only OCC
-mapping end to end:
+### Batch 11: Homebase rebase analysis
 
-- the canonical row key is the Set key and exact range-assert prefix;
-- disjoint exact-key assertions do not conflict;
-- a foreign winner after the submitter's applied cut fails the stale
-  assertion;
-- Homebase device sequence and checksum retry remain the sole idempotency
-  mechanism.
+Add a read-only Homebase client operation that compares unapplied admitted
+history with the active local submission window. It uses admitted keys and the
+submissions' existing range assertions to identify which local device
+sequences can no longer be replayed over the new admit cut. It moves no cursor
+and does not interpret Multilite operations.
 
-Add the narrow `homebase-client` active-submission view needed by Multilite.
-It returns the current active window in device-sequence order, preserves commit
-versus rollback-marker shape, and decodes commit entries through the space
-cipher without moving any cursor.
+### Batch 12: CREATE TABLE pull
 
-Tests:
+Multilite `pull` is fetch-only. It asks Homebase to append complete dense server
+batches to the durable admit log and does not modify SQLite user schema or move
+admit `neck`. Applications may therefore fetch while deferring reconciliation.
 
-- disjoint inserts admit;
-- concurrent inserts of the same logical row reject one conforming Multilite
-  client;
-- retry of the same device sequence is idempotent;
-- admission order is stable;
-- the active-submission view returns plaintext commits and rollback markers
-  without changing durable state;
-- a raw assertion-free Homebase Set can bypass the append-only convention,
-  documenting the V1 trust boundary.
+### Batch 13: CREATE TABLE rebase
 
-### Batch 11: push
+Multilite `rebase` decodes and validates the unapplied admitted operations,
+asks Homebase for rebase conflicts, and returns an error without mutation when
+one exists. Otherwise it applies foreign table creations in admission order,
+verifies already-materialized own admissions, and advances admit `neck` in the
+same SQLite transaction. Internal apply mode suppresses local capture.
 
-Delegate to the existing homebase push path. Successful acknowledgement trims
-the admitted submit-log prefix and advances its checksum. The expected
-exact-key `RangeAssertFailed` at the stalled active head is wrapped as a
-`PushRejection`; it does not mutate SQLite rows or retire the rejected suffix.
-Other kernel stalls remain non-repairable errors. Unavailable or ambiguous
-results remain ordinary retryable errors and never produce a repairable
-rejection. `PushRejection` binds the active `head` and exclusive `tail` it
-observed so later local submissions make the handle stale rather than silently
-expanding what repair will discard.
+### Batch 14: explicit CREATE TABLE rollback
 
-Tests:
+Given a current rejection or rebase conflict, explicit `rollback` validates
+that the pending and Homebase windows have not changed. In one SQLite
+transaction it runs reject effects for the speculative suffix in reverse
+order, applies the admitted schema history in forward order, records the
+Homebase rollback marker, advances admit `neck`, and retires the corresponding
+pending records. Rollback is the only V1 conflict-repair strategy; `push` and
+`rebase` never invoke it implicitly.
 
-- empty push is a no-op;
-- successful push trims entries through the acknowledged prefix;
-- lost acknowledgement followed by retry is safe;
-- an exact-key rejection reports the first failed local sequence and leaves
-  every active row and submission unchanged;
-- unrelated kernel stalls cannot be converted into a `PushRejection`;
-- dropping a `PushRejection` has no side effect;
-- submitting after rejection makes that rejection handle stale;
-- unavailable and ambiguous outcomes cannot be passed to repair.
+### Batch 15: CREATE TABLE fault and convergence matrix
 
-### Batch 12: pull and apply
+Run two-device tests for disjoint table creation, same-name rejection,
+pull-before-push conflict, explicit rollback, lost acknowledgement, stale
+rejection handles, restart between every phase, and injected transaction
+failures. Both replicas must eventually expose identical `sqlite_schema`
+results, while stock SQLite remains able to inspect each file.
 
-Use homebase `pull` to append complete dense batches to the durable admit log,
-then apply plaintext row-insert records from admit `neck` in admission and
-operation order under internal capture suppression. Each applied batch and the
-corresponding `mark_applied` transition commit in the same SQLite transaction.
+### Batch 16 and later: INSERT pipeline
 
-An existing row is idempotent only when the admitted entry is this file's own
-already-materialized `(device, device_seq)` submission, as in a lost-ack path.
-If a foreign admitted row collides with any active local submission, apply
-stops before that admission, leaves admit `neck` unchanged, and reports that
-push/explicit repair is required. Admit `tail` may continue to capture later
-batches without claiming they are applied.
-
-Tests:
-
-- device B pulls device A's rows;
-- repeated pull is idempotent;
-- crash during apply resumes safely;
-- apply does not echo into the homebase submit log;
-- pulling an own admitted row after a lost acknowledgement is idempotent;
-- pulling a foreign winner over a speculative local duplicate blocks before
-  advancing admit neck;
-- disjoint foreign rows still apply while local submissions are pending.
-
-### Batch 13: explicit rejected-tail rollback repair
-
-`push()` itself never repairs. Given a current definitive `PushRejection`, the
-application explicitly calls `repair(rejection)`. V1 offers no keep/rebase or
-selective retry strategy: repair rolls back the complete active submit-log
-window and restores user tables to admitted state.
-
-Repair first validates that the rejection still identifies the active head and
-pulls all currently available admitted history. It decodes the active suffix
-for the return value. Then one SQLite transaction:
-
-```text
-delete every speculative row represented by the active suffix
-apply unapplied admitted batches in exact order
-homebase rollback the active submit-log window
-advance admit neck through the applied batches
-commit
-```
-
-The returned repair outcome contains the rolled-back logical row inserts for
-application inspection or later manual resubmission, but rollback is the only
-V1 state transition. If validation no longer matches, repair refuses and the
-caller must push again. A crash before the transaction leaves the rejection
-retryable; a crash during it exposes either the entire old state or the entire
-repaired state.
-
-For append-only rows:
-
-- if the server has a winner for the key, keep/apply the winner;
-- otherwise delete the local speculative row;
-- retire the active homebase suffix with its normal rollback marker and cursor
-  transition.
-
-Tests:
-
-- two devices insert the same key; one wins and the loser repairs;
-- entries after the rejected sequence are also discarded;
-- push rejection alone leaves all rows and metadata unchanged;
-- repair returns every rolled-back logical insert in device-sequence order;
-- pull-before-push collision becomes applicable after explicit repair;
-- a stale or mismatched rejection handle cannot roll back newer work;
-- unavailable/ambiguous outcomes cannot trigger repair;
-- after a crash before repair, re-push produces a fresh rejection and repair
-  converges; after a committed repair, the old handle is stale and harmless.
-
-### Batch 14: end-to-end fault and fidelity matrix
-
-Run the full V1 scenario suite over two or more clients.
-
-Tests:
-
-- concurrent disjoint inserts converge;
-- concurrent duplicate inserts converge after loser repair;
-- restart between insert, push, pull, apply, and repair phases;
-- compare SQLite query output across replicas;
-- unsupported SQL matrix remains stable;
-- stock SQLite can inspect the file.
+Only after CREATE TABLE converges end to end, add row identity and operation
+encoding, preupdate-hook capture, atomic row submission, push, pull, rebase,
+and explicit rollback. Multi-row and `INSERT ... SELECT` must preserve SQLite
+row order in one Homebase commit. Duplicate local primary keys produce no
+submission, exact-key assertions enforce append-only OCC, and pending row
+effects follow the same accept/reject protocol established for schema.
 
 ## Post-V1 extensions
 
