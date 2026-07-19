@@ -45,3 +45,27 @@ Have Writer class like Reader
 Explroe if we can support concurrent write transactions, maybe via separate redb file for transactions
 
 Build policy for reads/writes
+
+Handle multi-schema / attach etc
+
+Async-first Multilite/database actor:
+- Replace the current operation mutex, direct `ConnectionOwner` access,
+  scheduler calls, and statement refresh callback with one database actor that
+  owns the SQLite connection, Homebase client, pending effects, sync-policy
+  state, and complete submit/push/pull/rebase/rollback workflows. Do not add a
+  Homebase-only worker: local SQLite changes and Homebase metadata must remain
+  in the same transaction.
+- Send owned commands over a bounded channel and return results through oneshot
+  replies. Define cancellation, backpressure, shutdown, and durable-side-effect
+  semantics explicitly; dropping a caller must not cancel an operation after
+  it may have committed.
+- Make the internal and primary API async. Keep SQLite-compatible synchronous
+  methods as thin blocking wrappers over the same command/reply path so the two
+  surfaces cannot acquire different behavior.
+- Return owned query rows and column metadata from the actor because
+  `rusqlite::Row` borrows its statement and connection and cannot cross the
+  channel. Perform public mapping and `FromSql` conversion on the caller side.
+- Represent transactions with logical handles or atomic batch commands rather
+  than borrowed `rusqlite::Transaction` values. Start with sequential actor
+  execution; add concurrent in-flight authority work only through an explicit
+  state machine that preserves SQLite/Homebase transaction boundaries.

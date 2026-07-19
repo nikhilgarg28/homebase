@@ -13,7 +13,7 @@ const VERSION_TABLE: &str = "__multilite__v1_schema";
 const ITEMS_TABLE: &str = "items";
 const CURRENT_VERSION: u64 = 1;
 
-pub(crate) fn open<H: ServerHandle>(database: &Database<H>) -> Result<()> {
+pub(crate) fn open<H: ServerHandle + Send + Sync + 'static>(database: &Database<H>) -> Result<()> {
     database.with_savepoint("__multilite__v1_open", |connection| {
         if table_exists(connection, VERSION_TABLE)? {
             validate_version_table(connection)?;

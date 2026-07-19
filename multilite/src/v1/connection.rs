@@ -1,6 +1,7 @@
 //! Temporary V1 connection wrapper over the general Multilite database.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use homebase_client::ServerHandle;
 
@@ -15,10 +16,10 @@ use crate::{Params, Result};
 /// A V1-format connection layered over a general Multilite database.
 pub struct Connection<H = OfflineServer>
 where
-    H: ServerHandle,
+    H: ServerHandle + Send + Sync + 'static,
 {
-    database: Database<H>,
-    runtime: DatabaseRuntime<V1Hooks>,
+    database: Arc<Database<H>>,
+    runtime: Arc<DatabaseRuntime<V1Hooks>>,
 }
 
 impl Connection<OfflineServer> {
@@ -29,16 +30,17 @@ impl Connection<OfflineServer> {
     }
 }
 
-impl<H: ServerHandle> Connection<H> {
+impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
     /// Open with general options, then initialize or validate V1 locally.
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Self> {
         let database = Database::open_with(path, options)?;
         Self::finish_open(database)
     }
 
-    fn finish_open(database: Database<H>) -> Result<Self> {
+    fn finish_open(database: Arc<Database<H>>) -> Result<Self> {
         schema::open(&database)?;
-        let runtime = database.runtime(V1Hooks)?;
+        let runtime = Arc::new(database.runtime(V1Hooks)?);
+        database.start_background_push()?;
         Ok(Self { database, runtime })
     }
 
@@ -55,6 +57,11 @@ impl<H: ServerHandle> Connection<H> {
     /// Device identity unique to this local replica file.
     pub fn device_id(&self) -> [u8; 16] {
         self.database.device_id()
+    }
+
+    /// Synchronization behavior selected when this connection was opened.
+    pub fn sync_policy(&self) -> crate::SyncPolicy {
+        self.database.sync_policy()
     }
 
     /// Push this database's active local submissions as far as possible.

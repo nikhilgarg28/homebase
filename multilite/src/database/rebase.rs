@@ -11,8 +11,15 @@ use super::{Database, DatabaseRuntime};
 use crate::runtime::{ExecutionMode, HookPolicy};
 use crate::{Error, Result};
 
-impl<H: ServerHandle> Database<H> {
+impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) fn rebase<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
+        let _operation = super::lock(&self.operation);
+        self.rebase_locked(runtime)?;
+        self.policy.mark_rebased();
+        Ok(())
+    }
+
+    pub fn rebase_locked<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
         self.rebase_inner(runtime, || Ok(()))
     }
 
@@ -22,6 +29,7 @@ impl<H: ServerHandle> Database<H> {
         runtime: &DatabaseRuntime<P>,
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        let _operation = super::lock(&self.operation);
         self.rebase_inner(runtime, after_snapshot)
     }
 

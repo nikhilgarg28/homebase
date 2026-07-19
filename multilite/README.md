@@ -52,6 +52,26 @@ existing general state is an identity constraint and can never replace its
 identity. Each database owns a Homebase client and uses an offline endpoint by
 default; `OpenOptions::server` supplies an explicit `ServerHandle`.
 
+`OpenOptions` also carries one `SyncPolicy`, defaulting to `LocalOnly`.
+Local-only writes still commit atomically to SQLite, the Homebase submit log,
+and the pending-effects log, but reads and writes perform no automatic network
+work. Reopening with an authority under `LocalFirst` or `Remote` can therefore
+deliver that buffered history. `LocalFirst { write_delay, read_staleness }`
+schedules authority push no later than the oldest buffered write's deadline
+and refreshes reads whose last applied authority observation is too old.
+`Remote` waits for each write's admission and refreshes before every prepared
+query. Both synchronized policies require authority at open.
+
+A required refresh first pushes a nonempty submit log, then pulls and
+atomically rebases the available admissions. A definitive push rejection fails
+the read and returns a rejection handle without implicitly rolling back
+speculative SQLite state. A remote write does undo its own local SQLite effects
+before returning a definitive rejection. Transport failure is not rejection:
+durable local submissions remain available for retry because admission may be
+ambiguous. Freshness is session-local and starts stale after every open. Until
+the general row-operation batch lands, synchronized policy modes reject
+`INSERT` instead of presenting a local-only row as admitted.
+
 V1 invitations and space envelopes are plaintext scaffolding. The stable API
 is designed for a later encrypted default: a fresh open will mint the final
 Homebase name and value keys, derive `DatabaseId` from the name key, and retain

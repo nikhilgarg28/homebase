@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use homebase_client::server::UnreachableSpace;
 use homebase_core::space::SpaceId;
-use multilite::{Error, MultiliteConnection, OpenOptions, ReplicaInvitation};
+use multilite::{Error, MultiliteConnection, OpenOptions, ReplicaInvitation, SyncPolicy};
 use rusqlite::Connection;
 
 #[test]
@@ -187,4 +189,47 @@ fn lifecycle_accepts_an_explicit_server_handle() {
     .unwrap();
 
     assert_ne!(database.database_id().to_bytes(), [0; 16]);
+}
+
+#[test]
+fn open_time_sync_policy_is_public_and_validated() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = MultiliteConnection::open(directory.path().join("local.sqlite")).unwrap();
+    assert_eq!(local.sync_policy(), SyncPolicy::LocalOnly);
+
+    let local_first = MultiliteConnection::open_with(
+        directory.path().join("local-first.sqlite"),
+        OpenOptions::new()
+            .sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::from_secs(30),
+                read_staleness: Duration::from_secs(10),
+            })
+            .server(|_: &SpaceId| None::<UnreachableSpace>),
+    )
+    .unwrap();
+    assert_eq!(
+        local_first.sync_policy(),
+        SyncPolicy::LocalFirst {
+            write_delay: Duration::from_secs(30),
+            read_staleness: Duration::from_secs(10),
+        }
+    );
+
+    assert!(matches!(
+        MultiliteConnection::open_with(
+            directory.path().join("local-first-offline.sqlite"),
+            OpenOptions::new().sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::ZERO,
+                read_staleness: Duration::ZERO,
+            }),
+        ),
+        Err(Error::AuthorityRequired("local-first policy"))
+    ));
+    assert!(matches!(
+        MultiliteConnection::open_with(
+            directory.path().join("remote.sqlite"),
+            OpenOptions::new().sync_policy(SyncPolicy::Remote),
+        ),
+        Err(Error::AuthorityRequired("remote policy"))
+    ));
 }

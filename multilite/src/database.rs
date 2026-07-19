@@ -2,12 +2,14 @@
 
 mod operation;
 mod pending;
+mod policy;
 mod rebase;
 mod schema;
 mod sql;
 mod store;
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase_client::meta::{MetaStore, OplogCursors};
@@ -27,7 +29,10 @@ use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 use self::operation::MultiliteOp;
+use self::policy::{PolicyState, PushScheduler};
 use self::store::DatabaseMetaStore;
+
+pub use self::policy::SyncPolicy;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -156,6 +161,8 @@ where
 {
     invitation: Option<ReplicaInvitation>,
     server: H,
+    authority: bool,
+    sync_policy: SyncPolicy,
 }
 
 impl Default for OpenOptions<OfflineServer> {
@@ -170,6 +177,8 @@ impl OpenOptions<OfflineServer> {
         Self {
             invitation: None,
             server: offline_server,
+            authority: false,
+            sync_policy: SyncPolicy::default(),
         }
     }
 }
@@ -181,12 +190,33 @@ impl<H: ServerHandle> OpenOptions<H> {
         self
     }
 
+    /// Select how local reads and writes interact with authority.
+    pub fn sync_policy(mut self, policy: SyncPolicy) -> Self {
+        self.sync_policy = policy;
+        self
+    }
+
     /// Replace the server route while retaining all other options.
     pub fn server<S: ServerHandle>(self, server: S) -> OpenOptions<S> {
         OpenOptions {
             invitation: self.invitation,
             server,
+            authority: true,
+            sync_policy: self.sync_policy,
         }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.authority {
+            match self.sync_policy {
+                SyncPolicy::LocalOnly => {}
+                SyncPolicy::LocalFirst { .. } => {
+                    return Err(Error::AuthorityRequired("local-first policy"));
+                }
+                SyncPolicy::Remote => return Err(Error::AuthorityRequired("remote policy")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -224,18 +254,38 @@ pub(crate) struct Database<H: ServerHandle> {
     owner: ConnectionOwner,
     database_id: DatabaseId,
     client: DatabaseClient<H>,
+    policy: PolicyState,
+    operation: Arc<Mutex<()>>,
+    scheduler: PushScheduler,
 }
 
 impl Database<OfflineServer> {
-    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         Self::open_with(path, OpenOptions::new())
     }
 }
 
-impl<H: ServerHandle> Database<H> {
-    pub(crate) fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Self> {
+impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
+    pub(crate) fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Arc<Self>> {
+        options.validate()?;
         let owner = ConnectionOwner::open(path)?;
-        open_on(owner, options.invitation, options.server)
+        let database = open_on(owner, options)?;
+        Ok(Arc::new(database))
+    }
+
+    pub(crate) fn start_background_push(self: &Arc<Self>) -> Result<()> {
+        if self.policy.write_delay().is_some() {
+            self.scheduler.start(Arc::downgrade(self))?;
+            let cursors = self.submit_cursors()?;
+            if cursors.neck < cursors.tail {
+                self.scheduler.schedule(std::time::Duration::ZERO);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_policy(&self) -> SyncPolicy {
+        self.policy.policy()
     }
 
     pub(crate) fn database_id(&self) -> DatabaseId {
@@ -260,17 +310,40 @@ impl<H: ServerHandle> Database<H> {
         sql: &str,
         params: Q,
     ) -> Result<(usize, Vec<P::Event>)> {
-        match sql::validate_execute(sql)? {
+        let validated = sql::validate_execute(sql)?;
+        let _operation = lock(&self.operation);
+        let result = match validated {
+            sql::ValidatedExecute::Insert if self.policy.policy() != SyncPolicy::LocalOnly => {
+                return Err(Error::UnsupportedSql(
+                    "synchronized INSERT is not implemented yet",
+                ));
+            }
             sql::ValidatedExecute::Insert => runtime.run(ExecutionMode::Public, |connection| {
                 Ok(connection.execute(sql, params)?)
             }),
             sql::ValidatedExecute::CreateTable(table) => {
+                if self.policy.policy() == SyncPolicy::Remote {
+                    self.drain_remote_queue()?;
+                }
                 self.execute_create_table(runtime, sql, params, table)
             }
+        };
+
+        let result = result?;
+        match self.policy.policy() {
+            SyncPolicy::LocalOnly => {}
+            SyncPolicy::LocalFirst { write_delay, .. } => self.scheduler.schedule(write_delay),
+            SyncPolicy::Remote => self.finish_remote_write()?,
         }
+        Ok(result)
     }
 
     pub(crate) fn push(&self) -> Result<PushOutcome> {
+        let _operation = lock(&self.operation);
+        self.push_locked()
+    }
+
+    fn push_locked(&self) -> Result<PushOutcome> {
         let pushed = block_on(async {
             self.client
                 .space(self.database_id.space_id())
@@ -296,6 +369,11 @@ impl<H: ServerHandle> Database<H> {
     /// Undo the speculative SQLite effects covered by one definitive push
     /// rejection and retire that exact active submit window.
     pub(crate) fn rollback(&self, rejection: &PushRejection) -> Result<()> {
+        let _operation = lock(&self.operation);
+        self.rollback_locked(rejection)
+    }
+
+    fn rollback_locked(&self, rejection: &PushRejection) -> Result<()> {
         if rejection.database_id != self.database_id
             || rejection.device_id != self.client.device()
             || rejection.failed_at != rejection.submit_cursors.neck
@@ -315,11 +393,41 @@ impl<H: ServerHandle> Database<H> {
     }
 
     pub(crate) fn pull(&self) -> Result<PullOutcome> {
+        let _operation = lock(&self.operation);
+        self.pull_locked()
+    }
+
+    fn pull_locked(&self) -> Result<PullOutcome> {
         let through = block_on(async {
             let space = self.client.space(self.database_id.space_id()).await?;
             space.pull().await.map_err(ClientError::from)
         })?;
+        self.policy.mark_pulled();
         Ok(PullOutcome { through })
+    }
+
+    fn drain_remote_queue(&self) -> Result<()> {
+        match self.push_locked()? {
+            PushOutcome::Drained => Ok(()),
+            PushOutcome::Rejected(rejection) => self.repair_remote_rejection(rejection),
+        }
+    }
+
+    fn finish_remote_write(&self) -> Result<()> {
+        match self.push_locked()? {
+            PushOutcome::Drained => Ok(()),
+            PushOutcome::Rejected(rejection) => self.repair_remote_rejection(rejection),
+        }
+    }
+
+    fn repair_remote_rejection(&self, rejection: PushRejection) -> Result<()> {
+        let error = rejection.error.clone();
+        self.rollback_locked(&rejection)?;
+        // Retire the rollback marker when authority remains reachable. If this
+        // best-effort push becomes unavailable, the marker remains durable and
+        // the next remote operation drains it before doing new work.
+        let _ = self.push_locked();
+        Err(Error::AuthorityRejected(error))
     }
 
     fn execute_create_table<P: HookPolicy, Q: Params>(
@@ -357,10 +465,11 @@ impl<H: ServerHandle> Database<H> {
     }
 
     pub(crate) fn prepare<P: HookPolicy>(
-        &self,
-        runtime: &DatabaseRuntime<P>,
+        self: &Arc<Self>,
+        runtime: &Arc<DatabaseRuntime<P>>,
         sql: &str,
     ) -> Result<Statement> {
+        let _operation = lock(&self.operation);
         runtime.run(ExecutionMode::Public, |connection| {
             let statement = connection.prepare(sql)?;
             if statement.readonly() {
@@ -369,8 +478,12 @@ impl<H: ServerHandle> Database<H> {
                 Err(Error::PreparedWrite)
             }
         })?;
+        let database = Arc::clone(self);
+        let runtime = Arc::clone(runtime);
         Ok(Statement {
             owner: self.owner.clone(),
+            operation: Arc::clone(&self.operation),
+            refresh: Arc::new(move || database.refresh_read_locked(&runtime)),
             sql: sql.to_owned(),
         })
     }
@@ -391,6 +504,25 @@ impl<H: ServerHandle> Database<H> {
     fn submit_cursors(&self) -> Result<OplogCursors> {
         let store = DatabaseMetaStore::new(self.owner.clone());
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
+    }
+
+    fn refresh_read_locked<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
+        if !self.policy.read_requires_refresh() {
+            return Ok(());
+        }
+        let submit = self.submit_cursors()?;
+        if submit.neck < submit.tail {
+            match self.push_locked()? {
+                PushOutcome::Drained => {}
+                PushOutcome::Rejected(rejection) => {
+                    return Err(Error::RefreshPushRejected(rejection));
+                }
+            }
+        }
+        self.pull_locked()?;
+        self.rebase_locked(runtime)?;
+        self.policy.mark_rebased();
+        Ok(())
     }
 }
 
@@ -467,6 +599,8 @@ fn has_multilite_prefix(table: &str) -> bool {
 /// A read-only prepared statement owned by a Multilite database.
 pub struct Statement {
     owner: ConnectionOwner,
+    operation: Arc<Mutex<()>>,
+    refresh: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     sql: String,
 }
 
@@ -477,6 +611,8 @@ impl Statement {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
+        let _operation = lock(&self.operation);
+        (self.refresh)()?;
         self.owner.with_connection(|connection| {
             let mut statement = connection.prepare(&self.sql)?;
             if !statement.readonly() {
@@ -490,11 +626,16 @@ impl Statement {
     }
 }
 
-fn open_on<H: ServerHandle>(
+fn open_on<H: ServerHandle + Send + Sync + 'static>(
     owner: ConnectionOwner,
-    invitation: Option<ReplicaInvitation>,
-    server: H,
+    options: OpenOptions<H>,
 ) -> Result<Database<H>> {
+    let OpenOptions {
+        invitation,
+        server,
+        authority: _,
+        sync_policy,
+    } = options;
     let lineage = Lineage(mint_id()?);
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
@@ -507,6 +648,9 @@ fn open_on<H: ServerHandle>(
         owner,
         database_id,
         client,
+        policy: PolicyState::new(sync_policy),
+        operation: Arc::new(Mutex::new(())),
+        scheduler: PushScheduler::new(),
     })
 }
 
@@ -622,12 +766,19 @@ fn offline_server(_: &SpaceId) -> Option<UnreachableSpace> {
     None
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use homebase::Server;
     use homebase::actor::{SpaceHandle, Spawner};
@@ -684,12 +835,17 @@ mod tests {
         }
     }
 
-    fn client_state<H: ServerHandle>(database: &Database<H>) -> ClientState {
+    fn client_state<H: ServerHandle + Send + Sync + 'static>(
+        database: &Database<H>,
+    ) -> ClientState {
         let store = DatabaseMetaStore::new(database.owner.clone());
         block_on(store.load()).unwrap()
     }
 
-    fn table_exists<H: ServerHandle>(database: &Database<H>, table: &str) -> bool {
+    fn table_exists<H: ServerHandle + Send + Sync + 'static>(
+        database: &Database<H>,
+        table: &str,
+    ) -> bool {
         database.with_connection(|connection| {
             connection
                 .query_row(
@@ -704,11 +860,16 @@ mod tests {
         })
     }
 
-    fn pending_ops<H: ServerHandle>(database: &Database<H>) -> Vec<pending::PendingOp> {
+    fn pending_ops<H: ServerHandle + Send + Sync + 'static>(
+        database: &Database<H>,
+    ) -> Vec<pending::PendingOp> {
         database.with_connection(pending::load).unwrap()
     }
 
-    fn table_sql<H: ServerHandle>(database: &Database<H>, table: &str) -> Option<String> {
+    fn table_sql<H: ServerHandle + Send + Sync + 'static>(
+        database: &Database<H>,
+        table: &str,
+    ) -> Option<String> {
         database.with_connection(|connection| {
             connection
                 .query_row(
@@ -760,7 +921,10 @@ mod tests {
         )
     }
 
-    fn submit_direct<H: ServerHandle>(database: &Database<H>, operation: &MultiliteOp) {
+    fn submit_direct<H: ServerHandle + Send + Sync + 'static>(
+        database: &Database<H>,
+        operation: &MultiliteOp,
+    ) {
         let (mutations, assertions) = operation.to_homebase().at(AdmissionSeq(0));
         block_on(async {
             database
@@ -774,13 +938,423 @@ mod tests {
         });
     }
 
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn policy_defaults_are_local_and_authority_requirements_fail_before_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let local_path = directory.path().join("local.sqlite");
+        let local = Database::open(&local_path).unwrap();
+        assert_eq!(local.sync_policy(), SyncPolicy::LocalOnly);
+
+        let remote_path = directory.path().join("remote.sqlite");
+        assert!(matches!(
+            Database::open_with(
+                &remote_path,
+                OpenOptions::new().sync_policy(SyncPolicy::Remote),
+            ),
+            Err(Error::AuthorityRequired("remote policy"))
+        ));
+        assert!(!remote_path.exists());
+
+        let local_first_path = directory.path().join("local-first.sqlite");
+        assert!(matches!(
+            Database::open_with(
+                &local_first_path,
+                OpenOptions::new().sync_policy(SyncPolicy::LocalFirst {
+                    write_delay: Duration::ZERO,
+                    read_staleness: Duration::from_secs(1),
+                }),
+            ),
+            Err(Error::AuthorityRequired("local-first policy"))
+        ));
+        assert!(!local_first_path.exists());
+    }
+
+    #[test]
+    fn local_first_zero_schedules_push_without_waiting_in_execute() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("local-first.sqlite"),
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::LocalFirst {
+                    write_delay: Duration::ZERO,
+                    read_staleness: Duration::from_secs(60),
+                })
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database.start_background_push().unwrap();
+
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        wait_until(|| pending_ops(&database).is_empty());
+
+        let state = client_state(&database);
+        let cursors = state.spaces[&database.database_id().space_id()].cursors;
+        assert_eq!(cursors.neck, cursors.tail);
+        assert!(table_exists(&database, "notes"));
+    }
+
+    #[test]
+    fn remote_write_returns_only_after_admission_and_pending_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("remote.sqlite"),
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+
+        assert!(pending_ops(&database).is_empty());
+        let state = client_state(&database);
+        let cursors = state.spaces[&database.database_id().space_id()].cursors;
+        assert_eq!(cursors.neck, cursors.tail);
+        assert!(table_exists(&database, "notes"));
+    }
+
+    #[test]
+    fn remote_rejection_undoes_sqlite_before_returning_the_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("winner.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+        let second = Database::open_with(
+            directory.path().join("loser.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let error = second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
+                (),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::AuthorityRejected(KernelError::RangeAssertFailed { .. })
+        ));
+        assert!(!table_exists(&second, "notes"));
+        assert!(pending_ops(&second).is_empty());
+        let state = client_state(&second);
+        let cursors = state.spaces[&second.database_id().space_id()].cursors;
+        assert_eq!(cursors.neck, cursors.tail);
+    }
+
+    #[test]
+    fn remote_write_first_drains_history_buffered_under_local_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy-change.sqlite");
+        let server = server();
+        let database = Database::open_with(
+            &path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE buffered (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(pending_ops(&database).len(), 1);
+        drop(runtime);
+        drop(database);
+
+        let database = Database::open_with(
+            &path,
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE admitted (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+
+        assert!(pending_ops(&database).is_empty());
+        let state = client_state(&database);
+        let cursors = state.spaces[&database.database_id().space_id()].cursors;
+        assert_eq!(cursors.neck, cursors.tail);
+    }
+
+    #[test]
+    fn remote_read_pulls_and_rebases_before_running_a_prepared_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("read-source.sqlite"),
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let source_runtime = source.runtime(NoopFormat).unwrap();
+        source
+            .execute(
+                &source_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+
+        let replica = Database::open_with(
+            directory.path().join("read-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let runtime = Arc::new(replica.runtime(NoopFormat).unwrap());
+        let mut statement = replica
+            .prepare(
+                &runtime,
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'notes'",
+            )
+            .unwrap();
+
+        assert_eq!(
+            statement
+                .query_map((), |row| row.get::<_, String>(0))
+                .unwrap(),
+            ["notes"]
+        );
+        assert!(table_exists(&replica, "notes"));
+    }
+
+    #[test]
+    fn local_first_read_honors_its_staleness_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("stale-source.sqlite"),
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let source_runtime = source.runtime(NoopFormat).unwrap();
+        source
+            .execute(
+                &source_runtime,
+                "CREATE TABLE first_table (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+
+        let replica = Database::open_with(
+            directory.path().join("stale-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .sync_policy(SyncPolicy::LocalFirst {
+                    write_delay: Duration::from_secs(60),
+                    read_staleness: Duration::from_millis(100),
+                })
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let replica_runtime = Arc::new(replica.runtime(NoopFormat).unwrap());
+        let mut tables = replica
+            .prepare(
+                &replica_runtime,
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name LIKE '%_table' ORDER BY name",
+            )
+            .unwrap();
+        assert_eq!(
+            tables.query_map((), |row| row.get::<_, String>(0)).unwrap(),
+            ["first_table"]
+        );
+
+        source
+            .execute(
+                &source_runtime,
+                "CREATE TABLE second_table (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            tables.query_map((), |row| row.get::<_, String>(0)).unwrap(),
+            ["first_table"],
+            "fresh local state should not contact authority"
+        );
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            tables.query_map((), |row| row.get::<_, String>(0)).unwrap(),
+            ["first_table", "second_table"]
+        );
+    }
+
+    #[test]
+    fn authority_read_pushes_pending_local_submissions_before_rebase() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let path = directory.path().join("pending-read.sqlite");
+        let database = Database::open_with(
+            &path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE pending (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(pending_ops(&database).len(), 1);
+        drop(runtime);
+        drop(database);
+
+        let database = Database::open_with(
+            &path,
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
+        let mut statement = database.prepare(&runtime, "SELECT 1").unwrap();
+
+        assert_eq!(
+            statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
+            [1]
+        );
+        assert!(table_exists(&database, "pending"));
+        assert!(pending_ops(&database).is_empty());
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id().space_id()];
+        assert_eq!(space.cursors.neck, space.cursors.tail);
+        assert_eq!(space.admit_cursors.neck, space.admit_cursors.tail);
+    }
+
+    #[test]
+    fn authority_read_surfaces_push_rejection_without_implicit_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("read-winner.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+        let second_path = directory.path().join("read-loser.sqlite");
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(pending_ops(&second).len(), 1);
+        drop(second_runtime);
+        drop(second);
+
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = Arc::new(second.runtime(NoopFormat).unwrap());
+        let mut statement = second.prepare(&second_runtime, "SELECT 1").unwrap();
+
+        let error = statement
+            .query_map((), |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        let Error::RefreshPushRejected(rejection) = error else {
+            panic!("remote read did not surface its push rejection")
+        };
+        assert!(matches!(
+            rejection.error(),
+            KernelError::RangeAssertFailed { .. }
+        ));
+        assert!(table_exists(&second, "notes"));
+        assert_eq!(pending_ops(&second).len(), 1);
+
+        second.rollback(&rejection).unwrap();
+        assert!(!table_exists(&second, "notes"));
+        assert!(pending_ops(&second).is_empty());
+    }
+
     #[test]
     fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captured-schema.sqlite");
         let database = Database::open(&path).unwrap();
         let database_id = database.database_id();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
 
         let (_changed, captured) = database
             .execute(
@@ -1088,7 +1662,7 @@ mod tests {
                     (),
                 )?;
                 assert_eq!(source.push()?, PushOutcome::Drained);
-                replica.pull()?;
+                replica.pull_locked()?;
                 Ok(())
             })
             .unwrap_err();
@@ -1729,7 +2303,7 @@ mod tests {
     fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("sql-surface.sqlite")).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
 
         assert!(matches!(
             database.execute(
@@ -1877,7 +2451,7 @@ mod tests {
                 .unwrap();
         });
 
-        let error = match open_on(owner.clone(), None, offline_router()) {
+        let error = match open_on(owner.clone(), OpenOptions::new().server(offline_router())) {
             Ok(_) => panic!("bootstrap unexpectedly succeeded"),
             Err(error) => error,
         };

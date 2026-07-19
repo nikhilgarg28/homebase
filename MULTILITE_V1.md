@@ -710,6 +710,23 @@ row order in one Homebase commit. Duplicate local primary keys produce no
 submission, exact-key assertions enforce append-only OCC, and pending row
 effects follow the same accept/reject protocol established for schema.
 
+### Open-time synchronization policies
+
+The general connection exposes synchronization intent through one
+`SyncPolicy` on `OpenOptions`. `LocalOnly` buffers every supported write in the
+local submit and pending logs while keeping both reads and writes offline.
+`LocalFirst { write_delay, read_staleness }` schedules buffered pushes and
+refreshes reads after their authority observation becomes too old. `Remote`
+completes admission or local repair before returning from a write and refreshes
+before every query. `LocalFirst` and `Remote` require authority; a file can be
+used under `LocalOnly` while offline and reopened later under either policy to
+deliver its durable history.
+
+Refresh force-pushes a nonempty submit log before pulling and atomically
+rebasing admissions. A definitive push rejection aborts the read with its
+rejection handle and leaves rollback explicit; transport ambiguity also aborts
+without changing speculative local state.
+
 ## Post-V1 extensions
 
 Each extension should relax one V1 constraint or add one clear user-facing

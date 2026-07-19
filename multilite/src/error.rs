@@ -1,8 +1,11 @@
 use std::fmt;
 
 use homebase_client::ClientError;
+use homebase_core::messages::KernelError;
 use homebase_core::storage::StorageError;
 use rusqlite::types::{FromSqlError, Type};
+
+use crate::database::PushRejection;
 
 /// An error returned by Multilite's SQLite-facing API.
 #[derive(Debug)]
@@ -13,6 +16,14 @@ pub enum Error {
     PreparedWrite,
     /// The statement uses SQL outside Multilite's current public surface.
     UnsupportedSql(&'static str),
+    /// The selected open-time policy cannot operate without authority.
+    AuthorityRequired(&'static str),
+    /// Authority definitively rejected a remote write and local effects were undone.
+    AuthorityRejected(KernelError),
+    /// A read refresh could not drain a definitively rejected local submission.
+    RefreshPushRejected(PushRejection),
+    /// An internal background worker could not be started.
+    BackgroundWorker(String),
     /// A borrowed SQLite value could not be copied into its owned form.
     ValueConversion(FromSqlError),
     /// A value did not have the required SQLite storage class.
@@ -66,6 +77,21 @@ impl fmt::Display for Error {
                 f.write_str("prepared statements are read-only; use execute for writes")
             }
             Self::UnsupportedSql(message) => write!(f, "unsupported SQL: {message}"),
+            Self::AuthorityRequired(policy) => {
+                write!(f, "{policy} requires an authority server")
+            }
+            Self::AuthorityRejected(error) => {
+                write!(f, "authority rejected write: {error}")
+            }
+            Self::RefreshPushRejected(rejection) => write!(
+                f,
+                "read refresh push was rejected at device sequence {}: {}",
+                rejection.failed_sequence(),
+                rejection.error()
+            ),
+            Self::BackgroundWorker(message) => {
+                write!(f, "could not start Multilite background worker: {message}")
+            }
             Self::ValueConversion(error) => {
                 write!(f, "could not copy SQLite value: {error}")
             }
@@ -113,7 +139,12 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
-            Self::PreparedWrite | Self::UnsupportedSql(_) => None,
+            Self::PreparedWrite
+            | Self::UnsupportedSql(_)
+            | Self::AuthorityRequired(_)
+            | Self::AuthorityRejected(_)
+            | Self::RefreshPushRejected(_)
+            | Self::BackgroundWorker(_) => None,
             Self::ValueConversion(error) => Some(error),
             Self::UnexpectedValueType { .. } => None,
             Self::CaptureInvariant(_) => None,
