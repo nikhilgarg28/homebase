@@ -19,9 +19,13 @@ and rollback complete the schema synchronization loop before INSERT is
 connected to synchronization. `push()` now admits the active Homebase stream,
 then atomically advances its local submit cursor and retires every definitively
 accepted pending prefix in one SQLite savepoint. It returns an opaque rejection
-handle without repairing a stalled suffix. `pull()` may capture admissions at
-any time, but `rebase()` applies them only after the submit log is empty;
-range-assert conflicts are decided exclusively by the server during push.
+handle without repairing a stalled suffix. Explicit `rollback(&rejection)`
+atomically runs the remaining reject effects in reverse order, retires the
+pending suffix, and appends Homebase's empty rollback marker. That marker must
+be pushed before rebase. `pull()` may capture admissions at any time, but
+`rebase()` applies them only after the submit log is empty and treats admitted
+empty markers as materialization no-ops. Range-assert conflicts are decided
+exclusively by the server during push.
 The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.

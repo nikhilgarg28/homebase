@@ -548,6 +548,16 @@ pub trait MetaStore {
         to: DeviceSeq,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Perform [`rollback`](Self::rollback) only if the active oplog still
+    /// has exactly the cursors observed by the caller. The exact completed
+    /// post-state is also accepted so retrying one transition is idempotent.
+    fn rollback_if_unchanged(
+        &self,
+        space: SpaceId,
+        to: DeviceSeq,
+        expected: OplogCursors,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
     /// Append one validated dense server pull at the current admit tail.
     /// Stores every complete batch, advances only `tail`, and raises the
     /// space-local ver high-water from the admitted entries, atomically.
@@ -1249,6 +1259,32 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             .encode(),
         );
         self.store.apply(batch).await
+    }
+
+    async fn rollback_if_unchanged(
+        &self,
+        space: SpaceId,
+        to: DeviceSeq,
+        expected: OplogCursors,
+    ) -> Result<(), StorageError> {
+        let current = self.oplog_cursors(space).await?;
+        let completed_tail = expected
+            .tail
+            .0
+            .checked_add(1)
+            .map(DeviceSeq)
+            .ok_or_else(|| StorageError("oplog tail overflow during guarded rollback".into()))?;
+        let completed = OplogCursors {
+            head: expected.head,
+            neck: expected.tail,
+            tail: completed_tail,
+        };
+        if current != expected && current != completed {
+            return Err(StorageError(format!(
+                "rollback window changed: expected {expected:?}, found {current:?}"
+            )));
+        }
+        self.rollback(space, to).await
     }
 
     async fn append_admits(
@@ -2966,6 +3002,53 @@ mod tests {
         block_on(async {
             let store = OrderedMetaStore::new(MemoryStore::new());
             conformance::run_all(&store).await;
+        });
+    }
+
+    #[test]
+    fn guarded_rollback_rejects_a_changed_window_and_retries_its_exact_post_state() {
+        block_on(async {
+            let store = OrderedMetaStore::new(MemoryStore::new());
+            let reserved = store
+                .reserve_commit(SPACE, 1, Vec::new(), SubmitMode::Unchecked)
+                .await
+                .unwrap();
+            let first_entry = set_entry(key(&[b"db", b"first"]), b"one", reserved.versions[0]);
+            let first = store
+                .commit(SPACE, reserved, vec![first_entry])
+                .await
+                .unwrap();
+            let stale = store.oplog_cursors(SPACE).await.unwrap();
+            let reserved = store
+                .reserve_commit(SPACE, 1, Vec::new(), SubmitMode::Unchecked)
+                .await
+                .unwrap();
+            let second_entry = set_entry(key(&[b"db", b"second"]), b"two", reserved.versions[0]);
+            store
+                .commit(SPACE, reserved, vec![second_entry])
+                .await
+                .unwrap();
+            let before = audit(&store).await;
+
+            assert!(
+                store
+                    .rollback_if_unchanged(SPACE, first.seq, stale)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(audit(&store).await, before);
+
+            let expected = store.oplog_cursors(SPACE).await.unwrap();
+            store
+                .rollback_if_unchanged(SPACE, first.seq, expected)
+                .await
+                .unwrap();
+            let completed = audit(&store).await;
+            store
+                .rollback_if_unchanged(SPACE, first.seq, expected)
+                .await
+                .unwrap();
+            assert_eq!(audit(&store).await, completed);
         });
     }
 

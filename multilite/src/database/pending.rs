@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use homebase_client::meta::DeviceOp;
 use homebase_core::reader::Reader;
 use homebase_core::tag::DeviceSeq;
 use rusqlite::{Connection, params};
@@ -284,6 +285,33 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
             &format!("DELETE FROM {TABLE} WHERE device_seq <= ?1"),
             [through.0.to_be_bytes().as_slice()],
         )?;
+    }
+    Ok(())
+}
+
+/// Undo and retire the pending operations represented by one exact active
+/// Homebase window. Operations are unwound in reverse device order.
+pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) -> Result<()> {
+    let expected = active
+        .iter()
+        .filter_map(|(seq, operation)| matches!(operation, DeviceOp::Commit { .. }).then_some(*seq))
+        .collect::<Vec<_>>();
+    let pending = load(connection)?;
+    let actual = pending
+        .iter()
+        .map(|operation| operation.seq)
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Err(Error::InvalidDatabase(
+            "pending operations do not match the active submit window",
+        ));
+    }
+
+    for operation in pending.iter().rev() {
+        apply_effects(connection, &operation.on_reject)?;
+    }
+    if !pending.is_empty() {
+        connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
     }
     Ok(())
 }

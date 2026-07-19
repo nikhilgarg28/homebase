@@ -54,10 +54,16 @@ impl<H: ServerHandle> Database<H> {
         let operations = batches
             .into_iter()
             .map(|batch| {
+                if batch.entries.is_empty() {
+                    return Ok(None);
+                }
                 let operation = MultiliteOp::from_homebase(&batch)?;
-                Ok((batch.device, operation))
+                Ok(Some((batch.device, operation)))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         after_snapshot()?;
 

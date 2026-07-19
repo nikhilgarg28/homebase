@@ -269,6 +269,18 @@ cursor/marker state. Retrying the exact completed rollback is idempotent while
 that exact post-state remains current; a later append makes the old target
 stale.
 
+Multilite authorizes rollback only with a `PushRejection` returned for a
+definitive kernel rejection. The handle binds the database, device, failed
+sequence, and complete observed submit cursors. Guarded rollback checks that
+window while holding Homebase's space coordinator. In the same SQLite
+savepoint, Multilite verifies that its pending journal exactly represents the
+active commit records, runs reject effects in reverse device order, removes
+the journal rows, and performs the marker transition. Therefore a crash or
+local SQL failure exposes all of the speculative suffix or none of it. The
+empty marker remains active until a later push accepts it; rebase continues to
+reject a nonempty submit log and skips the marker when it later appears as an
+empty admitted batch.
+
 ## 8. Leases
 
 Leases are prefix reservations, not write capabilities and not data-log

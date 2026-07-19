@@ -115,6 +115,33 @@ impl MetaStore for DatabaseMetaStore {
         self.inner.rollback(space, to).await
     }
 
+    async fn rollback_if_unchanged(
+        &self,
+        space: SpaceId,
+        to: DeviceSeq,
+        expected: OplogCursors,
+    ) -> Result<(), StorageError> {
+        self.owner
+            .with_savepoint("__multilite__rollback", |connection| {
+                let current = pollster::block_on(self.inner.oplog_cursors(space))?;
+                if current == expected {
+                    let through = DeviceSeq(
+                        expected
+                            .tail
+                            .0
+                            .checked_sub(1)
+                            .ok_or(Error::InvalidDatabase("submit tail cannot be zero"))?,
+                    );
+                    let active =
+                        pollster::block_on(self.inner.oplog(space, expected.neck, through))?;
+                    pending::reject_active(connection, &active)?;
+                }
+                pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?;
+                Ok(())
+            })
+            .map_err(storage_error)
+    }
+
     async fn append_admits(
         &self,
         space: SpaceId,

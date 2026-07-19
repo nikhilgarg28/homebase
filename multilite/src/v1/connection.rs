@@ -8,7 +8,7 @@ use super::hooks::V1Hooks;
 use super::schema;
 use crate::database::{
     Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
-    ReplicaInvitation, Statement,
+    PushRejection, ReplicaInvitation, Statement,
 };
 use crate::{Params, Result};
 
@@ -65,6 +65,11 @@ impl<H: ServerHandle> Connection<H> {
     /// Fetch all currently available admissions without applying them.
     pub fn pull(&self) -> Result<PullOutcome> {
         self.database.pull()
+    }
+
+    /// Undo and retire the exact speculative suffix named by a push rejection.
+    pub fn rollback(&self, rejection: &PushRejection) -> Result<()> {
+        self.database.rollback(rejection)
     }
 
     /// Reconcile the currently fetched admit interval with local SQLite state.

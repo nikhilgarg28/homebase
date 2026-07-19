@@ -65,8 +65,7 @@ pub struct PushRejection {
     database_id: DatabaseId,
     device_id: DeviceId,
     failed_at: DeviceSeq,
-    observed_neck: DeviceSeq,
-    observed_tail: DeviceSeq,
+    submit_cursors: OplogCursors,
     error: KernelError,
 }
 
@@ -287,11 +286,31 @@ impl<H: ServerHandle> Database<H> {
                     database_id: self.database_id,
                     device_id: self.client.device(),
                     failed_at: at,
-                    observed_neck: cursors.neck,
-                    observed_tail: cursors.tail,
+                    submit_cursors: cursors,
                     error,
                 }))
             }
+        }
+    }
+
+    /// Undo the speculative SQLite effects covered by one definitive push
+    /// rejection and retire that exact active submit window.
+    pub(crate) fn rollback(&self, rejection: &PushRejection) -> Result<()> {
+        if rejection.database_id != self.database_id
+            || rejection.device_id != self.client.device()
+            || rejection.failed_at != rejection.submit_cursors.neck
+        {
+            return Err(Error::StalePushRejection);
+        }
+
+        match block_on(self.client.rollback_if_unchanged(
+            self.database_id.space_id(),
+            rejection.failed_at,
+            rejection.submit_cursors,
+        )) {
+            Ok(()) => Ok(()),
+            Err(ClientError::RollbackWindowChanged) => Err(Error::StalePushRejection),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1264,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn push_finalizes_an_accepted_prefix_but_retains_the_rejected_suffix() {
+    fn rollback_preserves_an_accepted_prefix_and_retires_only_the_rejected_suffix() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
         let first = Database::open_with(
@@ -1313,8 +1332,14 @@ mod tests {
         assert_eq!(rejection.database_id, second.database_id());
         assert_eq!(rejection.device_id, second.client.device());
         assert_eq!(rejection.failed_sequence(), 2);
-        assert_eq!(rejection.observed_neck, DeviceSeq(2));
-        assert_eq!(rejection.observed_tail, DeviceSeq(3));
+        assert_eq!(
+            rejection.submit_cursors,
+            OplogCursors {
+                head: DeviceSeq(2),
+                neck: DeviceSeq(2),
+                tail: DeviceSeq(3),
+            }
+        );
         assert!(matches!(
             rejection.error(),
             KernelError::RangeAssertFailed { failures } if failures.len() == 1
@@ -1324,6 +1349,181 @@ mod tests {
         assert_eq!(pending[0].seq, DeviceSeq(2));
         assert!(table_exists(&second, "tasks"));
         assert!(table_exists(&second, "NOTES"));
+
+        second.rollback(&rejection).unwrap();
+        assert!(pending_ops(&second).is_empty());
+        assert!(table_exists(&second, "tasks"));
+        assert!(!table_exists(&second, "NOTES"));
+        let after_rollback = client_state(&second);
+        let space = &after_rollback.spaces[&second.database_id().space_id()];
+        assert_eq!(
+            space.cursors,
+            OplogCursors {
+                head: DeviceSeq(2),
+                neck: DeviceSeq(3),
+                tail: DeviceSeq(4),
+            }
+        );
+        assert_eq!(
+            space.oplog[&DeviceSeq(3)],
+            DeviceOp::Rollback {
+                marker: DeviceSeq(2)
+            }
+        );
+
+        second.rollback(&rejection).unwrap();
+        assert_eq!(client_state(&second), after_rollback);
+        assert!(matches!(
+            second.rebase(&second_runtime),
+            Err(Error::RebasePendingSubmissions)
+        ));
+
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase(&second_runtime).unwrap();
+        assert!(table_exists(&second, "tasks"));
+        assert!(table_exists(&second, "notes"));
+    }
+
+    #[test]
+    fn rollback_rejects_foreign_or_stale_push_rejections_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("stale-first.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let second = Database::open_with(
+            directory.path().join("stale-second.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-name schema submission unexpectedly drained")
+        };
+
+        let first_before = client_state(&first);
+        assert!(matches!(
+            first.rollback(&rejection),
+            Err(Error::StalePushRejection)
+        ));
+        assert_eq!(client_state(&first), first_before);
+        assert!(table_exists(&first, "notes"));
+
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        let second_before = client_state(&second);
+        let pending_before = pending_ops(&second);
+        assert!(matches!(
+            second.rollback(&rejection),
+            Err(Error::StalePushRejection)
+        ));
+        assert_eq!(client_state(&second), second_before);
+        assert_eq!(pending_ops(&second), pending_before);
+        assert!(table_exists(&second, "NOTES"));
+        assert!(table_exists(&second, "tasks"));
+    }
+
+    #[test]
+    fn rollback_failure_restores_sqlite_pending_and_homebase_state_before_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("atomic-rollback-first.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let second = Database::open_with(
+            directory.path().join("atomic-rollback-second.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-name schema submission unexpectedly drained")
+        };
+        second.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_pending_rollback
+                     BEFORE DELETE ON __multilite__pending
+                     BEGIN SELECT RAISE(ABORT, 'injected pending rollback failure'); END",
+                )
+                .unwrap();
+        });
+        let state_before = client_state(&second);
+        let pending_before = pending_ops(&second);
+
+        assert!(second.rollback(&rejection).is_err());
+        assert_eq!(client_state(&second), state_before);
+        assert_eq!(pending_ops(&second), pending_before);
+        assert!(table_exists(&second, "NOTES"));
+
+        second.with_connection(|connection| {
+            connection
+                .execute_batch("DROP TRIGGER reject_pending_rollback")
+                .unwrap();
+        });
+        second.rollback(&rejection).unwrap();
+        assert!(pending_ops(&second).is_empty());
+        assert!(!table_exists(&second, "NOTES"));
+        let state = client_state(&second);
+        let space = &state.spaces[&second.database_id().space_id()];
+        assert_eq!(space.cursors.neck, DeviceSeq(2));
+        assert_eq!(space.cursors.tail, DeviceSeq(3));
+        assert_eq!(
+            space.oplog[&DeviceSeq(2)],
+            DeviceOp::Rollback {
+                marker: DeviceSeq(1)
+            }
+        );
     }
 
     #[test]

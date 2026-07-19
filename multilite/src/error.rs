@@ -52,6 +52,8 @@ pub enum Error {
     RebasePendingSubmissions,
     /// Local submit or admit cursors changed during rebase preparation.
     RebaseStateChanged,
+    /// A push rejection belongs to another replica or an obsolete submit window.
+    StalePushRejection,
     /// The embedded Homebase client failed to initialize.
     Client(ClientError),
 }
@@ -99,6 +101,9 @@ impl fmt::Display for Error {
             Self::RebaseStateChanged => {
                 f.write_str("submit or admit state changed while preparing rebase")
             }
+            Self::StalePushRejection => {
+                f.write_str("push rejection does not match the current submit window")
+            }
             Self::Client(error) => write!(f, "homebase client error: {error}"),
         }
     }
@@ -120,7 +125,8 @@ impl std::error::Error for Error {
             | Self::Entropy(_)
             | Self::InvalidMultiliteOp(_)
             | Self::RebasePendingSubmissions
-            | Self::RebaseStateChanged => None,
+            | Self::RebaseStateChanged
+            | Self::StalePushRejection => None,
             Self::Client(error) => Some(error),
         }
     }

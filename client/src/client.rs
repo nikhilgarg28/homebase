@@ -416,6 +416,34 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
         self.store.rollback(space, to).await?;
         Ok(())
     }
+
+    /// Retire an active oplog window only if it is unchanged since a
+    /// definitive rejection was observed.
+    pub async fn rollback_if_unchanged(
+        &self,
+        space: SpaceId,
+        to: DeviceSeq,
+        expected: crate::meta::OplogCursors,
+    ) -> Result<(), ClientError> {
+        let _permit = self.enter_space(space).await?;
+        let current = self.store.oplog_cursors(space).await?;
+        let completed = expected
+            .tail
+            .0
+            .checked_add(1)
+            .map(|tail| crate::meta::OplogCursors {
+                head: expected.head,
+                neck: expected.tail,
+                tail: DeviceSeq(tail),
+            });
+        if current != expected && completed != Some(current) {
+            return Err(ClientError::RollbackWindowChanged);
+        }
+        self.store
+            .rollback_if_unchanged(space, to, expected)
+            .await?;
+        Ok(())
+    }
 }
 
 fn admission_batch(seq: DeviceSeq, record: &crate::meta::DeviceOp) -> AdmissionBatch {
@@ -490,6 +518,7 @@ pub enum ClientError {
     Cipher(CipherError),
     MissingCodec(SpaceId),
     CodecMismatch { id: SpaceId },
+    RollbackWindowChanged,
     Coordination { reason: String },
 }
 
@@ -531,6 +560,9 @@ impl fmt::Display for ClientError {
                     f,
                     "envelope does not match persisted codec for space {id:?}"
                 )
+            }
+            Self::RollbackWindowChanged => {
+                f.write_str("active oplog changed since rollback was authorized")
             }
             Self::Coordination { reason } => write!(f, "{reason}"),
         }

@@ -645,6 +645,22 @@ rollback transition, and retires those pending records. The resulting empty
 rollback marker must be pushed before `rebase` can proceed. Unavailable or
 ambiguous push errors still produce no rollback authority.
 
+Implementation result: `MultiliteConnection::rollback(&PushRejection)` first
+rejects handles from another database or device and handles made stale by a
+later local submission. Homebase's `rollback_if_unchanged` then holds the
+space coordinator while its metadata transition checks the complete observed
+cursor triple. The SQLite metadata adapter validates that pending rows exactly
+match active commit records, executes reject effects in reverse sequence
+order, deletes those rows, and appends the Homebase rollback marker in one
+savepoint. The exact completed post-state is retryable; any later append makes
+the handle stale. Rebase treats the admitted empty rollback marker as a
+transport no-op, but still refuses to run until that marker has itself pushed.
+
+Tests cover an already-accepted prefix surviving suffix rollback, foreign and
+stale handles causing no mutation, exact retry, an injected pending-delete
+failure restoring SQLite schema and Homebase metadata together, and the full
+rollback-marker push followed by pull/rebase convergence.
+
 ### Batch 15: CREATE TABLE fault and convergence matrix
 
 Run two-device tests for disjoint table creation, same-name rejection,
