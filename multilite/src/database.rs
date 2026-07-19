@@ -722,6 +722,29 @@ mod tests {
         })
     }
 
+    fn stock_user_schema(path: &Path) -> Vec<(String, String)> {
+        let connection = Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT name, sql FROM sqlite_schema
+                 WHERE type = 'table' ORDER BY name COLLATE NOCASE",
+            )
+            .unwrap();
+        statement
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .filter(|(name, _)| {
+                let name = name.to_ascii_lowercase();
+                !name.starts_with("__multilite__") && !name.starts_with("sqlite_")
+            })
+            .collect()
+    }
+
     fn create_operation(name: &str) -> MultiliteOp {
         MultiliteOp::create_table(
             &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
@@ -1151,19 +1174,22 @@ mod tests {
     }
 
     #[test]
-    fn rebase_requires_an_empty_submit_log_without_mutation() {
+    fn pull_before_push_conflict_recovers_across_restarts_and_converges() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
+        let first_path = directory.path().join("winning-schema.sqlite");
+        let second_path = directory.path().join("conflicting-schema.sqlite");
         let first = Database::open_with(
-            directory.path().join("winning-schema.sqlite"),
+            &first_path,
             OpenOptions::new().server(router(Arc::clone(&server))),
         )
         .unwrap();
         assert!(server.create_space(first.database_id().space_id()));
+        let invitation = first.replica_invitation();
         let second = Database::open_with(
-            directory.path().join("conflicting-schema.sqlite"),
+            &second_path,
             OpenOptions::new()
-                .invitation(first.replica_invitation())
+                .invitation(invitation)
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
@@ -1196,6 +1222,91 @@ mod tests {
         assert_eq!(client_state(&second), before);
         assert_eq!(table_sql(&second, "notes").unwrap(), before_sql);
         assert_eq!(pending_ops(&second).len(), 1);
+
+        let PushOutcome::Rejected(before_restart) = second.push().unwrap() else {
+            panic!("same-name schema submission unexpectedly drained")
+        };
+        drop(second_runtime);
+        drop(second);
+
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+        assert!(table_exists(&second, "NOTES"));
+        assert_eq!(pending_ops(&second).len(), 1);
+        let PushOutcome::Rejected(after_restart) = second.push().unwrap() else {
+            panic!("re-probed schema submission unexpectedly drained")
+        };
+        assert_eq!(after_restart, before_restart);
+
+        second.rollback(&after_restart).unwrap();
+        assert!(pending_ops(&second).is_empty());
+        assert!(!table_exists(&second, "notes"));
+        drop(second_runtime);
+        drop(second);
+
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let state = client_state(&second);
+        let space = &state.spaces[&second.database_id().space_id()];
+        assert_eq!(space.cursors.neck, DeviceSeq(2));
+        assert_eq!(space.cursors.tail, DeviceSeq(3));
+        assert_eq!(
+            space.oplog[&DeviceSeq(2)],
+            DeviceOp::Rollback {
+                marker: DeviceSeq(1)
+            }
+        );
+        assert!(matches!(
+            second.rebase(&second_runtime),
+            Err(Error::RebasePendingSubmissions)
+        ));
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        drop(second_runtime);
+        drop(second);
+
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+        second.pull().unwrap();
+        second.rebase(&second_runtime).unwrap();
+        assert!(table_exists(&second, "notes"));
+
+        first.pull().unwrap();
+        first.rebase(&first_runtime).unwrap();
+        assert_eq!(table_sql(&first, "notes"), table_sql(&second, "notes"));
+        let first_state = client_state(&first);
+        let second_state = client_state(&second);
+        assert_eq!(
+            first_state.spaces[&first.database_id().space_id()].admit_cursors,
+            second_state.spaces[&second.database_id().space_id()].admit_cursors
+        );
+
+        drop(first_runtime);
+        drop(second_runtime);
+        drop(first);
+        drop(second);
+        assert_eq!(
+            stock_user_schema(&first_path),
+            stock_user_schema(&second_path)
+        );
+        assert_eq!(
+            stock_user_schema(&first_path),
+            [(
+                String::from("notes"),
+                String::from("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
+            )]
+        );
     }
 
     #[test]
@@ -1547,11 +1658,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_cleanup_failure_rolls_back_homebase_trim_and_retry_converges() {
+    fn accepted_push_with_failed_local_trim_recovers_after_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
+        let path = directory.path().join("atomic-accept.sqlite");
         let database = Database::open_with(
-            directory.path().join("atomic-accept.sqlite"),
+            &path,
             OpenOptions::new().server(router(Arc::clone(&server))),
         )
         .unwrap();
@@ -1581,11 +1693,18 @@ mod tests {
                 .neck,
             DeviceSeq(1)
         );
-        database.with_connection(|connection| {
-            connection
-                .execute_batch("DROP TRIGGER reject_pending_cleanup")
-                .unwrap();
-        });
+        drop(runtime);
+        drop(database);
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_pending_cleanup")
+            .unwrap();
+        let database = Database::open_with(
+            &path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
 
         assert_eq!(database.push().unwrap(), PushOutcome::Drained);
         assert!(pending_ops(&database).is_empty());
@@ -1599,6 +1718,11 @@ mod tests {
             DeviceSeq(2)
         );
         assert!(table_exists(&database, "notes"));
+        assert_eq!(database.pull().unwrap().captured_through(), 1);
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id().space_id()];
+        assert_eq!(space.admit_cursors.tail, AdmissionSeq(2));
+        assert_eq!(space.admits.len(), 1, "the retry must not admit twice");
     }
 
     #[test]

@@ -669,6 +669,38 @@ rejection handles, restart between every phase, and injected transaction
 failures. Both replicas must eventually expose identical `sqlite_schema`
 results, while stock SQLite remains able to inspect each file.
 
+Implementation result: the restart matrix now spans local schema creation,
+fetch-before-push, blocked rebase, definitive same-name rejection, process
+reopen and rejection re-probing, explicit rollback, reopen with an active
+rollback marker, marker push, another reopen, and final pull/rebase on both
+replicas. The converged user schema is read back through a fresh stock
+`rusqlite::Connection`, independently of Multilite. A separate server-ahead
+test now crosses a process restart after the server accepted a submission but
+the local acknowledged-prefix transaction failed; retry certifies the retained
+history, finalizes its pending record, and observes exactly one admission.
+
+Together with the existing tests, the matrix covers disjoint creation,
+same-name conflict, stale and foreign rejection handles, unavailable transport,
+atomic submission/pending insertion, accepted-prefix cleanup, rollback effects,
+remote DDL application, and persistence of pulled and applied history. No
+production transition changed in this batch.
+
+### Batch 15a: retire the temporary V1 wrapper
+
+General CREATE TABLE coordination and the SQLite/Homebase lifecycle now live
+below `v1`; the remaining V1 layer primarily creates a synthetic `items` table,
+records a local V1 schema version, and captures item-shaped inserts that are
+not yet submitted. Remove that layer before implementing general INSERT so the
+new row pipeline is not built through an abstraction scheduled for deletion.
+
+Promote a general connection wrapper as `MultiliteConnection`, give it the
+database-owned hook policy needed by current SQL execution, and remove the V1
+schema ledger, forced `items` table, item codec, and V1-specific capture tests.
+Retain the generic runtime, SQLite value machinery, general schema operation
+codec, metastore, and synchronization APIs. There are no released files to
+migrate; this is deliberately a clean format break while the project has no
+users.
+
 ### Batch 16 and later: INSERT pipeline
 
 Only after CREATE TABLE converges end to end, add row identity and operation
