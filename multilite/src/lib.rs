@@ -11,7 +11,9 @@ mod v1;
 mod value;
 
 pub use database::Statement as MultiliteStatement;
-pub use database::{DatabaseId, OfflineServer, OpenOptions, ReplicaInvitation};
+pub use database::{
+    DatabaseId, OfflineServer, OpenOptions, PushOutcome, PushRejection, ReplicaInvitation,
+};
 pub use error::{Error, Result};
 pub use rusqlite::types::{FromSql, Type, Value, ValueRef};
 pub use rusqlite::{Params, ToSql, params};

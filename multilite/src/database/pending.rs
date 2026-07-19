@@ -267,6 +267,40 @@ pub fn load(connection: &Connection) -> Result<Vec<PendingOp>> {
     .collect()
 }
 
+/// Run acceptance effects and retire every pending operation through `through`.
+///
+/// The database metadata adapter calls this inside the same SQLite savepoint
+/// that advances Homebase's submit neck.
+pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()> {
+    let accepted = load(connection)?
+        .into_iter()
+        .take_while(|pending| pending.seq <= through)
+        .collect::<Vec<_>>();
+    for pending in &accepted {
+        apply_effects(connection, &pending.on_accept)?;
+    }
+    if !accepted.is_empty() {
+        connection.execute(
+            &format!("DELETE FROM {TABLE} WHERE device_seq <= ?1"),
+            [through.0.to_be_bytes().as_slice()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify that every pending operation still belongs to the active submit log.
+pub fn validate_active_from(connection: &Connection, neck: DeviceSeq) -> Result<()> {
+    if load(connection)?
+        .into_iter()
+        .any(|pending| pending.seq < neck)
+    {
+        return Err(Error::InvalidDatabase(
+            "accepted pending operation was not finalized with its submit trim",
+        ));
+    }
+    Ok(())
+}
+
 fn effects_for(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
     match operation {
         MultiliteOp::CreateTable(created) => (
@@ -276,6 +310,21 @@ fn effects_for(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
             }],
         ),
     }
+}
+
+fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
+    for effect in effects {
+        match effect {
+            Effect::DropTable { name } => {
+                connection.execute_batch(&format!("DROP TABLE {}", quote_identifier(name)))?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn put_field(frame: &mut Vec<u8>, tag: u8, value: &[u8]) {
@@ -508,6 +557,37 @@ mod tests {
             load(&connection),
             Err(Error::InvalidDatabase(
                 "pending record sequence does not match its row key"
+            ))
+        ));
+    }
+
+    #[test]
+    fn acceptance_retires_only_the_acknowledged_prefix() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let later = operation("tasks");
+        insert(&connection, DeviceSeq(3), &operation("notes")).unwrap();
+        insert(&connection, DeviceSeq(9), &later).unwrap();
+
+        accept_through(&connection, DeviceSeq(3)).unwrap();
+
+        assert_eq!(
+            load(&connection).unwrap(),
+            [PendingOp::new(DeviceSeq(9), later)]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_pending_operations_below_submit_neck() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        insert(&connection, DeviceSeq(3), &operation("notes")).unwrap();
+
+        validate_active_from(&connection, DeviceSeq(3)).unwrap();
+        assert!(matches!(
+            validate_active_from(&connection, DeviceSeq(4)),
+            Err(Error::InvalidDatabase(
+                "accepted pending operation was not finalized with its submit trim"
             ))
         ));
     }

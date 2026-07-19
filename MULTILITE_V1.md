@@ -560,6 +560,24 @@ stalled schema range assertion returns a rejection bound to the observed active
 submit window but performs no rollback. Unavailable or ambiguous outcomes are
 retryable and never authorize repair.
 
+Implementation result: `MultiliteConnection::push()` runs network admission
+without holding a SQLite transaction. After an acknowledgement, Multilite's
+`MetaStore` decorator wraps Homebase's submit-log trim, submit `neck` movement,
+acceptance effects, and pending-row deletion in one outer SQLite savepoint.
+There is therefore no committed state in which `neck` has advanced but its
+accepted pending record remains; reopen treats such a state as corruption. A
+stall returns an opaque `PushRejection` carrying the database, device, failed
+sequence, exact observed submit window, and kernel error for later rollback
+validation. It does not change the rejected operation or suffix. An
+unavailable push returns an error and retains every still-active pending row;
+any earlier prefix acknowledged during the same push attempt was already
+trimmed and finalized atomically.
+
+Tests cover an empty offline push, full drain, an accepted prefix followed by
+a same-name range-assert rejection, unavailable transport, complete Homebase
+`MetaStore` conformance, and an injected pending-cleanup failure that rolls
+back `neck` movement before a server-ahead retry converges.
+
 ### Batch 11: Homebase rebase analysis
 
 Add a read-only Homebase client operation that compares unapplied admitted

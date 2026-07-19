@@ -4,16 +4,18 @@ mod operation;
 mod pending;
 mod schema;
 mod sql;
+mod store;
 
 use std::path::Path;
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase_client::meta::{MetaStore, OrderedMetaStore};
+use homebase_client::meta::{MetaStore, OplogCursors};
 use homebase_client::server::UnreachableSpace;
-use homebase_client::{Client, ClientError, ServerHandle};
+use homebase_client::{Client, ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
 use homebase_core::clock::{Lineage, SystemHybridClock};
+use homebase_core::messages::KernelError;
 use homebase_core::space::SpaceId;
-use homebase_core::tag::{AdmissionSeq, DeviceId};
+use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq};
 use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
@@ -24,8 +26,44 @@ use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 use self::operation::MultiliteOp;
+use self::store::DatabaseMetaStore;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
+
+/// Result of pushing this database's active local submission window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Every currently active submission was admitted.
+    Drained,
+    /// Admission stopped at a kernel rejection.
+    Rejected(PushRejection),
+}
+
+/// Opaque record of a rejection against one observed local submission window.
+///
+/// A later rollback will validate this identity and window before changing
+/// local state. Merely receiving the handle never performs repair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushRejection {
+    database_id: DatabaseId,
+    device_id: DeviceId,
+    failed_at: DeviceSeq,
+    observed_neck: DeviceSeq,
+    observed_tail: DeviceSeq,
+    error: KernelError,
+}
+
+impl PushRejection {
+    /// Homebase sequence of the first rejected local submission.
+    pub fn failed_sequence(&self) -> u64 {
+        self.failed_at.0
+    }
+
+    /// Kernel invariant that rejected the submission.
+    pub fn error(&self) -> &KernelError {
+        &self.error
+    }
+}
 
 /// Public identity shared by every replica of a Multilite database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -137,7 +175,7 @@ impl<H: ServerHandle> OpenOptions<H> {
 }
 
 pub(crate) type DatabaseClient<H> =
-    Client<OrderedMetaStore<SqliteOrderedStore>, H, SystemHybridClock, SystemNonceSource>;
+    Client<DatabaseMetaStore, H, SystemHybridClock, SystemNonceSource>;
 pub(crate) type DatabaseRuntime<P> = RuntimeConnection<DatabaseHooks<P>>;
 
 pub(crate) struct DatabaseHooks<P> {
@@ -216,6 +254,30 @@ impl<H: ServerHandle> Database<H> {
         }
     }
 
+    pub(crate) fn push(&self) -> Result<PushOutcome> {
+        let pushed = block_on(async {
+            self.client
+                .space(self.database_id.space_id())
+                .await?
+                .push()
+                .await
+        })?;
+        match pushed {
+            HomebasePushOutcome::Drained { .. } => Ok(PushOutcome::Drained),
+            HomebasePushOutcome::Stalled { at, error, .. } => {
+                let cursors = self.submit_cursors()?;
+                Ok(PushOutcome::Rejected(PushRejection {
+                    database_id: self.database_id,
+                    device_id: self.client.device(),
+                    failed_at: at,
+                    observed_neck: cursors.neck,
+                    observed_tail: cursors.tail,
+                    error,
+                }))
+            }
+        }
+    }
+
     fn execute_create_table<P: HookPolicy, Q: Params>(
         &self,
         runtime: &DatabaseRuntime<P>,
@@ -280,6 +342,16 @@ impl<H: ServerHandle> Database<H> {
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         self.owner.with_savepoint(prefix, operation)
+    }
+
+    fn submit_cursors(&self) -> Result<OplogCursors> {
+        let store = DatabaseMetaStore::new(self.owner.clone());
+        let state = block_on(store.load())?;
+        Ok(state
+            .spaces
+            .get(&self.database_id.space_id())
+            .ok_or(Error::InvalidDatabase("database space is missing"))?
+            .cursors)
     }
 }
 
@@ -411,7 +483,7 @@ fn initialize<H: ServerHandle>(
     };
     SqliteOrderedStore::initialize(owner)?;
     owner.with_connection(pending::initialize)?;
-    let store = OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone()));
+    let store = DatabaseMetaStore::new(owner.clone());
     let client = block_on(Client::open(
         store,
         server,
@@ -429,8 +501,7 @@ fn reopen<H: ServerHandle>(
     server: H,
     lineage: Lineage,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
-    owner.with_connection(pending::load)?;
-    let store = OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone()));
+    let store = DatabaseMetaStore::new(owner.clone());
     let state = block_on(store.load())?;
     if state.device.is_none() {
         return Err(Error::InvalidDatabase("device identity is missing"));
@@ -464,6 +535,10 @@ fn reopen<H: ServerHandle>(
             actual: database_id.to_bytes(),
         });
     }
+
+    owner.with_connection(|connection| {
+        pending::validate_active_from(connection, space.cursors.neck)
+    })?;
 
     let client = block_on(Client::open(
         store,
@@ -510,17 +585,45 @@ fn offline_server(_: &SpaceId) -> Option<UnreachableSpace> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use homebase::Server;
+    use homebase::actor::{SpaceHandle, Spawner};
+    use homebase::storage::MemoryStore;
     use homebase_client::meta::{ClientState, DeviceOp, SubmitMode};
     use homebase_client::server::offline_router;
+    use homebase_core::clock::{ManualClock, Timestamp};
     use homebase_core::tag::DeviceSeq;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
     use super::*;
 
     struct NoopFormat;
+
+    struct ThreadSpawner;
+
+    impl Spawner for ThreadSpawner {
+        fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            std::thread::spawn(move || pollster::block_on(task));
+        }
+    }
+
+    type TestServer = Server<MemoryStore, ManualClock, ThreadSpawner>;
+
+    fn server() -> Arc<TestServer> {
+        Arc::new(Server::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(ManualClock::new(Timestamp(0))),
+            ThreadSpawner,
+        ))
+    }
+
+    fn router(server: Arc<TestServer>) -> impl Fn(&SpaceId) -> Option<SpaceHandle> + Sync {
+        move |space| server.space(space)
+    }
 
     impl HookPolicy for NoopFormat {
         type Event = ();
@@ -541,7 +644,7 @@ mod tests {
     }
 
     fn client_state<H: ServerHandle>(database: &Database<H>) -> ClientState {
-        let store = OrderedMetaStore::new(SqliteOrderedStore::new(database.owner.clone()));
+        let store = DatabaseMetaStore::new(database.owner.clone());
         block_on(store.load()).unwrap()
     }
 
@@ -702,6 +805,171 @@ mod tests {
             homebase_client::meta::OplogCursors::default()
         );
         assert!(space.oplog.is_empty());
+    }
+
+    #[test]
+    fn push_drains_and_retires_accepted_pending_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("pushed.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+
+        assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+        assert!(pending_ops(&database).is_empty());
+        assert!(table_exists(&database, "notes"));
+        let state = client_state(&database);
+        let space = state
+            .spaces
+            .get(&database.database_id().space_id())
+            .unwrap();
+        assert_eq!(space.cursors.neck, DeviceSeq(2));
+        assert_eq!(space.cursors.tail, DeviceSeq(2));
+    }
+
+    #[test]
+    fn push_finalizes_an_accepted_prefix_but_retains_the_rejected_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("first.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let second = Database::open_with(
+            directory.path().join("second.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE \"NOTES\" (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-name schema submission unexpectedly drained")
+        };
+        assert_eq!(rejection.database_id, second.database_id());
+        assert_eq!(rejection.device_id, second.client.device());
+        assert_eq!(rejection.failed_sequence(), 2);
+        assert_eq!(rejection.observed_neck, DeviceSeq(2));
+        assert_eq!(rejection.observed_tail, DeviceSeq(3));
+        assert!(matches!(
+            rejection.error(),
+            KernelError::RangeAssertFailed { failures } if failures.len() == 1
+        ));
+        let pending = pending_ops(&second);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, DeviceSeq(2));
+        assert!(table_exists(&second, "tasks"));
+        assert!(table_exists(&second, "NOTES"));
+    }
+
+    #[test]
+    fn unavailable_push_preserves_the_active_pending_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("offline.sqlite")).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+
+        assert!(database.push().is_err());
+        assert_eq!(pending_ops(&database).len(), 1);
+        let state = client_state(&database);
+        let space = state
+            .spaces
+            .get(&database.database_id().space_id())
+            .unwrap();
+        assert_eq!(space.cursors.neck, DeviceSeq(1));
+        assert_eq!(space.cursors.tail, DeviceSeq(2));
+    }
+
+    #[test]
+    fn pending_cleanup_failure_rolls_back_homebase_trim_and_retry_converges() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("atomic-accept.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        database.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_pending_cleanup
+                     BEFORE DELETE ON __multilite__pending
+                     BEGIN SELECT RAISE(ABORT, 'injected pending cleanup failure'); END",
+                )
+                .unwrap();
+        });
+
+        assert!(database.push().is_err());
+        assert_eq!(pending_ops(&database).len(), 1);
+        assert_eq!(
+            client_state(&database)
+                .spaces
+                .get(&database.database_id().space_id())
+                .unwrap()
+                .cursors
+                .neck,
+            DeviceSeq(1)
+        );
+        database.with_connection(|connection| {
+            connection
+                .execute_batch("DROP TRIGGER reject_pending_cleanup")
+                .unwrap();
+        });
+
+        assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+        assert!(pending_ops(&database).is_empty());
+        assert_eq!(
+            client_state(&database)
+                .spaces
+                .get(&database.database_id().space_id())
+                .unwrap()
+                .cursors
+                .neck,
+            DeviceSeq(2)
+        );
+        assert!(table_exists(&database, "notes"));
     }
 
     #[test]

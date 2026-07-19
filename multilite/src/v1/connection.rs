@@ -7,7 +7,8 @@ use homebase_client::ServerHandle;
 use super::hooks::V1Hooks;
 use super::schema;
 use crate::database::{
-    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, ReplicaInvitation, Statement,
+    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PushOutcome,
+    ReplicaInvitation, Statement,
 };
 use crate::{Params, Result};
 
@@ -54,6 +55,11 @@ impl<H: ServerHandle> Connection<H> {
     /// Device identity unique to this local replica file.
     pub fn device_id(&self) -> [u8; 16] {
         self.database.device_id()
+    }
+
+    /// Push this database's active local submissions as far as possible.
+    pub fn push(&self) -> Result<PushOutcome> {
+        self.database.push()
     }
 
     /// Execute one SQLite statement directly.

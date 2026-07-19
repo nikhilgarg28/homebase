@@ -15,8 +15,11 @@ The internal operation layer translates restricted table creation to and from
 its complete Homebase log-and-revision-cell envelope. Local `CREATE TABLE` and
 its Homebase submission now commit in one SQLite savepoint together with a
 pending-effects row keyed by the assigned device sequence. Push, pull, rebase,
-and rollback land in subsequent batches before INSERT is connected to
-synchronization.
+and rollback complete the schema synchronization loop before INSERT is
+connected to synchronization. `push()` now admits the active Homebase stream,
+then atomically advances its local submit cursor and retires every definitively
+accepted pending prefix in one SQLite savepoint. It returns an opaque rejection
+handle without repairing a stalled suffix.
 The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.

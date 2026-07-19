@@ -1,4 +1,4 @@
-use multilite::{Error, MultiliteConnection, params};
+use multilite::{Error, MultiliteConnection, PushOutcome, params};
 use rusqlite::ErrorCode;
 
 #[test]
@@ -116,4 +116,12 @@ fn query_conversion_error_remains_a_sqlite_error() {
         error,
         Error::Sqlite(rusqlite::Error::InvalidColumnType(..))
     ));
+}
+
+#[test]
+fn empty_push_drains_without_contacting_an_offline_server() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("empty-push.sqlite")).unwrap();
+
+    assert_eq!(db.push().unwrap(), PushOutcome::Drained);
 }
