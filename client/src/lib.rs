@@ -36,5 +36,6 @@ pub use homebase_core::Mutation;
 pub use server::{Offline, ServerHandle};
 pub use space::{
     Admits, DEFAULT_PULL_CAP, DEFAULT_PUSH_CAP, FetchedRange, LeaseState, PushOutcome, PushReceipt,
-    RepairedLeases, Space, SpaceDriverError, Submission, lease_margin,
+    RebaseAnalysis, RebaseConflict, RepairedLeases, Space, SpaceDriverError, Submission,
+    lease_margin,
 };

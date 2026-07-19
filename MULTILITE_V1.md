@@ -586,6 +586,26 @@ submissions' existing range assertions to identify which local device
 sequences can no longer be replayed over the new admit cut. It moves no cursor
 and does not interpret Multilite operations.
 
+Implementation result: `Space::analyze_rebase(from..to)` point-reads both
+cursor triples, scans the active submit window and exactly that retained admit
+interval, and returns the interval and observed cursors with
+per-device-sequence `RangeAssertFailure`s. Range assertions are the sole
+dependency declaration. Foreign Set/Delete descendants and overlapping
+DeleteRanges invalidate them; own-device history, admissions at or below
+`upto`, and unasserted submissions do not. If the same local sequence is
+already present in the selected interval, its admission caps the history
+relevant to replay. Analysis performs no network I/O, decryption, or cursor
+transition and assigns no implicit meaning to admit `neck`; callers own
+interval continuity and application policy. The `MetaStore` contract now has a symmetric
+`oplog_cursors(space)` point read, and Multilite uses it instead of loading the
+entire client state when recording a push rejection.
+
+Tests cover point and range overlap, sibling exclusion, inclusive `upto`, all
+failures and their order, own-device exclusion, the already-admitted retry
+case, unasserted submissions, explicit empty and unavailable intervals,
+encrypted name-domain agreement, cursor immutability, and both reference and
+joined-store conformance.
+
 ### Batch 12: CREATE TABLE pull
 
 Multilite `pull` is fetch-only. It asks Homebase to append complete dense server
@@ -594,11 +614,13 @@ admit `neck`. Applications may therefore fetch while deferring reconciliation.
 
 ### Batch 13: CREATE TABLE rebase
 
-Multilite `rebase` decodes and validates the unapplied admitted operations,
-asks Homebase for rebase conflicts, and returns an error without mutation when
-one exists. Otherwise it applies foreign table creations in admission order,
-verifies already-materialized own admissions, and advances admit `neck` in the
-same SQLite transaction. Internal apply mode suppresses local capture.
+Multilite `rebase` snapshots `[admit.neck, admit.tail)`, decodes and validates
+those admitted operations, asks Homebase to analyze that exact interval, and
+returns an error without mutation when a conflict exists. Otherwise it applies
+foreign table creations in admission order, verifies already-materialized own
+admissions, rechecks the returned submit/admit cursor snapshots, and advances
+admit `neck` in the same SQLite transaction. Internal apply mode suppresses
+local capture.
 
 ### Batch 14: explicit CREATE TABLE rollback
 

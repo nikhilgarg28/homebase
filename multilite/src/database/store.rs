@@ -2,7 +2,7 @@
 
 use homebase_client::meta::{
     AdmitCursors, ClientState, CodecRecord, Committed, DeviceOp, HeldLease, MetaStore,
-    OrderedMetaStore, ReservedCommit, SubmitMode,
+    OplogCursors, OrderedMetaStore, ReservedCommit, SubmitMode,
 };
 use homebase_core::clock::Timestamp;
 use homebase_core::key::Key;
@@ -44,6 +44,10 @@ impl MetaStore for DatabaseMetaStore {
         through: DeviceSeq,
     ) -> Result<Vec<(DeviceSeq, DeviceOp)>, StorageError> {
         self.inner.oplog(space, from, through).await
+    }
+
+    async fn oplog_cursors(&self, space: SpaceId) -> Result<OplogCursors, StorageError> {
+        self.inner.oplog_cursors(space).await
     }
 
     async fn admit_cursors(&self, space: SpaceId) -> Result<AdmitCursors, StorageError> {

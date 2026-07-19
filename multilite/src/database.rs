@@ -346,12 +346,7 @@ impl<H: ServerHandle> Database<H> {
 
     fn submit_cursors(&self) -> Result<OplogCursors> {
         let store = DatabaseMetaStore::new(self.owner.clone());
-        let state = block_on(store.load())?;
-        Ok(state
-            .spaces
-            .get(&self.database_id.space_id())
-            .ok_or(Error::InvalidDatabase("database space is missing"))?
-            .cursors)
+        Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 }
 

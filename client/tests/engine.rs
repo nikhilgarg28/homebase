@@ -623,6 +623,90 @@ fn unchecked_submit_bypasses_local_assert_gate() {
 }
 
 #[test]
+fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let db = key(&[b"db"]);
+        space
+            .submit_unchecked(
+                vec![set(key(&[b"db", b"local"]), b"local")],
+                vec![RangeAssert {
+                    prefix: db.clone(),
+                    upto: AdmissionSeq(0),
+                }],
+            )
+            .await
+            .unwrap();
+        space
+            .submit_unchecked(vec![set(key(&[b"db", b"unasserted"]), b"local")], vec![])
+            .await
+            .unwrap();
+
+        foreign_put(
+            &handle,
+            SPACE,
+            dev(2),
+            &db,
+            vec![PendingEntry {
+                key: key(&[b"db", b"foreign"]),
+                value: val(b"foreign"),
+                ver: Ver(1),
+            }],
+            DeviceSeq(1),
+        )
+        .await;
+        assert_eq!(space.pull().await.unwrap(), AdmissionSeq(1));
+
+        let before = audit(&OrderedMetaStore::new(&mem)).await;
+        let before_space = &before.spaces[&SPACE];
+        let analyzed_range = before_space.admit_cursors.neck..before_space.admit_cursors.tail;
+        let analysis = space.analyze_rebase(analyzed_range.clone()).await.unwrap();
+        assert_eq!(analysis.submit_cursors, before_space.cursors);
+        assert_eq!(analysis.admit_cursors, before_space.admit_cursors);
+        assert_eq!(analysis.admit_range, analyzed_range);
+        assert_eq!(
+            analysis.conflicts,
+            vec![homebase_client::RebaseConflict {
+                device_seq: DeviceSeq(1),
+                failures: vec![RangeAssertFailure {
+                    prefix: db,
+                    upto: AdmissionSeq(0),
+                    actual: AdmissionSeq(1),
+                }],
+            }]
+        );
+
+        let empty = space
+            .analyze_rebase(before_space.admit_cursors.tail..before_space.admit_cursors.tail)
+            .await
+            .unwrap();
+        assert!(empty.is_clean());
+        assert!(matches!(
+            space
+                .analyze_rebase(
+                    before_space.admit_cursors.head
+                        ..AdmissionSeq(before_space.admit_cursors.tail.0 + 1),
+                )
+                .await,
+            Err(SpaceDriverError::RebaseRangeUnavailable { .. })
+        ));
+
+        let after = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(after, before);
+    });
+}
+
+#[test]
 fn submissions_stamp_versions_from_each_spaces_high_water() {
     block_on(async {
         let mem = MemoryStore::new();

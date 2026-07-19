@@ -448,6 +448,12 @@ pub trait MetaStore {
         through: DeviceSeq,
     ) -> impl Future<Output = Result<Vec<(DeviceSeq, DeviceOp)>, StorageError>> + Send;
 
+    /// One space's durable outbound-log cursors.
+    fn oplog_cursors(
+        &self,
+        space: SpaceId,
+    ) -> impl Future<Output = Result<OplogCursors, StorageError>> + Send;
+
     /// One space's durable inbound-log cursors.
     fn admit_cursors(
         &self,
@@ -941,6 +947,13 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             out.push((seq, record));
         }
         Ok(out)
+    }
+
+    async fn oplog_cursors(&self, space: SpaceId) -> Result<OplogCursors, StorageError> {
+        Ok(match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
+        })
     }
 
     async fn admit_cursors(&self, space: SpaceId) -> Result<AdmitCursors, StorageError> {
@@ -2232,6 +2245,7 @@ pub mod conformance {
 
         let state = audit(store).await;
         let data = &state.spaces[&space];
+        assert_eq!(store.oplog_cursors(space).await.unwrap(), data.cursors);
         assert_eq!(
             data.cursors,
             OplogCursors {
@@ -2314,6 +2328,10 @@ pub mod conformance {
                 neck: DeviceSeq(2),
                 tail: DeviceSeq(3),
             }
+        );
+        assert_eq!(
+            store.oplog_cursors(space).await.unwrap(),
+            state.spaces[&space].cursors
         );
         assert_eq!(
             state.spaces[&link].oplog.len(),
