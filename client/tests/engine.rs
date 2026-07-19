@@ -670,6 +670,9 @@ fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
         let before = audit(&OrderedMetaStore::new(&mem)).await;
         let before_space = &before.spaces[&SPACE];
         let analyzed_range = before_space.admit_cursors.neck..before_space.admit_cursors.tail;
+        let admitted = space.admits().iter(analyzed_range.clone()).await.unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].admission_seq, AdmissionSeq(1));
         let analysis = space.analyze_rebase(analyzed_range.clone()).await.unwrap();
         assert_eq!(analysis.submit_cursors, before_space.cursors);
         assert_eq!(analysis.admit_cursors, before_space.admit_cursors);
@@ -698,7 +701,17 @@ fn rebase_analysis_reports_assertion_conflicts_without_moving_either_log() {
                         ..AdmissionSeq(before_space.admit_cursors.tail.0 + 1),
                 )
                 .await,
-            Err(SpaceDriverError::RebaseRangeUnavailable { .. })
+            Err(SpaceDriverError::AdmitRangeUnavailable { .. })
+        ));
+        assert!(matches!(
+            space
+                .admits()
+                .iter(
+                    before_space.admit_cursors.head
+                        ..AdmissionSeq(before_space.admit_cursors.tail.0 + 1),
+                )
+                .await,
+            Err(SpaceDriverError::AdmitRangeUnavailable { .. })
         ));
 
         let after = audit(&OrderedMetaStore::new(&mem)).await;

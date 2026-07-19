@@ -85,7 +85,7 @@ pub enum SpaceDriverError {
     SubmissionNotPending {
         seq: DeviceSeq,
     },
-    RebaseRangeUnavailable {
+    AdmitRangeUnavailable {
         from: AdmissionSeq,
         to: AdmissionSeq,
         head: AdmissionSeq,
@@ -149,14 +149,14 @@ impl fmt::Display for SpaceDriverError {
             Self::SubmissionNotPending { seq } => {
                 write!(f, "submission {seq:?} is no longer pending")
             }
-            Self::RebaseRangeUnavailable {
+            Self::AdmitRangeUnavailable {
                 from,
                 to,
                 head,
                 tail,
             } => write!(
                 f,
-                "rebase range [{from:?}, {to:?}) is not inside retained admit window [{head:?}, {tail:?})"
+                "admit range [{from:?}, {to:?}) is not inside retained window [{head:?}, {tail:?})"
             ),
             Self::MalformedResponse { reason } => write!(f, "malformed server response: {reason}"),
         }
@@ -447,7 +447,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             || admit_range.start < admit_cursors.head
             || admit_range.end > admit_cursors.tail
         {
-            return Err(SpaceDriverError::RebaseRangeUnavailable {
+            return Err(SpaceDriverError::AdmitRangeUnavailable {
                 from: admit_range.start,
                 to: admit_range.end,
                 head: admit_cursors.head,
@@ -1159,20 +1159,76 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             .store()
             .admit_cursors(self.space.id)
             .await?;
-        if cursors.neck == cursors.tail {
+        self.iter_inner(cursors.neck..cursors.tail, cursors).await
+    }
+
+    /// Return one exact retained half-open interval in server admission order,
+    /// authenticating and opening its operations for application use.
+    pub async fn iter(
+        &self,
+        range: SeqRange<AdmissionSeq>,
+    ) -> Result<Vec<AdmittedBatch<Vec<u8>>>, SpaceDriverError> {
+        let _permit = self.space.enter().await?;
+        let cursors = self
+            .space
+            .client
+            .store()
+            .admit_cursors(self.space.id)
+            .await?;
+        self.iter_inner(range, cursors).await
+    }
+
+    async fn iter_inner(
+        &self,
+        range: SeqRange<AdmissionSeq>,
+        cursors: AdmitCursors,
+    ) -> Result<Vec<AdmittedBatch<Vec<u8>>>, SpaceDriverError> {
+        if range.start > range.end || range.start < cursors.head || range.end > cursors.tail {
+            return Err(SpaceDriverError::AdmitRangeUnavailable {
+                from: range.start,
+                to: range.end,
+                head: cursors.head,
+                tail: cursors.tail,
+            });
+        }
+        if range.is_empty() {
             return Ok(Vec::new());
         }
-        let through = AdmissionSeq(cursors.tail.0.checked_sub(1).ok_or_else(|| {
+        let through = AdmissionSeq(range.end.0.checked_sub(1).ok_or_else(|| {
             SpaceDriverError::MalformedResponse {
-                reason: "local admit tail cannot be zero".into(),
+                reason: "admit range end cannot be zero".into(),
             }
         })?);
         let batches = self
             .space
             .client
             .store()
-            .admitted_batches(self.space.id, cursors.neck, through)
+            .admitted_batches(self.space.id, range.start, through)
             .await?;
+        let mut expected = range.start;
+        for batch in &batches {
+            if batch.admission_seq != expected {
+                return Err(SpaceDriverError::MalformedResponse {
+                    reason: format!(
+                        "admit range expected {expected:?}, found {:?}",
+                        batch.admission_seq
+                    ),
+                });
+            }
+            expected = AdmissionSeq(expected.0.checked_add(1).ok_or_else(|| {
+                SpaceDriverError::MalformedResponse {
+                    reason: "admit range sequence overflow".into(),
+                }
+            })?);
+        }
+        if expected != range.end {
+            return Err(SpaceDriverError::MalformedResponse {
+                reason: format!(
+                    "admit range ended at {expected:?}, expected {:?}",
+                    range.end
+                ),
+            });
+        }
         let cipher = self.space.cipher();
         self.space
             .client

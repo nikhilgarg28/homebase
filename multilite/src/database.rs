@@ -2,6 +2,7 @@
 
 mod operation;
 mod pending;
+mod rebase;
 mod schema;
 mod sql;
 mod store;
@@ -27,6 +28,8 @@ use crate::{Error, Params, Result};
 
 use self::operation::MultiliteOp;
 use self::store::DatabaseMetaStore;
+
+pub use self::rebase::RebaseConflict;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -615,7 +618,9 @@ mod tests {
     use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, SubmitMode};
     use homebase_client::server::offline_router;
     use homebase_core::clock::{ManualClock, Timestamp};
-    use homebase_core::tag::DeviceSeq;
+    use homebase_core::key::Key;
+    use homebase_core::tag::{DeviceSeq, Mutation};
+    use rusqlite::OptionalExtension;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
     use super::*;
@@ -684,6 +689,49 @@ mod tests {
 
     fn pending_ops<H: ServerHandle>(database: &Database<H>) -> Vec<pending::PendingOp> {
         database.with_connection(pending::load).unwrap()
+    }
+
+    fn table_sql<H: ServerHandle>(database: &Database<H>, table: &str) -> Option<String> {
+        database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+        })
+    }
+
+    fn create_operation(name: &str) -> MultiliteOp {
+        MultiliteOp::create_table(
+            &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
+            schema::CreateTableSpec {
+                name: schema::SqlName::new(name.into()),
+                columns: vec![schema::CreateColumn {
+                    name: schema::SqlName::new("id".into()),
+                    declared_type: schema::DeclaredType::Integer,
+                    not_null: false,
+                    primary_key: true,
+                }],
+            },
+        )
+    }
+
+    fn submit_direct<H: ServerHandle>(database: &Database<H>, operation: &MultiliteOp) {
+        let (mutations, assertions) = operation.to_homebase().at(AdmissionSeq(0));
+        block_on(async {
+            database
+                .client
+                .space(database.database_id().space_id())
+                .await
+                .unwrap()
+                .submit_unchecked(mutations, assertions)
+                .await
+                .unwrap();
+        });
     }
 
     #[test]
@@ -931,6 +979,316 @@ mod tests {
 
         assert!(database.pull().is_err());
         assert_eq!(client_state(&database), before);
+    }
+
+    #[test]
+    fn empty_rebase_is_an_idempotent_local_noop() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("empty-rebase.sqlite")).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        let before = client_state(&database);
+
+        database.rebase(&runtime).unwrap();
+        assert_eq!(client_state(&database), before);
+    }
+
+    #[test]
+    fn rebase_rejects_cursor_changes_between_analysis_and_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("moving-source.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let replica = Database::open_with(
+            directory.path().join("moving-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let source_runtime = source.runtime(NoopFormat).unwrap();
+        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        source
+            .execute(
+                &source_runtime,
+                "CREATE TABLE first_remote (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+        replica.pull().unwrap();
+
+        let error = replica
+            .rebase_after_plan(&replica_runtime, || {
+                source.execute(
+                    &source_runtime,
+                    "CREATE TABLE second_remote (id INTEGER PRIMARY KEY)",
+                    (),
+                )?;
+                assert_eq!(source.push()?, PushOutcome::Drained);
+                replica.pull()?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, Error::RebaseStateChanged));
+        assert!(!table_exists(&replica, "first_remote"));
+        assert!(!table_exists(&replica, "second_remote"));
+        let state = client_state(&replica);
+        let space = &state.spaces[&replica.database_id().space_id()];
+        assert_eq!(space.admit_cursors.neck, AdmissionSeq(1));
+        assert_eq!(space.admit_cursors.tail, AdmissionSeq(3));
+        assert_eq!(space.admits.len(), 2);
+    }
+
+    #[test]
+    fn rebase_applies_foreign_tables_and_verifies_own_tables_on_both_replicas() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first-rebase.sqlite");
+        let second_path = directory.path().join("second-rebase.sqlite");
+        let server = server();
+        let first = Database::open_with(
+            &first_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let second = Database::open_with(
+            &second_path,
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(first.pull().unwrap().captured_through(), 2);
+        assert_eq!(second.pull().unwrap().captured_through(), 2);
+
+        first.rebase(&first_runtime).unwrap();
+        second.rebase(&second_runtime).unwrap();
+        for database in [&first, &second] {
+            assert!(table_exists(database, "notes"));
+            assert!(table_exists(database, "tasks"));
+            let state = client_state(database);
+            let space = &state.spaces[&database.database_id().space_id()];
+            assert_eq!(space.admit_cursors.neck, AdmissionSeq(3));
+            assert_eq!(space.admit_cursors.tail, AdmissionSeq(3));
+        }
+
+        drop(first_runtime);
+        drop(first);
+        let reopened = Database::open_with(
+            &first_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(table_exists(&reopened, "notes"));
+        assert!(table_exists(&reopened, "tasks"));
+        let state = client_state(&reopened);
+        assert_eq!(
+            state.spaces[&reopened.database_id().space_id()]
+                .admit_cursors
+                .neck,
+            AdmissionSeq(3)
+        );
+    }
+
+    #[test]
+    fn rebase_conflict_returns_a_stable_handle_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("winning-schema.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id().space_id()));
+        let second = Database::open_with(
+            directory.path().join("conflicting-schema.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second
+            .execute(
+                &second_runtime,
+                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
+                (),
+            )
+            .unwrap();
+        second.pull().unwrap();
+        let before = client_state(&second);
+        let before_sql = table_sql(&second, "notes").unwrap();
+
+        let Error::RebaseConflict(conflict) = second.rebase(&second_runtime).unwrap_err() else {
+            panic!("same-name rebase returned the wrong failure")
+        };
+        assert_eq!(conflict.database_id, second.database_id());
+        assert_eq!(conflict.device_id, second.client.device());
+        assert_eq!(conflict.admitted_from(), 1);
+        assert_eq!(conflict.admitted_to_exclusive(), 2);
+        assert_eq!(conflict.conflicts().len(), 1);
+        assert_eq!(conflict.conflicts()[0].device_seq, DeviceSeq(1));
+        assert_eq!(client_state(&second), before);
+        assert_eq!(table_sql(&second, "notes").unwrap(), before_sql);
+        assert_eq!(pending_ops(&second).len(), 1);
+    }
+
+    #[test]
+    fn malformed_admitted_operation_fails_rebase_without_advancing_neck() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("malformed-source.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let replica = Database::open_with(
+            directory.path().join("malformed-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        let malformed_key = Key::from_bytes([b"malformed".as_slice()]).unwrap();
+        block_on(async {
+            source
+                .client
+                .space(source.database_id().space_id())
+                .await
+                .unwrap()
+                .submit_unchecked(
+                    vec![Mutation::Set {
+                        key: malformed_key,
+                        value: vec![1, 2, 3],
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+        });
+        assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+        replica.pull().unwrap();
+        let before = client_state(&replica);
+
+        assert!(matches!(
+            replica.rebase(&replica_runtime),
+            Err(Error::InvalidMultiliteOp(_))
+        ));
+        assert_eq!(client_state(&replica), before);
+    }
+
+    #[test]
+    fn own_admission_must_match_its_materialized_sqlite_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("own-mismatch.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id().space_id()));
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+        database.pull().unwrap();
+        database.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "DROP TABLE notes;
+                     CREATE TABLE notes (id INTEGER PRIMARY KEY, payload BLOB)",
+                )
+                .unwrap();
+        });
+        let before = client_state(&database);
+
+        assert!(matches!(
+            database.rebase(&runtime),
+            Err(Error::InvalidDatabase(
+                "accepted local CREATE TABLE does not match SQLite schema"
+            ))
+        ));
+        assert_eq!(client_state(&database), before);
+        assert!(
+            table_sql(&database, "notes")
+                .unwrap()
+                .contains("payload BLOB")
+        );
+    }
+
+    #[test]
+    fn failed_remote_ddl_rolls_back_prior_tables_and_admit_neck() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("atomic-source.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let replica = Database::open_with(
+            directory.path().join("atomic-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        submit_direct(&source, &create_operation("first_remote"));
+        submit_direct(&source, &create_operation("occupied"));
+        assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+        replica.pull().unwrap();
+        replica.with_connection(|connection| {
+            connection
+                .execute_batch("CREATE TABLE occupied (id INTEGER PRIMARY KEY, local BLOB)")
+                .unwrap();
+        });
+        let before = client_state(&replica);
+
+        assert!(matches!(
+            replica.rebase(&replica_runtime),
+            Err(Error::Sqlite(_))
+        ));
+        assert!(!table_exists(&replica, "first_remote"));
+        assert!(table_exists(&replica, "occupied"));
+        assert_eq!(client_state(&replica), before);
     }
 
     #[test]

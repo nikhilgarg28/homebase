@@ -635,6 +635,23 @@ admissions, rechecks the returned submit/admit cursor snapshots, and advances
 admit `neck` in the same SQLite transaction. Internal apply mode suppresses
 local capture.
 
+Implementation result: `MultiliteConnection::rebase()` performs exactly that
+local operation and never pulls or repairs implicitly. Homebase now exposes
+authenticated `admits().iter(from..to)` with exact retained-range and density
+checks; `iter_from_neck()` shares the implementation. Multilite decodes every
+operation before opening its apply transaction. A conflict returns
+`Error::RebaseConflict` with an opaque snapshot-bound handle for later explicit
+rollback. On a clean interval, foreign DDL, own-operation verification, cursor
+rechecks, and exclusive admit-`neck` advancement commit in one SQLite
+savepoint. Reserved Multilite table names are rejected by operation validation
+itself because remote apply intentionally bypasses the public authorizer.
+
+Tests cover empty rebase, two-device foreign/own convergence and reopen,
+same-name conflict without mutation, malformed admitted operations, mismatched
+own materialization, exact admit-range access, cursor movement between planning
+and apply, and failure of later remote DDL rolling back earlier DDL and cursor
+movement.
+
 ### Batch 14: explicit CREATE TABLE rollback
 
 Given a current rejection or rebase conflict, explicit `rollback` validates

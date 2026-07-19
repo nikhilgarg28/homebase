@@ -67,6 +67,11 @@ impl<H: ServerHandle> Connection<H> {
         self.database.pull()
     }
 
+    /// Reconcile the currently fetched admit interval with local SQLite state.
+    pub fn rebase(&self) -> Result<()> {
+        self.database.rebase(&self.runtime)
+    }
+
     /// Execute one SQLite statement directly.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
         let (changed, _captured) = self.database.execute(&self.runtime, sql, params)?;

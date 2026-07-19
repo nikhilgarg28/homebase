@@ -1,10 +1,5 @@
 //! Logical Multilite operations and their Homebase representation.
 
-#![allow(
-    dead_code,
-    reason = "operation translation is wired into local capture in the next batch"
-)]
-
 use homebase_core::key::Key;
 use homebase_core::messages::{AdmittedBatch, RangeAssert};
 use homebase_core::tag::{AdmissionSeq, Mutation};

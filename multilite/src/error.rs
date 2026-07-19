@@ -4,6 +4,8 @@ use homebase_client::ClientError;
 use homebase_core::storage::StorageError;
 use rusqlite::types::{FromSqlError, Type};
 
+use crate::database::RebaseConflict;
+
 /// An error returned by Multilite's SQLite-facing API.
 #[derive(Debug)]
 pub enum Error {
@@ -48,6 +50,10 @@ pub enum Error {
     Entropy(String),
     /// A Multilite operation was malformed or contradicted its SQL.
     InvalidMultiliteOp(String),
+    /// Local submit or admit cursors changed during read-only rebase planning.
+    RebaseStateChanged,
+    /// Active local assertions conflict with the fetched admission interval.
+    RebaseConflict(RebaseConflict),
     /// The embedded Homebase client failed to initialize.
     Client(ClientError),
 }
@@ -89,6 +95,14 @@ impl fmt::Display for Error {
             Self::InvalidMultiliteOp(message) => {
                 write!(f, "invalid Multilite operation: {message}")
             }
+            Self::RebaseStateChanged => {
+                f.write_str("submit or admit state changed while planning rebase")
+            }
+            Self::RebaseConflict(conflict) => write!(
+                f,
+                "rebase found {} conflicting local submissions",
+                conflict.conflicts().len()
+            ),
             Self::Client(error) => write!(f, "homebase client error: {error}"),
         }
     }
@@ -108,7 +122,9 @@ impl std::error::Error for Error {
             | Self::InvalidReplicaInvitation
             | Self::UnsupportedV1SchemaVersion { .. }
             | Self::Entropy(_)
-            | Self::InvalidMultiliteOp(_) => None,
+            | Self::InvalidMultiliteOp(_)
+            | Self::RebaseStateChanged
+            | Self::RebaseConflict(_) => None,
             Self::Client(error) => Some(error),
         }
     }

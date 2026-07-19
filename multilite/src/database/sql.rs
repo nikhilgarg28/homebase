@@ -84,6 +84,11 @@ fn parse_one(sql: &str) -> Result<Stmt> {
 }
 
 fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<ValidatedExecute> {
+    if super::has_multilite_prefix(name.value()) {
+        return Err(Error::UnsupportedSql(
+            "reserved Multilite table names are not supported",
+        ));
+    }
     let CreateTableBody::ColumnsAndConstraints {
         columns,
         constraints,
@@ -300,6 +305,7 @@ mod tests {
             "CREATE TABLE notes (id INTEGER UNIQUE ON CONFLICT FAIL)",
             "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id) ON CONFLICT ABORT)",
             "CREATE TABLE notes (id INTEGER, UNIQUE (id) ON CONFLICT ROLLBACK)",
+            "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
         ] {
             assert_unsupported(sql);
         }

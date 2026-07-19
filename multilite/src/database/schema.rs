@@ -4,11 +4,6 @@
 //! mutable revision cells. It can be reconstructed only from a complete,
 //! self-consistent admitted envelope.
 
-#![allow(
-    dead_code,
-    reason = "schema translation is wired into local capture in the next batch"
-)]
-
 use std::fmt;
 
 use homebase_core::key::Key;
@@ -49,7 +44,7 @@ impl SqlName {
         Self { value, canonical }
     }
 
-    fn value(&self) -> &str {
+    pub fn value(&self) -> &str {
         &self.value
     }
 
@@ -196,6 +191,31 @@ impl CreateTable {
     /// Return the exact SQLite spelling of the created table name.
     pub fn table_name(&self) -> &str {
         self.name.value()
+    }
+
+    /// Return the validated SQL used to materialize this table.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Check whether SQLite schema SQL describes this durable table shape.
+    pub fn matches_sql(&self, sql: &str) -> bool {
+        parse_create_table(sql).is_ok_and(|parsed| self.matches_spec(&parsed))
+    }
+
+    fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
+        self.name == spec.name
+            && self.columns.len() == spec.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&spec.columns)
+                .all(|(encoded, parsed)| {
+                    encoded.name == parsed.name
+                        && encoded.declared_type == parsed.declared_type
+                        && encoded.not_null == parsed.not_null
+                        && encoded.primary_key == parsed.primary_key
+                })
     }
 }
 
@@ -537,24 +557,20 @@ fn validate_revision_entry(
 }
 
 fn validate_literal_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
+    let parsed = parse_create_table(&created.sql)?;
+    if !created.matches_spec(&parsed) {
+        return Err(SchemaCodecError::SqlMismatch);
+    }
+    Ok(())
+}
+
+fn parse_create_table(sql: &str) -> std::result::Result<CreateTableSpec, SchemaCodecError> {
     let super::sql::ValidatedExecute::CreateTable(parsed) =
-        super::sql::validate_execute(&created.sql).map_err(|_| SchemaCodecError::InvalidSql)?
+        super::sql::validate_execute(sql).map_err(|_| SchemaCodecError::InvalidSql)?
     else {
         return Err(SchemaCodecError::InvalidSql);
     };
-    if parsed.name != created.name || parsed.columns.len() != created.columns.len() {
-        return Err(SchemaCodecError::SqlMismatch);
-    }
-    for (parsed, encoded) in parsed.columns.iter().zip(&created.columns) {
-        if parsed.name != encoded.name
-            || parsed.declared_type != encoded.declared_type
-            || parsed.not_null != encoded.not_null
-            || parsed.primary_key != encoded.primary_key
-        {
-            return Err(SchemaCodecError::SqlMismatch);
-        }
-    }
-    Ok(())
+    Ok(parsed)
 }
 
 #[cfg(test)]

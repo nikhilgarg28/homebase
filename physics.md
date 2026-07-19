@@ -491,13 +491,31 @@ head <= neck <= tail
 The cursors are exact server `AdmissionSeq` positions. The canonical empty
 state is `{ head: 1, neck: 1, tail: 1 }` while server high-water is 0.
 
-`iter_from_neck()` authenticates and returns all retained unapplied batches in
-server order. `mark_applied(to)` advances only `neck` to the exclusive
+`iter(from..to)` authenticates and returns exactly one retained dense interval
+in server order; `iter_from_neck()` is convenience for the current
+`[neck, tail)`. `mark_applied(to)` advances only `neck` to the exclusive
 position `to`. `trim(to)` reclaims records below `to` and advances only `head`;
 it may not trim beyond `neck`.
 
 Pulling does not move `neck`. Marking does not trim. Trimming does not claim
 new application progress.
+
+### Multilite rebase
+
+Multilite `rebase()` reconciles only the fetched interval that existed when it
+started. It snapshots `[admit.neck, admit.tail)`, authenticates and decodes that
+exact dense interval, and asks Homebase to analyze the same interval against
+the active submit window. Any malformed Multilite operation fails before local
+application. Any range-assert conflict returns an opaque conflict handle and
+changes neither SQLite nor Homebase metadata.
+
+On a clean analysis, Multilite opens one SQLite savepoint, verifies that both
+submit and admit cursor snapshots are unchanged, applies foreign operations in
+admission order, and verifies already-materialized own operations. Only then
+does it advance admit `neck` to the snapshotted `tail` in that same savepoint.
+Internal apply mode bypasses public SQL capture. A DDL, verification, metadata,
+or commit failure rolls back both application changes and cursor movement.
+`rebase()` performs no pull and no implicit rollback of speculative local work.
 
 ### Application obligation
 
