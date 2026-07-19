@@ -30,6 +30,22 @@ use self::store::DatabaseMetaStore;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
+/// Result of fetching this database's available server admissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PullOutcome {
+    through: AdmissionSeq,
+}
+
+impl PullOutcome {
+    /// Last server admission sequence durably captured by this database.
+    ///
+    /// Capturing an admission does not imply that it has been rebased or
+    /// applied to SQLite.
+    pub fn captured_through(&self) -> u64 {
+        self.through.0
+    }
+}
+
 /// Result of pushing this database's active local submission window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -276,6 +292,14 @@ impl<H: ServerHandle> Database<H> {
                 }))
             }
         }
+    }
+
+    pub(crate) fn pull(&self) -> Result<PullOutcome> {
+        let through = block_on(async {
+            let space = self.client.space(self.database_id.space_id()).await?;
+            space.pull().await.map_err(ClientError::from)
+        })?;
+        Ok(PullOutcome { through })
     }
 
     fn execute_create_table<P: HookPolicy, Q: Params>(
@@ -588,7 +612,7 @@ mod tests {
     use homebase::Server;
     use homebase::actor::{SpaceHandle, Spawner};
     use homebase::storage::MemoryStore;
-    use homebase_client::meta::{ClientState, DeviceOp, SubmitMode};
+    use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, SubmitMode};
     use homebase_client::server::offline_router;
     use homebase_core::clock::{ManualClock, Timestamp};
     use homebase_core::tag::DeviceSeq;
@@ -827,6 +851,86 @@ mod tests {
             .unwrap();
         assert_eq!(space.cursors.neck, DeviceSeq(2));
         assert_eq!(space.cursors.tail, DeviceSeq(2));
+    }
+
+    #[test]
+    fn pull_fetches_admissions_without_applying_them_and_survives_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite");
+        let replica_path = directory.path().join("replica.sqlite");
+        let server = server();
+        let source = Database::open_with(
+            &source_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let replica = Database::open_with(
+            &replica_path,
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let source_runtime = source.runtime(NoopFormat).unwrap();
+
+        source
+            .execute(
+                &source_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+        assert!(!table_exists(&replica, "notes"));
+
+        let outcome = replica.pull().unwrap();
+        assert_eq!(outcome.captured_through(), 1);
+        let after_first_pull = client_state(&replica);
+        let space = after_first_pull
+            .spaces
+            .get(&replica.database_id().space_id())
+            .unwrap();
+        assert_eq!(
+            space.admit_cursors,
+            AdmitCursors {
+                head: AdmissionSeq(1),
+                neck: AdmissionSeq(1),
+                tail: AdmissionSeq(2),
+            }
+        );
+        assert_eq!(space.admits.len(), 1);
+        assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 3);
+        assert!(!table_exists(&replica, "notes"));
+
+        assert_eq!(replica.pull().unwrap(), outcome);
+        assert_eq!(client_state(&replica), after_first_pull);
+        assert!(!table_exists(&replica, "notes"));
+
+        drop(replica);
+        let reopened = Database::open_with(
+            &replica_path,
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let reopened_state = client_state(&reopened);
+        let reopened_space = reopened_state
+            .spaces
+            .get(&reopened.database_id().space_id())
+            .unwrap();
+        assert_eq!(reopened_space.admit_cursors, space.admit_cursors);
+        assert_eq!(reopened_space.admits, space.admits);
+        assert!(!table_exists(&reopened, "notes"));
+    }
+
+    #[test]
+    fn unavailable_pull_preserves_the_admit_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("offline-pull.sqlite")).unwrap();
+        let before = client_state(&database);
+
+        assert!(database.pull().is_err());
+        assert_eq!(client_state(&database), before);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use homebase_client::ServerHandle;
 use super::hooks::V1Hooks;
 use super::schema;
 use crate::database::{
-    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PushOutcome,
+    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
     ReplicaInvitation, Statement,
 };
 use crate::{Params, Result};
@@ -60,6 +60,11 @@ impl<H: ServerHandle> Connection<H> {
     /// Push this database's active local submissions as far as possible.
     pub fn push(&self) -> Result<PushOutcome> {
         self.database.push()
+    }
+
+    /// Fetch all currently available admissions without applying them.
+    pub fn pull(&self) -> Result<PullOutcome> {
+        self.database.pull()
     }
 
     /// Execute one SQLite statement directly.

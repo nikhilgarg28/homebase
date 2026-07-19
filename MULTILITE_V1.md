@@ -612,6 +612,19 @@ Multilite `pull` is fetch-only. It asks Homebase to append complete dense server
 batches to the durable admit log and does not modify SQLite user schema or move
 admit `neck`. Applications may therefore fetch while deferring reconciliation.
 
+Implementation result: `MultiliteConnection::pull()` synchronously delegates
+to Homebase's paged pull and returns the last server admission sequence durably
+captured. It performs no SQLite schema application and gives the captured
+admissions no rebase or applied meaning. Each complete authenticated page is
+appended atomically by the joined metadata store; a later-page failure can
+retain earlier pages but cannot append the failed page. Repeated pulls are
+idempotent.
+
+Tests cover a remote three-entry `CREATE TABLE` admission, unchanged SQLite
+schema and admit `neck`, advancing admit `tail`, repeated pull without metadata
+churn, persistence across reopen, and an unavailable first page leaving the
+admit log unchanged.
+
 ### Batch 13: CREATE TABLE rebase
 
 Multilite `rebase` snapshots `[admit.neck, admit.tail)`, decodes and validates
