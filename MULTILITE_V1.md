@@ -630,10 +630,12 @@ admit log unchanged.
 Multilite `rebase` snapshots `[admit.neck, admit.tail)`, decodes and validates
 those admitted operations, asks Homebase to analyze that exact interval, and
 returns an error without mutation when a conflict exists. Otherwise it applies
-foreign table creations in admission order, verifies already-materialized own
-admissions, rechecks the returned submit/admit cursor snapshots, and advances
-admit `neck` in the same SQLite transaction. Internal apply mode suppresses
-local capture.
+foreign table creations in admission order, treats authenticated own admissions
+as materialization no-ops, rechecks the returned submit/admit cursor snapshots,
+and advances admit `neck` in the same SQLite transaction. Own operations were
+already materialized atomically with submission; comparing an older admission
+to current SQLite state would incorrectly reject a later speculative rewrite.
+Internal apply mode suppresses local capture.
 
 Implementation result: `MultiliteConnection::rebase()` performs exactly that
 local operation and never pulls or repairs implicitly. Homebase now exposes
@@ -641,16 +643,16 @@ authenticated `admits().iter(from..to)` with exact retained-range and density
 checks; `iter_from_neck()` shares the implementation. Multilite decodes every
 operation before opening its apply transaction. A conflict returns
 `Error::RebaseConflict` with an opaque snapshot-bound handle for later explicit
-rollback. On a clean interval, foreign DDL, own-operation verification, cursor
+rollback. On a clean interval, foreign DDL, own-operation skipping, cursor
 rechecks, and exclusive admit-`neck` advancement commit in one SQLite
 savepoint. Reserved Multilite table names are rejected by operation validation
 itself because remote apply intentionally bypasses the public authorizer.
 
 Tests cover empty rebase, two-device foreign/own convergence and reopen,
 same-name conflict without mutation, malformed admitted operations, mismatched
-own materialization, exact admit-range access, cursor movement between planning
-and apply, and failure of later remote DDL rolling back earlier DDL and cursor
-movement.
+own admission preserving newer local materialization, exact admit-range access,
+cursor movement between planning and apply, and failure of later remote DDL
+rolling back earlier DDL and cursor movement.
 
 ### Batch 14: explicit CREATE TABLE rollback
 

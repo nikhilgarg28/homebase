@@ -6,7 +6,7 @@ use homebase_client::meta::{AdmitCursors, MetaStore, OplogCursors};
 use homebase_client::{ClientError, RebaseConflict as HomebaseRebaseConflict, ServerHandle};
 use homebase_core::tag::{AdmissionSeq, DeviceId};
 use pollster::block_on;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
@@ -140,23 +140,14 @@ fn apply_operation(
     operation: &MultiliteOp,
     originated_locally: bool,
 ) -> Result<()> {
+    // Local operations were materialized atomically with submission. Their
+    // current SQLite state may already include later speculative operations,
+    // so replaying or comparing an older admission would be incorrect.
+    if originated_locally {
+        return Ok(());
+    }
+
     match operation {
-        MultiliteOp::CreateTable(created) if originated_locally => {
-            let materialized = connection
-                .query_row(
-                    "SELECT sql FROM main.sqlite_schema
-                     WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
-                    [created.table_name()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if !materialized.is_some_and(|sql| created.matches_sql(&sql)) {
-                return Err(Error::InvalidDatabase(
-                    "accepted local CREATE TABLE does not match SQLite schema",
-                ));
-            }
-            Ok(())
-        }
         MultiliteOp::CreateTable(created) => {
             connection.execute(created.sql(), ())?;
             Ok(())

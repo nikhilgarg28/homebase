@@ -511,11 +511,14 @@ changes neither SQLite nor Homebase metadata.
 
 On a clean analysis, Multilite opens one SQLite savepoint, verifies that both
 submit and admit cursor snapshots are unchanged, applies foreign operations in
-admission order, and verifies already-materialized own operations. Only then
-does it advance admit `neck` to the snapshotted `tail` in that same savepoint.
-Internal apply mode bypasses public SQL capture. A DDL, verification, metadata,
-or commit failure rolls back both application changes and cursor movement.
-`rebase()` performs no pull and no implicit rollback of speculative local work.
+admission order, and skips materialization for authenticated operations from
+the local device. Those operations were materialized atomically with their
+submission, and their current SQLite state may already include effects from a
+later speculative suffix. Only then does rebase advance admit `neck` to the
+snapshotted `tail` in that same savepoint. Internal apply mode bypasses public
+SQL capture. A DDL, metadata, or commit failure rolls back both application
+changes and cursor movement. `rebase()` performs no pull and no implicit
+rollback of speculative local work.
 
 ### Application obligation
 

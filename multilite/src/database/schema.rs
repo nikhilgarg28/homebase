@@ -198,11 +198,6 @@ impl CreateTable {
         &self.sql
     }
 
-    /// Check whether SQLite schema SQL describes this durable table shape.
-    pub fn matches_sql(&self, sql: &str) -> bool {
-        parse_create_table(sql).is_ok_and(|parsed| self.matches_spec(&parsed))
-    }
-
     fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
         self.name == spec.name
             && self.columns.len() == spec.columns.len()

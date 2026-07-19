@@ -1045,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn rebase_applies_foreign_tables_and_verifies_own_tables_on_both_replicas() {
+    fn rebase_applies_foreign_tables_and_preserves_own_tables_on_both_replicas() {
         let directory = tempfile::tempdir().unwrap();
         let first_path = directory.path().join("first-rebase.sqlite");
         let second_path = directory.path().join("second-rebase.sqlite");
@@ -1214,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn own_admission_must_match_its_materialized_sqlite_table() {
+    fn own_admission_does_not_overwrite_newer_local_materialization() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
         let database = Database::open_with(
@@ -1229,6 +1229,8 @@ mod tests {
             .unwrap();
         assert_eq!(database.push().unwrap(), PushOutcome::Drained);
         database.pull().unwrap();
+        // This stands in for a later speculative drop-and-recreate, which the
+        // current restricted SQL surface does not support yet.
         database.with_connection(|connection| {
             connection
                 .execute_batch(
@@ -1237,20 +1239,17 @@ mod tests {
                 )
                 .unwrap();
         });
-        let before = client_state(&database);
+        database.rebase(&runtime).unwrap();
 
-        assert!(matches!(
-            database.rebase(&runtime),
-            Err(Error::InvalidDatabase(
-                "accepted local CREATE TABLE does not match SQLite schema"
-            ))
-        ));
-        assert_eq!(client_state(&database), before);
         assert!(
             table_sql(&database, "notes")
                 .unwrap()
                 .contains("payload BLOB")
         );
+        let state = client_state(&database);
+        let cursors = state.spaces[&database.database_id().space_id()].admit_cursors;
+        assert_eq!(cursors.neck, AdmissionSeq(2));
+        assert_eq!(cursors.tail, AdmissionSeq(2));
     }
 
     #[test]
