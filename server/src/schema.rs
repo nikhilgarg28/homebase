@@ -33,9 +33,9 @@
 //! preserve both the global maximum and the maximum excluding one submitting
 //! device, even after overwrite or delete.
 //!
-//! The by-prefix index carries an explicit **depth** component (number of
-//! prefix components). That makes both conflict-check queries ordinary
-//! component-aligned prefix scans:
+//! The by-prefix index carries an explicit two-byte big-endian **depth**
+//! component (number of prefix components). That makes both conflict-check
+//! queries ordinary component-aligned prefix scans:
 //!
 //! - leases at *exactly* prefix A: scan `(space, LeaseByPrefix, len(A), A…)`
 //!   — depth pins the interpretation, so nothing deeper matches;
@@ -43,12 +43,12 @@
 //!   `(space, LeaseByPrefix, d, P…)` — prefix correspondence guarantees
 //!   each scan returns exactly the depth-d prefixes extending P.
 //!
-//! Storage tuples may exceed the user-facing 16-component key limit (they
+//! Storage tuples may exceed the user-facing component limit (they
 //! add space id, kind, and suffix components), which is why they encode via
 //! [`encode_components`] rather than [`Key::encode`].
 
 use homebase_core::clock::{HybridTimestamp, Lineage, Timestamp};
-use homebase_core::key::{Key, KeyComponent, decode_components, encode_components};
+use homebase_core::key::{Key, KeyComponent, MAX_COMPONENTS, decode_components, encode_components};
 use homebase_core::lease::{LeaseId, LeaseMode};
 use homebase_core::range::Range;
 use homebase_core::reader::Reader;
@@ -92,6 +92,15 @@ fn u32_component(v: u32) -> KeyComponent {
     KeyComponent::new(v.to_be_bytes().to_vec()).expect("4-byte component")
 }
 
+fn depth_component(depth: usize) -> KeyComponent {
+    assert!(
+        depth <= MAX_COMPONENTS,
+        "key depth exceeds the user-key limit"
+    );
+    let depth = u16::try_from(depth).expect("key depth must fit in u16");
+    KeyComponent::new(depth.to_be_bytes().to_vec()).expect("2-byte depth component")
+}
+
 /// `(space, Data, k1, k2, …)`. Also the scan prefix for data at or under a
 /// user prefix — by prefix correspondence they are the same bytes.
 pub fn data_key(space: SpaceId, key: &Key) -> Vec<u8> {
@@ -117,7 +126,7 @@ pub fn prefix_meta_key(space: SpaceId, head: &[KeyComponent]) -> Vec<u8> {
     let mut components = vec![
         space_component(space),
         RecordKind::PrefixMeta.component(),
-        KeyComponent::new(vec![head.len() as u8]).expect("depth byte"),
+        depth_component(head.len()),
     ];
     components.extend(head.iter().cloned());
     encode_components(&components)
@@ -144,12 +153,10 @@ pub fn range_delete_key(space: SpaceId, range: &Range) -> Vec<u8> {
     let mut components = vec![space_component(space), RecordKind::RangeDelete.component()];
     match range {
         Range::Full => {
-            components.push(KeyComponent::new(vec![0]).expect("depth byte"));
+            components.push(depth_component(0));
         }
         Range::Prefix(prefix) => {
-            components.push(
-                KeyComponent::new(vec![prefix.components().len() as u8]).expect("depth byte"),
-            );
+            components.push(depth_component(prefix.components().len()));
             components.extend(prefix.components().iter().cloned());
         }
     }
@@ -169,8 +176,10 @@ pub fn range_delete_parts(storage_key: &[u8]) -> Option<(SpaceId, Range)> {
     if components.get(1)?.as_bytes() != [RecordKind::RangeDelete as u8] {
         return None;
     }
-    let depth = *components.get(2)?.as_bytes().first()? as usize;
-    if components.get(2)?.as_bytes().len() != 1 || components.len() != 3 + depth {
+    let depth = usize::from(u16::from_be_bytes(
+        components.get(2)?.as_bytes().try_into().ok()?,
+    ));
+    if components.len() != 3 + depth {
         return None;
     }
     let range = if depth == 0 {
@@ -327,7 +336,7 @@ pub fn lease_by_prefix_key(space: SpaceId, prefix: &Key, id: LeaseId) -> Vec<u8>
     let mut components = vec![
         space_component(space),
         RecordKind::LeaseByPrefix.component(),
-        KeyComponent::new(vec![prefix.components().len() as u8]).expect("depth byte"),
+        depth_component(prefix.components().len()),
     ];
     components.extend(prefix.components().iter().cloned());
     components.push(u64_component(id.0));
@@ -342,7 +351,7 @@ pub fn lease_by_prefix_scan(space: SpaceId, depth: usize, head: &[KeyComponent])
     let mut components = vec![
         space_component(space),
         RecordKind::LeaseByPrefix.component(),
-        KeyComponent::new(vec![depth as u8]).expect("depth byte"),
+        depth_component(depth),
     ];
     components.extend(head.iter().cloned());
     encode_components(&components)
@@ -1013,6 +1022,25 @@ mod tests {
     }
 
     #[test]
+    fn maximum_user_depth_roundtrips_without_byte_wraparound() {
+        let space = SpaceId([1; 16]);
+        let key = Key::from_bytes(std::iter::repeat_n(b"x".as_slice(), MAX_COMPONENTS)).unwrap();
+
+        let meta = decode_components(&prefix_meta_key(space, key.components())).unwrap();
+        assert_eq!(meta[2].as_bytes(), (MAX_COMPONENTS as u16).to_be_bytes());
+
+        let range = Range::Prefix(key.clone());
+        assert_eq!(
+            range_delete_parts(&range_delete_key(space, &range)),
+            Some((space, range))
+        );
+
+        let lease = lease_by_prefix_key(space, &key, LeaseId(1));
+        let exact = lease_by_prefix_scan(space, MAX_COMPONENTS, key.components());
+        assert!(lease.starts_with(&exact));
+    }
+
+    #[test]
     fn range_delete_keys_roundtrip_full_and_prefix_in_storage_order() {
         use homebase_core::range::Range;
 
@@ -1042,11 +1070,11 @@ mod tests {
     #[test]
     fn range_delete_key_decode_rejects_malformed_shapes() {
         let space = SpaceId([1; 16]);
-        let malformed = |depth: u8, suffix: &[&[u8]]| {
+        let malformed = |depth: u16, suffix: &[&[u8]]| {
             let mut components = vec![
                 space_component(space),
                 RecordKind::RangeDelete.component(),
-                KeyComponent::new(vec![depth]).unwrap(),
+                KeyComponent::new(depth.to_be_bytes().to_vec()).unwrap(),
             ];
             components.extend(
                 suffix

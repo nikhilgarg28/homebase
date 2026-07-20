@@ -1,8 +1,9 @@
 //! Tuple keys and their order-preserving flat encoding.
 //!
 //! A kernel key is a tuple of non-empty byte strings (max [`MAX_COMPONENTS`]
-//! components of [`MAX_COMPONENT_LEN`] bytes each). Prefix means
-//! *component-wise* prefix: `["db","pay"]` never covers `["db","payroll"]`.
+//! components of [`MAX_COMPONENT_LEN`] bytes each and [`MAX_ENCODED_KEY_LEN`]
+//! encoded bytes total). Prefix means *component-wise* prefix:
+//! `["db","pay"]` never covers `["db","payroll"]`.
 //!
 //! # Encoding
 //!
@@ -25,10 +26,17 @@
 use std::fmt;
 
 /// Maximum number of components in a key.
-pub const MAX_COMPONENTS: usize = 16;
+pub const MAX_COMPONENTS: usize = 256;
 
 /// Maximum byte length of a single key component.
-pub const MAX_COMPONENT_LEN: usize = 256;
+pub const MAX_COMPONENT_LEN: usize = u16::MAX as usize;
+
+/// Maximum byte length of a complete flat-encoded user key.
+///
+/// Component limits bound individual allocations; this separate budget keeps
+/// a key containing many large components from becoming an unbounded storage,
+/// hashing, or network input. Zero bytes occupy two bytes in the flat form.
+pub const MAX_ENCODED_KEY_LEN: usize = 1024 * 1024;
 
 /// A single validated key component.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,6 +91,10 @@ impl Key {
                 len: components.len(),
             });
         }
+        let encoded_len = encoded_components_len(&components);
+        if encoded_len > MAX_ENCODED_KEY_LEN {
+            return Err(KeyError::EncodedTooLong { len: encoded_len });
+        }
         Ok(Self(components))
     }
 
@@ -116,6 +128,11 @@ impl Key {
     /// Decodes a flat-encoded key. Rejects malformed escapes, truncated
     /// input, and keys violating the component/count limits.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() > MAX_ENCODED_KEY_LEN {
+            return Err(DecodeError::InvalidKey(KeyError::EncodedTooLong {
+                len: bytes.len(),
+            }));
+        }
         Self::new(decode_components(bytes)?).map_err(DecodeError::InvalidKey)
     }
 }
@@ -144,14 +161,14 @@ pub fn decode_components(bytes: &[u8]) -> Result<Vec<KeyComponent>, DecodeError>
                     i += 2;
                 }
                 Some(0x01) => {
-                    current.push(0x00);
+                    push_component_byte(&mut current, 0x00)?;
                     i += 2;
                 }
                 Some(&byte) => return Err(DecodeError::InvalidEscape { offset: i, byte }),
                 None => return Err(DecodeError::Truncated),
             },
             b => {
-                current.push(b);
+                push_component_byte(&mut current, b)?;
                 i += 1;
             }
         }
@@ -170,7 +187,7 @@ pub fn decode_components(bytes: &[u8]) -> Result<Vec<KeyComponent>, DecodeError>
 /// suffixes) and encodes them through this function. All encoding properties
 /// (order preservation, prefix correspondence) hold regardless of count.
 pub fn encode_components(components: &[KeyComponent]) -> Vec<u8> {
-    let cap: usize = components.iter().map(|c| c.0.len() + 2).sum();
+    let cap = encoded_components_len(components);
     let mut out = Vec::with_capacity(cap);
     for component in components {
         for &b in &component.0 {
@@ -185,6 +202,25 @@ pub fn encode_components(components: &[KeyComponent]) -> Vec<u8> {
     out
 }
 
+fn push_component_byte(current: &mut Vec<u8>, byte: u8) -> Result<(), DecodeError> {
+    if current.len() == MAX_COMPONENT_LEN {
+        return Err(DecodeError::InvalidKey(KeyError::ComponentTooLong {
+            len: current.len() + 1,
+        }));
+    }
+    current.push(byte);
+    Ok(())
+}
+
+fn encoded_components_len(components: &[KeyComponent]) -> usize {
+    components.iter().fold(0_usize, |total, component| {
+        let escaped = component.0.iter().fold(2_usize, |len, byte| {
+            len.saturating_add(usize::from(*byte == 0) + 1)
+        });
+        total.saturating_add(escaped)
+    })
+}
+
 /// Key validation errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyError {
@@ -196,6 +232,8 @@ pub enum KeyError {
     TooManyComponents { len: usize },
     /// A component longer than [`MAX_COMPONENT_LEN`] bytes.
     ComponentTooLong { len: usize },
+    /// A complete flat-encoded key longer than [`MAX_ENCODED_KEY_LEN`] bytes.
+    EncodedTooLong { len: usize },
 }
 
 impl fmt::Display for KeyError {
@@ -208,6 +246,9 @@ impl fmt::Display for KeyError {
             }
             Self::ComponentTooLong { len } => {
                 write!(f, "key component is {len} bytes (max {MAX_COMPONENT_LEN})")
+            }
+            Self::EncodedTooLong { len } => {
+                write!(f, "encoded key is {len} bytes (max {MAX_ENCODED_KEY_LEN})")
             }
         }
     }
@@ -251,6 +292,7 @@ mod tests {
 
     #[test]
     fn enforces_limits() {
+        assert!(KeyComponent::new(vec![0; MAX_COMPONENT_LEN]).is_ok());
         assert_eq!(
             KeyComponent::new(vec![0; MAX_COMPONENT_LEN + 1]).unwrap_err(),
             KeyError::ComponentTooLong {
@@ -266,6 +308,7 @@ mod tests {
             KeyError::EmptyComponent
         );
         let too_many = vec![&b"x"[..]; MAX_COMPONENTS + 1];
+        assert!(Key::from_bytes(vec![&b"x"[..]; MAX_COMPONENTS]).is_ok());
         assert_eq!(
             Key::from_bytes(too_many).unwrap_err(),
             KeyError::TooManyComponents {
@@ -275,6 +318,23 @@ mod tests {
         assert_eq!(
             Key::from_bytes(Vec::<Vec<u8>>::new()).unwrap_err(),
             KeyError::Empty
+        );
+    }
+
+    #[test]
+    fn encoded_budget_accounts_for_escaping() {
+        let zero_component = KeyComponent::new(vec![0; MAX_COMPONENT_LEN]).unwrap();
+        let encoded_component_len = MAX_COMPONENT_LEN * 2 + 2;
+        assert_eq!(MAX_ENCODED_KEY_LEN % encoded_component_len, 0);
+        let exact_count = MAX_ENCODED_KEY_LEN / encoded_component_len;
+        let exact = Key::new(vec![zero_component.clone(); exact_count]).unwrap();
+        assert_eq!(exact.encode().len(), MAX_ENCODED_KEY_LEN);
+
+        assert_eq!(
+            Key::new(vec![zero_component; exact_count + 1]).unwrap_err(),
+            KeyError::EncodedTooLong {
+                len: encoded_component_len * (exact_count + 1),
+            }
         );
     }
 
@@ -345,6 +405,21 @@ mod tests {
                 offset: 0,
                 byte: 0x02
             }
+        );
+
+        let mut oversized_component = vec![b'x'; MAX_COMPONENT_LEN + 1];
+        oversized_component.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            Key::decode(&oversized_component).unwrap_err(),
+            DecodeError::InvalidKey(KeyError::ComponentTooLong {
+                len: MAX_COMPONENT_LEN + 1,
+            })
+        );
+        assert_eq!(
+            Key::decode(&vec![b'x'; MAX_ENCODED_KEY_LEN + 1]).unwrap_err(),
+            DecodeError::InvalidKey(KeyError::EncodedTooLong {
+                len: MAX_ENCODED_KEY_LEN + 1,
+            })
         );
     }
 }

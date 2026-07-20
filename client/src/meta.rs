@@ -818,13 +818,14 @@ fn codec_key(space: SpaceId) -> Vec<u8> {
     encode_components(&space_kind(space, SpaceKind::Codec))
 }
 
-/// Leases are keyed by the prefix they cover — the question the engine
-/// asks is "who covers this key?", answered by point reads on the
-/// query's ancestors. One live lease per (space, prefix): a re-grant of
-/// the same prefix overwrites.
+/// Leases are keyed by the prefix components they cover — the question the
+/// engine asks is "who covers this key?", answered by point reads on the
+/// query's ancestors. Keeping each part as its own storage component avoids
+/// nesting a potentially large encoded key inside one bounded component. One
+/// live lease per (space, prefix): a re-grant of the same prefix overwrites.
 fn lease_key(space: SpaceId, prefix: &Key) -> Vec<u8> {
     let mut components = space_kind(space, SpaceKind::Lease);
-    components.push(KeyComponent::new(prefix.encode()).expect("nonempty encoded prefix"));
+    components.extend(prefix.components().iter().cloned());
     encode_components(&components)
 }
 
@@ -877,12 +878,15 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                         }
                         k if k == SpaceKind::Lease as u8 => {
                             let record = HeldLease::decode(&bytes).expect("undecodable lease");
-                            assert_eq!(
+                            let stored_prefix = Key::new(
                                 components
-                                    .get(4)
+                                    .get(4..)
                                     .expect("lease key missing prefix")
-                                    .as_bytes(),
-                                record.lease.prefix.encode(),
+                                    .to_vec(),
+                            )
+                            .expect("lease key contains an invalid prefix");
+                            assert_eq!(
+                                stored_prefix, record.lease.prefix,
                                 "lease record prefix diverges from its storage key"
                             );
                             space.leases.insert(record.lease.id, record);
@@ -2010,11 +2014,11 @@ pub mod conformance {
         }
     }
 
-    fn sample_lease() -> HeldLease {
+    fn held_lease(id: LeaseId, prefix: Key) -> HeldLease {
         HeldLease {
             lease: Lease {
-                id: LeaseId(42),
-                prefix: key(&[b"db", b"pay"]),
+                id,
+                prefix,
                 mode: LeaseMode::Write,
                 requested_at: stamp(1_000),
                 granted_at: Timestamp(1_010),
@@ -2024,6 +2028,10 @@ pub mod conformance {
             deadline: stamp(1_300),
             forgotten: false,
         }
+    }
+
+    fn sample_lease() -> HeldLease {
+        held_lease(LeaseId(42), key(&[b"db", b"pay"]))
     }
 
     async fn commit_entries<M: MetaStore>(
@@ -2761,6 +2769,22 @@ mod tests {
         }
     }
 
+    fn held_lease(id: LeaseId, prefix: Key) -> HeldLease {
+        HeldLease {
+            lease: Lease {
+                id,
+                prefix,
+                mode: LeaseMode::Write,
+                requested_at: stamp(1_000),
+                granted_at: Timestamp(1_010),
+                ttl: Duration::from_secs(300),
+                barrier: AdmissionSeq(13),
+            },
+            deadline: stamp(1_300),
+            forgotten: false,
+        }
+    }
+
     fn seal(n: u8) -> homebase_core::seal::Seal {
         homebase_core::seal::Seal {
             scheme: SealScheme::AeadV1,
@@ -2995,6 +3019,28 @@ mod tests {
             KeyComponent::new(b"anything".to_vec()).unwrap(),
         ]);
         assert!(!foreign.starts_with(&brand));
+    }
+
+    #[test]
+    fn metadata_store_roundtrips_max_depth_and_long_component_leases() {
+        use homebase_core::key::{MAX_COMPONENT_LEN, MAX_COMPONENTS};
+
+        block_on(async {
+            let store = OrderedMetaStore::new(MemoryStore::new());
+            let deep =
+                Key::from_bytes(std::iter::repeat_n(b"x".as_slice(), MAX_COMPONENTS)).unwrap();
+            let long = Key::from_bytes([vec![b'x'; MAX_COMPONENT_LEN]]).unwrap();
+            let held = [
+                held_lease(LeaseId(101), deep.clone()),
+                held_lease(LeaseId(102), long.clone()),
+            ];
+
+            store.record_leases(SPACE, &held).await.unwrap();
+            let state = store.load().await.unwrap();
+            let leases = &state.spaces[&SPACE].leases;
+            assert_eq!(leases[&LeaseId(101)].lease.prefix, deep);
+            assert_eq!(leases[&LeaseId(102)].lease.prefix, long);
+        });
     }
 
     #[test]

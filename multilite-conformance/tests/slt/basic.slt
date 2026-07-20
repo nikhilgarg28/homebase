@@ -1,0 +1,11 @@
+statement ok
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)
+
+statement ok
+INSERT INTO notes (id, body) VALUES (1, 'hello')
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+1
+hello

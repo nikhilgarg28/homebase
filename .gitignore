@@ -1,5 +1,9 @@
 /target/
 
+# External conformance corpora are large local checkouts; commit the lock files,
+# not the corpus content.
+third_party/sql-logic-test/
+
 # npm
 npm/node_modules/
 

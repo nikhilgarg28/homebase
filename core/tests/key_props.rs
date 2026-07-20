@@ -3,12 +3,20 @@
 use homebase_core::key::{Key, MAX_COMPONENT_LEN, MAX_COMPONENTS};
 use proptest::prelude::*;
 
-/// Fully random keys across the whole legal shape space.
+/// Random keys covering both maximum depth and substantial component sizes.
+/// Exact size and total-budget boundaries live in `key`'s unit tests so one
+/// proptest case cannot allocate hundreds of megabytes.
 fn arb_key() -> impl Strategy<Value = Key> {
-    prop::collection::vec(
-        prop::collection::vec(any::<u8>(), 1..=MAX_COMPONENT_LEN),
-        1..=MAX_COMPONENTS,
-    )
+    prop_oneof![
+        3 => prop::collection::vec(
+            prop::collection::vec(any::<u8>(), 1..=8),
+            1..=MAX_COMPONENTS,
+        ),
+        1 => prop::collection::vec(
+            prop::collection::vec(any::<u8>(), 1..=1024.min(MAX_COMPONENT_LEN)),
+            1..=16,
+        ),
+    ]
     .prop_map(|components| Key::from_bytes(components).unwrap())
 }
 

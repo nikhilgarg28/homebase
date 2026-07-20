@@ -903,7 +903,7 @@ mod tests {
     use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, SubmitMode};
     use homebase_client::server::offline_router;
     use homebase_core::clock::{ManualClock, Timestamp};
-    use homebase_core::key::Key;
+    use homebase_core::key::{Key, MAX_COMPONENT_LEN};
     use homebase_core::tag::{DeviceSeq, Mutation};
     use rusqlite::OptionalExtension;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -2632,7 +2632,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_primary_key_rolls_back_before_submission() {
+    fn long_primary_key_succeeds_and_oversized_key_rolls_back_before_submission() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("large-key.sqlite")).unwrap();
         let runtime = database.runtime(NoopFormat).unwrap();
@@ -2643,6 +2643,18 @@ mod tests {
                 (),
             )
             .unwrap();
+        let longest = "x".repeat(MAX_COMPONENT_LEN - 1);
+        assert_eq!(
+            database
+                .execute(
+                    &runtime,
+                    "INSERT INTO notes VALUES (?1)",
+                    rusqlite::params![longest],
+                )
+                .unwrap()
+                .0,
+            1
+        );
         let pending_before = pending_ops(&database);
         let state_before = client_state(&database);
 
@@ -2650,7 +2662,7 @@ mod tests {
             database.execute(
                 &runtime,
                 "INSERT INTO notes VALUES (?1)",
-                rusqlite::params!["x".repeat(256)],
+                rusqlite::params!["y".repeat(MAX_COMPONENT_LEN)],
             ),
             Err(Error::InvalidMultiliteOp(_))
         ));
@@ -2659,9 +2671,10 @@ mod tests {
         database.with_connection(|connection| {
             assert_eq!(
                 connection
-                    .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                    .query_row("SELECT length(id) FROM notes", (), |row| row
+                        .get::<_, i64>(0))
                     .unwrap(),
-                0
+                i64::try_from(MAX_COMPONENT_LEN - 1).unwrap()
             );
         });
     }

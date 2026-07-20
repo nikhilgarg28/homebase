@@ -1,0 +1,17 @@
+name = "SQL Logic Test corpus"
+source = "https://github.com/hydromatic/sql-logic-test"
+checkout = "0a809c530457bf0e56d637ef19fcaabd2964fd67"
+checkout_date = "2023-06-20T13:50:10-07:00"
+fetched_at = "2026-07-19"
+local_path = "third_party/sql-logic-test"
+test_path = "third_party/sql-logic-test/src/main/resources/test"
+
+notes = """
+Initial large corpus seed for multilite-conformance.
+
+The official SQLite sqllogictest project is hosted in Fossil at
+https://sqlite.org/sqllogictest. Fossil is not installed in the local dev
+environment used for this fetch, so this branch uses the GitHub SQL Logic Test
+corpus mirror as the first populated test corpus. The checkout is intentionally
+ignored by git because it is approximately 1.1GB locally.
+"""

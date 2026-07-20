@@ -465,6 +465,19 @@ mod tests {
     }
 
     #[test]
+    fn maximum_depth_lease_conflicts_with_its_parent() {
+        let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
+        let deep = Key::from_bytes(std::iter::repeat_n(b"x".as_slice(), MAX_COMPONENTS)).unwrap();
+        let parent = Key::new(deep.components()[..MAX_COMPONENTS - 1].to_vec()).unwrap();
+
+        acquire_one(&mut mgr, &store, 0, 1, &deep, LeaseMode::Write, 100).unwrap();
+        assert!(matches!(
+            acquire_one(&mut mgr, &store, 0, 2, &parent, LeaseMode::Read, 100),
+            Err(Error::Kernel(KernelError::Contended { .. }))
+        ));
+    }
+
+    #[test]
     fn no_upgrade_even_for_own_device() {
         let (mut mgr, store) = (LeaseManager::new(SPACE), MemoryStore::new());
         let p = key(&[b"db"]);

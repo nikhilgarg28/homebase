@@ -84,12 +84,22 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
             (),
         )
         .unwrap();
+    first
+        .execute(
+            "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
     second.pull().unwrap();
     second.rebase().unwrap();
 
     first
         .execute("INSERT INTO notes VALUES (1, 'first')", ())
+        .unwrap();
+    let long_key = "long-key".repeat(512);
+    first
+        .execute("INSERT INTO documents VALUES (?1, 'large')", [&long_key])
         .unwrap();
     second
         .execute("INSERT INTO notes VALUES (2, 'second')", ())
@@ -127,4 +137,21 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
     ];
     assert_eq!(rows(&first), expected);
     assert_eq!(rows(&second), expected);
+    for database in [&first, &second] {
+        let mut statement = database
+            .prepare("SELECT length(id), body FROM documents")
+            .unwrap();
+        assert_eq!(
+            statement
+                .query_map((), |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?
+                )))
+                .unwrap(),
+            [(
+                i64::try_from(long_key.len()).unwrap(),
+                String::from("large")
+            )]
+        );
+    }
 }

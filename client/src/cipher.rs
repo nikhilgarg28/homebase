@@ -672,6 +672,29 @@ mod tests {
     }
 
     #[test]
+    fn name_cipher_accepts_max_depth_and_long_components() {
+        use homebase_core::key::{MAX_COMPONENT_LEN, MAX_COMPONENTS};
+
+        let codec = SpaceEnvelope::encrypted(name_key(1), space_key(2))
+            .open()
+            .unwrap();
+        let deep = Key::from_bytes(std::iter::repeat_n(b"x".as_slice(), MAX_COMPONENTS)).unwrap();
+        let encoded_deep = codec.encode_key(&deep).unwrap();
+        assert_eq!(encoded_deep.components().len(), MAX_COMPONENTS);
+        assert!(
+            encoded_deep
+                .components()
+                .iter()
+                .all(|component| component.as_bytes().len() == KEY_LEN)
+        );
+
+        let long = Key::from_bytes([vec![b'x'; MAX_COMPONENT_LEN]]).unwrap();
+        let encoded_long = codec.encode_key(&long).unwrap();
+        assert_eq!(encoded_long.components().len(), 1);
+        assert_eq!(encoded_long.components()[0].as_bytes().len(), KEY_LEN);
+    }
+
+    #[test]
     fn ranges_encode_under_the_same_prefix_rules() {
         let codec = SpaceEnvelope::encrypted(name_key(1), space_key(2))
             .open()

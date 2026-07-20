@@ -1,0 +1,14 @@
+[package]
+name = "multilite-conformance"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite compatibility and conformance harness for Multilite"
+publish = false
+
+[dependencies]
+multilite = { path = "../multilite" }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+sqllogictest.workspace = true
+tempfile.workspace = true

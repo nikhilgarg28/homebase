@@ -34,12 +34,6 @@ many responses should return global seqnum or return ops when range assert fails
 
 Add bucketing/padding to key components & values before encrypting
 
-Raise Homebase key limits after the core INSERT batch: support up to 256
-components and roughly `u16` bytes per component, widen every encoded depth and
-length field, impose a defensible total encoded-key budget, and audit server
-prefix aggregates, lease overlap, schema codecs, property tests, and allocation
-paths before exposing the larger bounds.
-
 admit log level checksum?
 
 use uuid indirection for key components - better rotation
@@ -79,3 +73,5 @@ Conformance suite
 Store a single metadata table and put everything in it as triples of namespace, key, value
 
 use db.view, db.update, db.watch api
+
+Change name of column from name-{name} to just <name> or <name>...[hash]

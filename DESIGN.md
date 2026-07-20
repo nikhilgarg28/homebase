@@ -18,7 +18,7 @@ The current Homebase client is an operation-log service, not a managed KV replic
 
 ## homebase — the kernel
 
-**The kernel in one line: an opaque materialized KV view plus an exact append-only admission log.** One ordered map per space holds tuple keys (`Vec<Bytes>`, component-wise prefixes, order-preserving flat encoding) and opaque values. Every Set, Delete, and DeleteRange carries a client-assigned `DeviceTag`, detached `Seal`, and server-assigned `AdmissionTag`; the server also maintains range tombstones, lease indexes, per-device sequence/checksum state, and prefix aggregates for history, version floors, and live counts. The transport-neutral verbs are:
+**The kernel in one line: an opaque materialized KV view plus an exact append-only admission log.** One ordered map per space holds tuple keys (`Vec<Bytes>`, component-wise prefixes, order-preserving flat encoding) and opaque values. A user key may contain up to 256 non-empty components, each up to 65,535 bytes, subject to a 1 MiB total flat-encoding budget. Every Set, Delete, and DeleteRange carries a client-assigned `DeviceTag`, detached `Seal`, and server-assigned `AdmissionTag`; the server also maintains range tombstones, lease indexes, per-device sequence/checksum state, and prefix aggregates for history, version floors, and live counts. The transport-neutral verbs are:
 
 ```
 acquire/renew/release/list_leases  # synchronous lease reservation and repair

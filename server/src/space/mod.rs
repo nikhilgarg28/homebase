@@ -135,7 +135,7 @@ mod tests {
     };
     use crate::storage::{MemoryStore, OrderedStore, ScanIter, StorageError, WriteBatch};
     use homebase_core::clock::HybridTimestamp;
-    use homebase_core::key::Key;
+    use homebase_core::key::{Key, MAX_COMPONENTS};
     use homebase_core::lease::{LeaseId, LeaseMode};
     use homebase_core::messages::{
         AdmissionBatch, AdmissionResult, KernelError, LeaseSpec, PullRequest, Range, RangeAssert,
@@ -501,6 +501,31 @@ mod tests {
         ))
         .unwrap();
         assert!(got.entries[0].is_none());
+    }
+
+    #[test]
+    fn maximum_depth_point_updates_every_prefix_and_roundtrips() {
+        let (mut space, store, lease) = setup();
+        let mut components = vec![b"db".to_vec()];
+        components.extend(std::iter::repeat_n(b"x".to_vec(), MAX_COMPONENTS - 1));
+        let key = Key::from_bytes(components).unwrap();
+
+        admit(&mut space, &store, lease, 1, vec![put(&key, b"deep", 1)]).unwrap();
+        let got = block_on(space.get(
+            &store,
+            &GetRequest {
+                keys: vec![key.clone()],
+            },
+        ))
+        .unwrap();
+        assert!(got.entries[0].is_some());
+
+        let deepest = block_on(store.get(&prefix_meta_key(SPACE, key.components())))
+            .unwrap()
+            .map(|bytes| PrefixMetaRecord::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(deepest.live_count, 1);
+        assert_eq!(deepest.max_ver, Ver(1));
     }
 
     #[test]
