@@ -1,56 +1,53 @@
-//! Local accept/reject effects for speculative Multilite operations.
+//! Local accept/reject effects for speculative Multilite transactions.
 
 use std::fmt;
 
 use homebase_client::meta::DeviceOp;
 use homebase_core::reader::Reader;
 use homebase_core::tag::DeviceSeq;
+use homebase_core::writer::Writer;
 use rusqlite::{Connection, params};
 
 use super::catalog;
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
-use super::schema::CreateTable;
+use super::transaction::MultiliteTransaction;
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__pending";
 
-const PENDING_FRAME_VERSION: u8 = 1;
+const PENDING_FRAME_VERSION: u8 = 2;
 const TAG_DEVICE_SEQ: u8 = 1;
-const TAG_OPERATION: u8 = 2;
+const TAG_TRANSACTION: u8 = 2;
 const TAG_ACCEPT_EFFECT: u8 = 3;
 const TAG_REJECT_EFFECT: u8 = 4;
-
-const OPERATION_FRAME_VERSION: u8 = 1;
-const CREATE_TABLE_OPERATION: u8 = 1;
-const INSERT_ROWS_OPERATION: u8 = 2;
 
 const EFFECT_FRAME_VERSION: u8 = 1;
 const DROP_TABLE_EFFECT: u8 = 1;
 const DELETE_ROWS_EFFECT: u8 = 2;
 
-/// A local effect to run when a speculative operation gets its disposition.
+/// A local effect to run when a speculative transaction gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     DropTable { name: String },
     DeleteRows { inserted: InsertRows },
 }
 
-/// One speculative Multilite operation keyed by its Homebase sequence.
+/// One speculative Multilite transaction keyed by its Homebase sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingOp {
+pub struct PendingTransaction {
     pub seq: DeviceSeq,
-    pub operation: MultiliteOp,
+    pub transaction: MultiliteTransaction,
     pub on_accept: Vec<Effect>,
     pub on_reject: Vec<Effect>,
 }
 
-impl PendingOp {
-    fn new(seq: DeviceSeq, operation: MultiliteOp) -> Self {
-        let (on_accept, on_reject) = effects_for(&operation);
+impl PendingTransaction {
+    fn new(seq: DeviceSeq, transaction: MultiliteTransaction) -> Self {
+        let (on_accept, on_reject) = effects_for(&transaction);
         Self {
             seq,
-            operation,
+            transaction,
             on_accept,
             on_reject,
         }
@@ -61,24 +58,21 @@ impl PendingOp {
 struct PendingCodec;
 
 impl PendingCodec {
-    fn encode(pending: &PendingOp) -> Vec<u8> {
-        let mut frame = vec![PENDING_FRAME_VERSION];
-        put_field(&mut frame, TAG_DEVICE_SEQ, &pending.seq.0.to_be_bytes());
-        put_field(
-            &mut frame,
-            TAG_OPERATION,
-            &Self::encode_operation(&pending.operation),
-        );
+    fn encode(pending: &PendingTransaction) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(PENDING_FRAME_VERSION);
+        put_field(&mut writer, TAG_DEVICE_SEQ, &pending.seq.0.to_be_bytes());
+        put_field(&mut writer, TAG_TRANSACTION, &pending.transaction.encode());
         for effect in &pending.on_accept {
-            put_field(&mut frame, TAG_ACCEPT_EFFECT, &Self::encode_effect(effect));
+            put_field(&mut writer, TAG_ACCEPT_EFFECT, &Self::encode_effect(effect));
         }
         for effect in &pending.on_reject {
-            put_field(&mut frame, TAG_REJECT_EFFECT, &Self::encode_effect(effect));
+            put_field(&mut writer, TAG_REJECT_EFFECT, &Self::encode_effect(effect));
         }
-        frame
+        writer.finish()
     }
 
-    fn decode(frame: &[u8]) -> std::result::Result<PendingOp, PendingCodecError> {
+    fn decode(frame: &[u8]) -> std::result::Result<PendingTransaction, PendingCodecError> {
         let mut reader = Reader::new(frame);
         let version = reader.u8().ok_or(PendingCodecError::Truncated)?;
         if version != PENDING_FRAME_VERSION {
@@ -89,80 +83,51 @@ impl PendingCodec {
         }
 
         let mut seq = None;
-        let mut operation = None;
+        let mut transaction = None;
         let mut on_accept = Vec::new();
         let mut on_reject = Vec::new();
         while let Some((tag, value)) = next_field(&mut reader)? {
             match tag {
                 TAG_DEVICE_SEQ => set_once(&mut seq, decode_seq(value)?)?,
-                TAG_OPERATION => set_once(&mut operation, Self::decode_operation(value)?)?,
+                TAG_TRANSACTION => set_once(
+                    &mut transaction,
+                    MultiliteTransaction::decode(value).map_err(|error| {
+                        PendingCodecError::InvalidTransaction(error.to_string())
+                    })?,
+                )?,
                 TAG_ACCEPT_EFFECT => on_accept.push(Self::decode_effect(value)?),
                 TAG_REJECT_EFFECT => on_reject.push(Self::decode_effect(value)?),
                 _ => {}
             }
         }
 
-        let pending = PendingOp {
+        let pending = PendingTransaction {
             seq: seq.ok_or(PendingCodecError::MissingField(TAG_DEVICE_SEQ))?,
-            operation: operation.ok_or(PendingCodecError::MissingField(TAG_OPERATION))?,
+            transaction: transaction.ok_or(PendingCodecError::MissingField(TAG_TRANSACTION))?,
             on_accept,
             on_reject,
         };
-        let (expected_accept, expected_reject) = effects_for(&pending.operation);
+        let (expected_accept, expected_reject) = effects_for(&pending.transaction);
         if pending.on_accept != expected_accept || pending.on_reject != expected_reject {
             return Err(PendingCodecError::EffectsMismatch);
         }
         Ok(pending)
     }
 
-    fn encode_operation(operation: &MultiliteOp) -> Vec<u8> {
-        let mut frame = vec![OPERATION_FRAME_VERSION];
-        match operation {
-            MultiliteOp::CreateTable(created) => {
-                frame.push(CREATE_TABLE_OPERATION);
-                frame.extend_from_slice(&created.encode());
-            }
-            MultiliteOp::InsertRows(inserted) => {
-                frame.push(INSERT_ROWS_OPERATION);
-                frame.extend_from_slice(&inserted.encode());
-            }
-        }
-        frame
-    }
-
-    fn decode_operation(frame: &[u8]) -> std::result::Result<MultiliteOp, PendingCodecError> {
-        let mut reader = Reader::new(frame);
-        let version = reader.u8().ok_or(PendingCodecError::Truncated)?;
-        if version != OPERATION_FRAME_VERSION {
-            return Err(PendingCodecError::UnknownVersion {
-                frame: FrameKind::Operation,
-                version,
-            });
-        }
-        match reader.u8().ok_or(PendingCodecError::Truncated)? {
-            CREATE_TABLE_OPERATION => CreateTable::decode(reader.rest())
-                .map(MultiliteOp::CreateTable)
-                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
-            INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())
-                .map(MultiliteOp::InsertRows)
-                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
-            kind => Err(PendingCodecError::UnknownOperation(kind)),
-        }
-    }
-
     fn encode_effect(effect: &Effect) -> Vec<u8> {
-        let mut frame = vec![EFFECT_FRAME_VERSION];
+        let mut writer = Writer::new();
+        writer.u8(EFFECT_FRAME_VERSION);
         match effect {
             Effect::DropTable { name } => {
-                frame.push(DROP_TABLE_EFFECT);
-                frame.extend_from_slice(name.as_bytes());
+                writer.u8(DROP_TABLE_EFFECT);
+                writer.bytes(name.as_bytes());
             }
             Effect::DeleteRows { inserted } => {
-                frame.push(DELETE_ROWS_EFFECT);
-                frame.extend_from_slice(&inserted.encode());
+                writer.u8(DELETE_ROWS_EFFECT);
+                writer.bytes(&inserted.encode());
             }
         }
-        frame
+        writer.finish()
     }
 
     fn decode_effect(frame: &[u8]) -> std::result::Result<Effect, PendingCodecError> {
@@ -254,8 +219,12 @@ pub fn validate(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn insert(connection: &Connection, seq: DeviceSeq, operation: &MultiliteOp) -> Result<()> {
-    let pending = PendingOp::new(seq, operation.clone());
+pub fn insert(
+    connection: &Connection,
+    seq: DeviceSeq,
+    transaction: &MultiliteTransaction,
+) -> Result<()> {
+    let pending = PendingTransaction::new(seq, transaction.clone());
     connection.execute(
         &format!("INSERT INTO {TABLE} (device_seq, record) VALUES (?1, ?2)"),
         params![
@@ -266,7 +235,7 @@ pub fn insert(connection: &Connection, seq: DeviceSeq, operation: &MultiliteOp) 
     Ok(())
 }
 
-pub fn load(connection: &Connection) -> Result<Vec<PendingOp>> {
+pub fn load(connection: &Connection) -> Result<Vec<PendingTransaction>> {
     let mut statement = connection.prepare(&format!(
         "SELECT device_seq, record FROM {TABLE} ORDER BY device_seq"
     ))?;
@@ -287,7 +256,7 @@ pub fn load(connection: &Connection) -> Result<Vec<PendingOp>> {
     .collect()
 }
 
-/// Run acceptance effects and retire every pending operation through `through`.
+/// Run acceptance effects and retire every pending transaction through `through`.
 ///
 /// The database metadata adapter calls this inside the same SQLite savepoint
 /// that advances Homebase's submit neck.
@@ -308,8 +277,8 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
     Ok(())
 }
 
-/// Undo and retire the pending operations represented by one exact active
-/// Homebase window. Operations are unwound in reverse device order.
+/// Undo and retire the pending transactions represented by one exact active
+/// Homebase window. Transactions are unwound in reverse device order.
 pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) -> Result<()> {
     let expected = active
         .iter()
@@ -318,16 +287,16 @@ pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) 
     let pending = load(connection)?;
     let actual = pending
         .iter()
-        .map(|operation| operation.seq)
+        .map(|pending| pending.seq)
         .collect::<Vec<_>>();
     if actual != expected {
         return Err(Error::InvalidDatabase(
-            "pending operations do not match the active submit window",
+            "pending transactions do not match the active submit window",
         ));
     }
 
-    for operation in pending.iter().rev() {
-        apply_effects(connection, &operation.on_reject)?;
+    for pending in pending.iter().rev() {
+        apply_effects(connection, &pending.on_reject)?;
     }
     if !pending.is_empty() {
         connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
@@ -335,20 +304,33 @@ pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) 
     Ok(())
 }
 
-/// Verify that every pending operation still belongs to the active submit log.
+/// Verify that every pending transaction still belongs to the active submit log.
 pub fn validate_active_from(connection: &Connection, neck: DeviceSeq) -> Result<()> {
     if load(connection)?
         .into_iter()
         .any(|pending| pending.seq < neck)
     {
         return Err(Error::InvalidDatabase(
-            "accepted pending operation was not finalized with its submit trim",
+            "accepted pending transaction was not finalized with its submit trim",
         ));
     }
     Ok(())
 }
 
-fn effects_for(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
+fn effects_for(transaction: &MultiliteTransaction) -> (Vec<Effect>, Vec<Effect>) {
+    let mut on_accept = Vec::new();
+    for operation in transaction.operations() {
+        on_accept.extend(effects_for_operation(operation).0);
+    }
+
+    let mut on_reject = Vec::new();
+    for operation in transaction.operations().iter().rev() {
+        on_reject.extend(effects_for_operation(operation).1);
+    }
+    (on_accept, on_reject)
+}
+
+fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
     match operation {
         MultiliteOp::CreateTable(created) => (
             Vec::new(),
@@ -382,11 +364,11 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn put_field(frame: &mut Vec<u8>, tag: u8, value: &[u8]) {
-    frame.push(tag);
+fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
     let len = u32::try_from(value.len()).expect("pending field length must fit in u32");
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(value);
+    writer.u8(tag);
+    writer.u32(len);
+    writer.bytes(value);
 }
 
 fn next_field<'a>(
@@ -424,7 +406,6 @@ fn invalid_record(_: PendingCodecError) -> Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameKind {
     Pending,
-    Operation,
     Effect,
 }
 
@@ -432,7 +413,6 @@ impl fmt::Display for FrameKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pending => f.write_str("pending"),
-            Self::Operation => f.write_str("pending operation"),
             Self::Effect => f.write_str("pending effect"),
         }
     }
@@ -445,7 +425,7 @@ enum PendingCodecError {
     DuplicateField,
     MissingField(u8),
     InvalidLength,
-    UnknownOperation(u8),
+    InvalidTransaction(String),
     InvalidOperation(String),
     UnknownEffect(u8),
     InvalidUtf8,
@@ -462,7 +442,9 @@ impl fmt::Display for PendingCodecError {
             Self::DuplicateField => f.write_str("pending frame contains a duplicate field"),
             Self::MissingField(tag) => write!(f, "pending frame is missing field {tag}"),
             Self::InvalidLength => f.write_str("pending field has an invalid length"),
-            Self::UnknownOperation(kind) => write!(f, "unknown pending operation {kind}"),
+            Self::InvalidTransaction(error) => {
+                write!(f, "invalid pending transaction: {error}")
+            }
             Self::InvalidOperation(error) => write!(f, "invalid pending operation: {error}"),
             Self::UnknownEffect(kind) => write!(f, "unknown pending effect {kind}"),
             Self::InvalidUtf8 => f.write_str("pending effect contains invalid UTF-8"),
@@ -475,6 +457,8 @@ impl fmt::Display for PendingCodecError {
 
 #[cfg(test)]
 mod tests {
+    use homebase_client::meta::{DeviceOp, SubmitMode};
+
     use super::*;
     use crate::database::row::{CapturedRow, StoredValue};
     use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
@@ -514,29 +498,33 @@ mod tests {
         MultiliteOp::InsertRows(inserted)
     }
 
+    fn transaction(operation: MultiliteOp) -> MultiliteTransaction {
+        MultiliteTransaction::one(operation)
+    }
+
     #[test]
-    fn journal_roundtrips_operations_and_effect_lists_in_sequence_order() {
+    fn journal_roundtrips_transactions_and_effect_lists_in_sequence_order() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        let later = operation("tasks");
-        let earlier = operation("notes");
+        let later = transaction(operation("tasks"));
+        let earlier = transaction(operation("notes"));
         insert(&connection, DeviceSeq(9), &later).unwrap();
         insert(&connection, DeviceSeq(3), &earlier).unwrap();
 
         assert_eq!(
             load(&connection).unwrap(),
             vec![
-                PendingOp {
+                PendingTransaction {
                     seq: DeviceSeq(3),
-                    operation: earlier,
+                    transaction: earlier,
                     on_accept: Vec::new(),
                     on_reject: vec![Effect::DropTable {
                         name: "notes".into()
                     }],
                 },
-                PendingOp {
+                PendingTransaction {
                     seq: DeviceSeq(9),
-                    operation: later,
+                    transaction: later,
                     on_accept: Vec::new(),
                     on_reject: vec![Effect::DropTable {
                         name: "tasks".into()
@@ -548,15 +536,15 @@ mod tests {
 
     #[test]
     fn codec_roundtrips_and_rejects_unknown_or_truncated_versions() {
-        let pending = PendingOp::new(DeviceSeq(7), operation("notes"));
+        let pending = PendingTransaction::new(DeviceSeq(7), transaction(operation("notes")));
         let encoded = PendingCodec::encode(&pending);
         assert_eq!(PendingCodec::decode(&encoded).unwrap(), pending);
         assert_eq!(PendingCodec::decode(&[]), Err(PendingCodecError::Truncated));
         assert_eq!(
-            PendingCodec::decode(&[2]),
+            PendingCodec::decode(&[3]),
             Err(PendingCodecError::UnknownVersion {
                 frame: FrameKind::Pending,
-                version: 2,
+                version: 3,
             })
         );
         assert_eq!(
@@ -568,7 +556,8 @@ mod tests {
     #[test]
     fn codec_and_journal_roundtrip_insert_rows_and_its_delete_effect() {
         let operation = insert_operation();
-        let pending = PendingOp::new(DeviceSeq(11), operation.clone());
+        let transaction = transaction(operation.clone());
+        let pending = PendingTransaction::new(DeviceSeq(11), transaction.clone());
         let MultiliteOp::InsertRows(inserted) = &operation else {
             unreachable!()
         };
@@ -586,8 +575,69 @@ mod tests {
 
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        insert(&connection, DeviceSeq(11), &operation).unwrap();
+        insert(&connection, DeviceSeq(11), &transaction).unwrap();
         assert_eq!(load(&connection).unwrap(), [pending]);
+    }
+
+    #[test]
+    fn mixed_transaction_repair_runs_reject_effects_in_reverse_operation_order() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        catalog::initialize(&connection).unwrap();
+
+        let created = operation("notes");
+        let MultiliteOp::CreateTable(table) = &created else {
+            unreachable!()
+        };
+        connection.execute(table.sql(), ()).unwrap();
+        catalog::insert(&connection, table).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (7)", ())
+            .unwrap();
+        let inserted = InsertRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "notes".into(),
+                values: vec![StoredValue::Integer(7)],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let transaction =
+            MultiliteTransaction::new(vec![created, MultiliteOp::InsertRows(inserted.clone())])
+                .unwrap();
+        insert(&connection, DeviceSeq(1), &transaction).unwrap();
+
+        let pending = load(&connection).unwrap();
+        assert!(matches!(
+            pending[0].on_reject.as_slice(),
+            [
+                Effect::DeleteRows { .. },
+                Effect::DropTable { name }
+            ] if name == "notes"
+        ));
+        let active = vec![(
+            DeviceSeq(1),
+            DeviceOp::Commit {
+                entries: Vec::new(),
+                range_asserts: Vec::new(),
+                evidence: Vec::new(),
+                submit_mode: SubmitMode::Unchecked,
+            },
+        )];
+        reject_active(&connection, &active).unwrap();
+
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'notes')",
+                    (),
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert!(catalog::by_name(&connection, "notes").unwrap().is_none());
+        assert!(load(&connection).unwrap().is_empty());
     }
 
     #[test]
@@ -626,10 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn effects_must_match_their_operation() {
-        let pending = PendingOp {
+    fn effects_must_match_their_transaction() {
+        let pending = PendingTransaction {
             seq: DeviceSeq(1),
-            operation: operation("notes"),
+            transaction: transaction(operation("notes")),
             on_accept: Vec::new(),
             on_reject: vec![Effect::DropTable {
                 name: "tasks".into(),
@@ -646,7 +696,10 @@ mod tests {
     fn record_sequence_must_match_its_ordering_key() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        let record = PendingCodec::encode(&PendingOp::new(DeviceSeq(2), operation("notes")));
+        let record = PendingCodec::encode(&PendingTransaction::new(
+            DeviceSeq(2),
+            transaction(operation("notes")),
+        ));
         connection
             .execute(
                 &format!("INSERT INTO {TABLE} (device_seq, record) VALUES (?1, ?2)"),
@@ -666,29 +719,29 @@ mod tests {
     fn acceptance_retires_only_the_acknowledged_prefix() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        let later = operation("tasks");
-        insert(&connection, DeviceSeq(3), &operation("notes")).unwrap();
+        let later = transaction(operation("tasks"));
+        insert(&connection, DeviceSeq(3), &transaction(operation("notes"))).unwrap();
         insert(&connection, DeviceSeq(9), &later).unwrap();
 
         accept_through(&connection, DeviceSeq(3)).unwrap();
 
         assert_eq!(
             load(&connection).unwrap(),
-            [PendingOp::new(DeviceSeq(9), later)]
+            [PendingTransaction::new(DeviceSeq(9), later)]
         );
     }
 
     #[test]
-    fn validation_rejects_pending_operations_below_submit_neck() {
+    fn validation_rejects_pending_transactions_below_submit_neck() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        insert(&connection, DeviceSeq(3), &operation("notes")).unwrap();
+        insert(&connection, DeviceSeq(3), &transaction(operation("notes"))).unwrap();
 
         validate_active_from(&connection, DeviceSeq(3)).unwrap();
         assert!(matches!(
             validate_active_from(&connection, DeviceSeq(4)),
             Err(Error::InvalidDatabase(
-                "accepted pending operation was not finalized with its submit trim"
+                "accepted pending transaction was not finalized with its submit trim"
             ))
         ));
     }

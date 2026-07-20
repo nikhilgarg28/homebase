@@ -7,8 +7,10 @@
 use std::fmt;
 
 use homebase_core::key::Key;
+#[cfg(test)]
 use homebase_core::messages::AdmittedBatch;
 use homebase_core::tag::Mutation;
+use homebase_core::writer::Writer;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
@@ -224,6 +226,7 @@ impl CreateTable {
     }
 
     /// Raise one complete authenticated Homebase batch into a schema change.
+    #[cfg(test)]
     pub fn from_homebase(
         batch: &AdmittedBatch<Vec<u8>>,
     ) -> std::result::Result<Self, SchemaCodecError> {
@@ -232,11 +235,12 @@ impl CreateTable {
 
     /// Encode this complete schema operation for local durable state.
     pub fn encode(&self) -> Vec<u8> {
-        let mut frame = vec![SCHEMA_FRAME_VERSION];
-        put_field(&mut frame, TAG_MUTATION_ID, &self.mutation_id.0);
-        put_field(&mut frame, TAG_SQL, self.sql.as_bytes());
-        put_field(&mut frame, TAG_CREATE_TABLE, &encode_create_table(self));
-        frame
+        let mut writer = Writer::new();
+        writer.u8(SCHEMA_FRAME_VERSION);
+        put_field(&mut writer, TAG_MUTATION_ID, &self.mutation_id.0);
+        put_field(&mut writer, TAG_SQL, self.sql.as_bytes());
+        put_field(&mut writer, TAG_CREATE_TABLE, &encode_create_table(self));
+        writer.finish()
     }
 
     /// Decode and validate one complete locally stored schema operation.
@@ -405,38 +409,42 @@ fn name_component(canonical: &[u8]) -> Vec<u8> {
 }
 
 fn encode_create_table(table: &CreateTable) -> Vec<u8> {
-    let mut frame = Vec::new();
-    put_field(&mut frame, TAG_TABLE_ID, &table.table_id.0);
-    put_field(&mut frame, TAG_TABLE_NAME, table.name.value().as_bytes());
+    let mut writer = Writer::new();
+    put_field(&mut writer, TAG_TABLE_ID, &table.table_id.0);
+    put_field(&mut writer, TAG_TABLE_NAME, table.name.value().as_bytes());
     put_field(
-        &mut frame,
+        &mut writer,
         TAG_SCHEMA_REVISION_ID,
         &table.schema_revision_id.0,
     );
-    put_field(&mut frame, TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0);
+    put_field(&mut writer, TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0);
     for column in &table.columns {
-        put_field(&mut frame, TAG_COLUMN, &encode_column(column));
+        put_field(&mut writer, TAG_COLUMN, &encode_column(column));
     }
-    frame
+    writer.finish()
 }
 
 fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
     let primary = table.primary_key_columns().collect::<Vec<_>>();
-    let mut frame = Vec::with_capacity(2 + primary.len() * 17);
-    frame.push(1);
-    frame.push(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
+    let mut writer = Writer::with_capacity(2 + primary.len() * 17);
+    writer.u8(1);
+    writer.u8(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
     for column in primary {
-        frame.extend_from_slice(&column.id.0);
-        frame.push(column.declared_type.to_u8());
+        writer.bytes16(&column.id.0);
+        writer.u8(column.declared_type.to_u8());
     }
-    frame
+    writer.finish()
 }
 
 fn encode_column(column: &Column) -> Vec<u8> {
-    let mut frame = Vec::new();
-    put_field(&mut frame, TAG_COLUMN_ID, &column.id.0);
-    put_field(&mut frame, TAG_COLUMN_NAME, column.name.value().as_bytes());
-    put_field(&mut frame, TAG_COLUMN_TYPE, &[column.declared_type.to_u8()]);
+    let mut writer = Writer::new();
+    put_field(&mut writer, TAG_COLUMN_ID, &column.id.0);
+    put_field(&mut writer, TAG_COLUMN_NAME, column.name.value().as_bytes());
+    put_field(
+        &mut writer,
+        TAG_COLUMN_TYPE,
+        &[column.declared_type.to_u8()],
+    );
     let mut flags = 0;
     if column.not_null {
         flags |= COLUMN_NOT_NULL;
@@ -444,15 +452,15 @@ fn encode_column(column: &Column) -> Vec<u8> {
     if column.primary_key {
         flags |= COLUMN_PRIMARY_KEY;
     }
-    put_field(&mut frame, TAG_COLUMN_FLAGS, &[flags]);
-    frame
+    put_field(&mut writer, TAG_COLUMN_FLAGS, &[flags]);
+    writer.finish()
 }
 
-fn put_field(frame: &mut Vec<u8>, tag: u8, value: &[u8]) {
-    frame.push(tag);
+fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
     let len = u32::try_from(value.len()).expect("schema field length must fit in u32");
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(value);
+    writer.u8(tag);
+    writer.u32(len);
+    writer.bytes(value);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -469,6 +477,7 @@ pub enum SchemaCodecError {
     InvalidUuid,
     InvalidSql,
     SqlMismatch,
+    #[cfg(test)]
     InvalidBatch,
 }
 
@@ -487,6 +496,7 @@ impl fmt::Display for SchemaCodecError {
             Self::InvalidUuid => f.write_str("schema id is not a UUID v4"),
             Self::InvalidSql => f.write_str("literal SQL is outside the supported grammar"),
             Self::SqlMismatch => f.write_str("literal SQL contradicts the structured schema"),
+            #[cfg(test)]
             Self::InvalidBatch => f.write_str("admitted schema mutation has an invalid envelope"),
         }
     }
@@ -657,6 +667,7 @@ fn decode_name(value: &[u8]) -> std::result::Result<SqlName, SchemaCodecError> {
     Ok(SqlName::new(value))
 }
 
+#[cfg(test)]
 fn from_homebase_inner(
     batch: &AdmittedBatch<Vec<u8>>,
 ) -> std::result::Result<CreateTable, SchemaCodecError> {
@@ -713,6 +724,7 @@ fn from_homebase_inner(
     Ok(created)
 }
 
+#[cfg(test)]
 fn validate_set(
     entry: &homebase_core::tag::AdmittedEntry<Vec<u8>>,
     expected_key: &Key,

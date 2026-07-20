@@ -1,13 +1,19 @@
-//! Logical Multilite operations and their Homebase representation.
+//! Logical Multilite operations and their durable representation.
+
+use std::fmt;
 
 use homebase_core::key::Key;
-use homebase_core::messages::{AdmittedBatch, RangeAssert};
-use homebase_core::tag::{AdmissionSeq, Mutation};
+use homebase_core::reader::Reader;
+use homebase_core::tag::Mutation;
+use homebase_core::writer::Writer;
 
-use super::codes;
 use super::row::{InsertRows, RowHomebaseOp};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::{Error, Result};
+
+const OPERATION_FRAME_VERSION: u8 = 1;
+const CREATE_TABLE_OPERATION: u8 = 1;
+const INSERT_ROWS_OPERATION: u8 = 2;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,14 +30,9 @@ pub struct HomebaseOp {
 }
 
 impl HomebaseOp {
-    /// Bind asserted scopes to the local admission cut used by submission.
-    pub fn at(self, upto: AdmissionSeq) -> (Vec<Mutation>, Vec<RangeAssert>) {
-        let assertions = self
-            .asserted_scopes
-            .into_iter()
-            .map(|prefix| RangeAssert { prefix, upto })
-            .collect();
-        (self.mutations, assertions)
+    /// Split deterministic mutations from their unbound assertion scopes.
+    pub fn into_parts(self) -> (Vec<Mutation>, Vec<Key>) {
+        (self.mutations, self.asserted_scopes)
     }
 }
 
@@ -39,6 +40,41 @@ impl MultiliteOp {
     /// Mint durable schema identities for one validated table creation.
     pub fn create_table(sql: &str, spec: CreateTableSpec) -> Self {
         Self::CreateTable(CreateTable::new(sql, spec))
+    }
+
+    /// Encode one complete logical operation for transaction and pending frames.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(OPERATION_FRAME_VERSION);
+        match self {
+            Self::CreateTable(created) => {
+                writer.u8(CREATE_TABLE_OPERATION);
+                writer.bytes(&created.encode());
+            }
+            Self::InsertRows(inserted) => {
+                writer.u8(INSERT_ROWS_OPERATION);
+                writer.bytes(&inserted.encode());
+            }
+        }
+        writer.finish()
+    }
+
+    /// Decode and validate one complete logical operation.
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, OperationCodecError> {
+        let mut reader = Reader::new(frame);
+        let version = reader.u8().ok_or(OperationCodecError::Truncated)?;
+        if version != OPERATION_FRAME_VERSION {
+            return Err(OperationCodecError::UnknownVersion(version));
+        }
+        match reader.u8().ok_or(OperationCodecError::Truncated)? {
+            CREATE_TABLE_OPERATION => CreateTable::decode(reader.rest())
+                .map(Self::CreateTable)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())
+                .map(Self::InsertRows)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            kind => Err(OperationCodecError::UnknownKind(kind)),
+        }
     }
 
     /// Lower this operation to its complete Homebase representation.
@@ -63,36 +99,32 @@ impl MultiliteOp {
             asserted_scopes,
         })
     }
+}
 
-    /// Raise one complete authenticated Homebase batch into a logical op.
-    pub fn from_homebase(batch: &AdmittedBatch<Vec<u8>>) -> Result<Self> {
-        let first = batch
-            .entries
-            .first()
-            .ok_or_else(|| Error::InvalidMultiliteOp("operation batch is empty".into()))?;
-        let components = first.key().components();
-        if components.len() >= 3
-            && components[0].as_bytes() == codes::ROOT
-            && components[1].as_bytes() == codes::SCHEMA
-            && components[2].as_bytes() == codes::LOG
-        {
-            CreateTable::from_homebase(batch)
-                .map(Self::CreateTable)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
-        } else {
-            InsertRows::from_homebase(batch)
-                .map(Self::InsertRows)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+/// Failure to decode one logical operation frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationCodecError {
+    UnknownVersion(u8),
+    Truncated,
+    UnknownKind(u8),
+    InvalidPayload(String),
+}
+
+impl fmt::Display for OperationCodecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownVersion(version) => {
+                write!(f, "unknown Multilite operation version {version}")
+            }
+            Self::Truncated => f.write_str("Multilite operation frame is truncated"),
+            Self::UnknownKind(kind) => write!(f, "unknown Multilite operation kind {kind}"),
+            Self::InvalidPayload(error) => write!(f, "invalid operation payload: {error}"),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use homebase_core::seal::Seal;
-    use homebase_core::tag::{
-        AdmissionTag, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq, DeviceTag, Ver,
-    };
     use rusqlite::Connection;
 
     use super::*;
@@ -112,58 +144,20 @@ mod tests {
         }
     }
 
-    fn admitted(mutations: Vec<Mutation>) -> AdmittedBatch<Vec<u8>> {
-        let device = DeviceId([7; 16]);
-        let device_seq = DeviceSeq(3);
-        let admission_seq = AdmissionSeq(9);
-        let entries = mutations
-            .into_iter()
-            .enumerate()
-            .map(|(index, mutation)| homebase_core::tag::AdmittedEntry {
-                device_entry: DeviceEntry {
-                    mutation,
-                    tag: DeviceTag {
-                        device,
-                        device_seq,
-                        ver: Ver(index as u64 + 1),
-                        cipher_epoch: CipherEpoch(0),
-                    },
-                    seal: Seal::empty_aead_v1(),
-                },
-                admission: AdmissionTag {
-                    admission_seq,
-                    op_index: index as u32,
-                },
-            })
-            .collect();
-        AdmittedBatch {
-            admission_seq,
-            device,
-            device_seq,
-            checksum: DeviceChecksum::EMPTY,
-            entries,
-        }
-    }
-
     #[test]
-    fn operation_dispatches_schema_translation_and_binds_the_submission_cut() {
+    fn operation_dispatches_schema_translation_and_exposes_asserted_scopes() {
         let operation =
             MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
-        let (mutations, assertions) = operation.to_homebase().unwrap().at(AdmissionSeq(41));
+        let (mutations, asserted_scopes) = operation.to_homebase().unwrap().into_parts();
 
         assert_eq!(mutations.len(), 6);
-        assert_eq!(assertions.len(), 2);
-        assert!(
-            assertions
-                .iter()
-                .all(|assertion| assertion.upto == AdmissionSeq(41))
-        );
-        assert_eq!(assertions[0].prefix, *mutations[1].key());
-        assert_eq!(assertions[1].prefix, *mutations[5].key());
+        assert_eq!(asserted_scopes.len(), 2);
+        assert_eq!(asserted_scopes[0], *mutations[1].key());
+        assert_eq!(asserted_scopes[1], *mutations[5].key());
     }
 
     #[test]
-    fn operation_dispatches_insert_rows_through_a_homebase_roundtrip() {
+    fn operation_codec_roundtrips_insert_rows() {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let created = CreateTable::new("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
@@ -180,11 +174,14 @@ mod tests {
         .unwrap();
         let operation = MultiliteOp::InsertRows(inserted);
 
-        let lowered = operation.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 1);
+        assert_eq!(MultiliteOp::decode(&operation.encode()).unwrap(), operation);
         assert_eq!(
-            MultiliteOp::from_homebase(&admitted(lowered.mutations)).unwrap(),
-            operation
+            MultiliteOp::decode(&[]),
+            Err(OperationCodecError::Truncated)
+        );
+        assert_eq!(
+            MultiliteOp::decode(&[2, CREATE_TABLE_OPERATION]),
+            Err(OperationCodecError::UnknownVersion(2))
         );
     }
 }

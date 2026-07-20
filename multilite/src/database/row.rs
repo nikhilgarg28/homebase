@@ -3,9 +3,11 @@
 use std::fmt;
 
 use homebase_core::key::{Key, KeyError};
+#[cfg(test)]
 use homebase_core::messages::AdmittedBatch;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
+use homebase_core::writer::Writer;
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
@@ -224,6 +226,7 @@ impl InsertRows {
         })
     }
 
+    #[cfg(test)]
     pub fn from_homebase(
         batch: &AdmittedBatch<Vec<u8>>,
     ) -> std::result::Result<Self, RowCodecError> {
@@ -278,12 +281,13 @@ impl InsertRows {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut frame = vec![INSERT_FRAME_VERSION];
-        put_field(&mut frame, TAG_TABLE, &self.table.as_bytes());
+        let mut writer = Writer::new();
+        writer.u8(INSERT_FRAME_VERSION);
+        put_field(&mut writer, TAG_TABLE, &self.table.as_bytes());
         for row in &self.rows {
-            put_field(&mut frame, TAG_ROW, &self.encode_row(row));
+            put_field(&mut writer, TAG_ROW, &self.encode_row(row));
         }
-        frame
+        writer.finish()
     }
 
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
@@ -468,24 +472,25 @@ impl InsertRows {
     }
 
     fn encode_row(&self, row: &Row) -> Vec<u8> {
-        let mut frame = vec![ROW_FRAME_VERSION];
+        let mut writer = Writer::new();
+        writer.u8(ROW_FRAME_VERSION);
         put_field(
-            &mut frame,
+            &mut writer,
             TAG_SCHEMA_REVISION,
             &self.schema_revision.as_bytes(),
         );
-        put_field(&mut frame, TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes());
+        put_field(&mut writer, TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes());
         for part in &self.key_parts {
-            put_field(&mut frame, TAG_KEY_PART, &encode_key_part(*part));
+            put_field(&mut writer, TAG_KEY_PART, &encode_key_part(*part));
         }
         for (column, value) in &row.values {
             put_field(
-                &mut frame,
+                &mut writer,
                 TAG_COLUMN_VALUE,
                 &encode_column_value(*column, value),
             );
         }
-        frame
+        writer.finish()
     }
 }
 
@@ -540,10 +545,10 @@ fn key_image(
 }
 
 fn encode_key_part(part: KeyPartRules) -> Vec<u8> {
-    let mut frame = Vec::new();
-    put_field(&mut frame, TAG_COLUMN_ID, &part.column.as_bytes());
-    put_field(&mut frame, TAG_COLUMN_TYPE, &[part.declared_type.to_u8()]);
-    frame
+    let mut writer = Writer::new();
+    put_field(&mut writer, TAG_COLUMN_ID, &part.column.as_bytes());
+    put_field(&mut writer, TAG_COLUMN_TYPE, &[part.declared_type.to_u8()]);
+    writer.finish()
 }
 
 fn decode_key_part(frame: &[u8]) -> std::result::Result<KeyPartRules, RowCodecError> {
@@ -572,10 +577,10 @@ fn decode_key_part(frame: &[u8]) -> std::result::Result<KeyPartRules, RowCodecEr
 }
 
 fn encode_column_value(column: ColumnId, value: &StoredValue) -> Vec<u8> {
-    let mut frame = Vec::new();
-    put_field(&mut frame, TAG_COLUMN_ID, &column.as_bytes());
-    put_field(&mut frame, TAG_VALUE, &value.encode());
-    frame
+    let mut writer = Writer::new();
+    put_field(&mut writer, TAG_COLUMN_ID, &column.as_bytes());
+    put_field(&mut writer, TAG_VALUE, &value.encode());
+    writer.finish()
 }
 
 fn decode_column_value(
@@ -645,11 +650,11 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn put_field(frame: &mut Vec<u8>, tag: u8, value: &[u8]) {
-    frame.push(tag);
+fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
     let len = u32::try_from(value.len()).expect("row field length fits in u32");
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(value);
+    writer.u8(tag);
+    writer.u32(len);
+    writer.bytes(value);
 }
 
 fn next_field<'a>(

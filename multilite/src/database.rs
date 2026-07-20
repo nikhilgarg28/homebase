@@ -11,6 +11,7 @@ mod row;
 mod schema;
 mod sql;
 mod store;
+mod transaction;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -36,6 +37,7 @@ use self::operation::MultiliteOp;
 use self::policy::{PolicyState, PushScheduler};
 use self::row::{CapturedRow, InsertRows, StoredValue};
 use self::store::DatabaseMetaStore;
+use self::transaction::MultiliteTransaction;
 
 pub use self::connection::Connection;
 pub use self::policy::SyncPolicy;
@@ -468,8 +470,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         params: Q,
         table: schema::CreateTableSpec,
     ) -> Result<usize> {
-        let operation = MultiliteOp::create_table(sql, table);
-        let MultiliteOp::CreateTable(created) = &operation else {
+        let transaction = MultiliteTransaction::one(MultiliteOp::create_table(sql, table));
+        let MultiliteOp::CreateTable(created) = &transaction.operations()[0] else {
             unreachable!("create-table constructor returned another operation")
         };
         let (space, upto) = block_on(async {
@@ -484,7 +486,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             );
             Ok::<_, Error>((space, upto))
         })?;
-        let (mutations, assertions) = operation.to_homebase()?.at(upto);
+        let (mutations, assertions) = transaction.to_homebase()?.at(upto);
 
         let (changed, _) = runtime.run(ExecutionMode::Public, |connection| {
             let changed = connection.execute(sql, params)?;
@@ -492,7 +494,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 catalog::insert(connection, created)?;
                 let submission = block_on(space.submit_unchecked(mutations, assertions))
                     .map_err(ClientError::from)?;
-                pending::insert(connection, submission.seq, &operation)?;
+                pending::insert(connection, submission.seq, &transaction)?;
                 Ok(())
             })?;
             Ok(changed)
@@ -531,12 +533,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                         "INSERT target has no synchronized schema identity",
                     ));
                 };
-                let operation = MultiliteOp::InsertRows(inserted);
-                let (mutations, assertions) = operation.to_homebase()?.at(upto);
+                let transaction = MultiliteTransaction::one(MultiliteOp::InsertRows(inserted));
+                let (mutations, assertions) = transaction.to_homebase()?.at(upto);
                 runtime.with_internal_metadata(|| {
                     let submission = block_on(space.submit_unchecked(mutations, assertions))
                         .map_err(ClientError::from)?;
-                    pending::insert(connection, submission.seq, &operation)?;
+                    pending::insert(connection, submission.seq, &transaction)?;
                     Ok(())
                 })
             },
@@ -918,7 +920,7 @@ mod tests {
 
     fn pending_ops<H: ServerHandle + Send + Sync + 'static>(
         database: &Database<H>,
-    ) -> Vec<pending::PendingOp> {
+    ) -> Vec<pending::PendingTransaction> {
         database.with_connection(pending::load).unwrap()
     }
 
@@ -981,7 +983,10 @@ mod tests {
         database: &Database<H>,
         operation: &MultiliteOp,
     ) {
-        let (mutations, assertions) = operation.to_homebase().unwrap().at(AdmissionSeq(0));
+        let (mutations, assertions) = MultiliteTransaction::one(operation.clone())
+            .to_homebase()
+            .unwrap()
+            .at(AdmissionSeq(0));
         block_on(async {
             database
                 .client
@@ -1433,7 +1438,7 @@ mod tests {
         else {
             panic!("captured schema operation was not a commit")
         };
-        assert_eq!(entries.len(), 6);
+        assert_eq!(entries.len(), 7);
         assert_eq!(range_asserts.len(), 2);
         assert_eq!(*submit_mode, SubmitMode::Unchecked);
         assert!(
@@ -1441,8 +1446,8 @@ mod tests {
                 .iter()
                 .all(|assertion| assertion.upto == AdmissionSeq(0))
         );
-        assert_eq!(range_asserts[0].prefix, *entries[1].key());
-        assert_eq!(range_asserts[1].prefix, *entries[5].key());
+        assert_eq!(range_asserts[0].prefix, *entries[2].key());
+        assert_eq!(range_asserts[1].prefix, *entries[6].key());
         let pending = pending_ops(&database);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, DeviceSeq(1));
@@ -1617,7 +1622,7 @@ mod tests {
             }
         );
         assert_eq!(space.admits.len(), 1);
-        assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 6);
+        assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 7);
         assert!(!table_exists(&replica, "notes"));
 
         assert_eq!(replica.pull().unwrap(), outcome);
@@ -1939,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_admitted_operation_fails_rebase_without_advancing_neck() {
+    fn malformed_admitted_transaction_fails_rebase_without_advancing_neck() {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
         let source = Database::open_with(
@@ -1979,7 +1984,7 @@ mod tests {
 
         assert!(matches!(
             replica.rebase(&replica_runtime),
-            Err(Error::InvalidMultiliteOp(_))
+            Err(Error::InvalidMultiliteTransaction(_))
         ));
         assert_eq!(client_state(&replica), before);
     }
@@ -2526,16 +2531,19 @@ mod tests {
         else {
             panic!("captured INSERT was not one commit")
         };
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(range_asserts.len(), 5);
-        assert!(entries.iter().all(|entry| {
+        assert!(entries[1..].iter().all(|entry| {
             let components = entry.key().components();
             components.len() == 6 && components[3].as_bytes() == b"rows"
         }));
 
         let pending = pending_ops(&database);
         assert_eq!(pending.len(), 2);
-        assert!(matches!(pending[1].operation, MultiliteOp::InsertRows(_)));
+        assert!(matches!(
+            pending[1].transaction.operations(),
+            [MultiliteOp::InsertRows(_)]
+        ));
         assert!(matches!(
             pending[1].on_reject.as_slice(),
             [pending::Effect::DeleteRows { .. }]

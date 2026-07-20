@@ -10,6 +10,7 @@
 //! - [`messages`] — transport-neutral request/response messages for the
 //!   kernel verbs, and [`KernelError`]
 //! - [`reader`] — bounded reads over encoded byte records
+//! - [`writer`] — construction of encoded byte records
 //! - [`seal`] — AEAD seal metadata attached to encrypted value operations
 //! - [`space`] — [`SpaceId`] and the [`Space`] trait, the async verb
 //!   contract every request executes against
@@ -32,6 +33,7 @@ pub mod seal;
 pub mod space;
 pub mod storage;
 pub mod tag;
+pub mod writer;
 
 pub use clock::{Clock, ManualClock, MonotonicClock, Timestamp};
 pub use key::{Key, KeyComponent};

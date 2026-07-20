@@ -38,7 +38,9 @@ admit log level checksum?
 
 use uuid indirection for key components - better rotation
 
-Have Writer class like Reader
+Migrate legacy core/client/server codecs to `homebase_core::writer::Writer` in a
+separate mechanical commit, retaining byte-for-byte fixtures for every stable
+format so the cleanup cannot accidentally change durable or wire encodings.
 
 Explroe if we can support concurrent write transactions, maybe via separate redb file for transactions
 

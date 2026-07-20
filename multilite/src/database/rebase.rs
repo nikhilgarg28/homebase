@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use super::catalog;
 use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
+use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
 use crate::runtime::ExecutionMode;
 use crate::{Error, Result};
@@ -60,14 +61,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 .map_err(ClientError::from)
         })?;
 
-        let operations = batches
+        let transactions = batches
             .into_iter()
             .map(|batch| {
                 if batch.entries.is_empty() {
                     return Ok(None);
                 }
-                let operation = MultiliteOp::from_homebase(&batch)?;
-                Ok(Some((batch.device, operation)))
+                let transaction = MultiliteTransaction::from_homebase(&batch)?;
+                Ok(Some((batch.device, transaction)))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -88,8 +89,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 Ok(())
             })?;
 
-            for (device, operation) in &operations {
-                apply_operation(connection, operation, *device == local_device)?;
+            for (device, transaction) in &transactions {
+                apply_transaction(connection, transaction, *device == local_device)?;
             }
 
             runtime.with_internal_metadata(|| {
@@ -102,9 +103,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 }
 
-fn apply_operation(
+fn apply_transaction(
     connection: &Connection,
-    operation: &MultiliteOp,
+    transaction: &MultiliteTransaction,
     originated_locally: bool,
 ) -> Result<()> {
     // Local operations were materialized atomically before their successful
@@ -114,6 +115,13 @@ fn apply_operation(
         return Ok(());
     }
 
+    for operation in transaction.operations() {
+        apply_operation(connection, operation)?;
+    }
+    Ok(())
+}
+
+fn apply_operation(connection: &Connection, operation: &MultiliteOp) -> Result<()> {
     match operation {
         MultiliteOp::CreateTable(created) => {
             connection.execute(created.sql(), ())?;
@@ -121,5 +129,58 @@ fn apply_operation(
             Ok(())
         }
         MultiliteOp::InsertRows(inserted) => inserted.apply(connection),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::row::{CapturedRow, InsertRows, StoredValue};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
+
+    #[test]
+    fn foreign_mixed_transaction_applies_operations_in_manifest_order() {
+        let created = MultiliteOp::create_table(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+            CreateTableSpec {
+                name: SqlName::new("notes".into()),
+                columns: vec![CreateColumn {
+                    name: SqlName::new("id".into()),
+                    declared_type: DeclaredType::Integer,
+                    not_null: false,
+                    primary_key: true,
+                }],
+            },
+        );
+        let MultiliteOp::CreateTable(table) = &created else {
+            unreachable!()
+        };
+        let source = Connection::open_in_memory().unwrap();
+        catalog::initialize(&source).unwrap();
+        source.execute(table.sql(), ()).unwrap();
+        catalog::insert(&source, table).unwrap();
+        let inserted = InsertRows::from_captured(
+            &source,
+            &[CapturedRow {
+                table: "notes".into(),
+                values: vec![StoredValue::Integer(7)],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let transaction =
+            MultiliteTransaction::new(vec![created, MultiliteOp::InsertRows(inserted)]).unwrap();
+
+        let target = Connection::open_in_memory().unwrap();
+        catalog::initialize(&target).unwrap();
+        apply_transaction(&target, &transaction, false).unwrap();
+
+        assert_eq!(
+            target
+                .query_row("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert!(catalog::by_name(&target, "notes").unwrap().is_some());
     }
 }

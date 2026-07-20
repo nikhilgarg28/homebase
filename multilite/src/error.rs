@@ -42,6 +42,8 @@ pub enum Error {
     Entropy(String),
     /// A Multilite operation was malformed or contradicted its SQL.
     InvalidMultiliteOp(String),
+    /// A transaction manifest or its lowered Homebase batch was malformed.
+    InvalidMultiliteTransaction(String),
     /// Fetched admissions cannot be rebased over speculative local work.
     RebasePendingSubmissions,
     /// Local submit or admit cursors changed during rebase preparation.
@@ -91,6 +93,9 @@ impl fmt::Display for Error {
             Self::InvalidMultiliteOp(message) => {
                 write!(f, "invalid Multilite operation: {message}")
             }
+            Self::InvalidMultiliteTransaction(message) => {
+                write!(f, "invalid Multilite transaction: {message}")
+            }
             Self::RebasePendingSubmissions => {
                 f.write_str("rebase requires the local submit log to be empty")
             }
@@ -122,6 +127,7 @@ impl std::error::Error for Error {
             | Self::InvalidReplicaInvitation
             | Self::Entropy(_)
             | Self::InvalidMultiliteOp(_)
+            | Self::InvalidMultiliteTransaction(_)
             | Self::RebasePendingSubmissions
             | Self::RebaseStateChanged
             | Self::StalePushRejection => None,

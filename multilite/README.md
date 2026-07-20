@@ -12,13 +12,17 @@ primary key; richer constraints and schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
-row insertion to and from complete Homebase envelopes. Local `CREATE TABLE` or
-multi-row `INSERT`, its Homebase submission, and its pending-effects row commit
-in one SQLite savepoint. Push, pull, rebase, and rollback cover both schema and
-row operations. `push()` now admits the active Homebase stream,
-then atomically advances its local submit cursor and retires every definitively
-accepted pending prefix in one SQLite savepoint. It returns an opaque rejection
-handle without repairing a stalled suffix. Explicit `rollback(&rejection)`
+row insertion into lean logical operations. Every write currently wraps one
+operation in a UUID-keyed `MultiliteTransaction`; its manifest is the first
+Homebase mutation and carries the ordered operation frames. Admission decoding
+re-lowers those frames and requires every following mutation to match exactly.
+Local `CREATE TABLE` or multi-row `INSERT`, its Homebase transaction, and its
+pending-effects row commit in one SQLite savepoint. Push, pull, rebase, and
+rollback cover both schema and row operations. `push()` admits the active
+Homebase stream, then atomically advances its local submit cursor and retires
+every definitively accepted pending prefix in one SQLite savepoint. It returns
+an opaque rejection handle without repairing a stalled suffix. Explicit
+`rollback(&rejection)`
 atomically runs the remaining reject effects in reverse order, retires the
 pending suffix, and appends Homebase's empty rollback marker. That marker must
 be pushed before rebase. `pull()` may capture admissions at any time, but
@@ -99,11 +103,13 @@ before the first supported release.
 
 Homebase client state is stored in the same SQLite file under
 `__multilite__meta`.
-Speculative Multilite operations and their explicit acceptance/rejection
+Speculative Multilite transactions and their explicit acceptance/rejection
 effects are stored under `__multilite__pending`; this is a local disposition
 journal, not a second operation log. Its versioned record codec stores repeated
-effect lists: CREATE TABLE rejection drops the speculative table and catalog
-entry, while INSERT rejection removes the exact speculative rows.
+effect lists derived from all ordered operations: acceptance runs forward,
+while rejection unwinds operations in reverse. CREATE TABLE rejection drops
+the speculative table and catalog entry, while INSERT rejection removes the
+exact speculative rows.
 `__multilite__schema` is the local lookup index from SQLite names and stable
 table UUIDs to authenticated schema definitions.
 The ordered-store adapter executes synchronously under a serialized,

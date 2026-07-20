@@ -10,3 +10,4 @@ pub const ACTIVE_ROW_KEYSPACE: &[u8] = b"active-row-keyspace";
 pub const ROW_KEYSPACES: &[u8] = b"row-keyspaces";
 pub const ROWS: &[u8] = b"rows";
 pub const WRITE_REVISION: &[u8] = b"write-revision";
+pub const TRANSACTIONS: &[u8] = b"transactions";
