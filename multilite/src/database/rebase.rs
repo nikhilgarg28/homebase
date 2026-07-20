@@ -9,34 +9,34 @@ use super::catalog;
 use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
 use super::{Database, DatabaseRuntime};
-use crate::runtime::{ExecutionMode, HookPolicy};
+use crate::runtime::ExecutionMode;
 use crate::{Error, Result};
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
-    pub(crate) fn rebase<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
+    pub(crate) fn rebase(&self, runtime: &DatabaseRuntime) -> Result<()> {
         let _operation = super::lock(&self.operation);
         self.rebase_locked(runtime)?;
         self.policy.mark_rebased();
         Ok(())
     }
 
-    pub fn rebase_locked<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
+    pub fn rebase_locked(&self, runtime: &DatabaseRuntime) -> Result<()> {
         self.rebase_inner(runtime, || Ok(()))
     }
 
     #[cfg(test)]
-    pub(super) fn rebase_after_snapshot<P: HookPolicy>(
+    pub(super) fn rebase_after_snapshot(
         &self,
-        runtime: &DatabaseRuntime<P>,
+        runtime: &DatabaseRuntime,
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let _operation = super::lock(&self.operation);
         self.rebase_inner(runtime, after_snapshot)
     }
 
-    fn rebase_inner<P: HookPolicy>(
+    fn rebase_inner(
         &self,
-        runtime: &DatabaseRuntime<P>,
+        runtime: &DatabaseRuntime,
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let space_id = self.database_id.space_id();

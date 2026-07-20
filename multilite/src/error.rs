@@ -3,7 +3,6 @@ use std::fmt;
 use homebase_client::ClientError;
 use homebase_core::messages::KernelError;
 use homebase_core::storage::StorageError;
-use rusqlite::types::{FromSqlError, Type};
 
 use crate::database::PushRejection;
 
@@ -12,7 +11,7 @@ use crate::database::PushRejection;
 pub enum Error {
     /// SQLite rejected an operation. The original error is retained intact.
     Sqlite(rusqlite::Error),
-    /// V1 prepared statements are read-only; writes must use `execute`.
+    /// Prepared statements are read-only; writes must use `execute`.
     PreparedWrite,
     /// The statement uses SQL outside Multilite's current public surface.
     UnsupportedSql(&'static str),
@@ -24,15 +23,6 @@ pub enum Error {
     RefreshPushRejected(PushRejection),
     /// An internal background worker could not be started.
     BackgroundWorker(String),
-    /// A borrowed SQLite value could not be copied into its owned form.
-    ValueConversion(FromSqlError),
-    /// A value did not have the required SQLite storage class.
-    UnexpectedValueType {
-        /// Storage class required by the operation.
-        expected: Type,
-        /// Storage class carried by the value.
-        actual: Type,
-    },
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
     /// Durable Homebase metadata storage failed.
@@ -48,13 +38,6 @@ pub enum Error {
     },
     /// Replica onboarding material has an unknown or malformed encoding.
     InvalidReplicaInvitation,
-    /// The local V1 schema was created by a newer unsupported implementation.
-    UnsupportedV1SchemaVersion {
-        /// Version stored in the local V1 schema ledger.
-        found: u64,
-        /// Newest V1 schema version understood by this implementation.
-        supported: u64,
-    },
     /// Operating-system randomness was unavailable while minting identity.
     Entropy(String),
     /// A Multilite operation was malformed or contradicted its SQL.
@@ -92,15 +75,6 @@ impl fmt::Display for Error {
             Self::BackgroundWorker(message) => {
                 write!(f, "could not start Multilite background worker: {message}")
             }
-            Self::ValueConversion(error) => {
-                write!(f, "could not copy SQLite value: {error}")
-            }
-            Self::UnexpectedValueType { expected, actual } => {
-                write!(
-                    f,
-                    "unexpected SQLite value type: expected {expected}, got {actual}"
-                )
-            }
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
@@ -113,10 +87,6 @@ impl fmt::Display for Error {
                 hex_id(actual)
             ),
             Self::InvalidReplicaInvitation => f.write_str("invalid Multilite replica invitation"),
-            Self::UnsupportedV1SchemaVersion { found, supported } => write!(
-                f,
-                "V1 schema version {found} is newer than supported version {supported}"
-            ),
             Self::Entropy(message) => write!(f, "could not mint database identity: {message}"),
             Self::InvalidMultiliteOp(message) => {
                 write!(f, "invalid Multilite operation: {message}")
@@ -145,14 +115,11 @@ impl std::error::Error for Error {
             | Self::AuthorityRejected(_)
             | Self::RefreshPushRejected(_)
             | Self::BackgroundWorker(_) => None,
-            Self::ValueConversion(error) => Some(error),
-            Self::UnexpectedValueType { .. } => None,
             Self::CaptureInvariant(_) => None,
             Self::Storage(error) => Some(error),
             Self::InvalidDatabase(_)
             | Self::DatabaseIdMismatch { .. }
             | Self::InvalidReplicaInvitation
-            | Self::UnsupportedV1SchemaVersion { .. }
             | Self::Entropy(_)
             | Self::InvalidMultiliteOp(_)
             | Self::RebasePendingSubmissions

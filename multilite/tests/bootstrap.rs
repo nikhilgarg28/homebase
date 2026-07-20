@@ -99,7 +99,7 @@ fn open_rejects_lookalike_internal_schema() {
 }
 
 #[test]
-fn v1_rejects_preexisting_items_after_general_open() {
+fn general_open_adopts_a_preexisting_user_schema() {
     let directory = tempfile::tempdir().unwrap();
     let items_only = directory.path().join("items-only.sqlite");
     Connection::open(&items_only)
@@ -114,10 +114,15 @@ fn v1_rejects_preexisting_items_after_general_open() {
         )
         .unwrap();
 
-    assert!(matches!(
-        MultiliteConnection::open(&items_only),
-        Err(Error::InvalidDatabase(_))
-    ));
+    let database = MultiliteConnection::open(&items_only).unwrap();
+    let mut statement = database.prepare("SELECT count(*) FROM items").unwrap();
+    assert_eq!(
+        statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
+        [0]
+    );
+    drop(statement);
+    drop(database);
+
     let stock = Connection::open(&items_only).unwrap();
     assert!(
         stock
@@ -141,11 +146,21 @@ fn v1_rejects_preexisting_items_after_general_open() {
 }
 
 #[test]
-fn valid_bootstrap_schema_reopens_without_changes_and_is_stock_sqlite_readable() {
+fn general_schema_reopens_without_changes_and_is_stock_sqlite_readable() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database.sqlite");
     {
         let database = MultiliteConnection::open(&path).unwrap();
+        database
+            .execute(
+                "CREATE TABLE items (
+                    collection TEXT NOT NULL,
+                    id BLOB PRIMARY KEY NOT NULL,
+                    payload BLOB NOT NULL
+                )",
+                (),
+            )
+            .unwrap();
         database
             .execute(
                 "INSERT INTO items (collection, id, payload) VALUES (?1, ?2, ?3)",

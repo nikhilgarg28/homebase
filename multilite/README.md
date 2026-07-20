@@ -25,9 +25,8 @@ be pushed before rebase. `pull()` may capture admissions at any time, but
 `rebase()` applies them only after the submit log is empty and treats admitted
 empty markers as materialization no-ops. Range-assert conflicts are decided
 exclusively by the server during push.
-The general `Database` owns this SQL gate and reserved namespace. The
-temporary V1 layer only initializes and validates its `items` representation
-and captures inserts into that table.
+The general database owns this SQL gate, reserved namespace, schema catalog,
+and row capture. Multilite does not create or require a built-in user table.
 
 Each translated table creation contains immutable UUID identities for its
 table, schema revision, row keyspace, and columns, plus the exact SQL. Its
@@ -47,14 +46,12 @@ write-revision cells. Accepted foreign rows replay by stable IDs through the
 local schema catalog; rejected local rows are deleted by the pending journal in
 the same transaction that rolls back the Homebase submit window.
 
-`MultiliteConnection::open` is the single file-lifecycle verb. Internally it
-first opens and commits a general Multilite database containing identity and
-Homebase metadata, then a temporary V1 wrapper initializes or validates its
-own local schema in a separate resumable transaction. A crash or V1 migration
-failure can leave valid general state without V1 tables; the next open retains
-the same database and device identities and retries V1 from its recorded
-version. The wrapper is intended to disappear as general Multilite absorbs the
-supported SQL surface.
+`Connection::open` is the single file-lifecycle verb;
+`MultiliteConnection` remains an alias for compatibility. Open initializes or
+validates database identity, Homebase metadata, the pending-effects journal,
+and the schema catalog in one general implementation path. Existing SQLite
+user tables are preserved and remain readable. Inserts into an adopted table
+are rejected until that table has a synchronized schema identity.
 
 A new database without options mints a public `DatabaseId` and local device
 identity. Another replica is initialized by passing the first file's opaque,
@@ -84,26 +81,21 @@ into tables created through Multilite participate in every synchronization
 policy; adopted tables without durable schema identities are rejected by the
 row pipeline.
 
-V1 invitations and space envelopes are plaintext scaffolding. The stable API
+Current invitations and space envelopes are plaintext scaffolding. The API
 is designed for a later encrypted default: a fresh open will mint the final
 Homebase name and value keys, derive `DatabaseId` from the name key, and retain
 the envelope locally. The invitation format can then carry or unlock that
-envelope without changing `open` or `OpenOptions`. See the V1 plan's opening
-and identity evolution section for the intended key-provider and sync path.
+envelope without changing `open` or `OpenOptions`.
 
 Multilite re-exports rusqlite's `params`, `Params`, `ToSql`, `FromSql`, `Type`,
 `Value`, and `ValueRef` interfaces. Applications can therefore use the normal
 SQLite parameter and conversion ecosystem rather than translating through a
 Multilite-specific value model.
 
-V1 item identities use a versioned, length-delimited canonical frame. Their
-Homebase keys are fixed namespace components plus a domain-separated SHA-256
-digest, so empty or large SQLite keys do not inherit Homebase component limits.
-
-V1 uses SQLite's preupdate hook to capture inserted values before a statement
-commits. Rusqlite enables that API through build-time bindings, so the current
-Rust build requires libclang; packaging may revisit that tradeoff before the
-first supported release.
+Multilite uses SQLite's preupdate hook to capture inserted values before a
+statement commits. Rusqlite enables that API through build-time bindings, so
+the current Rust build requires libclang; packaging may revisit that tradeoff
+before the first supported release.
 
 Homebase client state is stored in the same SQLite file under
 `__multilite__meta`.
@@ -121,11 +113,7 @@ that is already running on the owning thread. Range scans eagerly own their
 snapshot and retain neither a SQLite statement nor the connection lock.
 Consecutive metadata puts and deletes are issued as bounded multi-row SQL
 statements while preserving the original `WriteBatch` operation order.
-V1 separately owns `__multilite__v1_schema`, a one-row local migration ledger.
-Absence of that table means V1 version zero. Migration `0 -> 1` creates both
-the ledger and `items` atomically; a committed general database therefore
-remains safely retryable if V1 initialization has not happened yet. The
-`__multilite__` table namespace is reserved for library-owned state.
+The `__multilite__` table namespace is reserved for library-owned state.
 
 See the [monorepo README](../README.md) and
-[V1 plan](../MULTILITE_V1.md) for the current architecture and build sequence.
+[design notes](../DESIGN.md) for the current architecture and build sequence.

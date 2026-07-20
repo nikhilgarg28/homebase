@@ -154,7 +154,7 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
     assert!(db.prepare("SELECT value FROM __multilite__meta").is_err());
     assert!(
         db.execute(
-            "INSERT INTO __multilite__v1_schema (singleton, version) VALUES (1, 99)",
+            "INSERT INTO __multilite__schema (schema_name, table_name) VALUES ('main', x'01')",
             (),
         )
         .is_err()
@@ -180,7 +180,7 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
         .unwrap();
     assert_eq!(
         statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
-        [4]
+        [3]
     );
 }
 

@@ -1,29 +1,27 @@
-//! Temporary V1 connection wrapper over the general Multilite database.
+//! Public SQLite-shaped connection over the general Multilite database.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use homebase_client::ServerHandle;
 
-use super::hooks::V1Hooks;
-use super::schema;
-use crate::database::{
+use super::{
     Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
     PushRejection, ReplicaInvitation, Statement,
 };
 use crate::{Params, Result};
 
-/// A V1-format connection layered over a general Multilite database.
+/// An opened Multilite database connection.
 pub struct Connection<H = OfflineServer>
 where
     H: ServerHandle + Send + Sync + 'static,
 {
     database: Arc<Database<H>>,
-    runtime: Arc<DatabaseRuntime<V1Hooks>>,
+    runtime: Arc<DatabaseRuntime>,
 }
 
 impl Connection<OfflineServer> {
-    /// Open general database state, then initialize or validate V1 locally.
+    /// Open or initialize a local Multilite database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let database = Database::open(path)?;
         Self::finish_open(database)
@@ -31,15 +29,14 @@ impl Connection<OfflineServer> {
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
-    /// Open with general options, then initialize or validate V1 locally.
+    /// Open with explicit identity, authority, and synchronization options.
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Self> {
         let database = Database::open_with(path, options)?;
         Self::finish_open(database)
     }
 
     fn finish_open(database: Arc<Database<H>>) -> Result<Self> {
-        schema::open(&database)?;
-        let runtime = Arc::new(database.runtime(V1Hooks)?);
+        let runtime = Arc::new(database.runtime()?);
         database.start_background_push()?;
         Ok(Self { database, runtime })
     }
@@ -60,7 +57,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
     }
 
     /// Synchronization behavior selected when this connection was opened.
-    pub fn sync_policy(&self) -> crate::SyncPolicy {
+    pub fn sync_policy(&self) -> super::SyncPolicy {
         self.database.sync_policy()
     }
 
@@ -84,10 +81,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.rebase(&self.runtime)
     }
 
-    /// Execute one SQLite statement directly.
+    /// Execute one supported mutating SQLite statement.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
-        let (changed, _captured) = self.database.execute(&self.runtime, sql, params)?;
-        Ok(changed)
+        self.database.execute(&self.runtime, sql, params)
     }
 
     /// Prepare one read-only statement.

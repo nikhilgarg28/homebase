@@ -2,6 +2,7 @@
 
 mod catalog;
 mod codes;
+mod connection;
 mod operation;
 mod pending;
 mod policy;
@@ -24,7 +25,7 @@ use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq};
 use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection as SqliteConnection, Row};
 
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
@@ -36,6 +37,7 @@ use self::policy::{PolicyState, PushScheduler};
 use self::row::{CapturedRow, InsertRows, StoredValue};
 use self::store::DatabaseMetaStore;
 
+pub use self::connection::Connection;
 pub use self::policy::SyncPolicy;
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
@@ -226,25 +228,15 @@ impl<H: ServerHandle> OpenOptions<H> {
 
 pub(crate) type DatabaseClient<H> =
     Client<DatabaseMetaStore, H, SystemHybridClock, SystemNonceSource>;
-pub(crate) type DatabaseRuntime<P> = RuntimeConnection<DatabaseHooks<P>>;
+pub(crate) type DatabaseRuntime = RuntimeConnection<DatabaseHooks>;
 
-pub(crate) struct DatabaseHooks<P> {
-    format: P,
-}
+pub(crate) struct DatabaseHooks;
 
-pub(crate) struct DatabaseEvent<E> {
-    format: Option<E>,
-    inserted: Option<CapturedRow>,
-}
-
-impl<P: HookPolicy> HookPolicy for DatabaseHooks<P> {
-    type Event = DatabaseEvent<P::Event>;
+impl HookPolicy for DatabaseHooks {
+    type Event = CapturedRow;
 
     fn authorize(&mut self, mode: ExecutionMode, context: AuthContext<'_>) -> Authorization {
-        match authorize_database(mode, &context) {
-            Authorization::Allow => self.format.authorize(mode, context),
-            decision => decision,
-        }
+        authorize_database(mode, &context)
     }
 
     fn preupdate(
@@ -254,13 +246,7 @@ impl<P: HookPolicy> HookPolicy for DatabaseHooks<P> {
         table: &str,
         update: &PreUpdateCase,
     ) -> Result<Option<Self::Event>> {
-        let format = self.format.preupdate(mode, database, table, update)?;
-        let inserted = capture_insert(mode, database, table, update)?;
-        if format.is_none() && inserted.is_none() {
-            Ok(None)
-        } else {
-            Ok(Some(DatabaseEvent { format, inserted }))
-        }
+        capture_insert(mode, database, table, update)
     }
 }
 
@@ -301,7 +287,7 @@ fn capture_insert(
     }))
 }
 
-/// An opened general Multilite database, without a temporary format wrapper.
+/// An opened general Multilite database.
 pub(crate) struct Database<H: ServerHandle> {
     owner: ConnectionOwner,
     database_id: DatabaseId,
@@ -352,16 +338,16 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self.client.device().0
     }
 
-    pub(crate) fn runtime<P: HookPolicy>(&self, format: P) -> Result<DatabaseRuntime<P>> {
-        RuntimeConnection::new(self.owner.clone(), DatabaseHooks { format })
+    pub(crate) fn runtime(&self) -> Result<DatabaseRuntime> {
+        RuntimeConnection::new(self.owner.clone(), DatabaseHooks)
     }
 
-    pub(crate) fn execute<P: HookPolicy, Q: Params>(
+    pub(crate) fn execute<Q: Params>(
         &self,
-        runtime: &DatabaseRuntime<P>,
+        runtime: &DatabaseRuntime,
         sql: &str,
         params: Q,
-    ) -> Result<(usize, Vec<P::Event>)> {
+    ) -> Result<usize> {
         let validated = sql::validate_execute(sql)?;
         let _operation = lock(&self.operation);
         let result = match validated {
@@ -475,13 +461,13 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Err(Error::AuthorityRejected(error))
     }
 
-    fn execute_create_table<P: HookPolicy, Q: Params>(
+    fn execute_create_table<Q: Params>(
         &self,
-        runtime: &DatabaseRuntime<P>,
+        runtime: &DatabaseRuntime,
         sql: &str,
         params: Q,
         table: schema::CreateTableSpec,
-    ) -> Result<(usize, Vec<P::Event>)> {
+    ) -> Result<usize> {
         let operation = MultiliteOp::create_table(sql, table);
         let MultiliteOp::CreateTable(created) = &operation else {
             unreachable!("create-table constructor returned another operation")
@@ -500,7 +486,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         })?;
         let (mutations, assertions) = operation.to_homebase()?.at(upto);
 
-        let (changed, events) = runtime.run(ExecutionMode::Public, |connection| {
+        let (changed, _) = runtime.run(ExecutionMode::Public, |connection| {
             let changed = connection.execute(sql, params)?;
             runtime.with_internal_metadata(|| {
                 catalog::insert(connection, created)?;
@@ -511,15 +497,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             })?;
             Ok(changed)
         })?;
-        Ok((changed, format_events(events)))
+        Ok(changed)
     }
 
-    fn execute_insert<P: HookPolicy, Q: Params>(
+    fn execute_insert<Q: Params>(
         &self,
-        runtime: &DatabaseRuntime<P>,
+        runtime: &DatabaseRuntime,
         sql: &str,
         params: Q,
-    ) -> Result<(usize, Vec<P::Event>)> {
+    ) -> Result<usize> {
         let (space, upto) = block_on(async {
             let space = self.client.space(self.database_id.space_id()).await?;
             let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
@@ -533,24 +519,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             Ok::<_, Error>((space, upto))
         })?;
 
-        let (changed, events) = runtime.run_captured(
+        let (changed, _) = runtime.run_captured(
             ExecutionMode::Public,
             |connection| Ok(connection.execute(sql, params)?),
             |connection, events| {
-                let captured = events
-                    .iter()
-                    .filter_map(|event| event.inserted.clone())
-                    .collect::<Vec<_>>();
-                let Some(inserted) = InsertRows::from_captured(connection, &captured)? else {
-                    let handled_by_temporary_format = !captured.is_empty()
-                        && events
-                            .iter()
-                            .filter(|event| event.inserted.is_some())
-                            .all(|event| event.format.is_some());
-                    if captured.is_empty()
-                        || (self.policy.policy() == SyncPolicy::LocalOnly
-                            && handled_by_temporary_format)
-                    {
+                let Some(inserted) = InsertRows::from_captured(connection, events)? else {
+                    if events.is_empty() {
                         return Ok(());
                     }
                     return Err(Error::UnsupportedSql(
@@ -567,12 +541,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 })
             },
         )?;
-        Ok((changed, format_events(events)))
+        Ok(changed)
     }
 
-    pub(crate) fn prepare<P: HookPolicy>(
+    pub(crate) fn prepare(
         self: &Arc<Self>,
-        runtime: &Arc<DatabaseRuntime<P>>,
+        runtime: &Arc<DatabaseRuntime>,
         sql: &str,
     ) -> Result<Statement> {
         let _operation = lock(&self.operation);
@@ -595,16 +569,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> T) -> T {
+    pub(crate) fn with_connection<T>(&self, operation: impl FnOnce(&SqliteConnection) -> T) -> T {
         self.owner.with_connection(operation)
-    }
-
-    pub(crate) fn with_savepoint<T>(
-        &self,
-        prefix: &str,
-        operation: impl FnOnce(&Connection) -> Result<T>,
-    ) -> Result<T> {
-        self.owner.with_savepoint(prefix, operation)
     }
 
     fn submit_cursors(&self) -> Result<OplogCursors> {
@@ -612,7 +578,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
-    fn refresh_read_locked<P: HookPolicy>(&self, runtime: &DatabaseRuntime<P>) -> Result<()> {
+    fn refresh_read_locked(&self, runtime: &DatabaseRuntime) -> Result<()> {
         if !self.policy.read_requires_refresh() {
             return Ok(());
         }
@@ -700,13 +666,6 @@ fn has_multilite_prefix(table: &str) -> bool {
     table
         .get(.."__multilite__".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
-}
-
-fn format_events<E>(events: Vec<DatabaseEvent<E>>) -> Vec<E> {
-    events
-        .into_iter()
-        .filter_map(|event| event.format)
-        .collect()
 }
 
 /// A read-only prepared statement owned by a Multilite database.
@@ -855,7 +814,7 @@ enum DatabaseState {
     Initialized,
 }
 
-fn classify(connection: &Connection) -> Result<DatabaseState> {
+fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let metadata = SqliteOrderedStore::is_initialized(connection)?;
     let pending = pending::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
@@ -910,8 +869,6 @@ mod tests {
 
     use super::*;
 
-    struct NoopFormat;
-
     struct ThreadSpawner;
 
     impl Spawner for ThreadSpawner {
@@ -932,24 +889,6 @@ mod tests {
 
     fn router(server: Arc<TestServer>) -> impl Fn(&SpaceId) -> Option<SpaceHandle> + Sync {
         move |space| server.space(space)
-    }
-
-    impl HookPolicy for NoopFormat {
-        type Event = ();
-
-        fn authorize(&mut self, _mode: ExecutionMode, _context: AuthContext<'_>) -> Authorization {
-            Authorization::Allow
-        }
-
-        fn preupdate(
-            &mut self,
-            _mode: ExecutionMode,
-            _database: &str,
-            _table: &str,
-            _update: &PreUpdateCase,
-        ) -> Result<Option<Self::Event>> {
-            Ok(None)
-        }
     }
 
     fn client_state<H: ServerHandle + Send + Sync + 'static>(
@@ -1001,7 +940,7 @@ mod tests {
     }
 
     fn stock_user_schema(path: &Path) -> Vec<(String, String)> {
-        let connection = Connection::open(path).unwrap();
+        let connection = SqliteConnection::open(path).unwrap();
         let mut statement = connection
             .prepare(
                 "SELECT name, sql FROM sqlite_schema
@@ -1109,7 +1048,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database.start_background_push().unwrap();
 
         database
@@ -1135,7 +1074,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
 
         database
             .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
@@ -1158,7 +1097,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(first.database_id().space_id()));
-        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
         first
             .execute(
                 &first_runtime,
@@ -1176,7 +1115,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime().unwrap();
         let error = second
             .execute(
                 &second_runtime,
@@ -1207,7 +1146,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(
                 &runtime,
@@ -1226,7 +1165,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(
                 &runtime,
@@ -1253,7 +1192,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(source.database_id().space_id()));
-        let source_runtime = source.runtime(NoopFormat).unwrap();
+        let source_runtime = source.runtime().unwrap();
         source
             .execute(
                 &source_runtime,
@@ -1270,7 +1209,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let runtime = Arc::new(replica.runtime(NoopFormat).unwrap());
+        let runtime = Arc::new(replica.runtime().unwrap());
         let mut statement = replica
             .prepare(
                 &runtime,
@@ -1299,7 +1238,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(source.database_id().space_id()));
-        let source_runtime = source.runtime(NoopFormat).unwrap();
+        let source_runtime = source.runtime().unwrap();
         source
             .execute(
                 &source_runtime,
@@ -1319,7 +1258,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let replica_runtime = Arc::new(replica.runtime(NoopFormat).unwrap());
+        let replica_runtime = Arc::new(replica.runtime().unwrap());
         let mut tables = replica
             .prepare(
                 &replica_runtime,
@@ -1363,7 +1302,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(
                 &runtime,
@@ -1382,7 +1321,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
+        let runtime = Arc::new(database.runtime().unwrap());
         let mut statement = database.prepare(&runtime, "SELECT 1").unwrap();
 
         assert_eq!(
@@ -1407,7 +1346,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(first.database_id().space_id()));
-        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
         first
             .execute(
                 &first_runtime,
@@ -1425,7 +1364,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime().unwrap();
         second
             .execute(
                 &second_runtime,
@@ -1444,7 +1383,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = Arc::new(second.runtime(NoopFormat).unwrap());
+        let second_runtime = Arc::new(second.runtime().unwrap());
         let mut statement = second.prepare(&second_runtime, "SELECT 1").unwrap();
 
         let error = statement
@@ -1471,16 +1410,15 @@ mod tests {
         let path = directory.path().join("captured-schema.sqlite");
         let database = Database::open(&path).unwrap();
         let database_id = database.database_id();
-        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
+        let runtime = Arc::new(database.runtime().unwrap());
 
-        let (_changed, captured) = database
+        database
             .execute(
                 &runtime,
                 "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
                 (),
             )
             .unwrap();
-        assert!(captured.is_empty());
         assert!(table_exists(&database, "notes"));
 
         let state = client_state(&database);
@@ -1536,7 +1474,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("atomic-schema.sqlite")).unwrap();
         let database_id = database.database_id();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database.with_connection(|connection| {
             connection
                 .execute_batch(
@@ -1573,7 +1511,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("atomic-pending.sqlite")).unwrap();
         let database_id = database.database_id();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database.with_connection(|connection| {
             connection
                 .execute_batch(
@@ -1615,7 +1553,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
             .unwrap();
@@ -1651,7 +1589,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let source_runtime = source.runtime(NoopFormat).unwrap();
+        let source_runtime = source.runtime().unwrap();
 
         source
             .execute(
@@ -1716,7 +1654,7 @@ mod tests {
     fn empty_rebase_is_an_idempotent_local_noop() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("empty-rebase.sqlite")).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         let before = client_state(&database);
 
         database.rebase(&runtime).unwrap();
@@ -1727,7 +1665,7 @@ mod tests {
     fn rebase_rejects_pending_submission_even_without_fetched_admissions() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("pending-rebase.sqlite")).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
             .unwrap();
@@ -1759,8 +1697,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let source_runtime = source.runtime(NoopFormat).unwrap();
-        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        let source_runtime = source.runtime().unwrap();
+        let replica_runtime = replica.runtime().unwrap();
         source
             .execute(
                 &source_runtime,
@@ -1813,8 +1751,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
@@ -1884,8 +1822,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
@@ -1925,7 +1863,7 @@ mod tests {
             OpenOptions::new().server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime().unwrap();
         assert!(table_exists(&second, "NOTES"));
         assert_eq!(pending_ops(&second).len(), 1);
         let PushOutcome::Rejected(after_restart) = second.push().unwrap() else {
@@ -1944,7 +1882,7 @@ mod tests {
             OpenOptions::new().server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime().unwrap();
         let state = client_state(&second);
         let space = &state.spaces[&second.database_id().space_id()];
         assert_eq!(space.cursors.neck, DeviceSeq(2));
@@ -1968,7 +1906,7 @@ mod tests {
             OpenOptions::new().server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime().unwrap();
         second.pull().unwrap();
         second.rebase(&second_runtime).unwrap();
         assert!(table_exists(&second, "notes"));
@@ -2017,7 +1955,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        let replica_runtime = replica.runtime().unwrap();
         let malformed_key = Key::from_bytes([b"malformed".as_slice()]).unwrap();
         block_on(async {
             source
@@ -2063,7 +2001,7 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let replica_runtime = replica.runtime(NoopFormat).unwrap();
+        let replica_runtime = replica.runtime().unwrap();
         submit_direct(&source, &create_operation("first_remote"));
         submit_direct(&source, &create_operation("occupied"));
         assert_eq!(source.push().unwrap(), PushOutcome::Drained);
@@ -2101,8 +2039,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
@@ -2204,8 +2142,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
@@ -2270,8 +2208,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
@@ -2332,7 +2270,7 @@ mod tests {
     fn unavailable_push_preserves_the_active_pending_window() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("offline.sqlite")).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
             .unwrap();
@@ -2359,7 +2297,7 @@ mod tests {
         )
         .unwrap();
         assert!(server.create_space(database.database_id().space_id()));
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
             .unwrap();
@@ -2387,7 +2325,7 @@ mod tests {
         drop(runtime);
         drop(database);
 
-        Connection::open(&path)
+        SqliteConnection::open(&path)
             .unwrap()
             .execute_batch("DROP TRIGGER reject_pending_cleanup")
             .unwrap();
@@ -2420,7 +2358,7 @@ mod tests {
     fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("sql-surface.sqlite")).unwrap();
-        let runtime = Arc::new(database.runtime(NoopFormat).unwrap());
+        let runtime = Arc::new(database.runtime().unwrap());
 
         assert!(matches!(
             database.execute(
@@ -2507,7 +2445,7 @@ mod tests {
     fn general_open_adopts_an_existing_sqlite_schema() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("existing.sqlite");
-        Connection::open(&path)
+        SqliteConnection::open(&path)
             .unwrap()
             .execute_batch("CREATE TABLE application_data (id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -2539,7 +2477,7 @@ mod tests {
     fn general_open_rejects_unrecognized_metadata_namespace_tables() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reserved.sqlite");
-        Connection::open(&path)
+        SqliteConnection::open(&path)
             .unwrap()
             .execute_batch("CREATE TABLE __multilite__meta_future (value BLOB NOT NULL)")
             .unwrap();
@@ -2557,7 +2495,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rows.sqlite");
         let database = Database::open(&path).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(
                 &runtime,
@@ -2635,7 +2573,7 @@ mod tests {
     fn long_primary_key_succeeds_and_oversized_key_rolls_back_before_submission() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("large-key.sqlite")).unwrap();
-        let runtime = database.runtime(NoopFormat).unwrap();
+        let runtime = database.runtime().unwrap();
         database
             .execute(
                 &runtime,
@@ -2651,8 +2589,7 @@ mod tests {
                     "INSERT INTO notes VALUES (?1)",
                     rusqlite::params![longest],
                 )
-                .unwrap()
-                .0,
+                .unwrap(),
             1
         );
         let pending_before = pending_ops(&database);
@@ -2696,8 +2633,8 @@ mod tests {
                 .server(router(Arc::clone(&server))),
         )
         .unwrap();
-        let first_runtime = first.runtime(NoopFormat).unwrap();
-        let second_runtime = second.runtime(NoopFormat).unwrap();
+        let first_runtime = first.runtime().unwrap();
+        let second_runtime = second.runtime().unwrap();
 
         first
             .execute(
