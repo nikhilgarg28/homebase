@@ -47,19 +47,7 @@ impl HomebaseTransaction {
 }
 
 impl MultiliteTransaction {
-    /// Wrap the current one-statement write path as a one-operation transaction.
-    pub fn one(operation: MultiliteOp) -> Self {
-        Self {
-            id: TransactionId(Uuid::new_v4().into_bytes()),
-            operations: vec![operation],
-        }
-    }
-
     /// Mint one transaction containing the supplied ordered operations.
-    #[allow(
-        dead_code,
-        reason = "used by the managed multi-statement transaction batch"
-    )]
     pub fn new(operations: Vec<MultiliteOp>) -> Result<Self> {
         if operations.is_empty() {
             return Err(Error::InvalidMultiliteTransaction(

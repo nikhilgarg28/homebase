@@ -499,7 +499,7 @@ mod tests {
     }
 
     fn transaction(operation: MultiliteOp) -> MultiliteTransaction {
-        MultiliteTransaction::one(operation)
+        MultiliteTransaction::new(vec![operation]).unwrap()
     }
 
     #[test]

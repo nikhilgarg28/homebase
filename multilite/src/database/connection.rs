@@ -7,9 +7,10 @@ use homebase_client::ServerHandle;
 
 use super::{
     Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
-    PushRejection, ReplicaInvitation, Statement,
+    PushRejection, ReplicaInvitation, Statement, UpdateTransaction, ViewTransaction,
 };
 use crate::{Params, Result};
+use rusqlite::Row;
 
 /// An opened Multilite database connection.
 pub struct Connection<H = OfflineServer>
@@ -84,6 +85,37 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
     /// Execute one supported mutating SQLite statement.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
         self.database.execute(&self.runtime, sql, params)
+    }
+
+    /// Run a closure inside one refreshed, read-only SQLite snapshot.
+    pub fn view<T>(&self, operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>) -> Result<T> {
+        self.database.view(&self.runtime, operation)
+    }
+
+    /// Run a closure as one SQLite and Homebase transaction.
+    pub fn update<T>(
+        &self,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
+        self.database.update(&self.runtime, operation)
+    }
+
+    /// Execute one read-only statement as an implicit managed view.
+    pub fn query<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.view(|transaction| transaction.query(sql, params, map))
+    }
+
+    /// Alias matching rusqlite's mapped-query vocabulary.
+    pub fn query_map<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.query(sql, params, map)
     }
 
     /// Prepare one read-only statement.

@@ -12,6 +12,8 @@ mod schema;
 mod sql;
 mod store;
 mod transaction;
+mod update;
+mod view;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -33,14 +35,14 @@ use crate::metastore::SqliteOrderedStore;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
-use self::operation::MultiliteOp;
 use self::policy::{PolicyState, PushScheduler};
-use self::row::{CapturedRow, InsertRows, StoredValue};
+use self::row::{CapturedRow, StoredValue};
 use self::store::DatabaseMetaStore;
-use self::transaction::MultiliteTransaction;
 
 pub use self::connection::Connection;
 pub use self::policy::SyncPolicy;
+pub use self::update::UpdateTransaction;
+pub use self::view::{TransactionStatement, ViewTransaction};
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -351,24 +353,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         params: Q,
     ) -> Result<usize> {
         let validated = sql::validate_execute(sql)?;
-        let _operation = lock(&self.operation);
-        let result = match validated {
-            sql::ValidatedExecute::Insert => self.execute_insert(runtime, sql, params),
-            sql::ValidatedExecute::CreateTable(table) => {
-                if self.policy.policy() == SyncPolicy::Remote {
-                    self.drain_remote_queue()?;
-                }
-                self.execute_create_table(runtime, sql, params, table)
-            }
-        };
-
-        let result = result?;
-        match self.policy.policy() {
-            SyncPolicy::LocalOnly => {}
-            SyncPolicy::LocalFirst { write_delay, .. } => self.scheduler.schedule(write_delay),
-            SyncPolicy::Remote => self.finish_remote_write()?,
-        }
-        Ok(result)
+        self.update(runtime, |update| {
+            update.execute_validated(sql, params, validated)
+        })
     }
 
     pub(crate) fn push(&self) -> Result<PushOutcome> {
@@ -439,13 +426,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(PullOutcome { through })
     }
 
-    fn drain_remote_queue(&self) -> Result<()> {
-        match self.push_locked()? {
-            PushOutcome::Drained => Ok(()),
-            PushOutcome::Rejected(rejection) => self.repair_remote_rejection(rejection),
-        }
-    }
-
     fn finish_remote_write(&self) -> Result<()> {
         match self.push_locked()? {
             PushOutcome::Drained => Ok(()),
@@ -463,94 +443,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Err(Error::AuthorityRejected(error))
     }
 
-    fn execute_create_table<Q: Params>(
-        &self,
-        runtime: &DatabaseRuntime,
-        sql: &str,
-        params: Q,
-        table: schema::CreateTableSpec,
-    ) -> Result<usize> {
-        let transaction = MultiliteTransaction::one(MultiliteOp::create_table(sql, table));
-        let MultiliteOp::CreateTable(created) = &transaction.operations()[0] else {
-            unreachable!("create-table constructor returned another operation")
-        };
-        let (space, upto) = block_on(async {
-            let space = self.client.space(self.database_id.space_id()).await?;
-            let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
-            let upto = AdmissionSeq(
-                cursors
-                    .neck
-                    .0
-                    .checked_sub(1)
-                    .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
-            );
-            Ok::<_, Error>((space, upto))
-        })?;
-        let (mutations, assertions) = transaction.to_homebase()?.at(upto);
-
-        let (changed, _) = runtime.run(ExecutionMode::Public, |connection| {
-            let changed = connection.execute(sql, params)?;
-            runtime.with_internal_metadata(|| {
-                catalog::insert(connection, created)?;
-                let submission = block_on(space.submit_unchecked(mutations, assertions))
-                    .map_err(ClientError::from)?;
-                pending::insert(connection, submission.seq, &transaction)?;
-                Ok(())
-            })?;
-            Ok(changed)
-        })?;
-        Ok(changed)
-    }
-
-    fn execute_insert<Q: Params>(
-        &self,
-        runtime: &DatabaseRuntime,
-        sql: &str,
-        params: Q,
-    ) -> Result<usize> {
-        let (space, upto) = block_on(async {
-            let space = self.client.space(self.database_id.space_id()).await?;
-            let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
-            let upto = AdmissionSeq(
-                cursors
-                    .neck
-                    .0
-                    .checked_sub(1)
-                    .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
-            );
-            Ok::<_, Error>((space, upto))
-        })?;
-
-        let (changed, _) = runtime.run_captured(
-            ExecutionMode::Public,
-            |connection| Ok(connection.execute(sql, params)?),
-            |connection, events| {
-                let Some(inserted) = InsertRows::from_captured(connection, events)? else {
-                    if events.is_empty() {
-                        return Ok(());
-                    }
-                    return Err(Error::UnsupportedSql(
-                        "INSERT target has no synchronized schema identity",
-                    ));
-                };
-                let transaction = MultiliteTransaction::one(MultiliteOp::InsertRows(inserted));
-                let (mutations, assertions) = transaction.to_homebase()?.at(upto);
-                runtime.with_internal_metadata(|| {
-                    let submission = block_on(space.submit_unchecked(mutations, assertions))
-                        .map_err(ClientError::from)?;
-                    pending::insert(connection, submission.seq, &transaction)?;
-                    Ok(())
-                })
-            },
-        )?;
-        Ok(changed)
-    }
-
     pub(crate) fn prepare(
         self: &Arc<Self>,
         runtime: &Arc<DatabaseRuntime>,
         sql: &str,
     ) -> Result<Statement> {
+        sql::validate_managed_statement(sql)?;
         let _operation = lock(&self.operation);
         runtime.run(ExecutionMode::Public, |connection| {
             let statement = connection.prepare(sql)?;
@@ -687,17 +585,26 @@ impl Statement {
     {
         let _operation = lock(&self.operation);
         (self.refresh)()?;
-        self.owner.with_connection(|connection| {
-            let mut statement = connection.prepare(&self.sql)?;
-            if !statement.readonly() {
-                return Err(Error::PreparedWrite);
-            }
-            statement
-                .query_map(params, map)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })
+        self.owner
+            .with_savepoint("__multilite__statement_view", |connection| {
+                pin_snapshot(connection)?;
+                let mut statement = connection.prepare(&self.sql)?;
+                if !statement.readonly() {
+                    return Err(Error::PreparedWrite);
+                }
+                statement
+                    .query_map(params, map)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
     }
+}
+
+fn pin_snapshot(connection: &SqliteConnection) -> Result<()> {
+    let _: i64 = connection.query_row("SELECT count(*) FROM main.sqlite_schema", (), |row| {
+        row.get(0)
+    })?;
+    Ok(())
 }
 
 fn open_on<H: ServerHandle + Send + Sync + 'static>(
@@ -869,6 +776,8 @@ mod tests {
     use rusqlite::OptionalExtension;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
+    use super::operation::MultiliteOp;
+    use super::transaction::MultiliteTransaction;
     use super::*;
 
     struct ThreadSpawner;
@@ -983,7 +892,8 @@ mod tests {
         database: &Database<H>,
         operation: &MultiliteOp,
     ) {
-        let (mutations, assertions) = MultiliteTransaction::one(operation.clone())
+        let (mutations, assertions) = MultiliteTransaction::new(vec![operation.clone()])
+            .unwrap()
             .to_homebase()
             .unwrap()
             .at(AdmissionSeq(0));
@@ -1103,15 +1013,6 @@ mod tests {
         .unwrap();
         assert!(server.create_space(first.database_id().space_id()));
         let first_runtime = first.runtime().unwrap();
-        first
-            .execute(
-                &first_runtime,
-                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
-                (),
-            )
-            .unwrap();
-        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
-
         let second = Database::open_with(
             directory.path().join("loser.sqlite"),
             OpenOptions::new()
@@ -1122,11 +1023,19 @@ mod tests {
         .unwrap();
         let second_runtime = second.runtime().unwrap();
         let error = second
-            .execute(
-                &second_runtime,
-                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
-                (),
-            )
+            .update(&second_runtime, |update| {
+                update.execute(
+                    "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
+                    (),
+                )?;
+                first.execute(
+                    &first_runtime,
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                    (),
+                )?;
+                assert_eq!(first.push()?, PushOutcome::Drained);
+                Ok(())
+            })
             .unwrap_err();
 
         assert!(matches!(
@@ -1229,6 +1138,91 @@ mod tests {
             ["notes"]
         );
         assert!(table_exists(&replica, "notes"));
+    }
+
+    #[test]
+    fn managed_view_and_update_refresh_once_then_keep_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let source = Database::open_with(
+            directory.path().join("snapshot-source.sqlite"),
+            OpenOptions::new()
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(source.database_id().space_id()));
+        let source_runtime = source.runtime().unwrap();
+        source
+            .update(&source_runtime, |update| {
+                update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
+                update.execute("INSERT INTO notes VALUES (1)", ())?;
+                Ok(())
+            })
+            .unwrap();
+
+        let replica = Database::open_with(
+            directory.path().join("snapshot-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(source.replica_invitation())
+                .sync_policy(SyncPolicy::Remote)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let replica_runtime = replica.runtime().unwrap();
+        let count = |rows: Vec<i64>| rows.into_iter().next().unwrap();
+
+        let observed = replica
+            .view(&replica_runtime, |view| {
+                let before = count(
+                    view.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
+                );
+                source.execute(&source_runtime, "INSERT INTO notes VALUES (2)", ())?;
+                let after = count(
+                    view.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
+                );
+                Ok((before, after))
+            })
+            .unwrap();
+        assert_eq!(observed, (1, 1));
+        assert_eq!(
+            replica
+                .view(&replica_runtime, |view| {
+                    view.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                })
+                .unwrap(),
+            [2]
+        );
+
+        let observed = replica
+            .update(&replica_runtime, |update| {
+                let before = count(
+                    update.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
+                );
+                source.execute(&source_runtime, "INSERT INTO notes VALUES (3)", ())?;
+                let after_remote = count(update.query(
+                    "SELECT count(*) FROM notes",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )?);
+                update.execute("INSERT INTO notes VALUES (4)", ())?;
+                let after_local = count(
+                    update.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
+                );
+                Ok((before, after_remote, after_local))
+            })
+            .unwrap();
+        assert_eq!(observed, (2, 2, 3));
+        assert_eq!(
+            replica
+                .view(&replica_runtime, |view| {
+                    view.query("SELECT id FROM notes ORDER BY id", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .unwrap(),
+            [1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -1545,6 +1539,175 @@ mod tests {
             space.cursors,
             homebase_client::meta::OplogCursors::default()
         );
+        assert!(space.oplog.is_empty());
+    }
+
+    #[test]
+    fn serialized_update_is_one_sqlite_unit_submission_pending_record_and_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let database = Database::open_with(
+            directory.path().join("serialized-update.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(database.database_id.space_id()));
+        let replica = Database::open_with(
+            directory.path().join("serialized-update-replica.sqlite"),
+            OpenOptions::new()
+                .invitation(database.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let runtime = database.runtime().unwrap();
+        let replica_runtime = replica.runtime().unwrap();
+
+        let changed = database
+            .update(&runtime, |update| {
+                Ok([
+                    update.execute(
+                        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                        (),
+                    )?,
+                    update.execute("INSERT INTO notes VALUES (1, 'one')", ())?,
+                    update.execute("INSERT INTO notes VALUES (2, 'two')", ())?,
+                ])
+            })
+            .unwrap();
+        assert_eq!(changed, [1, 1, 1]);
+
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id.space_id()];
+        assert_eq!(space.cursors.tail, DeviceSeq(2));
+        assert_eq!(space.oplog.len(), 1);
+        let DeviceOp::Commit {
+            entries,
+            range_asserts,
+            ..
+        } = &space.oplog[&DeviceSeq(1)]
+        else {
+            panic!("serialized update was not one Homebase commit")
+        };
+        assert!(entries.len() > 3);
+        assert!(!range_asserts.is_empty());
+        assert!(
+            range_asserts
+                .iter()
+                .all(|assertion| assertion.upto == AdmissionSeq(0))
+        );
+
+        let pending = pending_ops(&database);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, DeviceSeq(1));
+        assert!(matches!(
+            pending[0].transaction.operations(),
+            [
+                MultiliteOp::CreateTable(_),
+                MultiliteOp::InsertRows(_),
+                MultiliteOp::InsertRows(_)
+            ]
+        ));
+
+        assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+        assert!(pending_ops(&database).is_empty());
+        assert_eq!(database.pull().unwrap().captured_through(), 1);
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id.space_id()];
+        assert_eq!(space.admits.len(), 1);
+        let admitted = block_on(async {
+            database
+                .client
+                .space(database.database_id.space_id())
+                .await
+                .unwrap()
+                .admits()
+                .iter(AdmissionSeq(1)..AdmissionSeq(2))
+                .await
+                .unwrap()
+        });
+        assert_eq!(admitted.len(), 1);
+        let decoded = MultiliteTransaction::from_homebase(&admitted[0]).unwrap();
+        assert_eq!(decoded.operations().len(), 3);
+
+        database.rebase(&runtime).unwrap();
+        assert_eq!(replica.pull().unwrap().captured_through(), 1);
+        replica.rebase(&replica_runtime).unwrap();
+        let rows = |database: &Database<_>| {
+            database.with_connection(|connection| {
+                connection
+                    .prepare("SELECT id, body FROM notes ORDER BY id")
+                    .unwrap()
+                    .query_map((), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+        };
+        let expected = vec![(1, "one".into()), (2, "two".into())];
+        assert_eq!(rows(&database), expected);
+        assert_eq!(rows(&replica), expected);
+    }
+
+    #[test]
+    fn statement_failure_rolls_back_the_complete_serialized_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("statement-failure.sqlite")).unwrap();
+        let runtime = database.runtime().unwrap();
+
+        let error = database
+            .update(&runtime, |update| {
+                update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
+                update.execute("INSERT INTO notes VALUES (1)", ())?;
+                update.execute("INSERT INTO notes VALUES (1)", ())?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::Sqlite(_)));
+        assert!(!table_exists(&database, "notes"));
+        assert!(
+            database
+                .with_connection(|connection| catalog::by_name(connection, "notes"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(pending_ops(&database).is_empty());
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id.space_id()];
+        assert_eq!(space.cursors, OplogCursors::default());
+        assert!(space.oplog.is_empty());
+    }
+
+    #[test]
+    fn final_submission_failure_rolls_back_all_serialized_update_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("submit-failure.sqlite")).unwrap();
+        let runtime = database.runtime().unwrap();
+        database.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_serialized_submission
+                     BEFORE INSERT ON __multilite__meta
+                     BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+                )
+                .unwrap();
+        });
+
+        assert!(
+            database
+                .update(&runtime, |update| {
+                    update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())?;
+                    update.execute("INSERT INTO notes VALUES (1, 'not committed')", ())?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!table_exists(&database, "notes"));
+        assert!(pending_ops(&database).is_empty());
+        let state = client_state(&database);
+        let space = &state.spaces[&database.database_id.space_id()];
+        assert_eq!(space.cursors, OplogCursors::default());
         assert!(space.oplog.is_empty());
     }
 

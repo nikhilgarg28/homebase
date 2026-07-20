@@ -77,3 +77,7 @@ Store a single metadata table and put everything in it as triples of namespace, 
 use db.view, db.update, db.watch api
 
 Change name of column from name-{name} to just <name> or <name>...[hash]
+
+Take gem name for multilite
+
+idea - split i64 in 8 components to make range locking / asserts finer

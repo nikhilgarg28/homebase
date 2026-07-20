@@ -12,13 +12,16 @@ primary key; richer constraints and schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
-row insertion into lean logical operations. Every write currently wraps one
-operation in a UUID-keyed `MultiliteTransaction`; its manifest is the first
-Homebase mutation and carries the ordered operation frames. Admission decoding
-re-lowers those frames and requires every following mutation to match exactly.
-Local `CREATE TABLE` or multi-row `INSERT`, its Homebase transaction, and its
-pending-effects row commit in one SQLite savepoint. Push, pull, rebase, and
-rollback cover both schema and row operations. `push()` admits the active
+row insertion into lean logical operations. `Connection::update(|tx| ...)`
+accumulates multiple statements into one UUID-keyed `MultiliteTransaction`,
+while `Connection::view(|tx| ...)` owns one read-only SQLite snapshot. Their
+transaction values provide SQLite-shaped `query`, `query_map`, and `prepare`
+methods; updates additionally provide `execute`. The manifest is the first
+Homebase mutation and carries the ordered operation frames.
+Admission decoding re-lowers those frames and requires every following mutation
+to match exactly. All local statement effects, their one Homebase submission,
+and their one pending-effects row commit in one outer SQLite savepoint. Push,
+pull, rebase, and rollback cover both schema and row operations. `push()` admits the active
 Homebase stream, then atomically advances its local submit cursor and retires
 every definitively accepted pending prefix in one SQLite savepoint. It returns
 an opaque rejection handle without repairing a stalled suffix. Explicit
@@ -65,14 +68,23 @@ identity. Each database owns a Homebase client and uses an offline endpoint by
 default; `OpenOptions::server` supplies an explicit `ServerHandle`.
 
 `OpenOptions` also carries one `SyncPolicy`, defaulting to `LocalOnly`.
-Local-only writes still commit atomically to SQLite, the Homebase submit log,
+Local-only updates still commit atomically to SQLite, the Homebase submit log,
 and the pending-effects log, but reads and writes perform no automatic network
 work. Reopening with an authority under `LocalFirst` or `Remote` can therefore
 deliver that buffered history. `LocalFirst { write_delay, read_staleness }`
 schedules authority push no later than the oldest buffered write's deadline
 and refreshes reads whose last applied authority observation is too old.
-`Remote` waits for each write's admission and refreshes before every prepared
-query. Both synchronized policies require authority at open.
+`Remote` waits for each update's admission and refreshes before every managed
+view or update. Both synchronized policies require authority at open. A managed
+closure refreshes at most once, then pins its SQLite snapshot before the
+closure begins; authority changes during the closure cannot alter that snapshot.
+
+`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
+managed closures because the closure owns its outer lifecycle. Returning an
+error or unwinding a panic rolls back the complete local update before any
+Homebase submission survives. Direct `execute` and `query` remain convenient
+one-statement managed transactions, and the existing reusable read-only
+`prepare` surface retains its SQLite-shaped parameter and conversion behavior.
 
 A required refresh first pushes a nonempty submit log, then pulls and
 atomically rebases the available admissions. A definitive push rejection fails

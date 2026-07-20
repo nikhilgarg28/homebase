@@ -8,8 +8,10 @@ mod error;
 mod metastore;
 mod runtime;
 
-pub use database::{Connection, Statement};
 pub use database::{Connection as MultiliteConnection, Statement as MultiliteStatement};
+pub use database::{
+    Connection, Statement, TransactionStatement, UpdateTransaction, ViewTransaction,
+};
 pub use database::{
     DatabaseId, OfflineServer, OpenOptions, PullOutcome, PushOutcome, PushRejection,
     ReplicaInvitation, SyncPolicy,

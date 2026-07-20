@@ -60,7 +60,36 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
     }
 }
 
+/// Reject transaction lifecycle commands owned by a managed closure.
+pub fn validate_managed_statement(sql: &str) -> Result<()> {
+    let command = parse_one_command(sql)?;
+    if matches!(
+        command,
+        Cmd::Stmt(
+            Stmt::Begin(..)
+                | Stmt::Commit(..)
+                | Stmt::Rollback { .. }
+                | Stmt::Savepoint(..)
+                | Stmt::Release(..)
+        )
+    ) {
+        return Err(Error::UnsupportedSql(
+            "transaction control is owned by the managed closure",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_one(sql: &str) -> Result<Stmt> {
+    match parse_one_command(sql)? {
+        Cmd::Stmt(statement) => Ok(statement),
+        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => {
+            Err(Error::UnsupportedSql("EXPLAIN is not supported"))
+        }
+    }
+}
+
+fn parse_one_command(sql: &str) -> Result<Cmd> {
     let mut parser = Parser::new(sql.as_bytes());
     let first = parser
         .next()
@@ -75,12 +104,7 @@ fn parse_one(sql: &str) -> Result<Stmt> {
             "multiple statements are not supported",
         ));
     }
-    match first {
-        Cmd::Stmt(statement) => Ok(statement),
-        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => {
-            Err(Error::UnsupportedSql("EXPLAIN is not supported"))
-        }
-    }
+    Ok(first)
 }
 
 fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<ValidatedExecute> {
@@ -323,6 +347,35 @@ mod tests {
             "CREATE TABLE one (id); CREATE TABLE two (id)",
         ] {
             assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn managed_statements_reject_outer_transaction_control_only() {
+        for sql in [
+            "BEGIN",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ROLLBACK TO nested",
+            "SAVEPOINT nested",
+            "RELEASE nested",
+        ] {
+            assert!(matches!(
+                validate_managed_statement(sql),
+                Err(Error::UnsupportedSql(
+                    "transaction control is owned by the managed closure"
+                ))
+            ));
+        }
+        for sql in [
+            "SELECT 1",
+            "EXPLAIN QUERY PLAN SELECT 1",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+            "INSERT INTO notes VALUES (1)",
+        ] {
+            validate_managed_statement(sql).unwrap();
         }
     }
 }
