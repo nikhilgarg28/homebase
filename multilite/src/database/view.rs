@@ -3,7 +3,7 @@
 use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
-use super::{Database, DatabaseRuntime, lock, pin_snapshot, sql};
+use super::{Database, DatabaseRuntime, lock, sql};
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
@@ -119,7 +119,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self.refresh_read_locked(runtime)?;
         self.owner
             .with_savepoint("__multilite__view", |connection| {
-                pin_snapshot(connection)?;
                 operation(&ViewTransaction::new(runtime, connection))
             })
     }

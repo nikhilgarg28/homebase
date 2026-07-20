@@ -252,7 +252,7 @@ fn managed_transactions_own_transaction_control_and_keep_views_read_only() {
 }
 
 #[test]
-fn managed_transactions_pin_their_snapshot_before_the_closure_runs() {
+fn managed_update_pins_its_snapshot_before_the_closure_runs() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pinned-snapshot.sqlite");
     let setup = SqliteConnection::open(&path).unwrap();
@@ -271,14 +271,7 @@ fn managed_transactions_pin_their_snapshot_before_the_closure_runs() {
     db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
         .unwrap();
     let writer = SqliteConnection::open(&path).unwrap();
-
-    let viewed = db
-        .view(|tx| {
-            writer.execute("INSERT INTO notes VALUES (1)", ())?;
-            tx.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
-        })
-        .unwrap();
-    assert_eq!(viewed, [0]);
+    writer.execute("INSERT INTO notes VALUES (1)", ()).unwrap();
 
     let updated = db
         .update(|tx| {

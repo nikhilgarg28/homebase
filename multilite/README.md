@@ -76,8 +76,9 @@ schedules authority push no later than the oldest buffered write's deadline
 and refreshes reads whose last applied authority observation is too old.
 `Remote` waits for each update's admission and refreshes before every managed
 view or update. Both synchronized policies require authority at open. A managed
-closure refreshes at most once, then pins its SQLite snapshot before the
-closure begins; authority changes during the closure cannot alter that snapshot.
+closure refreshes at most once before its SQLite savepoint begins. Updates pin
+their base snapshot before user code runs; views establish their snapshot on
+their first query and retain it for every later query in the closure.
 
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an

@@ -587,7 +587,6 @@ impl Statement {
         (self.refresh)()?;
         self.owner
             .with_savepoint("__multilite__statement_view", |connection| {
-                pin_snapshot(connection)?;
                 let mut statement = connection.prepare(&self.sql)?;
                 if !statement.readonly() {
                     return Err(Error::PreparedWrite);
