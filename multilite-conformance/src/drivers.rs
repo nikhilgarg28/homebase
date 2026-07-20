@@ -72,6 +72,10 @@ impl sqllogictest::DB for SqliteDriver {
     fn run(&mut self, sql: &str) -> DriverResult<DBOutput<Self::ColumnType>> {
         run_sqlite(&self.connection, sql)
     }
+
+    fn engine_name(&self) -> &str {
+        "sqlite"
+    }
 }
 
 impl sqllogictest::DB for MultiliteDriver {
@@ -87,6 +91,10 @@ impl sqllogictest::DB for MultiliteDriver {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn engine_name(&self) -> &str {
+        "multilite"
     }
 }
 
