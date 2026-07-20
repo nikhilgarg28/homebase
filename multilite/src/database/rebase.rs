@@ -5,6 +5,7 @@ use homebase_client::{ClientError, ServerHandle};
 use pollster::block_on;
 use rusqlite::Connection;
 
+use super::catalog;
 use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
 use super::{Database, DatabaseRuntime};
@@ -116,7 +117,9 @@ fn apply_operation(
     match operation {
         MultiliteOp::CreateTable(created) => {
             connection.execute(created.sql(), ())?;
+            catalog::insert(connection, created)?;
             Ok(())
         }
+        MultiliteOp::InsertRows(inserted) => inserted.apply(connection),
     }
 }

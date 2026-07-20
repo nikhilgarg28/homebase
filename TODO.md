@@ -34,7 +34,11 @@ many responses should return global seqnum or return ops when range assert fails
 
 Add bucketing/padding to key components & values before encrypting
 
-Relax the constraint that there can be at most 16 components
+Raise Homebase key limits after the core INSERT batch: support up to 256
+components and roughly `u16` bytes per component, widen every encoded depth and
+length field, impose a defensible total encoded-key budget, and audit server
+prefix aggregates, lease overlap, schema codecs, property tests, and allocation
+paths before exposing the larger bounds.
 
 admit log level checksum?
 
@@ -43,8 +47,6 @@ use uuid indirection for key components - better rotation
 Have Writer class like Reader
 
 Explroe if we can support concurrent write transactions, maybe via separate redb file for transactions
-
-Build policy for reads/writes
 
 Handle multi-schema / attach etc
 
@@ -69,3 +71,11 @@ Async-first Multilite/database actor:
   than borrowed `rusqlite::Transaction` values. Start with sequential actor
   execution; add concurrent in-flight authority work only through an explicit
   state machine that preserves SQLite/Homebase transaction boundaries.
+
+Live queries
+
+Conformance suite
+
+Store a single metadata table and put everything in it as triples of namespace, key, value
+
+use db.view, db.update, db.watch api

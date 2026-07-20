@@ -7,7 +7,9 @@ use homebase_core::reader::Reader;
 use homebase_core::tag::DeviceSeq;
 use rusqlite::{Connection, params};
 
+use super::catalog;
 use super::operation::MultiliteOp;
+use super::row::InsertRows;
 use super::schema::CreateTable;
 use crate::{Error, Result};
 
@@ -21,14 +23,17 @@ const TAG_REJECT_EFFECT: u8 = 4;
 
 const OPERATION_FRAME_VERSION: u8 = 1;
 const CREATE_TABLE_OPERATION: u8 = 1;
+const INSERT_ROWS_OPERATION: u8 = 2;
 
 const EFFECT_FRAME_VERSION: u8 = 1;
 const DROP_TABLE_EFFECT: u8 = 1;
+const DELETE_ROWS_EFFECT: u8 = 2;
 
 /// A local effect to run when a speculative operation gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     DropTable { name: String },
+    DeleteRows { inserted: InsertRows },
 }
 
 /// One speculative Multilite operation keyed by its Homebase sequence.
@@ -117,6 +122,10 @@ impl PendingCodec {
                 frame.push(CREATE_TABLE_OPERATION);
                 frame.extend_from_slice(&created.encode());
             }
+            MultiliteOp::InsertRows(inserted) => {
+                frame.push(INSERT_ROWS_OPERATION);
+                frame.extend_from_slice(&inserted.encode());
+            }
         }
         frame
     }
@@ -134,6 +143,9 @@ impl PendingCodec {
             CREATE_TABLE_OPERATION => CreateTable::decode(reader.rest())
                 .map(MultiliteOp::CreateTable)
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
+            INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())
+                .map(MultiliteOp::InsertRows)
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             kind => Err(PendingCodecError::UnknownOperation(kind)),
         }
     }
@@ -144,6 +156,10 @@ impl PendingCodec {
             Effect::DropTable { name } => {
                 frame.push(DROP_TABLE_EFFECT);
                 frame.extend_from_slice(name.as_bytes());
+            }
+            Effect::DeleteRows { inserted } => {
+                frame.push(DELETE_ROWS_EFFECT);
+                frame.extend_from_slice(&inserted.encode());
             }
         }
         frame
@@ -164,6 +180,9 @@ impl PendingCodec {
                     .map_err(|_| PendingCodecError::InvalidUtf8)?
                     .to_owned(),
             }),
+            DELETE_ROWS_EFFECT => InsertRows::decode(reader.rest())
+                .map(|inserted| Effect::DeleteRows { inserted })
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             kind => Err(PendingCodecError::UnknownEffect(kind)),
         }
     }
@@ -337,6 +356,12 @@ fn effects_for(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
                 name: created.table_name().to_owned(),
             }],
         ),
+        MultiliteOp::InsertRows(inserted) => (
+            Vec::new(),
+            vec![Effect::DeleteRows {
+                inserted: inserted.clone(),
+            }],
+        ),
     }
 }
 
@@ -344,8 +369,10 @@ fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
     for effect in effects {
         match effect {
             Effect::DropTable { name } => {
-                connection.execute_batch(&format!("DROP TABLE {}", quote_identifier(name)))?
+                connection.execute_batch(&format!("DROP TABLE {}", quote_identifier(name)))?;
+                catalog::remove_by_name(connection, name)?;
             }
+            Effect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
         }
     }
     Ok(())
@@ -449,6 +476,7 @@ impl fmt::Display for PendingCodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::row::{CapturedRow, StoredValue};
     use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
 
     fn operation(name: &str) -> MultiliteOp {
@@ -464,6 +492,26 @@ mod tests {
                 }],
             },
         )
+    }
+
+    fn insert_operation() -> MultiliteOp {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let MultiliteOp::CreateTable(created) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(created.sql(), ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        let inserted = InsertRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "notes".into(),
+                values: vec![StoredValue::Integer(7)],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        MultiliteOp::InsertRows(inserted)
     }
 
     #[test]
@@ -515,6 +563,31 @@ mod tests {
             PendingCodec::decode(&encoded[..encoded.len() - 1]),
             Err(PendingCodecError::Truncated)
         );
+    }
+
+    #[test]
+    fn codec_and_journal_roundtrip_insert_rows_and_its_delete_effect() {
+        let operation = insert_operation();
+        let pending = PendingOp::new(DeviceSeq(11), operation.clone());
+        let MultiliteOp::InsertRows(inserted) = &operation else {
+            unreachable!()
+        };
+        assert_eq!(pending.on_accept, Vec::new());
+        assert_eq!(
+            pending.on_reject,
+            vec![Effect::DeleteRows {
+                inserted: inserted.clone(),
+            }]
+        );
+        assert_eq!(
+            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            pending
+        );
+
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        insert(&connection, DeviceSeq(11), &operation).unwrap();
+        assert_eq!(load(&connection).unwrap(), [pending]);
     }
 
     #[test]

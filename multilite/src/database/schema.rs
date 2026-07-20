@@ -12,6 +12,8 @@ use homebase_core::tag::Mutation;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
+use super::codes;
+
 const SCHEMA_FRAME_VERSION: u8 = 1;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
@@ -19,6 +21,8 @@ const TAG_CREATE_TABLE: u8 = 10;
 const TAG_TABLE_ID: u8 = 1;
 const TAG_TABLE_NAME: u8 = 2;
 const TAG_COLUMN: u8 = 3;
+const TAG_SCHEMA_REVISION_ID: u8 = 4;
+const TAG_ROW_KEYSPACE_ID: u8 = 5;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_NAME: u8 = 2;
 const TAG_COLUMN_TYPE: u8 = 3;
@@ -26,7 +30,6 @@ const TAG_COLUMN_FLAGS: u8 = 4;
 const COLUMN_NOT_NULL: u8 = 1;
 const COLUMN_PRIMARY_KEY: u8 = 2;
 
-const SCHEMA_ROOT: [&[u8]; 2] = [b"multilite", b"schema"];
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
 
@@ -48,7 +51,7 @@ impl SqlName {
         &self.value
     }
 
-    fn canonical(&self) -> &[u8] {
+    pub fn canonical(&self) -> &[u8] {
         &self.canonical
     }
 }
@@ -63,7 +66,7 @@ pub enum DeclaredType {
 }
 
 impl DeclaredType {
-    fn to_u8(self) -> u8 {
+    pub fn to_u8(self) -> u8 {
         match self {
             Self::Integer => 1,
             Self::Real => 2,
@@ -72,7 +75,7 @@ impl DeclaredType {
         }
     }
 
-    fn from_u8(value: u8) -> std::result::Result<Self, SchemaCodecError> {
+    pub fn from_u8(value: u8) -> std::result::Result<Self, SchemaCodecError> {
         match value {
             1 => Ok(Self::Integer),
             2 => Ok(Self::Real),
@@ -100,16 +103,22 @@ pub struct CreateTableSpec {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MutationId([u8; 16]);
+pub struct MutationId([u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TableId([u8; 16]);
+pub struct TableId([u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ColumnId([u8; 16]);
+pub struct SchemaRevisionId([u8; 16]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowKeyspaceId([u8; 16]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnId([u8; 16]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Column {
+pub struct Column {
     id: ColumnId,
     name: SqlName,
     declared_type: DeclaredType,
@@ -123,6 +132,8 @@ pub struct CreateTable {
     mutation_id: MutationId,
     sql: String,
     table_id: TableId,
+    schema_revision_id: SchemaRevisionId,
+    row_keyspace_id: RowKeyspaceId,
     name: SqlName,
     columns: Vec<Column>,
 }
@@ -134,6 +145,39 @@ pub struct SchemaHomebaseOp {
     pub asserted_scopes: Vec<Key>,
 }
 
+macro_rules! id_accessors {
+    ($type:ty) => {
+        impl $type {
+            pub fn from_bytes(bytes: [u8; 16]) -> Self {
+                Self(bytes)
+            }
+
+            pub fn as_bytes(self) -> [u8; 16] {
+                self.0
+            }
+        }
+    };
+}
+
+id_accessors!(TableId);
+id_accessors!(SchemaRevisionId);
+id_accessors!(RowKeyspaceId);
+id_accessors!(ColumnId);
+
+impl Column {
+    pub fn id(&self) -> ColumnId {
+        self.id
+    }
+
+    pub fn name(&self) -> &SqlName {
+        &self.name
+    }
+
+    pub fn declared_type(&self) -> DeclaredType {
+        self.declared_type
+    }
+}
+
 impl CreateTable {
     /// Mint durable identities for one validated table creation.
     pub fn new(sql: &str, spec: CreateTableSpec) -> Self {
@@ -143,9 +187,11 @@ impl CreateTable {
     /// Lower this schema change to its complete Homebase representation.
     pub fn to_homebase(&self) -> SchemaHomebaseOp {
         let log = log_key(self.mutation_id);
-        let table_scope = table_scope_key(self.table_id);
         let name_scope = table_name_scope_key(&self.name);
-        let revision = self.mutation_id.0.to_vec();
+        let schema = table_schema_key(self.table_id, self.schema_revision_id);
+        let active_row_keyspace = active_row_keyspace_key(self.table_id);
+        let row_keyspace = row_keyspace_key(self.table_id, self.row_keyspace_id);
+        let write_revision = write_revision_key(self.table_id);
         SchemaHomebaseOp {
             mutations: vec![
                 Mutation::Set {
@@ -153,15 +199,27 @@ impl CreateTable {
                     value: self.encode(),
                 },
                 Mutation::Set {
-                    key: table_scope.clone(),
-                    value: revision.clone(),
+                    key: name_scope.clone(),
+                    value: self.table_id.0.to_vec(),
                 },
                 Mutation::Set {
-                    key: name_scope.clone(),
-                    value: revision,
+                    key: schema,
+                    value: self.encode(),
+                },
+                Mutation::Set {
+                    key: active_row_keyspace,
+                    value: self.row_keyspace_id.0.to_vec(),
+                },
+                Mutation::Set {
+                    key: row_keyspace,
+                    value: encode_row_keyspace(self),
+                },
+                Mutation::Set {
+                    key: write_revision.clone(),
+                    value: self.mutation_id.0.to_vec(),
                 },
             ],
-            asserted_scopes: vec![table_scope, name_scope],
+            asserted_scopes: vec![name_scope, write_revision],
         }
     }
 
@@ -198,6 +256,30 @@ impl CreateTable {
         &self.sql
     }
 
+    pub fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub fn schema_revision_id(&self) -> SchemaRevisionId {
+        self.schema_revision_id
+    }
+
+    pub fn row_keyspace_id(&self) -> RowKeyspaceId {
+        self.row_keyspace_id
+    }
+
+    pub fn table_name_identity(&self) -> &SqlName {
+        &self.name
+    }
+
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
+        self.columns.iter().filter(|column| column.primary_key)
+    }
+
     fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
         self.name == spec.name
             && self.columns.len() == spec.columns.len()
@@ -221,6 +303,8 @@ fn build_create_table(
 ) -> CreateTable {
     let mutation_id = MutationId(mint());
     let table_id = TableId(mint());
+    let schema_revision_id = SchemaRevisionId(mint());
+    let row_keyspace_id = RowKeyspaceId(mint());
     let columns = spec
         .columns
         .into_iter()
@@ -236,42 +320,71 @@ fn build_create_table(
         mutation_id,
         sql: sql.to_owned(),
         table_id,
+        schema_revision_id,
+        row_keyspace_id,
         name: spec.name,
         columns,
     }
 }
 
 fn log_key(id: MutationId) -> Key {
-    Key::from_bytes([
-        SCHEMA_ROOT[0],
-        SCHEMA_ROOT[1],
-        b"log".as_slice(),
-        id.0.as_slice(),
-    ])
-    .expect("schema log components are bounded and non-empty")
-}
-
-fn table_scope_key(id: TableId) -> Key {
-    Key::from_bytes([
-        SCHEMA_ROOT[0],
-        SCHEMA_ROOT[1],
-        b"scopes".as_slice(),
-        b"tables".as_slice(),
-        id.0.as_slice(),
-    ])
-    .expect("table scope components are bounded and non-empty")
+    Key::from_bytes([codes::ROOT, codes::SCHEMA, codes::LOG, id.0.as_slice()])
+        .expect("schema log components are bounded and non-empty")
 }
 
 fn table_name_scope_key(name: &SqlName) -> Key {
     let component = name_component(name.canonical());
     Key::from_bytes([
-        SCHEMA_ROOT[0],
-        SCHEMA_ROOT[1],
-        b"scopes".as_slice(),
-        b"table-names".as_slice(),
+        codes::ROOT,
+        codes::SCHEMA,
+        codes::NAMES,
+        codes::TABLES,
+        codes::MAIN,
         component.as_slice(),
     ])
     .expect("table-name scope components are bounded and non-empty")
+}
+
+fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::SCHEMA,
+        revision.0.as_slice(),
+    ])
+    .expect("table schema key is bounded")
+}
+
+pub fn active_row_keyspace_key(table: TableId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::ACTIVE_ROW_KEYSPACE,
+    ])
+    .expect("active row keyspace key is bounded")
+}
+
+fn row_keyspace_key(table: TableId, keyspace: RowKeyspaceId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::ROW_KEYSPACES,
+        keyspace.0.as_slice(),
+    ])
+    .expect("row keyspace key is bounded")
+}
+
+pub fn write_revision_key(table: TableId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::WRITE_REVISION,
+    ])
+    .expect("write revision key is bounded")
 }
 
 fn name_component(canonical: &[u8]) -> Vec<u8> {
@@ -295,8 +408,26 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
     let mut frame = Vec::new();
     put_field(&mut frame, TAG_TABLE_ID, &table.table_id.0);
     put_field(&mut frame, TAG_TABLE_NAME, table.name.value().as_bytes());
+    put_field(
+        &mut frame,
+        TAG_SCHEMA_REVISION_ID,
+        &table.schema_revision_id.0,
+    );
+    put_field(&mut frame, TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0);
     for column in &table.columns {
         put_field(&mut frame, TAG_COLUMN, &encode_column(column));
+    }
+    frame
+}
+
+fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
+    let primary = table.primary_key_columns().collect::<Vec<_>>();
+    let mut frame = Vec::with_capacity(2 + primary.len() * 17);
+    frame.push(1);
+    frame.push(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
+    for column in primary {
+        frame.extend_from_slice(&column.id.0);
+        frame.push(column.declared_type.to_u8());
     }
     frame
 }
@@ -388,12 +519,14 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     }
     let mutation_id = mutation_id.ok_or(SchemaCodecError::MissingField(TAG_MUTATION_ID))?;
     let sql = sql.ok_or(SchemaCodecError::MissingField(TAG_SQL))?;
-    let (table_id, name, columns) =
+    let (table_id, schema_revision_id, row_keyspace_id, name, columns) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
     Ok(CreateTable {
         mutation_id,
         sql,
         table_id,
+        schema_revision_id,
+        row_keyspace_id,
         name,
         columns,
     })
@@ -433,17 +566,35 @@ fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], SchemaCodecError> {
 
 fn decode_create_table(
     frame: &[u8],
-) -> std::result::Result<(TableId, SqlName, Vec<Column>), SchemaCodecError> {
+) -> std::result::Result<
+    (
+        TableId,
+        SchemaRevisionId,
+        RowKeyspaceId,
+        SqlName,
+        Vec<Column>,
+    ),
+    SchemaCodecError,
+> {
     use homebase_core::reader::Reader;
 
     let mut reader = Reader::new(frame);
     let mut table_id = None;
+    let mut schema_revision_id = None;
+    let mut row_keyspace_id = None;
     let mut name = None;
     let mut columns = Vec::new();
     while let Some((tag, value)) = next_field(&mut reader)? {
         match tag {
             TAG_TABLE_ID => set_once(&mut table_id, TableId(uuid_bytes(value)?))?,
             TAG_TABLE_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_SCHEMA_REVISION_ID => set_once(
+                &mut schema_revision_id,
+                SchemaRevisionId(uuid_bytes(value)?),
+            )?,
+            TAG_ROW_KEYSPACE_ID => {
+                set_once(&mut row_keyspace_id, RowKeyspaceId(uuid_bytes(value)?))?
+            }
             TAG_COLUMN => columns.push(decode_column(value)?),
             _ => {}
         }
@@ -454,6 +605,8 @@ fn decode_create_table(
     }
     Ok((
         table_id.ok_or(SchemaCodecError::MissingField(TAG_TABLE_ID))?,
+        schema_revision_id.ok_or(SchemaCodecError::MissingField(TAG_SCHEMA_REVISION_ID))?,
+        row_keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_ROW_KEYSPACE_ID))?,
         name.ok_or(SchemaCodecError::MissingField(TAG_TABLE_NAME))?,
         columns,
     ))
@@ -510,7 +663,15 @@ fn from_homebase_inner(
     batch
         .validate()
         .map_err(|_| SchemaCodecError::InvalidBatch)?;
-    let [log_entry, table_entry, name_entry] = batch.entries.as_slice() else {
+    let [
+        log_entry,
+        name_entry,
+        schema_entry,
+        active_entry,
+        keyspace_entry,
+        write_entry,
+    ] = batch.entries.as_slice()
+    else {
         return Err(SchemaCodecError::InvalidBatch);
     };
     let Mutation::Set {
@@ -524,28 +685,43 @@ fn from_homebase_inner(
     if admitted_log_key != &log_key(created.mutation_id) {
         return Err(SchemaCodecError::InvalidBatch);
     }
-    validate_revision_entry(
-        table_entry,
-        &table_scope_key(created.table_id),
-        created.mutation_id,
-    )?;
-    validate_revision_entry(
+    validate_set(
         name_entry,
         &table_name_scope_key(&created.name),
-        created.mutation_id,
+        &created.table_id.0,
+    )?;
+    validate_set(
+        schema_entry,
+        &table_schema_key(created.table_id, created.schema_revision_id),
+        &created.encode(),
+    )?;
+    validate_set(
+        active_entry,
+        &active_row_keyspace_key(created.table_id),
+        &created.row_keyspace_id.0,
+    )?;
+    validate_set(
+        keyspace_entry,
+        &row_keyspace_key(created.table_id, created.row_keyspace_id),
+        &encode_row_keyspace(&created),
+    )?;
+    validate_set(
+        write_entry,
+        &write_revision_key(created.table_id),
+        &created.mutation_id.0,
     )?;
     Ok(created)
 }
 
-fn validate_revision_entry(
+fn validate_set(
     entry: &homebase_core::tag::AdmittedEntry<Vec<u8>>,
     expected_key: &Key,
-    mutation_id: MutationId,
+    expected_value: &[u8],
 ) -> std::result::Result<(), SchemaCodecError> {
     let Mutation::Set { key, value } = &entry.device_entry.mutation else {
         return Err(SchemaCodecError::InvalidBatch);
     };
-    if key != expected_key || value.as_slice() != mutation_id.0 {
+    if key != expected_key || value != expected_value {
         return Err(SchemaCodecError::InvalidBatch);
     }
     Ok(())
@@ -655,7 +831,7 @@ mod tests {
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 3);
+        assert_eq!(lowered.mutations.len(), 6);
         assert_eq!(lowered.asserted_scopes.len(), 2);
 
         let Mutation::Set { key: log, value } = &lowered.mutations[0] else {
@@ -665,7 +841,7 @@ mod tests {
         assert_eq!(log.components()[3].as_bytes(), test_uuid(1));
         assert_eq!(decode_frame(value).unwrap(), created);
         assert_eq!(lowered.mutations[1].key(), &lowered.asserted_scopes[0]);
-        assert_eq!(lowered.mutations[2].key(), &lowered.asserted_scopes[1]);
+        assert_eq!(lowered.mutations[5].key(), &lowered.asserted_scopes[1]);
 
         let admitted = admit(lowered.mutations);
         assert_eq!(CreateTable::from_homebase(&admitted).unwrap(), created);
@@ -751,6 +927,8 @@ mod tests {
         );
         for bytes in std::iter::once(created.mutation_id.0)
             .chain(std::iter::once(created.table_id.0))
+            .chain(std::iter::once(created.schema_revision_id.0))
+            .chain(std::iter::once(created.row_keyspace_id.0))
             .chain(created.columns.iter().map(|column| column.id.0))
         {
             let uuid = Uuid::from_bytes(bytes);

@@ -1,9 +1,12 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod catalog;
+mod codes;
 mod operation;
 mod pending;
 mod policy;
 mod rebase;
+mod row;
 mod schema;
 mod sql;
 mod store;
@@ -30,6 +33,7 @@ use crate::{Error, Params, Result};
 
 use self::operation::MultiliteOp;
 use self::policy::{PolicyState, PushScheduler};
+use self::row::{CapturedRow, InsertRows, StoredValue};
 use self::store::DatabaseMetaStore;
 
 pub use self::policy::SyncPolicy;
@@ -228,8 +232,13 @@ pub(crate) struct DatabaseHooks<P> {
     format: P,
 }
 
+pub(crate) struct DatabaseEvent<E> {
+    format: Option<E>,
+    inserted: Option<CapturedRow>,
+}
+
 impl<P: HookPolicy> HookPolicy for DatabaseHooks<P> {
-    type Event = P::Event;
+    type Event = DatabaseEvent<P::Event>;
 
     fn authorize(&mut self, mode: ExecutionMode, context: AuthContext<'_>) -> Authorization {
         match authorize_database(mode, &context) {
@@ -245,8 +254,51 @@ impl<P: HookPolicy> HookPolicy for DatabaseHooks<P> {
         table: &str,
         update: &PreUpdateCase,
     ) -> Result<Option<Self::Event>> {
-        self.format.preupdate(mode, database, table, update)
+        let format = self.format.preupdate(mode, database, table, update)?;
+        let inserted = capture_insert(mode, database, table, update)?;
+        if format.is_none() && inserted.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(DatabaseEvent { format, inserted }))
+        }
     }
+}
+
+fn capture_insert(
+    mode: ExecutionMode,
+    database: &str,
+    table: &str,
+    update: &PreUpdateCase,
+) -> Result<Option<CapturedRow>> {
+    if mode != ExecutionMode::Public
+        || database != "main"
+        || is_schema_table(table)
+        || has_multilite_prefix(table)
+    {
+        return Ok(None);
+    }
+    let PreUpdateCase::Insert(values) = update else {
+        return Err(Error::CaptureInvariant(
+            "public table mutation was not an insert",
+        ));
+    };
+    if values.get_query_depth() != 0 {
+        return Err(Error::CaptureInvariant(
+            "writes caused by triggers are not supported",
+        ));
+    }
+    let values = (0..values.get_column_count())
+        .map(|index| {
+            values
+                .get_new_column_value(index)
+                .map(StoredValue::capture)
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(CapturedRow {
+        table: table.to_owned(),
+        values,
+    }))
 }
 
 /// An opened general Multilite database, without a temporary format wrapper.
@@ -313,14 +365,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         let validated = sql::validate_execute(sql)?;
         let _operation = lock(&self.operation);
         let result = match validated {
-            sql::ValidatedExecute::Insert if self.policy.policy() != SyncPolicy::LocalOnly => {
-                return Err(Error::UnsupportedSql(
-                    "synchronized INSERT is not implemented yet",
-                ));
-            }
-            sql::ValidatedExecute::Insert => runtime.run(ExecutionMode::Public, |connection| {
-                Ok(connection.execute(sql, params)?)
-            }),
+            sql::ValidatedExecute::Insert => self.execute_insert(runtime, sql, params),
             sql::ValidatedExecute::CreateTable(table) => {
                 if self.policy.policy() == SyncPolicy::Remote {
                     self.drain_remote_queue()?;
@@ -438,6 +483,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         table: schema::CreateTableSpec,
     ) -> Result<(usize, Vec<P::Event>)> {
         let operation = MultiliteOp::create_table(sql, table);
+        let MultiliteOp::CreateTable(created) = &operation else {
+            unreachable!("create-table constructor returned another operation")
+        };
         let (space, upto) = block_on(async {
             let space = self.client.space(self.database_id.space_id()).await?;
             let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
@@ -450,18 +498,76 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             );
             Ok::<_, Error>((space, upto))
         })?;
-        let (mutations, assertions) = operation.to_homebase().at(upto);
+        let (mutations, assertions) = operation.to_homebase()?.at(upto);
 
-        runtime.run(ExecutionMode::Public, |connection| {
+        let (changed, events) = runtime.run(ExecutionMode::Public, |connection| {
             let changed = connection.execute(sql, params)?;
             runtime.with_internal_metadata(|| {
+                catalog::insert(connection, created)?;
                 let submission = block_on(space.submit_unchecked(mutations, assertions))
                     .map_err(ClientError::from)?;
                 pending::insert(connection, submission.seq, &operation)?;
                 Ok(())
             })?;
             Ok(changed)
-        })
+        })?;
+        Ok((changed, format_events(events)))
+    }
+
+    fn execute_insert<P: HookPolicy, Q: Params>(
+        &self,
+        runtime: &DatabaseRuntime<P>,
+        sql: &str,
+        params: Q,
+    ) -> Result<(usize, Vec<P::Event>)> {
+        let (space, upto) = block_on(async {
+            let space = self.client.space(self.database_id.space_id()).await?;
+            let cursors = space.admits().cursors().await.map_err(ClientError::from)?;
+            let upto = AdmissionSeq(
+                cursors
+                    .neck
+                    .0
+                    .checked_sub(1)
+                    .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
+            );
+            Ok::<_, Error>((space, upto))
+        })?;
+
+        let (changed, events) = runtime.run_captured(
+            ExecutionMode::Public,
+            |connection| Ok(connection.execute(sql, params)?),
+            |connection, events| {
+                let captured = events
+                    .iter()
+                    .filter_map(|event| event.inserted.clone())
+                    .collect::<Vec<_>>();
+                let Some(inserted) = InsertRows::from_captured(connection, &captured)? else {
+                    let handled_by_temporary_format = !captured.is_empty()
+                        && events
+                            .iter()
+                            .filter(|event| event.inserted.is_some())
+                            .all(|event| event.format.is_some());
+                    if captured.is_empty()
+                        || (self.policy.policy() == SyncPolicy::LocalOnly
+                            && handled_by_temporary_format)
+                    {
+                        return Ok(());
+                    }
+                    return Err(Error::UnsupportedSql(
+                        "INSERT target has no synchronized schema identity",
+                    ));
+                };
+                let operation = MultiliteOp::InsertRows(inserted);
+                let (mutations, assertions) = operation.to_homebase()?.at(upto);
+                runtime.with_internal_metadata(|| {
+                    let submission = block_on(space.submit_unchecked(mutations, assertions))
+                        .map_err(ClientError::from)?;
+                    pending::insert(connection, submission.seq, &operation)?;
+                    Ok(())
+                })
+            },
+        )?;
+        Ok((changed, format_events(events)))
     }
 
     pub(crate) fn prepare<P: HookPolicy>(
@@ -596,6 +702,13 @@ fn has_multilite_prefix(table: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
 }
 
+fn format_events<E>(events: Vec<DatabaseEvent<E>>) -> Vec<E> {
+    events
+        .into_iter()
+        .filter_map(|event| event.format)
+        .collect()
+}
+
 /// A read-only prepared statement owned by a Multilite database.
 pub struct Statement {
     owner: ConnectionOwner,
@@ -666,6 +779,7 @@ fn initialize<H: ServerHandle>(
     };
     SqliteOrderedStore::initialize(owner)?;
     owner.with_connection(pending::initialize)?;
+    owner.with_connection(catalog::initialize)?;
     let store = DatabaseMetaStore::new(owner.clone());
     let client = block_on(Client::open(
         store,
@@ -720,6 +834,7 @@ fn reopen<H: ServerHandle>(
     }
 
     owner.with_connection(|connection| {
+        catalog::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)
     })?;
 
@@ -743,11 +858,13 @@ enum DatabaseState {
 fn classify(connection: &Connection) -> Result<DatabaseState> {
     let metadata = SqliteOrderedStore::is_initialized(connection)?;
     let pending = pending::is_initialized(connection)?;
-    match (metadata, pending) {
-        (false, false) => Ok(DatabaseState::Fresh),
-        (true, true) => {
+    let catalog = catalog::is_initialized(connection)?;
+    match (metadata, pending, catalog) {
+        (false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
+            catalog::validate(connection)?;
             Ok(DatabaseState::Initialized)
         }
         _ => Err(Error::InvalidDatabase(
@@ -925,7 +1042,7 @@ mod tests {
         database: &Database<H>,
         operation: &MultiliteOp,
     ) {
-        let (mutations, assertions) = operation.to_homebase().at(AdmissionSeq(0));
+        let (mutations, assertions) = operation.to_homebase().unwrap().at(AdmissionSeq(0));
         block_on(async {
             database
                 .client
@@ -1378,7 +1495,7 @@ mod tests {
         else {
             panic!("captured schema operation was not a commit")
         };
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 6);
         assert_eq!(range_asserts.len(), 2);
         assert_eq!(*submit_mode, SubmitMode::Unchecked);
         assert!(
@@ -1387,7 +1504,7 @@ mod tests {
                 .all(|assertion| assertion.upto == AdmissionSeq(0))
         );
         assert_eq!(range_asserts[0].prefix, *entries[1].key());
-        assert_eq!(range_asserts[1].prefix, *entries[2].key());
+        assert_eq!(range_asserts[1].prefix, *entries[5].key());
         let pending = pending_ops(&database);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, DeviceSeq(1));
@@ -1562,7 +1679,7 @@ mod tests {
             }
         );
         assert_eq!(space.admits.len(), 1);
-        assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 3);
+        assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 6);
         assert!(!table_exists(&replica, "notes"));
 
         assert_eq!(replica.pull().unwrap(), outcome);
@@ -2433,6 +2550,214 @@ mod tests {
                 "metadata table namespace contains unexpected tables"
             ))
         ));
+    }
+
+    #[test]
+    fn multi_row_insert_is_one_durable_pending_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rows.sqlite");
+        let database = Database::open(&path).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, payload BLOB)",
+                (),
+            )
+            .unwrap();
+        database
+            .execute(
+                &runtime,
+                "WITH input(body, payload) AS (
+                    VALUES ('one', x'01'), ('two', NULL), ('three', x'0304')
+                 )
+                 INSERT INTO notes (body, payload)
+                 SELECT body, payload FROM input ORDER BY body DESC",
+                (),
+            )
+            .unwrap();
+
+        let state = client_state(&database);
+        let space = state.spaces.get(&database.database_id.space_id()).unwrap();
+        assert_eq!(space.cursors.tail, DeviceSeq(3));
+        let DeviceOp::Commit {
+            entries,
+            range_asserts,
+            ..
+        } = space.oplog.get(&DeviceSeq(2)).unwrap()
+        else {
+            panic!("captured INSERT was not one commit")
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(range_asserts.len(), 5);
+        assert!(entries.iter().all(|entry| {
+            let components = entry.key().components();
+            components.len() == 6 && components[3].as_bytes() == b"rows"
+        }));
+
+        let pending = pending_ops(&database);
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(pending[1].operation, MultiliteOp::InsertRows(_)));
+        assert!(matches!(
+            pending[1].on_reject.as_slice(),
+            [pending::Effect::DeleteRows { .. }]
+        ));
+        database.with_connection(|connection| {
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                3
+            );
+            let mut statement = connection
+                .prepare("SELECT id, body FROM notes ORDER BY id")
+                .unwrap();
+            let rows = statement
+                .query_map((), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                [(1, "two".into()), (2, "three".into()), (3, "one".into())]
+            );
+        });
+
+        drop(runtime);
+        drop(database);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(pending_ops(&reopened).len(), 2);
+    }
+
+    #[test]
+    fn oversized_primary_key_rolls_back_before_submission() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("large-key.sqlite")).unwrap();
+        let runtime = database.runtime(NoopFormat).unwrap();
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY)",
+                (),
+            )
+            .unwrap();
+        let pending_before = pending_ops(&database);
+        let state_before = client_state(&database);
+
+        assert!(matches!(
+            database.execute(
+                &runtime,
+                "INSERT INTO notes VALUES (?1)",
+                rusqlite::params!["x".repeat(256)],
+            ),
+            Err(Error::InvalidMultiliteOp(_))
+        ));
+        assert_eq!(pending_ops(&database), pending_before);
+        assert_eq!(client_state(&database), state_before);
+        database.with_connection(|connection| {
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn two_replicas_converge_rows_and_reject_only_a_conflicting_insert() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = Database::open_with(
+            directory.path().join("first.sqlite"),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(first.database_id.space_id()));
+        let second = Database::open_with(
+            directory.path().join("second.sqlite"),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let first_runtime = first.runtime(NoopFormat).unwrap();
+        let second_runtime = second.runtime(NoopFormat).unwrap();
+
+        first
+            .execute(
+                &first_runtime,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase(&second_runtime).unwrap();
+
+        first
+            .execute(&first_runtime, "INSERT INTO notes VALUES (1, 'first')", ())
+            .unwrap();
+        second
+            .execute(
+                &second_runtime,
+                "INSERT INTO notes VALUES (2, 'second')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase(&first_runtime).unwrap();
+        second.rebase(&second_runtime).unwrap();
+
+        first
+            .execute(&first_runtime, "INSERT INTO notes VALUES (7, 'winner')", ())
+            .unwrap();
+        second
+            .execute(&second_runtime, "INSERT INTO notes VALUES (7, 'loser')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same primary key was not rejected")
+        };
+        assert!(matches!(
+            rejection.error(),
+            KernelError::RangeAssertFailed { .. }
+        ));
+        second.rollback(&rejection).unwrap();
+        assert!(pending_ops(&second).is_empty());
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase(&first_runtime).unwrap();
+        second.rebase(&second_runtime).unwrap();
+
+        let rows = |database: &Database<_>| {
+            database.with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT id, body FROM notes ORDER BY id")
+                    .unwrap();
+                statement
+                    .query_map((), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+        };
+        let expected = vec![
+            (1, String::from("first")),
+            (2, String::from("second")),
+            (7, String::from("winner")),
+        ];
+        assert_eq!(rows(&first), expected);
+        assert_eq!(rows(&second), expected);
     }
 
     #[test]

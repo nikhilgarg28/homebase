@@ -100,6 +100,16 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         mode: ExecutionMode,
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<(T, Vec<P::Event>)> {
+        self.run_captured(mode, operation, |_connection, _events| Ok(()))
+    }
+
+    /// Run an atomic unit and finalize its captured events before commit.
+    pub(crate) fn run_captured<T>(
+        &self,
+        mode: ExecutionMode,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+        finalize: impl FnOnce(&Connection, &[P::Event]) -> Result<()>,
+    ) -> Result<(T, Vec<P::Event>)> {
         let _operation_guard = OperationGuard::enter(Arc::clone(&self.state))?;
         let event_checkpoint = self.event_count();
         let event_guard = EventGuard::new(self, event_checkpoint);
@@ -115,8 +125,26 @@ impl<P: HookPolicy> RuntimeConnection<P> {
             };
             match result {
                 Ok(value) => {
-                    self.with_mode(ExecutionMode::InternalMetadata, || savepoint.release())?;
-                    Ok(value)
+                    let events = self.split_events(event_checkpoint);
+                    let finalized = finalize(connection, &events);
+                    let finalized = match self.take_callback_error() {
+                        Some(error) => Err(error),
+                        None => finalized,
+                    };
+                    match finalized {
+                        Ok(()) => {
+                            self.with_mode(ExecutionMode::InternalMetadata, || {
+                                savepoint.release()
+                            })?;
+                            Ok((value, events))
+                        }
+                        Err(error) => {
+                            self.with_mode(ExecutionMode::InternalMetadata, || {
+                                savepoint.rollback()
+                            })?;
+                            Err(error)
+                        }
+                    }
                 }
                 Err(error) => {
                     self.with_mode(ExecutionMode::InternalMetadata, || savepoint.rollback())?;
@@ -125,7 +153,7 @@ impl<P: HookPolicy> RuntimeConnection<P> {
             }
         })?;
         event_guard.commit();
-        Ok((value, self.split_events(event_checkpoint)))
+        Ok(value)
     }
 
     fn with_mode<T>(

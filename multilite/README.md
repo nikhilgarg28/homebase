@@ -11,12 +11,11 @@ tables. A table must use the initial four declared types and exactly one inline
 primary key; richer constraints and schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
-The internal operation layer translates restricted table creation to and from
-its complete Homebase log-and-revision-cell envelope. Local `CREATE TABLE` and
-its Homebase submission now commit in one SQLite savepoint together with a
-pending-effects row keyed by the assigned device sequence. Push, pull, rebase,
-and rollback complete the schema synchronization loop before INSERT is
-connected to synchronization. `push()` now admits the active Homebase stream,
+The internal operation layer translates restricted table creation and captured
+row insertion to and from complete Homebase envelopes. Local `CREATE TABLE` or
+multi-row `INSERT`, its Homebase submission, and its pending-effects row commit
+in one SQLite savepoint. Push, pull, rebase, and rollback cover both schema and
+row operations. `push()` now admits the active Homebase stream,
 then atomically advances its local submit cursor and retires every definitively
 accepted pending prefix in one SQLite savepoint. It returns an opaque rejection
 handle without repairing a stalled suffix. Explicit `rollback(&rejection)`
@@ -30,11 +29,23 @@ The general `Database` owns this SQL gate and reserved namespace. The
 temporary V1 layer only initializes and validates its `items` representation
 and captures inserts into that table.
 
-Each translated table creation contains immutable UUID identities and exact
-SQL. Its Homebase form contains an immutable operation record plus table and
-canonical-name revision cells, with those cells also serving as range-assert
-scopes. The inverse translation verifies the complete envelope and checks that
-the stored SQL projects to the same structured operation.
+Each translated table creation contains immutable UUID identities for its
+table, schema revision, row keyspace, and columns, plus the exact SQL. Its
+Homebase form records the immutable schema operation, canonical name lookup,
+schema revision, row-keyspace definition, active row keyspace, and one mutable
+`write-revision` cell whose value is the UUID of the latest DDL operation that
+changed valid row lowering. The inverse translation verifies the complete
+envelope and checks that stored SQL projects to the same structured operation.
+
+SQLite's preupdate hook captures final inserted values after affinity has run.
+One SQL statement becomes one `InsertRows` operation even when it inserts many
+rows. Row frames identify their schema revision and carry column-UUID/value
+pairs using lossless SQLite storage classes. Primary-key values become separate
+Homebase key components under the table and row-keyspace UUID. Submissions
+assert every exact row key plus the table's active-row-keyspace and
+write-revision cells. Accepted foreign rows replay by stable IDs through the
+local schema catalog; rejected local rows are deleted by the pending journal in
+the same transaction that rolls back the Homebase submit window.
 
 `MultiliteConnection::open` is the single file-lifecycle verb. Internally it
 first opens and commits a general Multilite database containing identity and
@@ -68,9 +79,10 @@ the read and returns a rejection handle without implicitly rolling back
 speculative SQLite state. A remote write does undo its own local SQLite effects
 before returning a definitive rejection. Transport failure is not rejection:
 durable local submissions remain available for retry because admission may be
-ambiguous. Freshness is session-local and starts stale after every open. Until
-the general row-operation batch lands, synchronized policy modes reject
-`INSERT` instead of presenting a local-only row as admitted.
+ambiguous. Freshness is session-local and starts stale after every open. Inserts
+into tables created through Multilite participate in every synchronization
+policy; adopted tables without durable schema identities are rejected by the
+row pipeline.
 
 V1 invitations and space envelopes are plaintext scaffolding. The stable API
 is designed for a later encrypted default: a fresh open will mint the final
@@ -98,8 +110,10 @@ Homebase client state is stored in the same SQLite file under
 Speculative Multilite operations and their explicit acceptance/rejection
 effects are stored under `__multilite__pending`; this is a local disposition
 journal, not a second operation log. Its versioned record codec stores repeated
-effect lists: the initial CREATE TABLE acceptance list is empty, while its
-rejection list drops the speculative table.
+effect lists: CREATE TABLE rejection drops the speculative table and catalog
+entry, while INSERT rejection removes the exact speculative rows.
+`__multilite__schema` is the local lookup index from SQLite names and stable
+table UUIDs to authenticated schema definitions.
 The ordered-store adapter executes synchronously under a serialized,
 thread-reentrant connection owner: other threads cannot use the connection
 concurrently, while metadata operations can join the outer SQLite savepoint

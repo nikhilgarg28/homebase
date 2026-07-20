@@ -685,7 +685,7 @@ atomic submission/pending insertion, accepted-prefix cleanup, rollback effects,
 remote DDL application, and persistence of pulled and applied history. No
 production transition changed in this batch.
 
-### Batch 15a: retire the temporary V1 wrapper
+### Batch 15a: retire the temporary V1 wrapper (deferred)
 
 General CREATE TABLE coordination and the SQLite/Homebase lifecycle now live
 below `v1`; the remaining V1 layer primarily creates a synthetic `items` table,
@@ -701,14 +701,38 @@ codec, metastore, and synchronization APIs. There are no released files to
 migrate; this is deliberately a clean format break while the project has no
 users.
 
+The general INSERT pipeline was kept below the temporary wrapper instead of
+waiting for this cleanup. The V1 `items` capture remains a local-only temporary
+exception; synchronized inserts require a table registered in the general
+schema catalog. Removing V1 remains a separate format cleanup.
+
 ### Batch 16 and later: INSERT pipeline
 
-Only after CREATE TABLE converges end to end, add row identity and operation
-encoding, preupdate-hook capture, atomic row submission, push, pull, rebase,
-and explicit rollback. Multi-row and `INSERT ... SELECT` must preserve SQLite
-row order in one Homebase commit. Duplicate local primary keys produce no
-submission, exact-key assertions enforce append-only OCC, and pending row
-effects follow the same accept/reject protocol established for schema.
+Implemented for tables created through Multilite: preupdate capture observes
+SQLite's final storage-class values, and one statement lowers to one
+`InsertRows` operation while preserving row order. Row frames carry a schema
+revision UUID plus column-UUID/value pairs. Each primary-key part is a separate
+Homebase component under
+`["multilite", "tables", T, "rows", Krow, ...]`; exact row assertions
+enforce append-only OCC.
+
+Every table has one mutable
+`["multilite", "tables", T, "write-revision"]` cell whose value is the UUID
+of the latest DDL mutation that changed valid row lowering. Inserts assert that
+cell and `active-row-keyspace` in addition to row keys. There is no separate
+write-contract record: immutable schema and keyspace records describe how to
+decode history, while this one fixed cell fences obsolete writers.
+
+The local `__multilite__schema` catalog maps canonical SQLite names and table
+UUIDs to the complete authenticated definition. Local DDL registers it in the
+same savepoint as SQLite and Homebase submission; remote DDL registers it before
+later rows replay. Pending INSERT rejection stores an explicit delete-rows
+effect, and rollback executes those effects in reverse submit order. Tests
+cover multi-row capture/reopen, codec and envelope validation, disjoint
+two-device inserts, same-primary-key rejection, explicit rollback, and final
+row convergence. The current Homebase component limit remains intentionally
+unchanged for this batch; oversized key images fail the finalizer and roll back
+both SQLite and metadata before commit.
 
 ### Open-time synchronization policies
 
