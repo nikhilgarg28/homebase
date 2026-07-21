@@ -89,9 +89,13 @@ arrive within each typed set. The final planner merges the selected antichains,
 prunes cross-category overlap, and binds every range assertion to the
 transaction's authority frontier. Snapshot isolation
 always includes writes and mandatory constraints. Serializable isolation also
-includes traced application reads. Read tracing lands in the next vtable batch,
-so both levels intentionally produce the same assertions for today's supported
-`CREATE TABLE` and `INSERT` operations.
+includes traced application reads. Managed-update reads over one synchronized
+table now run through a transaction-local virtual-table facade. Full scans and
+non-primary predicates conservatively trace the table's active row keyspace;
+primary-key equality traces one exact row key. The facade is refreshed before
+each execution, so a reusable prepared statement sees earlier writes in the
+same managed update without querying SQLite recursively from a vtable callback.
+Broader joins, subqueries, and index-prefix reads remain future SQL slices.
 
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an

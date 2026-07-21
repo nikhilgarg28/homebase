@@ -81,3 +81,12 @@ Change name of column from name-{name} to just <name> or <name>...[hash]
 Take gem name for multilite
 
 idea - split i64 in 8 components to make range locking / asserts finer
+
+
+Modes
+======
+1. Keep regular sqlite, just add concurrent transactions + watch queries
+
+2. Same as (1) but ability to sync to remote server
+
+3. 

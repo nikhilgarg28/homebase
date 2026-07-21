@@ -5,6 +5,7 @@ use homebase_core::tag::AdmissionSeq;
 use pollster::block_on;
 use rusqlite::{Connection, Row};
 
+use super::isolation::ReadTrace;
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
 use super::sql::ValidatedExecute;
@@ -29,6 +30,7 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
     connection: &'a Connection,
     authority_frontier: AdmissionSeq,
     isolation: IsolationLevel,
+    read_trace: ReadTrace,
     operations: Vec<MultiliteOp>,
 }
 
@@ -46,6 +48,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             connection,
             authority_frontier,
             isolation,
+            read_trace: ReadTrace::new(),
             operations: Vec::new(),
         }
     }
@@ -83,7 +86,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     /// Prepare one read-only statement bound to this managed update.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        TransactionStatement::new(self.runtime, self.connection, sql)
+        TransactionStatement::new(
+            self.runtime,
+            self.connection,
+            sql,
+            Some(self.read_trace.clone()),
+        )
     }
 
     /// Execute one statement validated before the outer update began.
@@ -140,9 +148,9 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             return Ok(());
         }
         let transaction = MultiliteTransaction::new(self.operations)?;
-        let (mutations, assertions) = transaction
-            .to_homebase()?
-            .plan(self.isolation, self.authority_frontier);
+        let mut homebase = transaction.to_homebase()?;
+        homebase.include_read_trace(&self.read_trace);
+        let (mutations, assertions) = homebase.plan(self.isolation, self.authority_frontier);
         self.runtime.with_internal_metadata(|| {
             let sequence = block_on(async {
                 let space = self

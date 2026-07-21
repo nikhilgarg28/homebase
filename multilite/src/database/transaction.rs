@@ -10,7 +10,7 @@ use homebase_core::writer::Writer;
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
-use super::isolation::{ConflictFootprint, IsolationLevel};
+use super::isolation::{ConflictFootprint, IsolationLevel, ReadTrace};
 use super::operation::MultiliteOp;
 use crate::{Error, Result};
 
@@ -36,6 +36,11 @@ pub struct HomebaseTransaction {
 }
 
 impl HomebaseTransaction {
+    /// Merge reads observed while the transaction's SQLite statements ran.
+    pub fn include_read_trace(&mut self, trace: &ReadTrace) {
+        self.footprint.extend(trace.footprint());
+    }
+
     /// Plan assertions for one isolation level and authority snapshot.
     pub fn plan(
         self,

@@ -2,7 +2,8 @@
 
 use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, InsertBody, Name, Stmt, TabFlags,
+    As, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Name, OneSelect, Operator,
+    ResultColumn, SelectTable, Stmt, TabFlags,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -12,6 +13,124 @@ use crate::{Error, Result};
 pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
     Insert,
+}
+
+/// One supported transaction read rewritten to the internal vtable facade.
+pub struct VTabReadPlan {
+    pub table_name: String,
+    pub rewritten_sql: String,
+}
+
+/// Validate the initial transaction-read grammar and replace its one source.
+pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
+    let command = parse_one_command(sql)?;
+    let Cmd::Stmt(Stmt::Select(mut select)) = command else {
+        return Err(Error::UnsupportedSql(
+            "managed update queries accept only SELECT",
+        ));
+    };
+    if select.with.is_some() || select.body.compounds.is_some() {
+        return Err(unsupported_transaction_read());
+    }
+    let OneSelect::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        window_clause,
+        ..
+    } = &mut select.body.select
+    else {
+        return Err(unsupported_transaction_read());
+    };
+    validate_result_columns(columns)?;
+    if group_by.is_some() || having.is_some() || window_clause.is_some() {
+        return Err(unsupported_transaction_read());
+    }
+    if let Some(where_clause) = where_clause {
+        validate_read_expression(where_clause)?;
+    }
+    if let Some(order_by) = &select.order_by {
+        for column in order_by {
+            validate_read_expression(&column.expr)?;
+        }
+    }
+    if let Some(limit) = &select.limit {
+        validate_read_expression(&limit.expr)?;
+        if let Some(offset) = &limit.offset {
+            validate_read_expression(offset)?;
+        }
+    }
+
+    let Some(from) = from else {
+        return Ok(None);
+    };
+    if from.joins.is_some() {
+        return Err(unsupported_transaction_read());
+    }
+    let Some(source) = from.select.as_deref_mut() else {
+        return Err(unsupported_transaction_read());
+    };
+    let SelectTable::Table(name, alias, indexed) = source else {
+        return Err(unsupported_transaction_read());
+    };
+    if name.db_name.is_some() || name.alias.is_some() || indexed.is_some() {
+        return Err(unsupported_transaction_read());
+    }
+    let table = identifier(&name.name)?;
+    if super::is_schema_table(table.value()) {
+        return Ok(None);
+    }
+    if super::has_multilite_prefix(table.value()) {
+        return Err(Error::UnsupportedSql(
+            "reserved Multilite tables are not supported",
+        ));
+    }
+    if alias.is_none() {
+        *alias = Some(As::As(name.name.clone()));
+    }
+    name.name = Name(super::vtab::MODULE_NAME.into());
+
+    Ok(Some(VTabReadPlan {
+        table_name: table.value().to_owned(),
+        rewritten_sql: Cmd::Stmt(Stmt::Select(select)).to_string(),
+    }))
+}
+
+fn validate_result_columns(columns: &[ResultColumn]) -> Result<()> {
+    for column in columns {
+        match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => {}
+            ResultColumn::Expr(expression, _) => validate_read_expression(expression)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_read_expression(expression: &Expr) -> Result<()> {
+    match expression {
+        Expr::Id(_) | Expr::Name(_) | Expr::Qualified(_, _) | Expr::Variable(_) => Ok(()),
+        Expr::Literal(_) => Ok(()),
+        Expr::FunctionCallStar {
+            name,
+            filter_over: None,
+        } if name.0.eq_ignore_ascii_case("count") => Ok(()),
+        Expr::Binary(left, Operator::Equals | Operator::And, right) => {
+            validate_read_expression(left)?;
+            validate_read_expression(right)
+        }
+        Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            validate_read_expression(&expressions[0])
+        }
+        _ => Err(unsupported_transaction_read()),
+    }
+}
+
+fn unsupported_transaction_read() -> Error {
+    Error::UnsupportedSql(
+        "managed update SELECT supports one table with simple equality predicates",
+    )
 }
 
 pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
@@ -376,6 +495,34 @@ mod tests {
             "INSERT INTO notes VALUES (1)",
         ] {
             validate_managed_statement(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn transaction_reads_rewrite_one_table_and_leave_constant_selects_direct() {
+        let plan = plan_vtab_read("SELECT count(*) FROM notes WHERE day = ?1 ORDER BY id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.table_name, "notes");
+        assert!(plan.rewritten_sql.contains(super::super::vtab::MODULE_NAME));
+        assert!(plan.rewritten_sql.contains("notes"));
+        assert!(plan_vtab_read("SELECT 1").unwrap().is_none());
+    }
+
+    #[test]
+    fn transaction_reads_reject_sources_outside_the_initial_vtable_slice() {
+        for sql in [
+            "SELECT * FROM notes JOIN tasks USING (id)",
+            "SELECT * FROM (SELECT * FROM notes)",
+            "SELECT * FROM notes WHERE id = 1 OR id = 2",
+            "SELECT EXISTS(SELECT 1 FROM notes)",
+            "WITH values AS (SELECT 1) SELECT * FROM values",
+            "SELECT * FROM __multilite__vtab",
+        ] {
+            assert!(
+                matches!(plan_vtab_read(sql), Err(Error::UnsupportedSql(_))),
+                "transaction read was accepted: {sql}"
+            );
         }
     }
 }

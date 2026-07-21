@@ -443,18 +443,7 @@ impl InsertRows {
 
     fn row_key(&self, row: &Row) -> std::result::Result<Key, RowCodecError> {
         let images = self.key_images(row)?;
-        Key::from_bytes(
-            [
-                codes::ROOT.to_vec(),
-                codes::TABLES.to_vec(),
-                self.table.as_bytes().to_vec(),
-                codes::ROWS.to_vec(),
-                self.row_keyspace.as_bytes().to_vec(),
-            ]
-            .into_iter()
-            .chain(images),
-        )
-        .map_err(RowCodecError::InvalidKey)
+        row_prefix(self.table, self.row_keyspace, images)
     }
 
     fn key_images(&self, row: &Row) -> std::result::Result<Vec<Vec<u8>>, RowCodecError> {
@@ -493,6 +482,65 @@ impl InsertRows {
         }
         writer.finish()
     }
+}
+
+/// Prefix covering every row encoded under a table's active row keyspace.
+pub fn row_keyspace_prefix(created: &CreateTable) -> Key {
+    row_prefix(created.table_id(), created.row_keyspace_id(), Vec::new())
+        .expect("table row prefix is bounded and non-empty")
+}
+
+/// Exact row prefix produced by one complete primary-key value tuple.
+pub fn primary_key_prefix(
+    created: &CreateTable,
+    values: &[StoredValue],
+) -> std::result::Result<Key, RowCodecError> {
+    let primary = created.primary_key_columns().collect::<Vec<_>>();
+    if primary.len() != values.len() {
+        return Err(RowCodecError::InvalidRow);
+    }
+    let images = primary
+        .into_iter()
+        .zip(values)
+        .map(|(column, value)| {
+            if matches!(
+                (column.declared_type(), value),
+                (
+                    DeclaredType::Integer | DeclaredType::Real,
+                    StoredValue::Text(_)
+                )
+            ) {
+                return Err(RowCodecError::InvalidRow);
+            }
+            key_image(
+                value,
+                KeyPartRules {
+                    column: column.id(),
+                    declared_type: column.declared_type(),
+                },
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    row_prefix(created.table_id(), created.row_keyspace_id(), images)
+}
+
+fn row_prefix(
+    table: TableId,
+    row_keyspace: RowKeyspaceId,
+    images: Vec<Vec<u8>>,
+) -> std::result::Result<Key, RowCodecError> {
+    Key::from_bytes(
+        [
+            codes::ROOT.to_vec(),
+            codes::TABLES.to_vec(),
+            table.as_bytes().to_vec(),
+            codes::ROWS.to_vec(),
+            row_keyspace.as_bytes().to_vec(),
+        ]
+        .into_iter()
+        .chain(images),
+    )
+    .map_err(RowCodecError::InvalidKey)
 }
 
 fn key_image(
@@ -839,6 +887,10 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 2);
         assert_eq!(lowered.footprint.writes().len(), 2);
         assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(
+            lowered.mutations[0].key(),
+            &primary_key_prefix(&created, &[StoredValue::Integer(7)]).unwrap()
+        );
         for (mutation, assertion) in lowered.mutations.iter().zip(lowered.footprint.writes()) {
             assert_eq!(mutation.key(), assertion);
             assert_eq!(mutation.key().components().len(), 6);

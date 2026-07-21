@@ -15,6 +15,7 @@ mod store;
 mod transaction;
 mod update;
 mod view;
+mod vtab;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1211,24 +1212,30 @@ mod tests {
             [2]
         );
 
-        let observed = replica
-            .update(&replica_runtime, |update| {
-                let before = count(
-                    update.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
-                );
-                source.execute(&source_runtime, "INSERT INTO notes VALUES (3)", ())?;
-                let after_remote = count(update.query(
-                    "SELECT count(*) FROM notes",
-                    (),
-                    |row| row.get::<_, i64>(0),
-                )?);
-                update.execute("INSERT INTO notes VALUES (4)", ())?;
-                let after_local = count(
-                    update.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))?,
-                );
-                Ok((before, after_remote, after_local))
-            })
-            .unwrap();
+        let observed =
+            replica
+                .update_with(
+                    &replica_runtime,
+                    UpdateOptions::new(IsolationLevel::Snapshot),
+                    |update| {
+                        let before =
+                            count(update.query("SELECT count(*) FROM notes", (), |row| {
+                                row.get::<_, i64>(0)
+                            })?);
+                        source.execute(&source_runtime, "INSERT INTO notes VALUES (3)", ())?;
+                        let after_remote =
+                            count(update.query("SELECT count(*) FROM notes", (), |row| {
+                                row.get::<_, i64>(0)
+                            })?);
+                        update.execute("INSERT INTO notes VALUES (4)", ())?;
+                        let after_local =
+                            count(update.query("SELECT count(*) FROM notes", (), |row| {
+                                row.get::<_, i64>(0)
+                            })?);
+                        Ok((before, after_remote, after_local))
+                    },
+                )
+                .unwrap();
         assert_eq!(observed, (2, 2, 3));
         assert_eq!(
             replica
@@ -1665,6 +1672,67 @@ mod tests {
         let expected = vec![(1, "one".into()), (2, "two".into())];
         assert_eq!(rows(&database), expected);
         assert_eq!(rows(&replica), expected);
+    }
+
+    #[test]
+    fn managed_update_reads_are_asserted_only_for_serializable_isolation() {
+        let directory = tempfile::tempdir().unwrap();
+        let assertions_for = |isolation, filename: &str, table: &str| {
+            let database = Database::open(directory.path().join(filename)).unwrap();
+            let runtime = database.runtime().unwrap();
+            database
+                .update_with(&runtime, UpdateOptions::new(isolation), |update| {
+                    update.execute(
+                        &format!(
+                            "CREATE TABLE {table} (
+                                id INTEGER PRIMARY KEY,
+                                day TEXT NOT NULL
+                             )"
+                        ),
+                        (),
+                    )?;
+                    assert_eq!(
+                        update.query(
+                            &format!("SELECT count(*) FROM {table} WHERE day = ?1"),
+                            ["mon"],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        [0]
+                    );
+                    update.execute(&format!("INSERT INTO {table} VALUES (1, 'mon')"), ())?;
+                    Ok(())
+                })
+                .unwrap();
+
+            let traced = database.with_connection(|connection| {
+                let created = catalog::by_name(connection, table).unwrap().unwrap();
+                row::row_keyspace_prefix(&created)
+            });
+            let state = client_state(&database);
+            let space = &state.spaces[&database.database_id.space_id()];
+            (space.oplog[&DeviceSeq(1)].range_asserts().to_vec(), traced)
+        };
+
+        let (snapshot, snapshot_read) =
+            assertions_for(IsolationLevel::Snapshot, "snapshot.sqlite", "notes");
+        assert!(
+            !snapshot
+                .iter()
+                .any(|assertion| assertion.prefix == snapshot_read)
+        );
+
+        let (serializable, serializable_read) =
+            assertions_for(IsolationLevel::Serializable, "serializable.sqlite", "tasks");
+        assert!(
+            serializable
+                .iter()
+                .any(|assertion| assertion.prefix == serializable_read)
+        );
+        assert!(
+            serializable
+                .iter()
+                .all(|assertion| assertion.upto == AdmissionSeq(0))
+        );
     }
 
     #[test]
