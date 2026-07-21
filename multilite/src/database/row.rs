@@ -12,6 +12,7 @@ use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
+use super::isolation::ConflictFootprint;
 use super::schema::{
     ColumnId, CreateTable, DeclaredType, RowKeyspaceId, SchemaRevisionId, TableId,
     active_row_keyspace_key, write_revision_key,
@@ -149,10 +150,10 @@ pub struct InsertRows {
     rows: Vec<Row>,
 }
 
-/// Homebase mutations and asserted cells for one row insertion.
+/// Homebase mutations and conflict footprint for one row insertion.
 pub struct RowHomebaseOp {
     pub mutations: Vec<Mutation>,
-    pub asserted_scopes: Vec<Key>,
+    pub footprint: ConflictFootprint,
 }
 
 impl InsertRows {
@@ -207,22 +208,22 @@ impl InsertRows {
 
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
         let mut mutations = Vec::with_capacity(self.rows.len());
-        let mut asserted_scopes = Vec::with_capacity(self.rows.len() + 2);
+        let mut footprint = ConflictFootprint::new();
         for row in &self.rows {
             let key = self
                 .row_key(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            asserted_scopes.push(key.clone());
+            footprint.add_write(key.clone());
             mutations.push(Mutation::Set {
                 key,
                 value: self.encode_row(row),
             });
         }
-        asserted_scopes.push(active_row_keyspace_key(self.table));
-        asserted_scopes.push(write_revision_key(self.table));
+        footprint.add_constraint(active_row_keyspace_key(self.table));
+        footprint.add_constraint(write_revision_key(self.table));
         Ok(RowHomebaseOp {
             mutations,
-            asserted_scopes,
+            footprint,
         })
     }
 
@@ -836,8 +837,9 @@ mod tests {
         assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
-        assert_eq!(lowered.asserted_scopes.len(), 4);
-        for (mutation, assertion) in lowered.mutations.iter().zip(&lowered.asserted_scopes) {
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 2);
+        for (mutation, assertion) in lowered.mutations.iter().zip(lowered.footprint.writes()) {
             assert_eq!(mutation.key(), assertion);
             assert_eq!(mutation.key().components().len(), 6);
         }

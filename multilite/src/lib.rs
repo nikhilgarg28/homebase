@@ -13,8 +13,8 @@ pub use database::{
     Connection, Statement, TransactionStatement, UpdateTransaction, ViewTransaction,
 };
 pub use database::{
-    DatabaseId, OfflineServer, OpenOptions, PullOutcome, PushOutcome, PushRejection,
-    ReplicaInvitation, SyncPolicy,
+    DatabaseId, IsolationLevel, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
+    PushRejection, ReplicaInvitation, SyncPolicy, UpdateOptions,
 };
 pub use error::{Error, Result};
 pub use rusqlite::types::{FromSql, Type, Value, ValueRef};

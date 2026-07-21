@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use homebase_client::server::UnreachableSpace;
 use homebase_core::space::SpaceId;
-use multilite::{Error, MultiliteConnection, OpenOptions, ReplicaInvitation, SyncPolicy};
+use multilite::{
+    Error, IsolationLevel, MultiliteConnection, OpenOptions, ReplicaInvitation, SyncPolicy,
+};
 use rusqlite::Connection;
 
 #[test]
@@ -247,4 +249,20 @@ fn open_time_sync_policy_is_public_and_validated() {
         ),
         Err(Error::AuthorityRequired("remote policy"))
     ));
+}
+
+#[test]
+fn isolation_defaults_to_serializable_and_can_be_selected_at_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let default = MultiliteConnection::open(directory.path().join("serializable.sqlite")).unwrap();
+    assert_eq!(default.isolation_level(), IsolationLevel::Serializable);
+
+    let snapshot = MultiliteConnection::open_with(
+        directory.path().join("snapshot.sqlite"),
+        OpenOptions::new()
+            .isolation_level(IsolationLevel::Snapshot)
+            .server(|_: &SpaceId| None::<UnreachableSpace>),
+    )
+    .unwrap();
+    assert_eq!(snapshot.isolation_level(), IsolationLevel::Snapshot);
 }

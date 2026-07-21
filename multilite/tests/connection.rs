@@ -1,6 +1,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use multilite::{Error, MultiliteConnection, PushOutcome, Result, params};
+use multilite::{
+    Error, IsolationLevel, MultiliteConnection, OpenOptions, PushOutcome, Result, UpdateOptions,
+    params,
+};
 use rusqlite::{Connection as SqliteConnection, ErrorCode};
 
 #[test]
@@ -285,4 +288,26 @@ fn managed_update_pins_its_snapshot_before_the_closure_runs() {
             .unwrap(),
         [2]
     );
+}
+
+#[test]
+fn managed_update_uses_the_open_default_or_an_explicit_override() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open_with(
+        directory.path().join("isolation.sqlite"),
+        OpenOptions::new().isolation_level(IsolationLevel::Snapshot),
+    )
+    .unwrap();
+
+    db.update(|tx| {
+        assert_eq!(tx.isolation_level(), IsolationLevel::Snapshot);
+        Ok(())
+    })
+    .unwrap();
+    db.update_with(UpdateOptions::new(IsolationLevel::Serializable), |tx| {
+        assert_eq!(tx.isolation_level(), IsolationLevel::Serializable);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(db.isolation_level(), IsolationLevel::Snapshot);
 }

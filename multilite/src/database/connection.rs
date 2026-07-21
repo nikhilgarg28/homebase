@@ -6,8 +6,9 @@ use std::sync::Arc;
 use homebase_client::ServerHandle;
 
 use super::{
-    Database, DatabaseId, DatabaseRuntime, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
-    PushRejection, ReplicaInvitation, Statement, UpdateTransaction, ViewTransaction,
+    Database, DatabaseId, DatabaseRuntime, IsolationLevel, OfflineServer, OpenOptions, PullOutcome,
+    PushOutcome, PushRejection, ReplicaInvitation, Statement, UpdateOptions, UpdateTransaction,
+    ViewTransaction,
 };
 use crate::{Params, Result};
 use rusqlite::Row;
@@ -62,6 +63,11 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.sync_policy()
     }
 
+    /// Default isolation level selected when this connection was opened.
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.database.isolation_level()
+    }
+
     /// Push this database's active local submissions as far as possible.
     pub fn push(&self) -> Result<PushOutcome> {
         self.database.push()
@@ -98,6 +104,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
         self.database.update(&self.runtime, operation)
+    }
+
+    /// Run one managed update with an explicit per-transaction override.
+    pub fn update_with<T>(
+        &self,
+        options: UpdateOptions,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
+        self.database.update_with(&self.runtime, options, operation)
     }
 
     /// Execute one read-only statement as an implicit managed view.

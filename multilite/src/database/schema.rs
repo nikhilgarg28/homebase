@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
+use super::isolation::ConflictFootprint;
 
 const SCHEMA_FRAME_VERSION: u8 = 1;
 const TAG_MUTATION_ID: u8 = 1;
@@ -140,11 +141,11 @@ pub struct CreateTable {
     columns: Vec<Column>,
 }
 
-/// Homebase mutations and coordination scopes for one schema change.
+/// Homebase mutations and conflict footprint for one schema change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaHomebaseOp {
     pub mutations: Vec<Mutation>,
-    pub asserted_scopes: Vec<Key>,
+    pub footprint: ConflictFootprint,
 }
 
 macro_rules! id_accessors {
@@ -194,6 +195,9 @@ impl CreateTable {
         let active_row_keyspace = active_row_keyspace_key(self.table_id);
         let row_keyspace = row_keyspace_key(self.table_id, self.row_keyspace_id);
         let write_revision = write_revision_key(self.table_id);
+        let mut footprint = ConflictFootprint::new();
+        footprint.add_constraint(name_scope.clone());
+        footprint.add_write(write_revision.clone());
         SchemaHomebaseOp {
             mutations: vec![
                 Mutation::Set {
@@ -221,7 +225,7 @@ impl CreateTable {
                     value: self.mutation_id.0.to_vec(),
                 },
             ],
-            asserted_scopes: vec![name_scope, write_revision],
+            footprint,
         }
     }
 
@@ -844,7 +848,8 @@ mod tests {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase();
         assert_eq!(lowered.mutations.len(), 6);
-        assert_eq!(lowered.asserted_scopes.len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 1);
+        assert_eq!(lowered.footprint.writes().len(), 1);
 
         let Mutation::Set { key: log, value } = &lowered.mutations[0] else {
             panic!("schema log entry was not a set")
@@ -852,8 +857,18 @@ mod tests {
         assert_eq!(log.components()[2].as_bytes(), b"log");
         assert_eq!(log.components()[3].as_bytes(), test_uuid(1));
         assert_eq!(decode_frame(value).unwrap(), created);
-        assert_eq!(lowered.mutations[1].key(), &lowered.asserted_scopes[0]);
-        assert_eq!(lowered.mutations[5].key(), &lowered.asserted_scopes[1]);
+        assert!(
+            lowered
+                .footprint
+                .constraints()
+                .contains(lowered.mutations[1].key())
+        );
+        assert!(
+            lowered
+                .footprint
+                .writes()
+                .contains(lowered.mutations[5].key())
+        );
 
         let admitted = admit(lowered.mutations);
         assert_eq!(CreateTable::from_homebase(&admitted).unwrap(), created);

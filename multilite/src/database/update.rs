@@ -10,7 +10,10 @@ use super::row::InsertRows;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
-use super::{Database, DatabaseRuntime, SyncPolicy, catalog, lock, pending, pin_snapshot};
+use super::{
+    Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog, lock, pending,
+    pin_snapshot,
+};
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
@@ -25,6 +28,7 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
     runtime: &'a DatabaseRuntime,
     connection: &'a Connection,
     authority_frontier: AdmissionSeq,
+    isolation: IsolationLevel,
     operations: Vec<MultiliteOp>,
 }
 
@@ -34,14 +38,21 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         runtime: &'a DatabaseRuntime,
         connection: &'a Connection,
         authority_frontier: AdmissionSeq,
+        isolation: IsolationLevel,
     ) -> Self {
         Self {
             database,
             runtime,
             connection,
             authority_frontier,
+            isolation,
             operations: Vec::new(),
         }
+    }
+
+    /// Isolation level selected for this managed update.
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation
     }
 
     /// Execute one supported mutating statement inside this update.
@@ -129,7 +140,9 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             return Ok(());
         }
         let transaction = MultiliteTransaction::new(self.operations)?;
-        let (mutations, assertions) = transaction.to_homebase()?.at(self.authority_frontier);
+        let (mutations, assertions) = transaction
+            .to_homebase()?
+            .plan(self.isolation, self.authority_frontier);
         self.runtime.with_internal_metadata(|| {
             let sequence = block_on(async {
                 let space = self
@@ -155,6 +168,16 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         runtime: &DatabaseRuntime,
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
+        self.update_with(runtime, UpdateOptions::new(self.isolation_level), operation)
+    }
+
+    /// Run one managed update with an explicit isolation override.
+    pub fn update_with<T>(
+        &self,
+        runtime: &DatabaseRuntime,
+        options: UpdateOptions,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
         let _operation = lock(&self.operation);
         self.refresh_read_locked(runtime)?;
         let authority_frontier = self.authority_frontier()?;
@@ -162,8 +185,13 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             .owner
             .with_savepoint("__multilite__serialized_update", |connection| {
                 pin_snapshot(connection)?;
-                let mut update =
-                    UpdateTransaction::new(self, runtime, connection, authority_frontier);
+                let mut update = UpdateTransaction::new(
+                    self,
+                    runtime,
+                    connection,
+                    authority_frontier,
+                    options.isolation_level(),
+                );
                 let value = operation(&mut update)?;
                 update.finalize()?;
                 Ok(value)

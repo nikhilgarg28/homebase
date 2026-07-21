@@ -3,6 +3,7 @@
 mod catalog;
 mod codes;
 mod connection;
+mod isolation;
 mod operation;
 mod pending;
 mod policy;
@@ -40,6 +41,7 @@ use self::row::{CapturedRow, StoredValue};
 use self::store::DatabaseMetaStore;
 
 pub use self::connection::Connection;
+pub use self::isolation::{IsolationLevel, UpdateOptions};
 pub use self::policy::SyncPolicy;
 pub use self::update::UpdateTransaction;
 pub use self::view::{TransactionStatement, ViewTransaction};
@@ -173,6 +175,7 @@ where
     server: H,
     authority: bool,
     sync_policy: SyncPolicy,
+    isolation_level: IsolationLevel,
 }
 
 impl Default for OpenOptions<OfflineServer> {
@@ -189,6 +192,7 @@ impl OpenOptions<OfflineServer> {
             server: offline_server,
             authority: false,
             sync_policy: SyncPolicy::default(),
+            isolation_level: IsolationLevel::default(),
         }
     }
 }
@@ -206,6 +210,12 @@ impl<H: ServerHandle> OpenOptions<H> {
         self
     }
 
+    /// Select the default isolation level for managed updates.
+    pub fn isolation_level(mut self, isolation_level: IsolationLevel) -> Self {
+        self.isolation_level = isolation_level;
+        self
+    }
+
     /// Replace the server route while retaining all other options.
     pub fn server<S: ServerHandle>(self, server: S) -> OpenOptions<S> {
         OpenOptions {
@@ -213,6 +223,7 @@ impl<H: ServerHandle> OpenOptions<H> {
             server,
             authority: true,
             sync_policy: self.sync_policy,
+            isolation_level: self.isolation_level,
         }
     }
 
@@ -297,6 +308,7 @@ pub(crate) struct Database<H: ServerHandle> {
     database_id: DatabaseId,
     client: DatabaseClient<H>,
     policy: PolicyState,
+    isolation_level: IsolationLevel,
     operation: Arc<Mutex<()>>,
     scheduler: PushScheduler,
 }
@@ -328,6 +340,10 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     pub(crate) fn sync_policy(&self) -> SyncPolicy {
         self.policy.policy()
+    }
+
+    pub(crate) fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_level
     }
 
     pub(crate) fn database_id(&self) -> DatabaseId {
@@ -615,6 +631,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         server,
         authority: _,
         sync_policy,
+        isolation_level,
     } = options;
     let lineage = Lineage(mint_id()?);
     let (database_id, client) =
@@ -629,6 +646,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         database_id,
         client,
         policy: PolicyState::new(sync_policy),
+        isolation_level,
         operation: Arc::new(Mutex::new(())),
         scheduler: PushScheduler::new(),
     })
@@ -895,7 +913,7 @@ mod tests {
             .unwrap()
             .to_homebase()
             .unwrap()
-            .at(AdmissionSeq(0));
+            .plan(IsolationLevel::Serializable, AdmissionSeq(0));
         block_on(async {
             database
                 .client

@@ -10,6 +10,7 @@ use homebase_core::writer::Writer;
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
+use super::isolation::{ConflictFootprint, IsolationLevel};
 use super::operation::MultiliteOp;
 use crate::{Error, Result};
 
@@ -27,21 +28,21 @@ pub struct MultiliteTransaction {
     operations: Vec<MultiliteOp>,
 }
 
-/// Homebase mutations and coordination scopes for one transaction.
+/// Homebase mutations and conflict footprint for one transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomebaseTransaction {
     pub mutations: Vec<Mutation>,
-    asserted_scopes: Vec<Key>,
+    footprint: ConflictFootprint,
 }
 
 impl HomebaseTransaction {
-    /// Bind every asserted scope to the transaction's authority snapshot.
-    pub fn at(self, upto: AdmissionSeq) -> (Vec<Mutation>, Vec<RangeAssert>) {
-        let assertions = self
-            .asserted_scopes
-            .into_iter()
-            .map(|prefix| RangeAssert { prefix, upto })
-            .collect();
+    /// Plan assertions for one isolation level and authority snapshot.
+    pub fn plan(
+        self,
+        isolation: IsolationLevel,
+        upto: AdmissionSeq,
+    ) -> (Vec<Mutation>, Vec<RangeAssert>) {
+        let assertions = self.footprint.plan(isolation, upto);
         (self.mutations, assertions)
     }
 }
@@ -116,15 +117,15 @@ impl MultiliteTransaction {
             key: transaction_key(self.id),
             value: self.encode(),
         }];
-        let mut asserted_scopes = Vec::new();
+        let mut footprint = ConflictFootprint::new();
         for operation in &self.operations {
-            let (operation_mutations, operation_scopes) = operation.to_homebase()?.into_parts();
+            let (operation_mutations, operation_footprint) = operation.to_homebase()?.into_parts();
             mutations.extend(operation_mutations);
-            asserted_scopes.extend(operation_scopes);
+            footprint.extend(operation_footprint);
         }
         Ok(HomebaseTransaction {
             mutations,
-            asserted_scopes,
+            footprint,
         })
     }
 
@@ -339,7 +340,9 @@ mod tests {
 
         let lowered = transaction.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 8);
-        assert_eq!(lowered.asserted_scopes.len(), 5);
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 3);
+        assert!(lowered.footprint.reads().is_empty());
         let Mutation::Set { key, value } = &lowered.mutations[0] else {
             panic!("manifest was not a set")
         };
@@ -349,6 +352,26 @@ mod tests {
             MultiliteTransaction::from_homebase(&admitted(lowered.mutations)).unwrap(),
             transaction
         );
+    }
+
+    #[test]
+    fn current_operations_plan_identically_at_both_isolation_levels() {
+        let transaction = mixed_transaction();
+        let frontier = AdmissionSeq(23);
+        let snapshot = transaction
+            .to_homebase()
+            .unwrap()
+            .plan(IsolationLevel::Snapshot, frontier)
+            .1;
+        let serializable = transaction
+            .to_homebase()
+            .unwrap()
+            .plan(IsolationLevel::Serializable, frontier)
+            .1;
+
+        assert_eq!(snapshot, serializable);
+        assert_eq!(snapshot.len(), 4);
+        assert!(snapshot.iter().all(|assertion| assertion.upto == frontier));
     }
 
     #[test]

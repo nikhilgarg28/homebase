@@ -2,11 +2,11 @@
 
 use std::fmt;
 
-use homebase_core::key::Key;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
 
+use super::isolation::ConflictFootprint;
 use super::row::{InsertRows, RowHomebaseOp};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::{Error, Result};
@@ -22,17 +22,17 @@ pub enum MultiliteOp {
     InsertRows(InsertRows),
 }
 
-/// Homebase mutations and coordination scopes for one [`MultiliteOp`].
+/// Homebase mutations and conflict footprint for one [`MultiliteOp`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomebaseOp {
     pub mutations: Vec<Mutation>,
-    asserted_scopes: Vec<Key>,
+    footprint: ConflictFootprint,
 }
 
 impl HomebaseOp {
-    /// Split deterministic mutations from their unbound assertion scopes.
-    pub fn into_parts(self) -> (Vec<Mutation>, Vec<Key>) {
-        (self.mutations, self.asserted_scopes)
+    /// Split deterministic mutations from their logical conflict footprint.
+    pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
+        (self.mutations, self.footprint)
     }
 }
 
@@ -79,24 +79,24 @@ impl MultiliteOp {
 
     /// Lower this operation to its complete Homebase representation.
     pub fn to_homebase(&self) -> Result<HomebaseOp> {
-        let (mutations, asserted_scopes) = match self {
+        let (mutations, footprint) = match self {
             Self::CreateTable(created) => {
                 let schema = created.to_homebase();
-                (schema.mutations, schema.asserted_scopes)
+                (schema.mutations, schema.footprint)
             }
             Self::InsertRows(inserted) => {
                 let RowHomebaseOp {
                     mutations,
-                    asserted_scopes,
+                    footprint,
                 } = inserted
                     .to_homebase()
                     .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-                (mutations, asserted_scopes)
+                (mutations, footprint)
             }
         };
         Ok(HomebaseOp {
             mutations,
-            asserted_scopes,
+            footprint,
         })
     }
 }
@@ -145,15 +145,17 @@ mod tests {
     }
 
     #[test]
-    fn operation_dispatches_schema_translation_and_exposes_asserted_scopes() {
+    fn operation_dispatches_schema_translation_and_exposes_its_footprint() {
         let operation =
             MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
-        let (mutations, asserted_scopes) = operation.to_homebase().unwrap().into_parts();
+        let (mutations, footprint) = operation.to_homebase().unwrap().into_parts();
 
         assert_eq!(mutations.len(), 6);
-        assert_eq!(asserted_scopes.len(), 2);
-        assert_eq!(asserted_scopes[0], *mutations[1].key());
-        assert_eq!(asserted_scopes[1], *mutations[5].key());
+        assert_eq!(footprint.constraints().len(), 1);
+        assert!(footprint.constraints().contains(mutations[1].key()));
+        assert_eq!(footprint.writes().len(), 1);
+        assert!(footprint.writes().contains(mutations[5].key()));
+        assert!(footprint.reads().is_empty());
     }
 
     #[test]

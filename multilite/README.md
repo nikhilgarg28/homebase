@@ -80,6 +80,19 @@ closure refreshes at most once before its SQLite savepoint begins. Updates pin
 their base snapshot before user code runs; views establish their snapshot on
 their first query and retain it for every later query in the closure.
 
+Isolation is configured independently through `IsolationLevel`, defaulting to
+`Serializable`. `OpenOptions::isolation_level` selects the connection default,
+while `update_with(UpdateOptions::new(...), |tx| ...)` overrides one managed
+update. Every operation contributes typed write and constraint prefixes to one
+transaction footprint, which eagerly prunes redundant descendants as prefixes
+arrive within each typed set. The final planner merges the selected antichains,
+prunes cross-category overlap, and binds every range assertion to the
+transaction's authority frontier. Snapshot isolation
+always includes writes and mandatory constraints. Serializable isolation also
+includes traced application reads. Read tracing lands in the next vtable batch,
+so both levels intentionally produce the same assertions for today's supported
+`CREATE TABLE` and `INSERT` operations.
+
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an
 error or unwinding a panic rolls back the complete local update before any
