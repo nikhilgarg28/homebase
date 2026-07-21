@@ -1,36 +1,12 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use homebase::Server;
-use homebase::actor::{SpaceHandle, Spawner};
-use homebase::storage::MemoryStore;
 use homebase_client::ServerHandle;
-use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::space::SpaceId;
 use multilite::{MultiliteConnection, OpenOptions, PushOutcome};
 
-struct ThreadSpawner;
+mod common;
 
-impl Spawner for ThreadSpawner {
-    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
-        std::thread::spawn(move || pollster::block_on(task));
-    }
-}
-
-type TestServer = Server<MemoryStore, ManualClock, ThreadSpawner>;
-
-fn server() -> Arc<TestServer> {
-    Arc::new(Server::new(
-        Arc::new(MemoryStore::new()),
-        Arc::new(ManualClock::new(Timestamp(0))),
-        ThreadSpawner,
-    ))
-}
-
-fn router(server: Arc<TestServer>) -> impl Fn(&SpaceId) -> Option<SpaceHandle> + Sync {
-    move |space| server.space(space)
-}
+use common::{router, server};
 
 fn tables<H>(database: &MultiliteConnection<H>) -> Vec<(String, String)>
 where
