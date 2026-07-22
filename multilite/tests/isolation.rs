@@ -140,6 +140,47 @@ fn primary_key_collisions_are_mandatory_at_both_isolation_levels() {
     }
 }
 
+#[test]
+fn serializable_primary_key_reads_allow_disjoint_conditional_inserts() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("serializable-point-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+    assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("serializable-point-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+    synchronize_schema(&first, &second);
+
+    assert!(conditionally_book_after_point_read(
+        &first,
+        IsolationLevel::Serializable,
+        1,
+        "mon"
+    ));
+    assert!(conditionally_book_after_point_read(
+        &second,
+        IsolationLevel::Serializable,
+        2,
+        "tue"
+    ));
+
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    converge(&first, &second);
+
+    let expected = vec![(1, String::from("mon")), (2, String::from("tue"))];
+    assert_eq!(bookings(&first), expected);
+    assert_eq!(bookings(&second), expected);
+}
+
 fn synchronize_schema<H1, H2>(source: &MultiliteConnection<H1>, replica: &MultiliteConnection<H2>)
 where
     H1: ServerHandle + Send + Sync + 'static,
@@ -190,6 +231,31 @@ fn insert_without_read<H>(
             Ok(())
         })
         .unwrap();
+}
+
+fn conditionally_book_after_point_read<H>(
+    database: &MultiliteConnection<H>,
+    isolation: IsolationLevel,
+    id: i64,
+    day: &str,
+) -> bool
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database
+        .update_with(UpdateOptions::new(isolation), |transaction| {
+            let count =
+                transaction.query("SELECT count(*) FROM bookings WHERE id = ?1", [id], |row| {
+                    row.get::<_, i64>(0)
+                })?[0];
+            if count == 0 {
+                transaction.execute("INSERT INTO bookings VALUES (?1, ?2)", (id, day))?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .unwrap()
 }
 
 fn converge<H1, H2>(first: &MultiliteConnection<H1>, second: &MultiliteConnection<H2>)
