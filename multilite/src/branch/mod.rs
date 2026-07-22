@@ -155,10 +155,26 @@ trait PageSource: Send + Sync {
     fn read_at(&self, destination: &mut [u8], offset: u64) -> std::io::Result<usize>;
 }
 
+trait SpillStore: PageSource {
+    fn write_at(&self, source: &[u8], offset: u64) -> std::io::Result<usize>;
+}
+
 impl PageSource for File {
     fn read_at(&self, destination: &mut [u8], offset: u64) -> std::io::Result<usize> {
         FileExt::read_at(self, destination, offset)
     }
+}
+
+impl SpillStore for File {
+    fn write_at(&self, source: &[u8], offset: u64) -> std::io::Result<usize> {
+        FileExt::write_at(self, source, offset)
+    }
+}
+
+type SpillFactory = fn() -> std::io::Result<Box<dyn SpillStore>>;
+
+fn create_spill_store() -> std::io::Result<Box<dyn SpillStore>> {
+    tempfile::tempfile().map(|file| Box::new(file) as Box<dyn SpillStore>)
 }
 
 impl SnapshotReader {
@@ -349,6 +365,7 @@ struct PageOverlay {
     memory_bytes: usize,
     pages: BTreeMap<u32, OverlayPage>,
     spill: Option<SpillFile>,
+    spill_factory: SpillFactory,
 }
 
 enum OverlayPage {
@@ -357,12 +374,21 @@ enum OverlayPage {
 }
 
 struct SpillFile {
-    file: File,
+    file: Box<dyn SpillStore>,
     next_offset: u64,
 }
 
 impl PageOverlay {
     fn new(page_size: usize, logical_size: u64, memory_limit: usize) -> Self {
+        Self::new_with_spill_factory(page_size, logical_size, memory_limit, create_spill_store)
+    }
+
+    fn new_with_spill_factory(
+        page_size: usize,
+        logical_size: u64,
+        memory_limit: usize,
+        spill_factory: SpillFactory,
+    ) -> Self {
         Self {
             page_size,
             logical_size,
@@ -371,6 +397,7 @@ impl PageOverlay {
             memory_bytes: 0,
             pages: BTreeMap::new(),
             spill: None,
+            spill_factory,
         }
     }
 
@@ -397,7 +424,7 @@ impl PageOverlay {
                 Some(OverlayPage::Spilled { offset }) => {
                     let spill = self.spill.as_ref().expect("spilled page owns a spill file");
                     if !read_exact_at(
-                        &spill.file,
+                        spill.file.as_ref(),
                         *offset + within,
                         &mut destination[copied..copied + amount],
                     )? {
@@ -474,7 +501,7 @@ impl PageOverlay {
                 offset: spill_offset,
             } => {
                 let spill = self.spill.as_ref().expect("spilled page owns a spill file");
-                write_all_at(&spill.file, *spill_offset + offset as u64, source)?;
+                write_all_at(spill.file.as_ref(), *spill_offset + offset as u64, source)?;
             }
         }
         Ok(())
@@ -510,21 +537,34 @@ impl PageOverlay {
         }
         if self.spill.is_none() {
             self.spill = Some(SpillFile {
-                file: tempfile::tempfile()?,
+                file: (self.spill_factory)()?,
                 next_offset: 0,
             });
         }
-        let spill = self.spill.as_mut().expect("created above");
-        for page in self.pages.values_mut() {
-            let OverlayPage::Memory(bytes) = page else {
-                continue;
-            };
-            let offset = spill.next_offset;
-            write_all_at(&spill.file, offset, bytes)?;
-            spill.next_offset += bytes.len() as u64;
-            *page = OverlayPage::Spilled { offset };
+        let mut replacements = Vec::new();
+        let final_offset = {
+            let spill = self.spill.as_ref().expect("created above");
+            let mut next_offset = spill.next_offset;
+            for (page_number, page) in &self.pages {
+                let OverlayPage::Memory(bytes) = page else {
+                    continue;
+                };
+                write_all_at(spill.file.as_ref(), next_offset, bytes)?;
+                replacements.push((*page_number, next_offset, bytes.len()));
+                next_offset += bytes.len() as u64;
+            }
+            next_offset
+        };
+        let spilled_bytes = replacements
+            .iter()
+            .map(|(_, _, length)| *length)
+            .sum::<usize>();
+        for (page_number, offset, _) in replacements {
+            self.pages
+                .insert(page_number, OverlayPage::Spilled { offset });
         }
-        self.memory_bytes = 0;
+        self.spill.as_mut().expect("created above").next_offset = final_offset;
+        self.memory_bytes = self.memory_bytes.saturating_sub(spilled_bytes);
         Ok(())
     }
 
@@ -548,7 +588,7 @@ impl PageOverlay {
     }
 }
 
-fn write_all_at(file: &File, mut offset: u64, mut source: &[u8]) -> std::io::Result<()> {
+fn write_all_at(file: &dyn SpillStore, mut offset: u64, mut source: &[u8]) -> std::io::Result<()> {
     while !source.is_empty() {
         let written = file.write_at(source, offset)?;
         if written == 0 {
@@ -629,6 +669,7 @@ impl From<rusqlite::Error> for BranchError {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use rusqlite::OptionalExtension as _;
@@ -644,10 +685,36 @@ mod tests {
 
     struct FailingPageSource;
 
+    struct PartiallyFailingSpillStore {
+        writes: AtomicUsize,
+    }
+
     impl PageSource for FailingPageSource {
         fn read_at(&self, _destination: &mut [u8], _offset: u64) -> std::io::Result<usize> {
             Err(std::io::Error::other("injected branch page read failure"))
         }
+    }
+
+    impl PageSource for PartiallyFailingSpillStore {
+        fn read_at(&self, _destination: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl SpillStore for PartiallyFailingSpillStore {
+        fn write_at(&self, source: &[u8], _offset: u64) -> std::io::Result<usize> {
+            if self.writes.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(source.len())
+            } else {
+                Err(std::io::Error::other("injected spill write failure"))
+            }
+        }
+    }
+
+    fn partially_failing_spill_store() -> std::io::Result<Box<dyn SpillStore>> {
+        Ok(Box::new(PartiallyFailingSpillStore {
+            writes: AtomicUsize::new(0),
+        }))
     }
 
     impl Fixture {
@@ -790,6 +857,39 @@ mod tests {
         let mut end = vec![7; 16];
         assert!(!reader.read_at(reader.logical_size() - 4, &mut end).unwrap());
         assert_eq!(&end[4..], &[0; 12]);
+    }
+
+    #[test]
+    fn partial_spill_failure_keeps_every_dirty_page_in_memory() {
+        let mut fixture = Fixture::new();
+        fixture.advance("INSERT INTO records VALUES (1, 'one', randomblob(8000))");
+        let reader = SnapshotReader::open(fixture.snapshot()).unwrap();
+        let page_size = reader.snapshot.page_size() as usize;
+        let mut overlay = PageOverlay::new_with_spill_factory(
+            page_size,
+            reader.logical_size(),
+            0,
+            partially_failing_spill_store,
+        );
+        let mut source = vec![0x41; page_size * 2];
+        source[page_size..].fill(0x42);
+
+        let error = overlay.write_at(&reader, 0, &source).unwrap_err();
+        assert_eq!(error.to_string(), "injected spill write failure");
+        assert_eq!(
+            overlay.stats(),
+            OverlayStats {
+                dirty_pages: 2,
+                memory_bytes: page_size * 2,
+                spilled_pages: 0,
+                logical_size: reader.logical_size(),
+            }
+        );
+
+        let mut recovered = vec![0; page_size * 2];
+        assert!(overlay.read_at(&reader, 0, &mut recovered).unwrap());
+        assert_eq!(recovered[100], 0x41);
+        assert_eq!(recovered[page_size + 100], 0x42);
     }
 
     #[test]
