@@ -1093,6 +1093,91 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_rows_replaced_with_the_same_logical_primary_key() {
+        let fixture = Fixture::new(
+            "CREATE TABLE records (code TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "INSERT INTO records VALUES ('a', 'base'), ('b', 'anchor')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(branch.connection(), &["records"]).unwrap();
+        branch
+            .connection()
+            .execute("UPDATE records SET value = 'branch' WHERE code = 'a'", ())
+            .unwrap();
+        let changeset = capture.finish().unwrap();
+        fixture
+            .writer
+            .execute_batch(
+                "DELETE FROM records WHERE code = 'a';
+                 INSERT INTO records VALUES ('a', 'base')",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            changeset.apply(&fixture.writer),
+            Err(ChangesetError::Conflict(message)) if message.contains("rowid")
+        ));
+        assert_eq!(
+            fixture
+                .writer
+                .query_row("SELECT value FROM records WHERE code = 'a'", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "base"
+        );
+    }
+
+    #[test]
+    fn late_constraint_failure_rolls_back_only_the_replay_savepoint() {
+        let fixture = Fixture::new(
+            "CREATE TABLE records (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE surrounding (value TEXT NOT NULL)",
+            "INSERT INTO records VALUES (1, 'old@example.com')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(branch.connection(), &["records"]).unwrap();
+        branch
+            .connection()
+            .execute(
+                "UPDATE records SET email = 'claimed@example.com' WHERE id = 1",
+                (),
+            )
+            .unwrap();
+        let changeset = capture.finish().unwrap();
+
+        fixture.writer.execute_batch("BEGIN").unwrap();
+        fixture
+            .writer
+            .execute("INSERT INTO surrounding VALUES ('keep me')", ())
+            .unwrap();
+        fixture
+            .writer
+            .execute("INSERT INTO records VALUES (2, 'claimed@example.com')", ())
+            .unwrap();
+        assert!(matches!(
+            changeset.apply(&fixture.writer),
+            Err(ChangesetError::Sqlite(rusqlite::Error::SqliteFailure(_, _)))
+        ));
+
+        assert_eq!(row_count(&fixture.writer, "surrounding"), 1);
+        assert_eq!(
+            fixture
+                .writer
+                .query_row("SELECT email FROM records WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "old@example.com"
+        );
+        fixture.writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(row_count(&fixture.writer, "records"), 2);
+    }
+
+    #[test]
     fn replay_rejects_schema_changes_before_mutating_rows() {
         let fixture = Fixture::new(
             "CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
