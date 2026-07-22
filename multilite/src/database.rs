@@ -17,6 +17,7 @@ mod transaction;
 mod update;
 mod view;
 mod vtab;
+mod wal;
 
 use std::ops::Deref;
 use std::path::Path;
