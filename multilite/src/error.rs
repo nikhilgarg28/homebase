@@ -23,6 +23,8 @@ pub enum Error {
     RefreshPushRejected(PushRejection),
     /// An internal background worker could not be started.
     BackgroundWorker(String),
+    /// The serial database actor could not accept or complete an operation.
+    DatabaseActor(String),
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
     /// Durable Homebase metadata storage failed.
@@ -77,6 +79,7 @@ impl fmt::Display for Error {
             Self::BackgroundWorker(message) => {
                 write!(f, "could not start Multilite background worker: {message}")
             }
+            Self::DatabaseActor(message) => write!(f, "database actor error: {message}"),
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
@@ -119,7 +122,8 @@ impl std::error::Error for Error {
             | Self::AuthorityRequired(_)
             | Self::AuthorityRejected(_)
             | Self::RefreshPushRejected(_)
-            | Self::BackgroundWorker(_) => None,
+            | Self::BackgroundWorker(_)
+            | Self::DatabaseActor(_) => None,
             Self::CaptureInvariant(_) => None,
             Self::Storage(error) => Some(error),
             Self::InvalidDatabase(_)

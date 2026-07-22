@@ -5,7 +5,7 @@ use rusqlite::{Connection, Row};
 
 use super::isolation::ReadTrace;
 use super::sql::VTabReadPlan;
-use super::{Database, DatabaseRuntime, lock, sql, vtab};
+use super::{Database, DatabaseRuntime, sql, vtab};
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
@@ -149,8 +149,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         runtime: &DatabaseRuntime,
         operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let _operation = lock(&self.operation);
-        self.refresh_read_locked(runtime)?;
+        let _operation = self.enter_operation()?;
+        self.refresh_read_serial(runtime)?;
         self.owner
             .with_savepoint("__multilite__view", |connection| {
                 operation(&ViewTransaction::new(runtime, connection))

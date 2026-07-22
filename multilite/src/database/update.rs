@@ -12,7 +12,7 @@ use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
 use super::{
-    Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog, lock, pending,
+    Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog, pending,
     pin_snapshot,
 };
 use crate::runtime::ExecutionMode;
@@ -20,7 +20,7 @@ use crate::{Error, Params, Result};
 
 /// One serialized SQLite update accumulating a single durable transaction.
 ///
-/// The database operation lock and outer SQLite savepoint are owned by
+/// The database actor permit and outer SQLite savepoint are owned by
 /// `Database::update`. Individual statements use nested runtime
 /// savepoints only to attribute hook events; no Homebase state is submitted
 /// until the complete operation list has succeeded.
@@ -186,8 +186,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         options: UpdateOptions,
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
-        let _operation = lock(&self.operation);
-        self.refresh_read_locked(runtime)?;
+        let _operation = self.enter_operation()?;
+        self.refresh_read_serial(runtime)?;
         let authority_frontier = self.authority_frontier()?;
         let value = self
             .owner

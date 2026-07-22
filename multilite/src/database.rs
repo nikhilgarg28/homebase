@@ -1,5 +1,6 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod actor;
 mod catalog;
 mod codes;
 mod connection;
@@ -18,7 +19,7 @@ mod view;
 mod vtab;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase_client::meta::{MetaStore, OplogCursors};
@@ -37,6 +38,7 @@ use crate::metastore::SqliteOrderedStore;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
+use self::actor::{ActorPermit, SerialActor};
 use self::policy::{PolicyState, PushScheduler};
 use self::row::{CapturedRow, StoredValue};
 use self::store::DatabaseMetaStore;
@@ -310,7 +312,7 @@ pub(crate) struct Database<H: ServerHandle> {
     client: DatabaseClient<H>,
     policy: PolicyState,
     isolation_level: IsolationLevel,
-    operation: Arc<Mutex<()>>,
+    actor: SerialActor,
     scheduler: PushScheduler,
 }
 
@@ -375,12 +377,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         })
     }
 
-    pub(crate) fn push(&self) -> Result<PushOutcome> {
-        let _operation = lock(&self.operation);
-        self.push_locked()
+    pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
+        let database = Arc::clone(self);
+        self.actor
+            .call_blocking(move || database.push_serial())
+            .map_err(actor_error)?
     }
 
-    fn push_locked(&self) -> Result<PushOutcome> {
+    fn push_serial(&self) -> Result<PushOutcome> {
         let pushed = block_on(async {
             self.client
                 .space(self.database_id.space_id())
@@ -405,12 +409,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     /// Undo the speculative SQLite effects covered by one definitive push
     /// rejection and retire that exact active submit window.
-    pub(crate) fn rollback(&self, rejection: &PushRejection) -> Result<()> {
-        let _operation = lock(&self.operation);
-        self.rollback_locked(rejection)
+    pub(crate) fn rollback(self: &Arc<Self>, rejection: &PushRejection) -> Result<()> {
+        let database = Arc::clone(self);
+        let rejection = rejection.clone();
+        self.actor
+            .call_blocking(move || database.rollback_serial(&rejection))
+            .map_err(actor_error)?
     }
 
-    fn rollback_locked(&self, rejection: &PushRejection) -> Result<()> {
+    fn rollback_serial(&self, rejection: &PushRejection) -> Result<()> {
         if rejection.database_id != self.database_id
             || rejection.device_id != self.client.device()
             || rejection.failed_at != rejection.submit_cursors.neck
@@ -429,12 +436,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         }
     }
 
-    pub(crate) fn pull(&self) -> Result<PullOutcome> {
-        let _operation = lock(&self.operation);
-        self.pull_locked()
+    pub(crate) fn pull(self: &Arc<Self>) -> Result<PullOutcome> {
+        let database = Arc::clone(self);
+        self.actor
+            .call_blocking(move || database.pull_serial())
+            .map_err(actor_error)?
     }
 
-    fn pull_locked(&self) -> Result<PullOutcome> {
+    fn pull_serial(&self) -> Result<PullOutcome> {
         let through = block_on(async {
             let space = self.client.space(self.database_id.space_id()).await?;
             space.pull().await.map_err(ClientError::from)
@@ -444,7 +453,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     fn finish_remote_write(&self) -> Result<()> {
-        match self.push_locked()? {
+        match self.push_serial()? {
             PushOutcome::Drained => Ok(()),
             PushOutcome::Rejected(rejection) => self.repair_remote_rejection(rejection),
         }
@@ -452,11 +461,11 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     fn repair_remote_rejection(&self, rejection: PushRejection) -> Result<()> {
         let error = rejection.error.clone();
-        self.rollback_locked(&rejection)?;
+        self.rollback_serial(&rejection)?;
         // Retire the rollback marker when authority remains reachable. If this
         // best-effort push becomes unavailable, the marker remains durable and
         // the next remote operation drains it before doing new work.
-        let _ = self.push_locked();
+        let _ = self.push_serial();
         Err(Error::AuthorityRejected(error))
     }
 
@@ -464,9 +473,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self: &Arc<Self>,
         runtime: &Arc<DatabaseRuntime>,
         sql: &str,
-    ) -> Result<Statement> {
+    ) -> Result<Statement<H>> {
         sql::validate_managed_statement(sql)?;
-        let _operation = lock(&self.operation);
+        let _operation = self.enter_operation()?;
         runtime.run(ExecutionMode::Public, |connection| {
             let statement = connection.prepare(sql)?;
             if statement.readonly() {
@@ -475,12 +484,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 Err(Error::PreparedWrite)
             }
         })?;
-        let database = Arc::clone(self);
-        let runtime = Arc::clone(runtime);
         Ok(Statement {
-            owner: self.owner.clone(),
-            operation: Arc::clone(&self.operation),
-            refresh: Arc::new(move || database.refresh_read_locked(&runtime)),
+            database: Arc::clone(self),
+            runtime: Arc::clone(runtime),
             sql: sql.to_owned(),
         })
     }
@@ -495,23 +501,27 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
-    fn refresh_read_locked(&self, runtime: &DatabaseRuntime) -> Result<()> {
+    fn refresh_read_serial(&self, runtime: &DatabaseRuntime) -> Result<()> {
         if !self.policy.read_requires_refresh() {
             return Ok(());
         }
         let submit = self.submit_cursors()?;
         if submit.neck < submit.tail {
-            match self.push_locked()? {
+            match self.push_serial()? {
                 PushOutcome::Drained => {}
                 PushOutcome::Rejected(rejection) => {
                     return Err(Error::RefreshPushRejected(rejection));
                 }
             }
         }
-        self.pull_locked()?;
-        self.rebase_locked(runtime)?;
+        self.pull_serial()?;
+        self.rebase_serial(runtime)?;
         self.policy.mark_rebased();
         Ok(())
+    }
+
+    fn enter_operation(&self) -> Result<ActorPermit> {
+        self.actor.enter_blocking().map_err(actor_error)
     }
 }
 
@@ -586,23 +596,26 @@ fn has_multilite_prefix(table: &str) -> bool {
 }
 
 /// A read-only prepared statement owned by a Multilite database.
-pub struct Statement {
-    owner: ConnectionOwner,
-    operation: Arc<Mutex<()>>,
-    refresh: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+pub struct Statement<H = OfflineServer>
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database: Arc<Database<H>>,
+    runtime: Arc<DatabaseRuntime>,
     sql: String,
 }
 
-impl Statement {
+impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
     /// Execute the query and eagerly map every row.
     pub fn query_map<T, P, F>(&mut self, params: P, map: F) -> Result<Vec<T>>
     where
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let _operation = lock(&self.operation);
-        (self.refresh)()?;
-        self.owner
+        let _operation = self.database.enter_operation()?;
+        self.database.refresh_read_serial(&self.runtime)?;
+        self.database
+            .owner
             .with_savepoint("__multilite__statement_view", |connection| {
                 let mut statement = connection.prepare(&self.sql)?;
                 if !statement.readonly() {
@@ -648,7 +661,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         client,
         policy: PolicyState::new(sync_policy),
         isolation_level,
-        operation: Arc::new(Mutex::new(())),
+        actor: SerialActor::new().map_err(actor_error)?,
         scheduler: PushScheduler::new(),
     })
 }
@@ -769,10 +782,8 @@ fn offline_server(_: &SpaceId) -> Option<UnreachableSpace> {
     None
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn actor_error(error: actor::ActorError) -> Error {
+    Error::DatabaseActor(error.to_string())
 }
 
 #[cfg(test)]
@@ -1970,7 +1981,7 @@ mod tests {
                     (),
                 )?;
                 assert_eq!(source.push()?, PushOutcome::Drained);
-                replica.pull_locked()?;
+                replica.pull_serial()?;
                 Ok(())
             })
             .unwrap_err();

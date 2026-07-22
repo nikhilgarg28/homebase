@@ -8,8 +8,10 @@ description = "Multi-writer SQLite with E2EE sync, built on homebase - not yet r
 readme = "README.md"
 
 [dependencies]
+async-channel.workspace = true
 getrandom = "0.3"
 fallible-iterator.workspace = true
+futures-channel.workspace = true
 homebase-client.workspace = true
 homebase-core.workspace = true
 parking_lot.workspace = true

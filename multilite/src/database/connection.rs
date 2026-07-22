@@ -134,7 +134,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
     }
 
     /// Prepare one read-only statement.
-    pub fn prepare(&self, sql: &str) -> Result<Statement> {
+    pub fn prepare(&self, sql: &str) -> Result<Statement<H>> {
         self.database.prepare(&self.runtime, sql)
     }
 }
