@@ -11,7 +11,6 @@ use std::fmt;
 use std::fs::File;
 use std::mem::{align_of, size_of};
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use rusqlite::ffi;
 use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
 
-use super::wal::SnapshotDescriptor;
+use super::snapshot::{PinnedSnapshot, SnapshotDescriptor, SnapshotPin};
 
 /// A read-only SQLite connection fixed at one committed WAL snapshot.
 pub struct ReadBranch {
@@ -29,16 +28,12 @@ pub struct ReadBranch {
 }
 
 impl ReadBranch {
-    pub fn open(
-        database_path: impl AsRef<Path>,
-        wal_path: impl AsRef<Path>,
-        snapshot: SnapshotDescriptor,
-    ) -> Result<Self, BranchError> {
-        let database_path = database_path.as_ref();
-        let reader = SnapshotReader::open(database_path, wal_path.as_ref(), snapshot)?;
+    pub fn open(snapshot: PinnedSnapshot) -> Result<Self, BranchError> {
+        let database_path = snapshot.database_path().to_owned();
+        let reader = SnapshotReader::open(snapshot)?;
         let vfs = BranchVfs::register(BranchImage::read_only(reader))?;
         let connection = Connection::open_with_flags_and_vfs(
-            database_path,
+            &database_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             vfs.name(),
         )?;
@@ -81,17 +76,12 @@ pub struct WritableBranch {
 }
 
 impl WritableBranch {
-    pub fn open(
-        database_path: impl AsRef<Path>,
-        wal_path: impl AsRef<Path>,
-        snapshot: SnapshotDescriptor,
-        options: OverlayOptions,
-    ) -> Result<Self, BranchError> {
-        let database_path = database_path.as_ref();
-        let reader = SnapshotReader::open(database_path, wal_path.as_ref(), snapshot)?;
+    pub fn open(snapshot: PinnedSnapshot, options: OverlayOptions) -> Result<Self, BranchError> {
+        let database_path = snapshot.database_path().to_owned();
+        let reader = SnapshotReader::open(snapshot)?;
         let vfs = BranchVfs::register(BranchImage::writable(reader, options))?;
         let connection = Connection::open_with_flags_and_vfs(
-            database_path,
+            &database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             vfs.name(),
         )?;
@@ -139,23 +129,24 @@ struct SnapshotReader {
     base: File,
     wal: File,
     snapshot: SnapshotDescriptor,
+    _pin: SnapshotPin,
 }
 
 impl SnapshotReader {
-    fn open(
-        database_path: &Path,
-        wal_path: &Path,
-        snapshot: SnapshotDescriptor,
-    ) -> std::io::Result<Self> {
+    fn open(snapshot: PinnedSnapshot) -> std::io::Result<Self> {
+        let base = File::open(snapshot.database_path())?;
+        let wal = File::open(snapshot.wal_path())?;
+        let (snapshot, pin) = snapshot.into_descriptor_and_pin();
         Ok(Self {
-            base: File::open(database_path)?,
-            wal: File::open(wal_path)?,
+            base,
+            wal,
             snapshot,
+            _pin: pin,
         })
     }
 
     fn logical_size(&self) -> u64 {
-        u64::from(self.snapshot.page_count) * u64::from(self.snapshot.page_size)
+        u64::from(self.snapshot.image.page_count()) * u64::from(self.snapshot.image.page_size())
     }
 
     /// Read an arbitrary byte range and report whether it was entirely present.
@@ -165,7 +156,7 @@ impl SnapshotReader {
         let available = logical_size.saturating_sub(offset);
         let requested = destination.len() as u64;
         let readable = available.min(requested) as usize;
-        let page_size = u64::from(self.snapshot.page_size);
+        let page_size = u64::from(self.snapshot.image.page_size());
         let mut copied = 0_usize;
 
         while copied < readable {
@@ -175,7 +166,7 @@ impl SnapshotReader {
             })?;
             let within_page = position % page_size;
             let amount = (page_size - within_page).min((readable - copied) as u64) as usize;
-            let (source, source_offset) = match self.snapshot.page_map.get(&page) {
+            let (source, source_offset) = match self.snapshot.image.page_map().get(&page) {
                 Some(frame) => (&self.wal, frame.data_offset() + within_page),
                 None => (&self.base, u64::from(page - 1) * page_size + within_page),
             };
@@ -212,7 +203,7 @@ impl BranchImage {
 
     fn writable(reader: SnapshotReader, options: OverlayOptions) -> Self {
         let logical_size = reader.logical_size();
-        let page_size = reader.snapshot.page_size as usize;
+        let page_size = reader.snapshot.image.page_size() as usize;
         Self {
             reader,
             overlay: Some(Mutex::new(PageOverlay::new(
@@ -1011,12 +1002,14 @@ impl From<rusqlite::Error> for BranchError {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
+    use homebase_client::meta::OplogCursors;
     use homebase_core::tag::AdmissionSeq;
     use rusqlite::OptionalExtension as _;
 
     use super::*;
-    use crate::database::wal::WalParser;
+    use crate::database::snapshot::{LocalGeneration, PinnedSnapshot};
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -1055,13 +1048,15 @@ mod tests {
             self.directory.path().join("branch.sqlite-wal")
         }
 
-        fn snapshot(&self) -> SnapshotDescriptor {
-            let parsed = WalParser::parse(&fs::read(self.wal_path()).unwrap()).unwrap();
-            SnapshotDescriptor::from_wal(
-                self.generation,
+        fn snapshot(&self) -> PinnedSnapshot {
+            PinnedSnapshot::capture(
+                self.path(),
+                self.wal_path(),
+                LocalGeneration(self.generation),
                 AdmissionSeq(self.generation),
-                &parsed.snapshot.unwrap(),
+                OplogCursors::default(),
             )
+            .unwrap()
         }
 
         fn advance(&mut self, sql: &str) {
@@ -1077,16 +1072,14 @@ mod tests {
             "INSERT INTO records VALUES (1, 'old', zeroblob(6000));
              INSERT INTO records VALUES (2, 'stable', zeroblob(3000));",
         );
-        let first =
-            ReadBranch::open(fixture.path(), fixture.wal_path(), fixture.snapshot()).unwrap();
+        let first = ReadBranch::open(fixture.snapshot()).unwrap();
 
         fixture.advance(
             "UPDATE records SET value = 'new', payload = randomblob(7000) WHERE id = 1;
              DELETE FROM records WHERE id = 2;
              INSERT INTO records VALUES (3, 'later', randomblob(9000));",
         );
-        let second =
-            ReadBranch::open(fixture.path(), fixture.wal_path(), fixture.snapshot()).unwrap();
+        let second = ReadBranch::open(fixture.snapshot()).unwrap();
 
         assert_eq!(
             first
@@ -1110,18 +1103,15 @@ mod tests {
                 .unwrap(),
             "1:new,3:later"
         );
-        assert!(first.snapshot().max_frame < second.snapshot().max_frame);
+        assert!(first.snapshot().image.max_frame() < second.snapshot().image.max_frame());
     }
 
     #[test]
     fn many_connections_keep_independent_immutable_views() {
         let mut fixture = Fixture::new();
         fixture.advance("INSERT INTO records VALUES (1, 'one', randomblob(5000))");
-        let old_snapshot = fixture.snapshot();
         let branches = (0..12)
-            .map(|_| {
-                ReadBranch::open(fixture.path(), fixture.wal_path(), old_snapshot.clone()).unwrap()
-            })
+            .map(|_| ReadBranch::open(fixture.snapshot()).unwrap())
             .collect::<Vec<_>>();
 
         fixture.advance(
@@ -1145,9 +1135,9 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.advance("INSERT INTO records VALUES (1, 'one', randomblob(12000))");
         let snapshot = fixture.snapshot();
-        let reader =
-            SnapshotReader::open(&fixture.path(), &fixture.wal_path(), snapshot.clone()).unwrap();
-        let page_size = snapshot.page_size as u64;
+        let image = snapshot.descriptor().image.clone();
+        let reader = SnapshotReader::open(snapshot).unwrap();
+        let page_size = image.page_size() as u64;
         let offset = page_size - 13;
         let mut crossed = vec![0; 64];
         assert!(reader.read_at(offset, &mut crossed).unwrap());
@@ -1157,7 +1147,7 @@ mod tests {
                 let position = offset + index as u64;
                 let page = (position / page_size + 1) as u32;
                 let within = position % page_size;
-                let (file, source_offset) = match snapshot.page_map.get(&page) {
+                let (file, source_offset) = match image.page_map().get(&page) {
                     Some(frame) => (&reader.wal, frame.data_offset() + within),
                     None => (&reader.base, u64::from(page - 1) * page_size + within),
                 };
@@ -1178,15 +1168,15 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.advance("INSERT INTO records VALUES (1, 'one', randomblob(9000))");
         let snapshot = fixture.snapshot();
-        let branch =
-            ReadBranch::open(fixture.path(), fixture.wal_path(), snapshot.clone()).unwrap();
+        let page_count = snapshot.descriptor().image.page_count();
+        let branch = ReadBranch::open(snapshot).unwrap();
 
         assert_eq!(
             branch
                 .connection()
                 .query_row("PRAGMA page_count", (), |row| row.get::<_, u32>(0))
                 .unwrap(),
-            snapshot.page_count
+            page_count
         );
         let mmap_size = branch
             .connection()
@@ -1207,8 +1197,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.advance("INSERT INTO records VALUES (1, 'before', randomblob(9000))");
         let old_epoch = {
-            let branch =
-                ReadBranch::open(fixture.path(), fixture.wal_path(), fixture.snapshot()).unwrap();
+            let branch = ReadBranch::open(fixture.snapshot()).unwrap();
             assert_eq!(
                 branch
                     .connection()
@@ -1217,7 +1206,7 @@ mod tests {
                     .unwrap(),
                 "before"
             );
-            branch.snapshot().wal_epoch
+            branch.snapshot().image.epoch()
         };
 
         fixture
@@ -1225,9 +1214,8 @@ mod tests {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |_| Ok(()))
             .unwrap();
         fixture.advance("UPDATE records SET value = 'after'");
-        let branch =
-            ReadBranch::open(fixture.path(), fixture.wal_path(), fixture.snapshot()).unwrap();
-        assert_ne!(branch.snapshot().wal_epoch, old_epoch);
+        let branch = ReadBranch::open(fixture.snapshot()).unwrap();
+        assert_ne!(branch.snapshot().image.epoch(), old_epoch);
         assert_eq!(
             branch
                 .connection()
@@ -1236,6 +1224,60 @@ mod tests {
                 .unwrap(),
             "after"
         );
+    }
+
+    #[test]
+    fn companion_pin_preserves_live_branches_across_every_checkpoint_mode() {
+        for mode in ["PASSIVE", "FULL", "RESTART", "TRUNCATE"] {
+            let mut fixture = Fixture::new();
+            fixture.advance(
+                "INSERT INTO records VALUES (1, 'old', randomblob(200000));
+                 INSERT INTO records VALUES (2, 'stable', randomblob(200000))",
+            );
+            let branch = ReadBranch::open(fixture.snapshot()).unwrap();
+            fixture.advance(
+                "UPDATE records SET value = 'new', payload = randomblob(200000) WHERE id = 1",
+            );
+            fixture.writer.busy_timeout(Duration::ZERO).unwrap();
+
+            let checkpoint = format!("PRAGMA wal_checkpoint({mode})");
+            let (busy, _, _) = fixture
+                .writer
+                .query_row(&checkpoint, (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap();
+            if mode != "PASSIVE" {
+                assert_eq!(busy, 1, "{mode} reset should be held behind the reader");
+            }
+            assert_eq!(
+                branch
+                    .connection()
+                    .query_row("SELECT value FROM records WHERE id = 1", (), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                "old"
+            );
+
+            drop(branch);
+            let (busy, _, _) = fixture
+                .writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(busy, 0);
+            assert_eq!(fs::metadata(fixture.wal_path()).unwrap().len(), 0);
+        }
     }
 
     #[test]
@@ -1255,14 +1297,11 @@ mod tests {
         );
         let database_before = fs::read(fixture.path()).unwrap();
         let wal_before = fs::read(fixture.wal_path()).unwrap();
-        let branch = WritableBranch::open(
-            fixture.path(),
-            fixture.wal_path(),
-            fixture.snapshot(),
-            OverlayOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(branch.snapshot().local_generation, fixture.generation);
+        let branch = WritableBranch::open(fixture.snapshot(), OverlayOptions::default()).unwrap();
+        assert_eq!(
+            branch.snapshot().local_generation,
+            LocalGeneration(fixture.generation)
+        );
 
         branch.connection().execute_batch("BEGIN").unwrap();
         let inserted = branch
@@ -1339,13 +1378,8 @@ mod tests {
     fn dirty_pages_spill_and_remain_queryable() {
         let mut fixture = Fixture::new();
         fixture.advance("CREATE TABLE large_rows (id INTEGER PRIMARY KEY, payload BLOB)");
-        let branch = WritableBranch::open(
-            fixture.path(),
-            fixture.wal_path(),
-            fixture.snapshot(),
-            OverlayOptions { memory_limit: 1 },
-        )
-        .unwrap();
+        let branch =
+            WritableBranch::open(fixture.snapshot(), OverlayOptions { memory_limit: 1 }).unwrap();
         branch
             .connection()
             .execute("INSERT INTO large_rows VALUES (1, randomblob(200000))", ())
@@ -1378,13 +1412,7 @@ mod tests {
     fn transaction_rollback_restores_the_private_snapshot() {
         let mut fixture = Fixture::new();
         fixture.advance("INSERT INTO records VALUES (1, 'original', x'01')");
-        let branch = WritableBranch::open(
-            fixture.path(),
-            fixture.wal_path(),
-            fixture.snapshot(),
-            OverlayOptions::default(),
-        )
-        .unwrap();
+        let branch = WritableBranch::open(fixture.snapshot(), OverlayOptions::default()).unwrap();
         branch
             .connection()
             .execute_batch(
@@ -1412,21 +1440,8 @@ mod tests {
     fn writable_branches_do_not_lock_or_observe_each_other() {
         let mut fixture = Fixture::new();
         fixture.advance("CREATE TABLE proposals (id INTEGER PRIMARY KEY, value TEXT)");
-        let snapshot = fixture.snapshot();
-        let first = WritableBranch::open(
-            fixture.path(),
-            fixture.wal_path(),
-            snapshot.clone(),
-            OverlayOptions::default(),
-        )
-        .unwrap();
-        let second = WritableBranch::open(
-            fixture.path(),
-            fixture.wal_path(),
-            snapshot,
-            OverlayOptions::default(),
-        )
-        .unwrap();
+        let first = WritableBranch::open(fixture.snapshot(), OverlayOptions::default()).unwrap();
+        let second = WritableBranch::open(fixture.snapshot(), OverlayOptions::default()).unwrap();
 
         first
             .connection()

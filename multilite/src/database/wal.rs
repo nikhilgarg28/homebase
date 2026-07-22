@@ -7,14 +7,50 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-
-use homebase_core::tag::AdmissionSeq;
 
 const WAL_HEADER_SIZE: usize = 32;
 const FRAME_HEADER_SIZE: usize = 24;
 const WAL_MAGIC: u32 = 0x377f_0682;
 const WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// Positional source used to observe one fixed-length WAL prefix.
+pub trait WalSource {
+    fn len(&self) -> io::Result<u64>;
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<usize>;
+}
+
+impl WalSource for File {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<usize> {
+        FileExt::read_at(self, destination, offset)
+    }
+}
+
+/// Read exactly the prefix length observed before I/O began.
+pub fn read_observation(source: &impl WalSource) -> io::Result<Vec<u8>> {
+    let length = usize::try_from(source.len()?)
+        .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "WAL is too large"))?;
+    let mut bytes = vec![0; length];
+    let mut offset = 0_usize;
+    while offset < length {
+        let read = source.read_at(offset as u64, &mut bytes[offset..])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL shrank during observation",
+            ));
+        }
+        offset += read;
+    }
+    Ok(bytes)
+}
 
 /// One WAL incarnation. A checkpoint reset rotates these salts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,36 +78,6 @@ impl WalFrame {
 
     pub fn data_offset(self) -> u64 {
         self.data_offset
-    }
-}
-
-/// Immutable coordinates for one complete local SQLite commit.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotDescriptor {
-    pub local_generation: u64,
-    pub authority_frontier: AdmissionSeq,
-    pub wal_epoch: WalEpoch,
-    pub max_frame: u32,
-    pub page_count: u32,
-    pub page_size: u32,
-    pub page_map: Arc<BTreeMap<u32, WalFrame>>,
-}
-
-impl SnapshotDescriptor {
-    pub fn from_wal(
-        local_generation: u64,
-        authority_frontier: AdmissionSeq,
-        snapshot: &WalSnapshot,
-    ) -> Self {
-        Self {
-            local_generation,
-            authority_frontier,
-            wal_epoch: snapshot.epoch,
-            max_frame: snapshot.max_frame,
-            page_count: snapshot.page_count,
-            page_size: snapshot.page_size,
-            page_map: Arc::clone(&snapshot.page_map),
-        }
     }
 }
 
@@ -345,6 +351,7 @@ impl std::error::Error for WalError {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
 
     use rusqlite::Connection;
@@ -381,6 +388,166 @@ mod tests {
             bytes.extend_from_slice(&frame);
         }
         bytes
+    }
+
+    struct FaultSource {
+        bytes: Vec<u8>,
+        reported_len: usize,
+        max_chunk: usize,
+        fail_on_read: Option<usize>,
+        reads: Cell<usize>,
+    }
+
+    impl WalSource for FaultSource {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.reported_len as u64)
+        }
+
+        fn read_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<usize> {
+            let read_number = self.reads.get();
+            self.reads.set(read_number + 1);
+            if self.fail_on_read == Some(read_number) {
+                return Err(io::Error::new(io::ErrorKind::Other, "injected WAL read"));
+            }
+            let offset = offset as usize;
+            if offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let amount = destination
+                .len()
+                .min(self.max_chunk)
+                .min(self.bytes.len() - offset);
+            destination[..amount].copy_from_slice(&self.bytes[offset..offset + amount]);
+            Ok(amount)
+        }
+    }
+
+    #[test]
+    fn malformed_headers_and_frame_guards_are_classified() {
+        let valid = test_wal(ChecksumOrder::Little, &[(1, 1), (2, 2)]);
+        for length in 0..WAL_HEADER_SIZE {
+            assert_eq!(
+                WalParser::parse(&valid[..length]),
+                Err(WalError::IncompleteHeader(length))
+            );
+        }
+
+        let mut bytes = valid.clone();
+        bytes[0..4].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        assert_eq!(
+            WalParser::parse(&bytes),
+            Err(WalError::InvalidMagic(0xdead_beef))
+        );
+
+        let mut bytes = valid.clone();
+        bytes[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            WalParser::parse(&bytes),
+            Err(WalError::UnsupportedVersion(1))
+        );
+
+        let mut bytes = valid.clone();
+        bytes[8..12].copy_from_slice(&513_u32.to_be_bytes());
+        assert_eq!(
+            WalParser::parse(&bytes),
+            Err(WalError::InvalidPageSize(513))
+        );
+
+        let mut bytes = valid.clone();
+        bytes[24] ^= 1;
+        assert_eq!(
+            WalParser::parse(&bytes),
+            Err(WalError::InvalidHeaderChecksum)
+        );
+
+        let frame_size = FRAME_HEADER_SIZE + 512;
+        let second = WAL_HEADER_SIZE + frame_size;
+        let mut bytes = valid.clone();
+        bytes[second + 8] ^= 1;
+        let parsed = WalParser::parse(&bytes).unwrap();
+        assert_eq!(parsed.snapshot.unwrap().max_frame(), 1);
+        assert_eq!(parsed.tail, WalTail::InvalidSalt { frame: 2 });
+
+        let mut bytes = valid;
+        bytes[second..second + 4].fill(0);
+        let parsed = WalParser::parse(&bytes).unwrap();
+        assert_eq!(parsed.snapshot.unwrap().max_frame(), 1);
+        assert_eq!(parsed.tail, WalTail::InvalidPageNumber { frame: 2 });
+    }
+
+    #[test]
+    fn fixed_observations_handle_short_reads_growth_shrink_and_io_failure() {
+        let bytes = test_wal(ChecksumOrder::Little, &[(1, 1), (2, 2)]);
+        let source = FaultSource {
+            bytes: bytes.clone(),
+            reported_len: bytes.len(),
+            max_chunk: 7,
+            fail_on_read: None,
+            reads: Cell::new(0),
+        };
+        assert_eq!(read_observation(&source).unwrap(), bytes);
+        assert!(source.reads.get() > 2);
+
+        let growing = FaultSource {
+            bytes: [bytes.clone(), vec![9; 100]].concat(),
+            reported_len: bytes.len(),
+            max_chunk: usize::MAX,
+            fail_on_read: None,
+            reads: Cell::new(0),
+        };
+        assert_eq!(read_observation(&growing).unwrap(), bytes);
+
+        let shrinking = FaultSource {
+            bytes: bytes[..bytes.len() - 1].to_vec(),
+            reported_len: bytes.len(),
+            max_chunk: 31,
+            fail_on_read: None,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            read_observation(&shrinking).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let failing = FaultSource {
+            bytes,
+            reported_len: growing.reported_len,
+            max_chunk: 17,
+            fail_on_read: Some(2),
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            read_observation(&failing).unwrap_err().to_string(),
+            "injected WAL read"
+        );
+    }
+
+    #[test]
+    fn randomized_incremental_observations_equal_cold_parses() {
+        let mut seed = 0x6d75_6c74_696c_6974_u64;
+        for order in [ChecksumOrder::Little, ChecksumOrder::Big] {
+            let mut frames = Vec::new();
+            for index in 0..80_u32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let page = ((seed >> 32) as u32 % 16) + 1;
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let commit = index % 7 == 6 || seed.is_multiple_of(5);
+                frames.push((page, if commit { 16 } else { 0 }));
+            }
+            frames.last_mut().unwrap().1 = 16;
+            let bytes = test_wal(order, &frames);
+            let mut incremental = WalParser::new();
+            for _ in 0..500 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let length =
+                    WAL_HEADER_SIZE + (seed as usize % (bytes.len() - WAL_HEADER_SIZE + 1));
+                assert_eq!(
+                    incremental.refresh(&bytes[..length]),
+                    WalParser::parse(&bytes[..length])
+                );
+            }
+            assert_eq!(incremental.refresh(&bytes), WalParser::parse(&bytes));
+        }
     }
 
     #[test]
@@ -540,31 +707,6 @@ mod tests {
         let refreshed = parser.refresh(&bytes).unwrap();
         assert_eq!(refreshed, WalParser::parse(&bytes).unwrap());
         assert_ne!(refreshed.snapshot.unwrap().epoch(), first_epoch);
-    }
-
-    #[test]
-    fn descriptor_carries_both_local_and_authority_coordinates() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("descriptor.sqlite");
-        let wal_path = directory.path().join("descriptor.sqlite-wal");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .unwrap();
-        connection
-            .execute_batch("CREATE TABLE records (id)")
-            .unwrap();
-        let parsed = WalParser::parse(&fs::read(&wal_path).unwrap()).unwrap();
-        let snapshot = parsed.snapshot.unwrap();
-        let descriptor = SnapshotDescriptor::from_wal(41, AdmissionSeq(17), &snapshot);
-
-        assert_eq!(descriptor.local_generation, 41);
-        assert_eq!(descriptor.authority_frontier, AdmissionSeq(17));
-        assert_eq!(descriptor.wal_epoch, snapshot.epoch());
-        assert_eq!(descriptor.max_frame, snapshot.max_frame());
-        assert_eq!(descriptor.page_count, snapshot.page_count());
-        assert_eq!(descriptor.wal_epoch.salts(), snapshot.epoch().salts());
-        assert_eq!(descriptor.page_map.as_ref(), snapshot.page_map());
     }
 
     #[test]

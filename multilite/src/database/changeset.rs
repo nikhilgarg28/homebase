@@ -567,14 +567,14 @@ struct ChangeSummary {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
+    use homebase_client::meta::OplogCursors;
     use homebase_core::tag::AdmissionSeq;
 
     use super::*;
     use crate::database::branch::{OverlayOptions, WritableBranch};
-    use crate::database::wal::{SnapshotDescriptor, WalParser};
+    use crate::database::snapshot::{LocalGeneration, PinnedSnapshot};
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -608,23 +608,19 @@ mod tests {
             self.directory.path().join("changeset.sqlite-wal")
         }
 
-        fn snapshot(&self) -> SnapshotDescriptor {
-            let parsed = WalParser::parse(&fs::read(self.wal_path()).unwrap()).unwrap();
-            SnapshotDescriptor::from_wal(
-                self.generation,
+        fn snapshot(&self) -> PinnedSnapshot {
+            PinnedSnapshot::capture(
+                self.path(),
+                self.wal_path(),
+                LocalGeneration(self.generation),
                 AdmissionSeq(self.generation),
-                &parsed.snapshot.unwrap(),
+                OplogCursors::default(),
             )
+            .unwrap()
         }
 
         fn branch(&self) -> WritableBranch {
-            WritableBranch::open(
-                self.path(),
-                self.wal_path(),
-                self.snapshot(),
-                OverlayOptions::default(),
-            )
-            .unwrap()
+            WritableBranch::open(self.snapshot(), OverlayOptions::default()).unwrap()
         }
     }
 

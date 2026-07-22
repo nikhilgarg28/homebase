@@ -13,6 +13,7 @@ mod policy;
 mod rebase;
 mod row;
 mod schema;
+mod snapshot;
 mod sql;
 mod store;
 mod transaction;
