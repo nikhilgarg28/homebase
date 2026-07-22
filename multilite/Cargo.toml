@@ -11,12 +11,13 @@ readme = "README.md"
 async-channel.workspace = true
 getrandom = "0.3"
 fallible-iterator.workspace = true
+fallible-streaming-iterator = "0.1"
 futures-channel.workspace = true
 homebase-client.workspace = true
 homebase-core.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
-rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "preupdate_hook", "vtab"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "preupdate_hook", "session", "vtab"] }
 sha2.workspace = true
 sqlite3-parser.workspace = true
 tempfile.workspace = true

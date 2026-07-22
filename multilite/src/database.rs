@@ -3,6 +3,7 @@
 mod actor;
 mod branch;
 mod catalog;
+mod changeset;
 mod codes;
 mod connection;
 mod isolation;

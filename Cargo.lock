@@ -1809,6 +1809,7 @@ version = "0.0.1"
 dependencies = [
  "async-channel",
  "fallible-iterator",
+ "fallible-streaming-iterator",
  "futures-channel",
  "getrandom 0.3.4",
  "homebase",
