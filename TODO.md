@@ -13,8 +13,19 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
-- maintain some metadata about the last sqllite wal multilite saw - makes it easy
-to detect that multilite db was written to from sqlite later
+- Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
+  remains one cooperating Multilite writer actor per file. Later, derive the
+  page map exclusively from committed WAL frames, place a real SQLite guardian
+  read transaction before issuing branches, fence writer apply against an
+  unexpected WAL tip, poison stale update generations, and rebuild on salt
+  rotation. Treat another Multilite writer as a retryable all-range conflict.
+  Detect stock-SQLite commits with a dedicated `PRAGMA data_version` observer,
+  WAL epoch/tip comparison, and schema-cookie validation; enter an explicit
+  externally-modified/quarantine state until a logical import/diff exists, since
+  repairing the page map alone cannot create the missing Homebase operation.
+  Keep the cold-parse == incremental-parse invariant in the VFS simulation
+  harness from the first WAL-parser batch so this later hardening does not
+  require a new map representation.
 
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?
@@ -42,31 +53,21 @@ Migrate legacy core/client/server codecs to `homebase_core::writer::Writer` in a
 separate mechanical commit, retaining byte-for-byte fixtures for every stable
 format so the cleanup cannot accidentally change durable or wire encodings.
 
-Explroe if we can support concurrent write transactions, maybe via separate redb file for transactions
-
 Handle multi-schema / attach etc
 
-Async-first Multilite/database actor:
-- Replace the current operation mutex, direct `ConnectionOwner` access,
-  scheduler calls, and statement refresh callback with one database actor that
-  owns the SQLite connection, Homebase client, pending effects, sync-policy
-  state, and complete submit/push/pull/rebase/rollback workflows. Do not add a
-  Homebase-only worker: local SQLite changes and Homebase metadata must remain
-  in the same transaction.
-- Send owned commands over a bounded channel and return results through oneshot
-  replies. Define cancellation, backpressure, shutdown, and durable-side-effect
-  semantics explicitly; dropping a caller must not cancel an operation after
-  it may have committed.
-- Make the internal and primary API async. Keep SQLite-compatible synchronous
-  methods as thin blocking wrappers over the same command/reply path so the two
-  surfaces cannot acquire different behavior.
-- Return owned query rows and column metadata from the actor because
-  `rusqlite::Row` borrows its statement and connection and cannot cross the
-  channel. Perform public mapping and `FromSql` conversion on the caller side.
-- Represent transactions with logical handles or atomic batch commands rather
-  than borrowed `rusqlite::Transaction` values. Start with sequential actor
-  execution; add concurrent in-flight authority work only through an explicit
-  state machine that preserves SQLite/Homebase transaction boundaries.
+Async-first Multilite/database actor completion (the bounded channel, oneshot
+replies, and borrowed-scope permits landed in `b763fee`):
+- After Branch VFS updates produce owned `CommitProposal`s, move canonical
+  SQLite materialization, Homebase metadata, pending effects, sync-policy state,
+  and submit/push/pull/rebase/rollback workflows fully behind actor commands.
+  Local rows and Homebase metadata must remain in the same SQLite transaction.
+- Make the primary internal API async and keep SQLite-compatible synchronous
+  methods as blocking wrappers over the same command/reply path.
+- Return owned query rows and column metadata across the actor boundary; perform
+  public mapping and `FromSql` conversion on the caller side.
+- Preserve cancellation, backpressure, shutdown, and durable-side-effect rules:
+  dropping a caller never cancels work after it may have committed, and network
+  I/O is never awaited while a canonical SQLite transaction is open.
 
 Live queries
 
@@ -89,4 +90,4 @@ Modes
 
 2. Same as (1) but ability to sync to remote server
 
-3. 
+3.
