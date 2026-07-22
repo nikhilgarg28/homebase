@@ -301,7 +301,7 @@ fn parse_header(bytes: &[u8]) -> Result<WalHeader, WalError> {
 }
 
 fn checksum_bytes(order: ChecksumOrder, bytes: &[u8], checksum: &mut [u32; 2]) {
-    debug_assert!(bytes.len() >= 8 && bytes.len() % 8 == 0);
+    debug_assert!(bytes.len() >= 8 && bytes.len().is_multiple_of(8));
     for pair in bytes.chunks_exact(8) {
         let first = checksum_u32(order, &pair[..4]);
         let second = checksum_u32(order, &pair[4..]);
@@ -407,7 +407,7 @@ mod tests {
             let read_number = self.reads.get();
             self.reads.set(read_number + 1);
             if self.fail_on_read == Some(read_number) {
-                return Err(io::Error::new(io::ErrorKind::Other, "injected WAL read"));
+                return Err(io::Error::other("injected WAL read"));
             }
             let offset = offset as usize;
             if offset >= self.bytes.len() {
@@ -624,7 +624,7 @@ mod tests {
         for end in final_transaction_start..after.len() {
             let parsed = WalParser::parse(&after[..end]).unwrap();
             assert_eq!(parsed.snapshot.as_ref(), Some(&committed_before));
-            let ends_at_frame_boundary = (end - WAL_HEADER_SIZE) % frame_size == 0;
+            let ends_at_frame_boundary = (end - WAL_HEADER_SIZE).is_multiple_of(frame_size);
             assert_eq!(
                 parsed.tail,
                 if ends_at_frame_boundary {
