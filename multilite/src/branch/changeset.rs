@@ -25,7 +25,7 @@ use sqlite3_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::WritableBranch;
-use crate::database::row::StoredValue;
+use crate::value::StoredValue;
 
 const CHANGESET_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA: u8 = 1;

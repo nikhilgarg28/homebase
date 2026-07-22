@@ -14,18 +14,16 @@
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
-  remains one cooperating Multilite writer actor per file. Later, derive the
-  page map exclusively from committed WAL frames, place a real SQLite guardian
-  read transaction before issuing branches, fence writer apply against an
-  unexpected WAL tip, poison stale update generations, and rebuild on salt
-  rotation. Treat another Multilite writer as a retryable all-range conflict.
-  Detect stock-SQLite commits with a dedicated `PRAGMA data_version` observer,
-  WAL epoch/tip comparison, and schema-cookie validation; enter an explicit
-  externally-modified/quarantine state until a logical import/diff exists, since
-  repairing the page map alone cannot create the missing Homebase operation.
-  Keep the cold-parse == incremental-parse invariant in the VFS simulation
-  harness from the first WAL-parser batch so this later hardening does not
-  require a new map representation.
+  remains one cooperating Multilite writer actor per file. The WAL-derived map,
+  cold-parse == incremental-parse invariant, and per-snapshot companion SQLite
+  reader pins have landed. Remaining work is to fence writer apply against an
+  unexpected WAL tip while holding SQLite's real write lock, poison stale
+  update generations, and rebuild after salt rotation. Treat another Multilite
+  writer as a retryable all-range conflict. Detect stock-SQLite commits with a
+  dedicated `PRAGMA data_version` observer, WAL epoch/tip comparison, schema
+  cookie, and Multilite commit marker; enter an explicit externally-modified or
+  quarantine state until a logical import/diff exists, since repairing the page
+  map alone cannot create the missing Homebase operation.
 
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?

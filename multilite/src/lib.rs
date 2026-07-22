@@ -9,6 +9,7 @@ mod error;
 mod metastore;
 mod runtime;
 mod snapshot;
+mod value;
 
 pub use database::{Connection as MultiliteConnection, Statement as MultiliteStatement};
 pub use database::{

@@ -8,8 +8,7 @@ use homebase_core::messages::AdmittedBatch;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
-use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ToSql, params_from_iter};
+use rusqlite::{Connection, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::isolation::ConflictFootprint;
@@ -18,6 +17,7 @@ use super::schema::{
     active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
+pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
 const ROW_FRAME_VERSION: u8 = 1;
@@ -39,27 +39,7 @@ pub struct CapturedRow {
     pub values: Vec<StoredValue>,
 }
 
-/// Lossless SQLite storage-class value used by row frames.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredValue {
-    Null,
-    Integer(i64),
-    Real(u64),
-    Text(Vec<u8>),
-    Blob(Vec<u8>),
-}
-
 impl StoredValue {
-    pub fn capture(value: ValueRef<'_>) -> Self {
-        match value {
-            ValueRef::Null => Self::Null,
-            ValueRef::Integer(value) => Self::Integer(value),
-            ValueRef::Real(value) => Self::Real(value.to_bits()),
-            ValueRef::Text(value) => Self::Text(value.to_vec()),
-            ValueRef::Blob(value) => Self::Blob(value.to_vec()),
-        }
-    }
-
     fn encode(&self) -> Vec<u8> {
         match self {
             Self::Null => vec![0],
@@ -114,18 +94,6 @@ impl StoredValue {
             return Err(RowCodecError::InvalidLength);
         }
         Ok(value)
-    }
-}
-
-impl ToSql for StoredValue {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match self {
-            Self::Null => ValueRef::Null,
-            Self::Integer(value) => ValueRef::Integer(*value),
-            Self::Real(bits) => ValueRef::Real(f64::from_bits(*bits)),
-            Self::Text(value) => ValueRef::Text(value),
-            Self::Blob(value) => ValueRef::Blob(value),
-        }))
     }
 }
 
