@@ -12,7 +12,9 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
 
 use super::wal::{WalError, WalFrame, WalParse, WalParser, WalSnapshot, read_observation};
@@ -116,13 +118,26 @@ impl PinnedSnapshot {
             wal_path: _,
             _reader,
         } = self;
-        (snapshot, SnapshotPin { _reader })
+        (
+            snapshot,
+            SnapshotPin {
+                _reader: Arc::new(Mutex::new(_reader)),
+            },
+        )
     }
 }
 
 /// Reader ownership retained by a branch after its paths have been opened.
 pub struct SnapshotPin {
-    _reader: Connection,
+    _reader: Arc<Mutex<Connection>>,
+}
+
+impl Clone for SnapshotPin {
+    fn clone(&self) -> Self {
+        Self {
+            _reader: Arc::clone(&self._reader),
+        }
+    }
 }
 
 fn read_snapshot(path: &Path) -> Result<Option<WalSnapshot>, SnapshotError> {
