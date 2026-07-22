@@ -12,7 +12,6 @@ use std::fs::File;
 use std::mem::{align_of, size_of};
 use std::os::unix::fs::FileExt as _;
 use std::ptr;
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rusqlite::ffi;
@@ -272,6 +271,7 @@ pub struct OverlayStats {
 struct PageOverlay {
     page_size: usize,
     logical_size: u64,
+    snapshot_fallback_size: u64,
     memory_limit: usize,
     memory_bytes: usize,
     pages: BTreeMap<u32, OverlayPage>,
@@ -293,6 +293,7 @@ impl PageOverlay {
         Self {
             page_size,
             logical_size,
+            snapshot_fallback_size: logical_size,
             memory_limit,
             memory_bytes: 0,
             pages: BTreeMap::new(),
@@ -331,11 +332,12 @@ impl PageOverlay {
                     }
                 }
                 None => {
-                    if !reader.read_at(
-                        u64::from(page - 1) * self.page_size as u64 + within,
-                        &mut destination[copied..copied + amount],
-                    )? {
-                        // New pages above the snapshot start as zeroes.
+                    let source_offset = u64::from(page - 1) * self.page_size as u64 + within;
+                    if source_offset >= self.snapshot_fallback_size
+                        || !reader
+                            .read_at(source_offset, &mut destination[copied..copied + amount])?
+                    {
+                        // New or previously truncated pages start as zeroes.
                         destination[copied..copied + amount].fill(0);
                     }
                 }
@@ -385,7 +387,9 @@ impl PageOverlay {
         if !self.pages.contains_key(&page) {
             let mut bytes = vec![0; self.page_size];
             let page_offset = u64::from(page - 1) * self.page_size as u64;
-            let _ = reader.read_at(page_offset, &mut bytes)?;
+            if page_offset < self.snapshot_fallback_size {
+                let _ = reader.read_at(page_offset, &mut bytes)?;
+            }
             self.memory_bytes += bytes.len();
             self.pages.insert(page, OverlayPage::Memory(bytes));
         }
@@ -423,6 +427,7 @@ impl PageOverlay {
                 * self.page_size,
         );
         self.logical_size = size;
+        self.snapshot_fallback_size = self.snapshot_fallback_size.min(size);
         Ok(())
     }
 
@@ -514,7 +519,7 @@ fn patch_rollback_header(offset: u64, bytes: &mut [u8]) {
 
 struct VfsContext {
     base_vfs: *mut ffi::sqlite3_vfs,
-    image: Arc<BranchImage>,
+    image: BranchImage,
 }
 
 // SQLite's default VFS has process lifetime, while the reader is immutable and
@@ -544,10 +549,7 @@ impl BranchVfs {
         }
         let name = CString::new(format!("multilite-branch-{}", Uuid::new_v4()))
             .expect("generated VFS names contain no NUL bytes");
-        let mut context = Box::new(VfsContext {
-            base_vfs,
-            image: Arc::new(image),
-        });
+        let mut context = Box::new(VfsContext { base_vfs, image });
         let os_file_size = branch_file_size(unsafe { (*base_vfs).szOsFile })?;
         let mut vfs = Box::new(ffi::sqlite3_vfs {
             iVersion: unsafe { (*base_vfs).iVersion },
@@ -1161,6 +1163,40 @@ mod tests {
         let mut end = vec![7; 16];
         assert!(!reader.read_at(reader.logical_size() - 4, &mut end).unwrap());
         assert_eq!(&end[4..], &[0; 12]);
+    }
+
+    #[test]
+    fn truncate_then_regrow_never_resurrects_snapshot_pages() {
+        let mut fixture = Fixture::new();
+        fixture.advance("INSERT INTO records VALUES (1, 'one', randomblob(20000))");
+        let snapshot = fixture.snapshot();
+        let image = snapshot.descriptor().image.clone();
+        let reader = SnapshotReader::open(snapshot).unwrap();
+        let page_size = image.page_size() as usize;
+        assert!(reader.logical_size() >= (page_size * 3) as u64);
+        let mut overlay = PageOverlay::new(page_size, reader.logical_size(), usize::MAX);
+
+        overlay.truncate(page_size as u64).unwrap();
+        overlay
+            .write_at(&reader, (page_size * 2 + 17) as u64, &[0x5a])
+            .unwrap();
+
+        let mut removed_page = vec![0xff; page_size];
+        assert!(
+            overlay
+                .read_at(&reader, page_size as u64, &mut removed_page)
+                .unwrap()
+        );
+        assert_eq!(removed_page, vec![0; page_size]);
+
+        let mut new_page = vec![0xff; 18];
+        assert!(
+            overlay
+                .read_at(&reader, (page_size * 2) as u64, &mut new_page)
+                .unwrap()
+        );
+        assert_eq!(&new_page[..17], &[0; 17]);
+        assert_eq!(new_page[17], 0x5a);
     }
 
     #[test]
