@@ -1,9 +1,7 @@
 //! General Multilite database identity and Homebase lifecycle.
 
 mod actor;
-mod branch;
 mod catalog;
-mod changeset;
 mod codes;
 mod connection;
 mod isolation;
@@ -11,16 +9,14 @@ mod operation;
 mod pending;
 mod policy;
 mod rebase;
-mod row;
+pub mod row;
 mod schema;
-mod snapshot;
 mod sql;
 mod store;
 mod transaction;
 mod update;
 mod view;
 mod vtab;
-mod wal;
 
 use std::ops::Deref;
 use std::path::Path;

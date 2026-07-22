@@ -2,11 +2,13 @@
 //!
 //! Not published for use yet.
 
+mod branch;
 mod connection;
 mod database;
 mod error;
 mod metastore;
 mod runtime;
+mod snapshot;
 
 pub use database::{Connection as MultiliteConnection, Statement as MultiliteStatement};
 pub use database::{

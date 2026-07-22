@@ -19,7 +19,7 @@ use rusqlite::session::{ChangesetIter, Session};
 use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
 use sha2::{Digest, Sha256};
 
-use super::row::StoredValue;
+use crate::database::row::StoredValue;
 
 /// Hash of the complete application schema against which a changeset ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -741,17 +741,13 @@ struct ChangeSummary {
 mod tests {
     use std::path::PathBuf;
 
-    use homebase_client::meta::OplogCursors;
-    use homebase_core::tag::AdmissionSeq;
-
     use super::*;
-    use crate::database::branch::{OverlayOptions, WritableBranch};
-    use crate::database::snapshot::{LocalGeneration, PinnedSnapshot};
+    use crate::branch::snapshot::PinnedSnapshot;
+    use crate::branch::{OverlayOptions, WritableBranch};
 
     struct Fixture {
         directory: tempfile::TempDir,
         writer: Connection,
-        generation: u64,
     }
 
     impl Fixture {
@@ -765,11 +761,7 @@ mod tests {
             if !seed.is_empty() {
                 writer.execute_batch(seed).unwrap();
             }
-            Self {
-                directory,
-                writer,
-                generation: 1,
-            }
+            Self { directory, writer }
         }
 
         fn path(&self) -> PathBuf {
@@ -781,14 +773,7 @@ mod tests {
         }
 
         fn snapshot(&self) -> PinnedSnapshot {
-            PinnedSnapshot::capture(
-                self.path(),
-                self.wal_path(),
-                LocalGeneration(self.generation),
-                AdmissionSeq(self.generation),
-                OplogCursors::default(),
-            )
-            .unwrap()
+            PinnedSnapshot::capture(self.path(), self.wal_path()).unwrap()
         }
 
         fn branch(&self) -> WritableBranch {
