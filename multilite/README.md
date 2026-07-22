@@ -81,21 +81,22 @@ their base snapshot before user code runs; views establish their snapshot on
 their first query and retain it for every later query in the closure.
 
 Isolation is configured independently through `IsolationLevel`, defaulting to
-`Serializable`. `OpenOptions::isolation_level` selects the connection default,
+`Snapshot`. `OpenOptions::isolation_level` selects the connection default,
 while `update_with(UpdateOptions::new(...), |tx| ...)` overrides one managed
 update. Every operation contributes typed write and constraint prefixes to one
 transaction footprint, which eagerly prunes redundant descendants as prefixes
 arrive within each typed set. The final planner merges the selected antichains,
 prunes cross-category overlap, and binds every range assertion to the
-transaction's authority frontier. Snapshot isolation
-always includes writes and mandatory constraints. Serializable isolation also
-includes traced application reads. Managed-update reads over one synchronized
-table now run through a transaction-local virtual-table facade. Full scans and
-non-primary predicates conservatively trace the table's active row keyspace;
-primary-key equality traces one exact row key. The facade is refreshed before
-each execution, so a reusable prepared statement sees earlier writes in the
-same managed update without querying SQLite recursively from a vtable callback.
-Broader joins, subqueries, and index-prefix reads remain future SQL slices.
+transaction's authority frontier. Snapshot isolation always includes writes
+and mandatory constraints and executes reads directly against SQLite.
+Serializable isolation also includes traced application reads. Its currently
+supported single-table reads run through a transaction-local virtual-table
+facade: full scans and non-primary predicates conservatively trace the table's
+active row keyspace, while primary-key equality traces one exact row key. The
+facade is refreshed before each execution, so a reusable prepared statement
+sees earlier writes in the same managed update without querying SQLite
+recursively from a vtable callback. Broader joins, subqueries, and index-prefix
+reads remain future precision work and do not block snapshot updates.
 
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an

@@ -86,12 +86,9 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     /// Prepare one read-only statement bound to this managed update.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        TransactionStatement::new(
-            self.runtime,
-            self.connection,
-            sql,
-            Some(self.read_trace.clone()),
-        )
+        let trace =
+            (self.isolation == IsolationLevel::Serializable).then(|| self.read_trace.clone());
+        TransactionStatement::new(self.runtime, self.connection, sql, trace)
     }
 
     /// Execute one statement validated before the outer update began.

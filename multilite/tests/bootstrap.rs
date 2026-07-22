@@ -252,10 +252,10 @@ fn open_time_sync_policy_is_public_and_validated() {
 }
 
 #[test]
-fn isolation_defaults_to_serializable_and_can_be_selected_at_open() {
+fn isolation_defaults_to_snapshot_and_can_be_selected_at_open() {
     let directory = tempfile::tempdir().unwrap();
-    let default = MultiliteConnection::open(directory.path().join("serializable.sqlite")).unwrap();
-    assert_eq!(default.isolation_level(), IsolationLevel::Serializable);
+    let default = MultiliteConnection::open(directory.path().join("default.sqlite")).unwrap();
+    assert_eq!(default.isolation_level(), IsolationLevel::Snapshot);
 
     let snapshot = MultiliteConnection::open_with(
         directory.path().join("snapshot.sqlite"),

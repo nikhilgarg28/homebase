@@ -11,9 +11,9 @@ use homebase_core::tag::AdmissionSeq;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
     /// Validate writes and mandatory constraints, but not ordinary reads.
+    #[default]
     Snapshot,
     /// Additionally validate every logical read range observed by the update.
-    #[default]
     Serializable,
 }
 
