@@ -30,6 +30,7 @@ pub struct SchemaFingerprint([u8; 32]);
 pub struct CapturedChangeset {
     schema: SchemaFingerprint,
     bytes: Vec<u8>,
+    final_rowids: Vec<Option<i64>>,
 }
 
 impl CapturedChangeset {
@@ -47,11 +48,13 @@ impl CapturedChangeset {
 
     /// Replay the final logical changes without re-running triggers or FK actions.
     pub fn apply(&self, connection: &Connection) -> Result<(), ChangesetError> {
-        if schema_fingerprint(connection)? != self.schema {
-            return Err(ChangesetError::SchemaChanged);
-        }
         let changes = decode_changeset(&self.bytes)?;
-        apply_changes(connection, &changes)
+        if changes.len() != self.final_rowids.len() {
+            return Err(ChangesetError::Malformed(
+                "captured rowid metadata has the wrong length",
+            ));
+        }
+        apply_changes(connection, self.schema, &changes, &self.final_rowids)
     }
 
     #[cfg(test)]
@@ -71,6 +74,7 @@ impl CapturedChangeset {
 
 /// Active SQLite Session capture scoped to one branch transaction.
 pub struct ChangesetCapture<'connection> {
+    connection: &'connection Connection,
     session: Session<'connection>,
     schema: SchemaFingerprint,
 }
@@ -89,15 +93,22 @@ impl<'connection> ChangesetCapture<'connection> {
             }
             session.attach(Some(*table))?;
         }
-        Ok(Self { session, schema })
+        Ok(Self {
+            connection,
+            session,
+            schema,
+        })
     }
 
     pub fn finish(mut self) -> Result<CapturedChangeset, ChangesetError> {
         let mut bytes = Vec::new();
         self.session.changeset_strm(&mut bytes)?;
+        let changes = decode_changeset(&bytes)?;
+        let final_rowids = capture_final_rowids(self.connection, &changes)?;
         Ok(CapturedChangeset {
             schema: self.schema,
             bytes,
+            final_rowids,
         })
     }
 }
@@ -130,6 +141,7 @@ struct ColumnLayout {
 struct TableLayout {
     name: String,
     columns: Vec<ColumnLayout>,
+    rowid_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +149,7 @@ struct ReplayChange {
     table: TableLayout,
     old_key: Option<Vec<StoredValue>>,
     final_row: Option<Vec<StoredValue>>,
+    final_rowid: Option<i64>,
 }
 
 fn schema_fingerprint(connection: &Connection) -> Result<SchemaFingerprint, ChangesetError> {
@@ -228,65 +241,85 @@ fn optional_value(
     }
 }
 
-fn apply_changes(connection: &Connection, changes: &[NetChange]) -> Result<(), ChangesetError> {
-    if changes.is_empty() {
-        return Ok(());
-    }
+fn apply_changes(
+    connection: &Connection,
+    expected_schema: SchemaFingerprint,
+    changes: &[NetChange],
+    final_rowids: &[Option<i64>],
+) -> Result<(), ChangesetError> {
     connection.execute_batch("SAVEPOINT __multilite_changeset_apply")?;
-    let triggers = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
-    let foreign_keys = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
-    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
-    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)?;
-
     let result = (|| {
-        let replay = prepare_replay(connection, changes)?;
-        for change in &replay {
-            if let Some(key) = &change.old_key {
-                delete_old_row(connection, &change.table, key)?;
+        if schema_fingerprint(connection)? != expected_schema {
+            return Err(ChangesetError::SchemaChanged);
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let triggers = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
+        let foreign_keys = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+        if let Err(error) = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false) {
+            let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers);
+            return Err(error.into());
+        }
+
+        let replay_result = (|| {
+            let replay = prepare_replay(connection, changes, final_rowids)?;
+            for change in &replay {
+                if let Some(key) = &change.old_key {
+                    delete_old_row(connection, &change.table, key)?;
+                }
             }
-        }
-        for change in &replay {
-            if let Some(row) = &change.final_row {
-                insert_final_row(connection, &change.table, row)?;
+            for change in &replay {
+                if let Some(row) = &change.final_row {
+                    insert_final_row(connection, &change.table, row, change.final_rowid)?;
+                }
             }
-        }
-        let foreign_key_violation = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
-            (),
-            |row| row.get::<_, bool>(0),
-        )?;
-        if foreign_key_violation {
-            return Err(ChangesetError::ForeignKeyViolation);
-        }
+            let foreign_key_violation = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                (),
+                |row| row.get::<_, bool>(0),
+            )?;
+            if foreign_key_violation {
+                return Err(ChangesetError::ForeignKeyViolation);
+            }
+            Ok(())
+        })();
+
+        let restore_triggers = connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers)
+            .map(|_| ());
+        let restore_foreign_keys = connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys)
+            .map(|_| ());
+        replay_result?;
+        restore_triggers?;
+        restore_foreign_keys?;
         Ok(())
     })();
 
-    if result.is_err() {
-        let _ = connection.execute_batch(
-            "ROLLBACK TO __multilite_changeset_apply;
-             RELEASE __multilite_changeset_apply",
-        );
+    match result {
+        Ok(()) => connection.execute_batch("RELEASE __multilite_changeset_apply")?,
+        Err(error) => {
+            connection.execute_batch(
+                "ROLLBACK TO __multilite_changeset_apply;
+                 RELEASE __multilite_changeset_apply",
+            )?;
+            return Err(error);
+        }
     }
-    let restore_triggers = connection
-        .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers)
-        .map(|_| ());
-    let restore_foreign_keys = connection
-        .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys)
-        .map(|_| ());
-    result?;
-    restore_triggers?;
-    restore_foreign_keys?;
-    connection.execute_batch("RELEASE __multilite_changeset_apply")?;
     Ok(())
 }
 
 fn prepare_replay(
     connection: &Connection,
     changes: &[NetChange],
+    final_rowids: &[Option<i64>],
 ) -> Result<Vec<ReplayChange>, ChangesetError> {
     let mut layouts: BTreeMap<String, TableLayout> = BTreeMap::new();
     let mut replay = Vec::with_capacity(changes.len());
-    for change in changes {
+    for (change, captured_rowid) in changes.iter().zip(final_rowids) {
         let layout = match layouts.get(&change.table) {
             Some(layout) => layout.clone(),
             None => {
@@ -314,18 +347,24 @@ fn prepare_replay(
         let final_row = match change.kind {
             ChangeKind::Delete => {
                 let current = load_current_row(connection, &layout, old_key.as_ref().unwrap())?;
-                verify_old_values(change, &current)?;
+                verify_old_values(change, &current.values)?;
                 None
             }
             ChangeKind::Update => {
                 let mut current = load_current_row(connection, &layout, old_key.as_ref().unwrap())?;
-                verify_old_values(change, &current)?;
-                for (slot, value) in current.iter_mut().zip(&change.new) {
+                verify_old_values(change, &current.values)?;
+                if current.rowid != *captured_rowid {
+                    return Err(ChangesetError::Conflict(format!(
+                        "rowid in {} changed since the branch snapshot",
+                        change.table
+                    )));
+                }
+                for (slot, value) in current.values.iter_mut().zip(&change.new) {
                     if let Some(value) = value {
                         *slot = value.clone();
                     }
                 }
-                Some(current)
+                Some(current.values)
             }
             ChangeKind::Insert => Some(
                 change
@@ -345,10 +384,16 @@ fn prepare_replay(
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         };
+        if final_row.is_some() != captured_rowid.is_some() && layout.rowid_name.is_some() {
+            return Err(ChangesetError::Malformed(
+                "captured rowid does not match its row operation",
+            ));
+        }
         replay.push(ReplayChange {
             table: layout,
             old_key,
             final_row,
+            final_rowid: *captured_rowid,
         });
     }
     Ok(replay)
@@ -371,36 +416,116 @@ fn primary_values(
         .collect()
 }
 
+fn final_primary_values(change: &NetChange) -> Result<Vec<StoredValue>, ChangesetError> {
+    change
+        .primary_key
+        .iter()
+        .enumerate()
+        .filter_map(|(index, primary)| primary.then_some(index))
+        .map(|index| {
+            change.new[index]
+                .clone()
+                .or_else(|| change.old[index].clone())
+                .ok_or(ChangesetError::Malformed(
+                    "changeset is missing a final primary-key value",
+                ))
+        })
+        .collect()
+}
+
+fn capture_final_rowids(
+    connection: &Connection,
+    changes: &[NetChange],
+) -> Result<Vec<Option<i64>>, ChangesetError> {
+    let mut layouts: BTreeMap<String, TableLayout> = BTreeMap::new();
+    changes
+        .iter()
+        .map(|change| {
+            if change.kind == ChangeKind::Delete {
+                return Ok(None);
+            }
+            let layout = match layouts.get(&change.table) {
+                Some(layout) => layout.clone(),
+                None => {
+                    let layout = table_layout(connection, &change.table)?;
+                    layouts.insert(change.table.clone(), layout.clone());
+                    layout
+                }
+            };
+            let Some(rowid_name) = &layout.rowid_name else {
+                return Ok(None);
+            };
+            let key = final_primary_values(change)?;
+            let predicate = primary_key_predicate(&layout);
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {predicate}",
+                quote_identifier(rowid_name),
+                quote_identifier(&layout.name)
+            );
+            connection
+                .query_row(&sql, params_from_iter(&key), |row| row.get::<_, i64>(0))
+                .optional()?
+                .map(Some)
+                .ok_or_else(|| {
+                    ChangesetError::Conflict(format!(
+                        "final row missing from branch table {}",
+                        layout.name
+                    ))
+                })
+        })
+        .collect()
+}
+
+struct CurrentRow {
+    values: Vec<StoredValue>,
+    rowid: Option<i64>,
+}
+
 fn load_current_row(
     connection: &Connection,
     table: &TableLayout,
     key: &[StoredValue],
-) -> Result<Vec<StoredValue>, ChangesetError> {
-    let columns = table
+) -> Result<CurrentRow, ChangesetError> {
+    let mut selected = table
         .columns
         .iter()
         .map(|column| quote_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let predicate = table
-        .columns
-        .iter()
-        .filter(|column| column.primary_key > 0)
-        .map(|column| format!("{} IS ?", quote_identifier(&column.name)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
+        .collect::<Vec<_>>();
+    if let Some(rowid_name) = &table.rowid_name {
+        selected.insert(0, quote_identifier(rowid_name));
+    }
+    let columns = selected.join(", ");
+    let predicate = primary_key_predicate(table);
     let sql = format!(
         "SELECT {columns} FROM {} WHERE {predicate}",
         quote_identifier(&table.name)
     );
     connection
         .query_row(&sql, params_from_iter(key), |row| {
-            (0..table.columns.len())
-                .map(|index| row.get_ref(index).map(StoredValue::capture))
-                .collect::<rusqlite::Result<Vec<_>>>()
+            let value_offset = usize::from(table.rowid_name.is_some());
+            Ok(CurrentRow {
+                values: (0..table.columns.len())
+                    .map(|index| row.get_ref(index + value_offset).map(StoredValue::capture))
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+                rowid: table
+                    .rowid_name
+                    .as_ref()
+                    .map(|_| row.get::<_, i64>(0))
+                    .transpose()?,
+            })
         })
         .optional()?
         .ok_or_else(|| ChangesetError::Conflict(format!("row missing from {}", table.name)))
+}
+
+fn primary_key_predicate(table: &TableLayout) -> String {
+    table
+        .columns
+        .iter()
+        .filter(|column| column.primary_key > 0)
+        .map(|column| format!("{} IS ?", quote_identifier(&column.name)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn verify_old_values(change: &NetChange, current: &[StoredValue]) -> Result<(), ChangesetError> {
@@ -447,6 +572,7 @@ fn insert_final_row(
     connection: &Connection,
     table: &TableLayout,
     row: &[StoredValue],
+    rowid: Option<i64>,
 ) -> Result<(), ChangesetError> {
     let writable = table
         .columns
@@ -454,37 +580,60 @@ fn insert_final_row(
         .enumerate()
         .filter(|(_, column)| column.writable)
         .collect::<Vec<_>>();
-    let columns = writable
+    let mut columns = writable
         .iter()
         .map(|(_, column)| quote_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = std::iter::repeat_n("?", writable.len())
+        .collect::<Vec<_>>();
+    if let Some(rowid_name) = &table.rowid_name {
+        columns.insert(0, quote_identifier(rowid_name));
+    }
+    let columns = columns.join(", ");
+    let placeholders = std::iter::repeat_n("?", writable.len() + usize::from(rowid.is_some()))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
         "INSERT INTO {} ({columns}) VALUES ({placeholders})",
         quote_identifier(&table.name)
     );
+    let rowid_value = rowid.map(StoredValue::Integer);
     connection.execute(
         &sql,
-        params_from_iter(writable.iter().map(|(index, _)| &row[*index])),
+        params_from_iter(
+            rowid_value
+                .iter()
+                .chain(writable.iter().map(|(index, _)| &row[*index])),
+        ),
     )?;
     Ok(())
 }
 
 fn table_layout(connection: &Connection, table: &str) -> Result<TableLayout, ChangesetError> {
-    let exists = connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM main.sqlite_schema
-             WHERE type = 'table' AND name = ?1 COLLATE NOCASE
-         )",
-        [table],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !exists {
-        return Err(ChangesetError::UnknownTable(table.to_owned()));
+    let schema_sql = connection
+        .query_row(
+            "SELECT sql FROM main.sqlite_schema
+             WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| ChangesetError::UnknownTable(table.to_owned()))?;
+    let normalized_sql = schema_sql.to_ascii_uppercase();
+    if normalized_sql
+        .trim_start()
+        .starts_with("CREATE VIRTUAL TABLE")
+    {
+        return Err(ChangesetError::UnsupportedTable {
+            table: table.to_owned(),
+            reason: "virtual tables are not yet supported",
+        });
     }
+    if normalized_sql.contains("AUTOINCREMENT") {
+        return Err(ChangesetError::UnsupportedTable {
+            table: table.to_owned(),
+            reason: "AUTOINCREMENT state is not yet captured",
+        });
+    }
+
     let mut statement = connection.prepare(&format!(
         "PRAGMA main.table_xinfo({})",
         quote_identifier(table)
@@ -507,9 +656,28 @@ fn table_layout(connection: &Connection, table: &str) -> Result<TableLayout, Cha
     if columns.is_empty() {
         return Err(ChangesetError::UnknownTable(table.to_owned()));
     }
+
+    let rowid_name = if normalized_sql.contains("WITHOUT ROWID") {
+        None
+    } else {
+        ["_rowid_", "rowid", "oid"]
+            .into_iter()
+            .find(|candidate| {
+                !columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(candidate))
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| ChangesetError::UnsupportedTable {
+                table: table.to_owned(),
+                reason: "all hidden rowid aliases are shadowed",
+            })?
+            .into()
+    };
     Ok(TableLayout {
         name: table.to_owned(),
         columns,
+        rowid_name,
     })
 }
 
@@ -523,6 +691,7 @@ pub enum ChangesetError {
     SchemaChanged,
     UnknownTable(String),
     TableWithoutPrimaryKey(String),
+    UnsupportedTable { table: String, reason: &'static str },
     Malformed(&'static str),
     Conflict(String),
     ForeignKeyViolation,
@@ -538,6 +707,9 @@ impl fmt::Display for ChangesetError {
             Self::UnknownTable(table) => write!(formatter, "unknown changeset table {table:?}"),
             Self::TableWithoutPrimaryKey(table) => {
                 write!(formatter, "changeset table {table:?} has no primary key")
+            }
+            Self::UnsupportedTable { table, reason } => {
+                write!(formatter, "unsupported changeset table {table:?}: {reason}")
             }
             Self::Malformed(message) => write!(formatter, "malformed SQLite changeset: {message}"),
             Self::Conflict(message) => write!(formatter, "changeset conflict: {message}"),
@@ -685,6 +857,118 @@ mod tests {
     }
 
     #[test]
+    fn replay_preserves_hidden_rowids_for_non_integer_primary_keys() {
+        let fixture = Fixture::new(
+            "CREATE TABLE records (
+                code TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             )",
+            "INSERT INTO records VALUES ('a', 'one'), ('b', 'two')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(branch.connection(), &["records"]).unwrap();
+        branch
+            .connection()
+            .execute_batch(
+                "UPDATE records SET value = 'updated' WHERE code = 'a';
+                 INSERT INTO records VALUES ('c', 'three');
+                 DELETE FROM records WHERE code = 'b'",
+            )
+            .unwrap();
+        let changeset = capture.finish().unwrap();
+        changeset.apply(&fixture.writer).unwrap();
+
+        let dump = |connection: &Connection| {
+            let mut statement = connection
+                .prepare("SELECT rowid, code, value FROM records ORDER BY code")
+                .unwrap();
+            statement
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(dump(branch.connection()), dump(&fixture.writer));
+        assert_eq!(
+            dump(&fixture.writer),
+            vec![
+                (1, "a".into(), "updated".into()),
+                (3, "c".into(), "three".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_without_rowid_tables_accept_richer_dml_grammar() {
+        let fixture = Fixture::new(
+            "CREATE TABLE metrics (
+                org TEXT COLLATE NOCASE,
+                slug TEXT,
+                score REAL CHECK(score >= 0),
+                note TEXT,
+                PRIMARY KEY(org, slug)
+             ) WITHOUT ROWID, STRICT;
+             CREATE UNIQUE INDEX metrics_note
+                ON metrics(lower(note)) WHERE note IS NOT NULL",
+            "INSERT INTO metrics VALUES ('acme', 'one', 1.0, 'First')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(branch.connection(), &["metrics"]).unwrap();
+        branch
+            .connection()
+            .execute_batch(
+                "WITH incoming(org, slug, score, note) AS (
+                    VALUES ('acme', 'two', 2.0, 'Second')
+                 )
+                 INSERT INTO metrics SELECT * FROM incoming;
+                 INSERT INTO metrics VALUES ('ACME', 'one', 3.0, 'First')
+                 ON CONFLICT(org, slug) DO UPDATE SET score = excluded.score;
+                 WITH patch(org, slug, score) AS (
+                    VALUES ('acme', 'two', 4.5)
+                 )
+                 UPDATE metrics SET score = patch.score
+                 FROM patch
+                 WHERE metrics.org = patch.org AND metrics.slug = patch.slug",
+            )
+            .unwrap();
+        let deleted = branch
+            .connection()
+            .query_row(
+                "DELETE FROM metrics WHERE slug = 'one' RETURNING note",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, "First");
+        let changeset = capture.finish().unwrap();
+        changeset.apply(&fixture.writer).unwrap();
+
+        let dump = |connection: &Connection| {
+            connection
+                .query_row("SELECT org, slug, score, note FROM metrics", (), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+        };
+        assert_eq!(dump(branch.connection()), dump(&fixture.writer));
+        assert_eq!(
+            dump(&fixture.writer),
+            ("acme".into(), "two".into(), 4.5, "Second".into())
+        );
+    }
+
+    #[test]
     fn indirect_cascade_and_trigger_effects_are_replayed_exactly_once() {
         let fixture = Fixture::new(
             "PRAGMA foreign_keys = ON;
@@ -794,6 +1078,18 @@ mod tests {
             Err(ChangesetError::Conflict(_))
         ));
         assert_eq!(record_value(&fixture.writer), "foreign");
+        assert!(
+            fixture
+                .writer
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .writer
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -859,6 +1155,36 @@ mod tests {
         assert!(matches!(
             ChangesetCapture::start(&connection, &["loose"]),
             Err(ChangesetError::TableWithoutPrimaryKey(table)) if table == "loose"
+        ));
+    }
+
+    #[test]
+    fn capture_explicitly_rejects_untracked_row_identity_state() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE generated_ids (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    value TEXT
+                 );
+                 CREATE TABLE shadowed (
+                    rowid TEXT,
+                    _rowid_ TEXT,
+                    oid TEXT,
+                    id TEXT PRIMARY KEY
+                 )",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ChangesetCapture::start(&connection, &["generated_ids"]),
+            Err(ChangesetError::UnsupportedTable { table, reason })
+                if table == "generated_ids" && reason.contains("AUTOINCREMENT")
+        ));
+        assert!(matches!(
+            ChangesetCapture::start(&connection, &["shadowed"]),
+            Err(ChangesetError::UnsupportedTable { table, reason })
+                if table == "shadowed" && reason.contains("rowid")
         ));
     }
 
