@@ -1,6 +1,7 @@
 //! General Multilite database identity and Homebase lifecycle.
 
 mod actor;
+mod branch;
 mod catalog;
 mod codes;
 mod connection;
