@@ -18,6 +18,7 @@ mod update;
 mod view;
 mod vtab;
 
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -246,7 +247,28 @@ impl<H: ServerHandle> OpenOptions<H> {
 
 pub(crate) type DatabaseClient<H> =
     Client<DatabaseMetaStore, H, SystemHybridClock, SystemNonceSource>;
-pub(crate) type DatabaseRuntime = RuntimeConnection<DatabaseHooks>;
+
+pub(crate) struct DatabaseRuntime {
+    inner: RuntimeConnection<DatabaseHooks>,
+    vtabs: vtab::Registry,
+}
+
+impl DatabaseRuntime {
+    fn new(owner: ConnectionOwner) -> Result<Self> {
+        Ok(Self {
+            inner: RuntimeConnection::new(owner, DatabaseHooks)?,
+            vtabs: vtab::Registry::default(),
+        })
+    }
+}
+
+impl Deref for DatabaseRuntime {
+    type Target = RuntimeConnection<DatabaseHooks>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 pub(crate) struct DatabaseHooks;
 
@@ -362,7 +384,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) fn runtime(&self) -> Result<DatabaseRuntime> {
-        RuntimeConnection::new(self.owner.clone(), DatabaseHooks)
+        DatabaseRuntime::new(self.owner.clone())
     }
 
     pub(crate) fn execute<Q: Params>(

@@ -4,8 +4,8 @@ use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
 use super::isolation::ReadTrace;
-use super::sql::VTabReadPlan;
-use super::{Database, DatabaseRuntime, sql, vtab};
+use super::vtab::Plan;
+use super::{Database, DatabaseRuntime, sql};
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
@@ -53,12 +53,12 @@ pub struct TransactionStatement<'a> {
     runtime: &'a DatabaseRuntime,
     connection: &'a Connection,
     read_trace: Option<ReadTrace>,
-    vtab_read_plan: Option<VTabReadPlan>,
+    vtab_read_plan: Option<Plan>,
     sql: String,
 }
 
 impl<'a> TransactionStatement<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         runtime: &'a DatabaseRuntime,
         connection: &'a Connection,
         sql: &str,
@@ -67,7 +67,7 @@ impl<'a> TransactionStatement<'a> {
         sql::validate_managed_statement(sql)?;
         let vtab_read_plan = read_trace
             .as_ref()
-            .map(|_| sql::plan_vtab_read(sql))
+            .map(|_| runtime.vtabs.plan(connection, sql))
             .transpose()?
             .flatten();
         let ((), events) = runtime.run(ExecutionMode::Public, |connection| {
@@ -98,22 +98,22 @@ impl<'a> TransactionStatement<'a> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let (sql, mode) = match &self.vtab_read_plan {
+        let (sql, mode, _bindings) = match &self.vtab_read_plan {
             Some(plan) => {
                 let trace = self
                     .read_trace
                     .as_ref()
                     .expect("read plans carry an update trace")
                     .clone();
-                let ((), events) = self
+                let (bindings, events) = self
                     .runtime
                     .run(ExecutionMode::InternalMetadata, |connection| {
-                        vtab::install(connection, plan, trace)
+                        plan.bind(connection, trace)
                     })?;
                 ensure_read_only_events(events)?;
-                (&plan.rewritten_sql, ExecutionMode::InternalMetadata)
+                (plan.sql(), ExecutionMode::InternalMetadata, Some(bindings))
             }
-            None => (&self.sql, ExecutionMode::Public),
+            None => (self.sql.as_str(), ExecutionMode::Public, None),
         };
         let expected_connection = self.connection;
         let (rows, events) = self.runtime.run(mode, |connection| {

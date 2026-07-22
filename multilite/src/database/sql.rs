@@ -15,14 +15,11 @@ pub enum ValidatedExecute {
     Insert,
 }
 
-/// One supported transaction read rewritten to the internal vtable facade.
-pub struct VTabReadPlan {
-    pub table_name: String,
-    pub rewritten_sql: String,
-}
-
-/// Validate the initial transaction-read grammar and replace its one source.
-pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
+/// Validate the initial transaction-read grammar and rewrite its sources.
+pub fn rewrite_managed_read(
+    sql: &str,
+    mut resolve_source: impl FnMut(&str) -> Result<String>,
+) -> Result<Option<String>> {
     let command = parse_one_command(sql)?;
     let Cmd::Stmt(Stmt::Select(mut select)) = command else {
         return Err(Error::UnsupportedSql(
@@ -30,7 +27,7 @@ pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
         ));
     };
     if select.with.is_some() || select.body.compounds.is_some() {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     }
     let OneSelect::Select {
         columns,
@@ -42,11 +39,11 @@ pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
         ..
     } = &mut select.body.select
     else {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     };
     validate_result_columns(columns)?;
     if group_by.is_some() || having.is_some() || window_clause.is_some() {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     }
     if let Some(where_clause) = where_clause {
         validate_read_expression(where_clause)?;
@@ -67,16 +64,16 @@ pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
         return Ok(None);
     };
     if from.joins.is_some() {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     }
     let Some(source) = from.select.as_deref_mut() else {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     };
     let SelectTable::Table(name, alias, indexed) = source else {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     };
     if name.db_name.is_some() || name.alias.is_some() || indexed.is_some() {
-        return Err(unsupported_transaction_read());
+        return Err(unsupported_managed_read());
     }
     let table = identifier(&name.name)?;
     if super::is_schema_table(table.value()) {
@@ -90,12 +87,9 @@ pub fn plan_vtab_read(sql: &str) -> Result<Option<VTabReadPlan>> {
     if alias.is_none() {
         *alias = Some(As::As(name.name.clone()));
     }
-    name.name = Name(super::vtab::MODULE_NAME.into());
+    name.name = Name(resolve_source(table.value())?.into());
 
-    Ok(Some(VTabReadPlan {
-        table_name: table.value().to_owned(),
-        rewritten_sql: Cmd::Stmt(Stmt::Select(select)).to_string(),
-    }))
+    Ok(Some(Cmd::Stmt(Stmt::Select(select)).to_string()))
 }
 
 fn validate_result_columns(columns: &[ResultColumn]) -> Result<()> {
@@ -123,11 +117,11 @@ fn validate_read_expression(expression: &Expr) -> Result<()> {
         Expr::Parenthesized(expressions) if expressions.len() == 1 => {
             validate_read_expression(&expressions[0])
         }
-        _ => Err(unsupported_transaction_read()),
+        _ => Err(unsupported_managed_read()),
     }
 }
 
-fn unsupported_transaction_read() -> Error {
+fn unsupported_managed_read() -> Error {
     Error::UnsupportedSql(
         "managed update SELECT supports one table with simple equality predicates",
     )
@@ -499,18 +493,24 @@ mod tests {
     }
 
     #[test]
-    fn transaction_reads_rewrite_one_table_and_leave_constant_selects_direct() {
-        let plan = plan_vtab_read("SELECT count(*) FROM notes WHERE day = ?1 ORDER BY id")
-            .unwrap()
-            .unwrap();
-        assert_eq!(plan.table_name, "notes");
-        assert!(plan.rewritten_sql.contains(super::super::vtab::MODULE_NAME));
-        assert!(plan.rewritten_sql.contains("notes"));
-        assert!(plan_vtab_read("SELECT 1").unwrap().is_none());
+    fn managed_reads_rewrite_one_source_and_leave_constant_selects_direct() {
+        let rewritten = rewrite_managed_read(
+            "SELECT count(*) FROM notes WHERE day = ?1 ORDER BY id",
+            |_| Ok("__multilite__source_test".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(rewritten.contains("__multilite__source_test"));
+        assert!(rewritten.contains("notes"));
+        assert!(
+            rewrite_managed_read("SELECT 1", |_| unreachable!())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn transaction_reads_reject_sources_outside_the_initial_vtable_slice() {
+    fn managed_reads_reject_sources_outside_the_initial_sql_slice() {
         for sql in [
             "SELECT * FROM notes JOIN tasks USING (id)",
             "SELECT * FROM (SELECT * FROM notes)",
@@ -520,8 +520,11 @@ mod tests {
             "SELECT * FROM __multilite__vtab",
         ] {
             assert!(
-                matches!(plan_vtab_read(sql), Err(Error::UnsupportedSql(_))),
-                "transaction read was accepted: {sql}"
+                matches!(
+                    rewrite_managed_read(sql, |_| Ok("__multilite__source_test".into())),
+                    Err(Error::UnsupportedSql(_))
+                ),
+                "managed read was accepted: {sql}"
             );
         }
     }
