@@ -16,14 +16,28 @@ multilite
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
   remains one cooperating Multilite committer per file. The WAL-derived map,
   cold-parse == incremental-parse invariant, and per-snapshot companion SQLite
-  reader pins have landed. Remaining work is to fence writer apply against an
+  reader pins have landed. Remaining work is to fence committer apply against an
   unexpected WAL tip while holding SQLite's real write lock, poison stale
-  update generations, and rebuild after salt rotation. Treat another Multilite
+  writable branches, and rebuild after salt rotation. Treat another Multilite
   writer as a retryable all-range conflict. Detect stock-SQLite commits with a
   dedicated `PRAGMA data_version` observer, WAL epoch/tip comparison, schema
   cookie, and Multilite commit marker; enter an explicit externally-modified or
   quarantine state until a logical import/diff exists, since repairing the page
   map alone cannot create the missing Homebase operation.
+
+- Generalize canonical OCC history before branch support expands beyond
+  insert-only snapshot updates. Every canonical transaction advances
+  `ApplySeq`, including serialized DDL/DML, remote replay, and rejection repair.
+  Today stale INSERT collisions are also rejected by typed proposal history,
+  schema fingerprints, or SQLite constraint replay. UPDATE, DELETE, richer
+  constraints, and concurrent DDL need one typed local-apply record (or an
+  explicit all-range barrier) for every canonical transaction so no `ApplySeq`
+  interval is invisible to local OCC.
+
+- Support DDL inside managed snapshot updates only after it has a stop-the-world
+  committer path and a logical schema proposal. It currently remains available
+  through direct serialized execution; private branch proposals deliberately
+  reject schema changes.
 
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?
