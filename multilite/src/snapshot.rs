@@ -21,6 +21,10 @@ pub struct SnapshotDescriptor {
 
 impl SnapshotDescriptor {
     /// Encode one complete logical transaction-start frontier.
+    #[allow(
+        dead_code,
+        reason = "persisted by owned proposals before actor integration"
+    )]
     pub fn encode(self) -> Vec<u8> {
         let mut writer = Writer::with_capacity(42);
         writer.u8(SNAPSHOT_FRAME_VERSION);

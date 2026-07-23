@@ -104,6 +104,10 @@ impl ConflictFootprint {
     }
 
     /// Ordinary logical reads used only by serializable transactions.
+    #[allow(
+        dead_code,
+        reason = "persisted by owned proposals before actor integration"
+    )]
     pub fn reads(&self) -> &BTreeSet<Key> {
         self.reads.as_set()
     }
@@ -128,6 +132,10 @@ impl ConflictFootprint {
     }
 
     /// True when writes committed after this snapshot invalidate this proposal.
+    #[allow(
+        dead_code,
+        reason = "used by the proposal journal before actor integration"
+    )]
     pub fn conflicts_with_writes(
         &self,
         isolation: IsolationLevel,

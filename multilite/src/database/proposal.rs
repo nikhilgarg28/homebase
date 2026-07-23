@@ -1,5 +1,13 @@
 //! Owned branch commit proposals and deterministic logical lowering.
 
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "owned proposals are sent to the canonical actor in batch 16"
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -8,7 +16,7 @@ use homebase_core::messages::RangeAssert;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::{Uuid, Variant, Version};
 
 use super::isolation::{ConflictFootprint, IsolationLevel};
@@ -29,6 +37,8 @@ const TAG_WRITE: u8 = 10;
 const TAG_CONSTRAINT: u8 = 11;
 const TAG_READ: u8 = 12;
 
+const TABLE: &str = "__multilite__commits";
+
 /// Stable identity used to deduplicate an uncertain canonical commit reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProposalId([u8; 16]);
@@ -36,10 +46,6 @@ pub struct ProposalId([u8; 16]);
 impl ProposalId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().into_bytes())
-    }
-
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
     }
 
     pub const fn to_bytes(self) -> [u8; 16] {
@@ -56,6 +62,27 @@ pub struct CommitProposal {
     changeset: CapturedChangeset,
     transaction: MultiliteTransaction,
     footprint: ConflictFootprint,
+}
+
+/// One proposal retained as canonical OCC and retry history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedProposal {
+    pub generation: crate::snapshot::LocalGeneration,
+    pub proposal: CommitProposal,
+}
+
+/// Whether this call applied a proposal or found its durable receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitDisposition {
+    Applied,
+    AlreadyCommitted,
+}
+
+/// Stable result of canonically committing one proposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitReceipt {
+    pub generation: crate::snapshot::LocalGeneration,
+    pub disposition: CommitDisposition,
 }
 
 impl CommitProposal {
@@ -105,10 +132,6 @@ impl CommitProposal {
         &self.changeset
     }
 
-    pub fn transaction(&self) -> &MultiliteTransaction {
-        &self.transaction
-    }
-
     pub fn footprint(&self) -> &ConflictFootprint {
         &self.footprint
     }
@@ -128,7 +151,7 @@ impl CommitProposal {
     pub fn validate_against(&self, connection: &Connection) -> Result<()> {
         self.changeset
             .validate_schema(connection)
-            .map_err(invalid_changeset)?;
+            .map_err(commit_changeset)?;
         let operations = lower_insert_operations(&self.changeset, connection)?;
         if operations != self.transaction.operations() {
             return Err(Error::InvalidCommitProposal(
@@ -252,6 +275,268 @@ impl CommitProposal {
     }
 }
 
+/// Create the durable local commit history as part of database bootstrap.
+pub fn initialize(connection: &Connection) -> Result<()> {
+    connection.execute_batch(&format!(
+        "CREATE TABLE {TABLE} (
+            proposal_id BLOB PRIMARY KEY NOT NULL CHECK(length(proposal_id) = 16),
+            local_generation BLOB NOT NULL UNIQUE CHECK(length(local_generation) = 8),
+            record BLOB NOT NULL
+        ) WITHOUT ROWID"
+    ))?;
+    Ok(())
+}
+
+/// Check whether the complete reserved commit-journal namespace is present.
+pub fn is_initialized(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_schema
+         WHERE type = 'table'
+           AND substr(name, 1, length(?1)) = ?1 COLLATE NOCASE
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([TABLE], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match tables.as_slice() {
+        [] => Ok(false),
+        [table] if table == TABLE => Ok(true),
+        _ => Err(Error::InvalidDatabase(
+            "commit history namespace contains unexpected tables",
+        )),
+    }
+}
+
+/// Validate the journal schema and every retained proposal receipt.
+pub fn validate(connection: &Connection) -> Result<()> {
+    if !is_initialized(connection)? {
+        return Err(Error::InvalidDatabase("commit history table is missing"));
+    }
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({TABLE})"))?;
+    let columns = statement
+        .query_map((), |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u32>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = vec![
+        (String::from("proposal_id"), String::from("BLOB"), true, 1),
+        (
+            String::from("local_generation"),
+            String::from("BLOB"),
+            true,
+            0,
+        ),
+        (String::from("record"), String::from("BLOB"), true, 0),
+    ];
+    if columns != expected {
+        return Err(Error::InvalidDatabase(
+            "commit history table schema is invalid",
+        ));
+    }
+    let schema_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+        [TABLE],
+        |row| row.get(0),
+    )?;
+    if !schema_sql.to_ascii_uppercase().contains("WITHOUT ROWID") {
+        return Err(Error::InvalidDatabase(
+            "commit history table must use WITHOUT ROWID",
+        ));
+    }
+    let history = history_after(connection, crate::snapshot::LocalGeneration(0))?;
+    if history
+        .windows(2)
+        .any(|pair| pair[0].generation >= pair[1].generation)
+    {
+        return Err(Error::InvalidDatabase(
+            "commit history generations are not increasing",
+        ));
+    }
+    Ok(())
+}
+
+/// Last canonical generation, or zero before the first branch proposal.
+pub fn current_generation(connection: &Connection) -> Result<crate::snapshot::LocalGeneration> {
+    let encoded = connection
+        .query_row(
+            &format!(
+                "SELECT local_generation FROM {TABLE}
+                 ORDER BY local_generation DESC LIMIT 1"
+            ),
+            (),
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    encoded
+        .map(|bytes| decode_generation(&bytes))
+        .transpose()
+        .map(|generation| generation.unwrap_or(crate::snapshot::LocalGeneration(0)))
+}
+
+/// Load canonical proposals strictly newer than a snapshot generation.
+pub fn history_after(
+    connection: &Connection,
+    generation: crate::snapshot::LocalGeneration,
+) -> Result<Vec<CommittedProposal>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT proposal_id, local_generation, record FROM {TABLE}
+         WHERE local_generation > ?1 ORDER BY local_generation"
+    ))?;
+    let rows = statement.query_map([generation.0.to_be_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, generation, record) = row?;
+        let id = decode_proposal_id(&id)?;
+        let generation = decode_generation(&generation)?;
+        let proposal = CommitProposal::decode(&record)
+            .map_err(|error| Error::InvalidCommitProposal(error.to_string()))?;
+        if proposal.id() != id {
+            return Err(Error::InvalidDatabase(
+                "commit history row key contradicts its proposal",
+            ));
+        }
+        Ok(CommittedProposal {
+            generation,
+            proposal,
+        })
+    })
+    .collect()
+}
+
+/// Validate, replay, and receipt one proposal in a single SQLite savepoint.
+pub fn apply(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {
+    connection.execute_batch("SAVEPOINT __multilite__commit_proposal")?;
+    let result = apply_inner(connection, proposal);
+    match result {
+        Ok(receipt) => {
+            connection.execute_batch("RELEASE __multilite__commit_proposal")?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let rollback = connection.execute_batch(
+                "ROLLBACK TO __multilite__commit_proposal;
+                 RELEASE __multilite__commit_proposal",
+            );
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback.into()),
+            }
+        }
+    }
+}
+
+fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {
+    if let Some(committed) = committed_by_id(connection, proposal.id())? {
+        if committed.proposal != *proposal {
+            return Err(Error::InvalidCommitProposal(
+                "proposal id is already committed with another payload".into(),
+            ));
+        }
+        return Ok(CommitReceipt {
+            generation: committed.generation,
+            disposition: CommitDisposition::AlreadyCommitted,
+        });
+    }
+
+    let current = current_generation(connection)?;
+    if proposal.snapshot().local_generation > current {
+        return Err(Error::CommitConflict(
+            "proposal snapshot is newer than canonical SQLite".into(),
+        ));
+    }
+    proposal.validate_against(connection)?;
+    for committed in history_after(connection, proposal.snapshot().local_generation)? {
+        if proposal
+            .footprint()
+            .conflicts_with_writes(proposal.isolation(), committed.proposal.footprint())
+        {
+            return Err(Error::CommitConflict(format!(
+                "proposal conflicts with local generation {}",
+                committed.generation.0
+            )));
+        }
+    }
+
+    proposal
+        .changeset()
+        .apply(connection)
+        .map_err(commit_changeset)?;
+    let generation = crate::snapshot::LocalGeneration(
+        current
+            .0
+            .checked_add(1)
+            .ok_or_else(|| Error::CommitConflict("local generation is exhausted".into()))?,
+    );
+    connection.execute(
+        &format!(
+            "INSERT INTO {TABLE} (proposal_id, local_generation, record)
+             VALUES (?1, ?2, ?3)"
+        ),
+        params![
+            proposal.id().to_bytes().as_slice(),
+            generation.0.to_be_bytes().as_slice(),
+            proposal.encode()?,
+        ],
+    )?;
+    Ok(CommitReceipt {
+        generation,
+        disposition: CommitDisposition::Applied,
+    })
+}
+
+fn committed_by_id(connection: &Connection, id: ProposalId) -> Result<Option<CommittedProposal>> {
+    let row = connection
+        .query_row(
+            &format!("SELECT local_generation, record FROM {TABLE} WHERE proposal_id = ?1"),
+            [id.to_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    row.map(|(generation, record)| {
+        let proposal = CommitProposal::decode(&record)
+            .map_err(|error| Error::InvalidCommitProposal(error.to_string()))?;
+        if proposal.id() != id {
+            return Err(Error::InvalidDatabase(
+                "commit history row key contradicts its proposal",
+            ));
+        }
+        Ok(CommittedProposal {
+            generation: decode_generation(&generation)?,
+            proposal,
+        })
+    })
+    .transpose()
+}
+
+fn decode_proposal_id(bytes: &[u8]) -> Result<ProposalId> {
+    uuid_bytes(bytes)
+        .map(ProposalId)
+        .map_err(|error| Error::InvalidCommitProposal(error.to_string()))
+}
+
+fn decode_generation(bytes: &[u8]) -> Result<crate::snapshot::LocalGeneration> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidDatabase("commit generation is malformed"))?;
+    let generation = u64::from_be_bytes(bytes);
+    if generation == 0 {
+        return Err(Error::InvalidDatabase(
+            "committed generation must be greater than zero",
+        ));
+    }
+    Ok(crate::snapshot::LocalGeneration(generation))
+}
+
 fn lower_insert_operations(
     changeset: &CapturedChangeset,
     connection: &Connection,
@@ -284,6 +569,24 @@ fn lower_insert_operations(
 
 fn invalid_changeset(error: impl fmt::Display) -> Error {
     Error::InvalidCommitProposal(error.to_string())
+}
+
+fn commit_changeset(error: crate::branch::changeset::ChangesetError) -> Error {
+    use crate::branch::changeset::ChangesetError;
+
+    match error {
+        ChangesetError::Malformed(_)
+        | ChangesetError::UnknownTable(_)
+        | ChangesetError::TableWithoutPrimaryKey(_)
+        | ChangesetError::UnsupportedTable { .. }
+        | ChangesetError::UnsupportedChange { .. } => {
+            Error::InvalidCommitProposal(error.to_string())
+        }
+        ChangesetError::Sqlite(_)
+        | ChangesetError::SchemaChanged
+        | ChangesetError::Conflict(_)
+        | ChangesetError::ForeignKeyViolation => Error::CommitConflict(error.to_string()),
+    }
 }
 
 fn encode_isolation(isolation: IsolationLevel) -> u8 {
@@ -422,6 +725,7 @@ mod tests {
             writer.pragma_update(None, "journal_mode", "WAL").unwrap();
             writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
             catalog::initialize(&writer).unwrap();
+            initialize(&writer).unwrap();
             let created = CreateTable::new(
                 "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
                 CreateTableSpec {
@@ -473,22 +777,29 @@ mod tests {
         isolation: IsolationLevel,
         read: Option<Key>,
     ) -> CommitProposal {
-        let branch = fixture.branch();
-        let capture = ChangesetCapture::start(&branch, &["notes"]).unwrap();
-        branch
-            .connection()
-            .execute("INSERT INTO notes(body) VALUES ('generated')", ())
-            .unwrap();
-        let changeset = capture.finish().unwrap();
-        CommitProposal::from_captured(
-            descriptor(),
+        proposal_for_sql(
+            fixture,
+            "INSERT INTO notes(body) VALUES ('generated')",
             isolation,
-            changeset,
-            branch.connection(),
+            descriptor(),
             read,
         )
-        .unwrap()
-        .unwrap()
+    }
+
+    fn proposal_for_sql(
+        fixture: &Fixture,
+        sql: &str,
+        isolation: IsolationLevel,
+        snapshot: SnapshotDescriptor,
+        reads: impl IntoIterator<Item = Key>,
+    ) -> CommitProposal {
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(&branch, &["notes"]).unwrap();
+        branch.connection().execute(sql, ()).unwrap();
+        let changeset = capture.finish().unwrap();
+        CommitProposal::from_captured(snapshot, isolation, changeset, branch.connection(), reads)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -595,6 +906,249 @@ mod tests {
                 [],
             ),
             Err(Error::InvalidCommitProposal(message)) if message.contains("schema")
+        ));
+    }
+
+    #[test]
+    fn canonical_apply_is_idempotent_and_persists_generation_history() {
+        let fixture = Fixture::new();
+        let proposal = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (7, 'once')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+
+        assert_eq!(
+            apply(&fixture.writer, &proposal).unwrap(),
+            CommitReceipt {
+                generation: LocalGeneration(1),
+                disposition: CommitDisposition::Applied,
+            }
+        );
+        assert_eq!(
+            apply(&fixture.writer, &proposal).unwrap(),
+            CommitReceipt {
+                generation: LocalGeneration(1),
+                disposition: CommitDisposition::AlreadyCommitted,
+            }
+        );
+        assert_eq!(
+            current_generation(&fixture.writer).unwrap(),
+            LocalGeneration(1)
+        );
+        assert_eq!(
+            history_after(&fixture.writer, LocalGeneration(0)).unwrap(),
+            vec![CommittedProposal {
+                generation: LocalGeneration(1),
+                proposal,
+            }]
+        );
+        assert_eq!(
+            fixture
+                .writer
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        validate(&fixture.writer).unwrap();
+    }
+
+    #[test]
+    fn snapshot_occ_accepts_disjoint_rows_and_rejects_the_same_primary_key() {
+        let fixture = Fixture::new();
+        let first = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (1, 'first')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+        let disjoint = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (2, 'disjoint')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+        let collision = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (1, 'collision')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+
+        assert_eq!(
+            apply(&fixture.writer, &first).unwrap().generation,
+            LocalGeneration(1)
+        );
+        assert_eq!(
+            apply(&fixture.writer, &disjoint).unwrap().generation,
+            LocalGeneration(2)
+        );
+        assert!(matches!(
+            apply(&fixture.writer, &collision),
+            Err(Error::CommitConflict(message)) if message.contains("generation 1")
+        ));
+        assert_eq!(
+            current_generation(&fixture.writer).unwrap(),
+            LocalGeneration(2)
+        );
+        assert_eq!(
+            fixture
+                .writer
+                .prepare("SELECT id, body FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?
+                )))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            vec![(1, "first".into()), (2, "disjoint".into())]
+        );
+    }
+
+    #[test]
+    fn serializable_reads_conflict_with_new_writes_but_snapshot_reads_do_not() {
+        let fixture = Fixture::new();
+        let first = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (1, 'first')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+        let first_row = first
+            .footprint()
+            .writes()
+            .first()
+            .expect("insert footprint has one row")
+            .clone();
+        let serializable = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (2, 'serial')",
+            IsolationLevel::Serializable,
+            descriptor(),
+            [first_row.clone()],
+        );
+        let snapshot = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (3, 'snapshot')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [first_row],
+        );
+
+        apply(&fixture.writer, &first).unwrap();
+        assert!(matches!(
+            apply(&fixture.writer, &serializable),
+            Err(Error::CommitConflict(_))
+        ));
+        assert_eq!(
+            apply(&fixture.writer, &snapshot).unwrap().generation,
+            LocalGeneration(2)
+        );
+    }
+
+    #[test]
+    fn receipt_failure_rolls_back_replay_and_retry_can_commit() {
+        let fixture = Fixture::new();
+        fixture
+            .writer
+            .execute_batch(&format!(
+                "CREATE TABLE failure_switch (enabled INTEGER NOT NULL);
+                 INSERT INTO failure_switch VALUES (1);
+                 CREATE TRIGGER fail_commit_receipt
+                 BEFORE INSERT ON {TABLE}
+                 WHEN (SELECT enabled FROM failure_switch) = 1
+                 BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END"
+            ))
+            .unwrap();
+        let proposal = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (9, 'atomic')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+
+        assert!(matches!(
+            apply(&fixture.writer, &proposal),
+            Err(Error::Sqlite(_))
+        ));
+        assert_eq!(
+            current_generation(&fixture.writer).unwrap(),
+            LocalGeneration(0)
+        );
+        assert_eq!(
+            fixture
+                .writer
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        fixture
+            .writer
+            .execute("UPDATE failure_switch SET enabled = 0", ())
+            .unwrap();
+        assert_eq!(
+            apply(&fixture.writer, &proposal).unwrap().disposition,
+            CommitDisposition::Applied
+        );
+        assert_eq!(
+            fixture
+                .writer
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn one_proposal_id_cannot_name_two_payloads() {
+        let fixture = Fixture::new();
+        let first = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (1, 'first')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+        let mut impostor = proposal_for_sql(
+            &fixture,
+            "INSERT INTO notes VALUES (2, 'impostor')",
+            IsolationLevel::Snapshot,
+            descriptor(),
+            [],
+        );
+        impostor.replace_id(first.id());
+
+        apply(&fixture.writer, &first).unwrap();
+        assert!(matches!(
+            apply(&fixture.writer, &impostor),
+            Err(Error::InvalidCommitProposal(message)) if message.contains("another payload")
+        ));
+    }
+
+    #[test]
+    fn commit_namespace_validation_rejects_lookalike_tables() {
+        let fixture = Fixture::new();
+        assert!(is_initialized(&fixture.writer).unwrap());
+        validate(&fixture.writer).unwrap();
+        fixture
+            .writer
+            .execute_batch("CREATE TABLE __multilite__commits_future (value BLOB NOT NULL)")
+            .unwrap();
+        assert!(matches!(
+            is_initialized(&fixture.writer),
+            Err(Error::InvalidDatabase(
+                "commit history namespace contains unexpected tables"
+            ))
         ));
     }
 }
