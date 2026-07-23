@@ -41,6 +41,11 @@ impl HomebaseTransaction {
         self.footprint.extend(trace.footprint());
     }
 
+    /// Split deterministic mutations from their typed conflict footprint.
+    pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
+        (self.mutations, self.footprint)
+    }
+
     /// Plan assertions for one isolation level and authority snapshot.
     pub fn plan(
         self,

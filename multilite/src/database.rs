@@ -8,6 +8,7 @@ mod isolation;
 mod operation;
 mod pending;
 mod policy;
+mod proposal;
 mod rebase;
 mod row;
 mod schema;

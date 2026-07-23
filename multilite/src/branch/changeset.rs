@@ -1,13 +1,5 @@
 //! Net SQLite changes captured from a private branch and replayed canonically.
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "wired into branch commit proposals in the next batch"
-    )
-)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
@@ -44,6 +36,13 @@ pub struct CapturedChangeset {
     rowids: Vec<RowidTransition>,
 }
 
+/// One final inserted row projected from SQLite's net changeset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedInsert {
+    pub table: String,
+    pub values: Vec<StoredValue>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowidTransition {
     before: Option<i64>,
@@ -61,6 +60,42 @@ impl CapturedChangeset {
 
     pub fn sqlite_bytes(&self) -> &[u8] {
         &self.sqlite
+    }
+
+    /// Verify that this capture still describes the supplied SQLite schema.
+    pub fn validate_schema(&self, connection: &Connection) -> Result<(), ChangesetError> {
+        if schema_fingerprint(connection)? != self.schema {
+            return Err(ChangesetError::SchemaChanged);
+        }
+        Ok(())
+    }
+
+    /// Project the currently supported insert-only logical transaction.
+    pub fn inserted_rows(&self) -> Result<Vec<CapturedInsert>, ChangesetError> {
+        decode_changeset(&self.sqlite)?
+            .into_iter()
+            .map(|change| {
+                if change.kind != ChangeKind::Insert {
+                    return Err(ChangesetError::UnsupportedChange {
+                        table: change.table,
+                        operation: change.kind.name(),
+                    });
+                }
+                let values = change
+                    .new
+                    .into_iter()
+                    .map(|value| {
+                        value.ok_or(ChangesetError::Malformed(
+                            "insert changeset omits a final column value",
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CapturedInsert {
+                    table: change.table,
+                    values,
+                })
+            })
+            .collect()
     }
 
     /// Encode the complete replay record, including every required sidecar.
@@ -269,6 +304,16 @@ enum ChangeKind {
     Insert,
     Update,
     Delete,
+}
+
+impl ChangeKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -931,7 +976,14 @@ pub enum ChangesetError {
     SchemaChanged,
     UnknownTable(String),
     TableWithoutPrimaryKey(String),
-    UnsupportedTable { table: String, reason: &'static str },
+    UnsupportedTable {
+        table: String,
+        reason: &'static str,
+    },
+    UnsupportedChange {
+        table: String,
+        operation: &'static str,
+    },
     Malformed(&'static str),
     Conflict(String),
     ForeignKeyViolation,
@@ -950,6 +1002,12 @@ impl fmt::Display for ChangesetError {
             }
             Self::UnsupportedTable { table, reason } => {
                 write!(formatter, "unsupported changeset table {table:?}: {reason}")
+            }
+            Self::UnsupportedChange { table, operation } => {
+                write!(
+                    formatter,
+                    "unsupported {operation} change in table {table:?}"
+                )
             }
             Self::Malformed(message) => write!(formatter, "malformed SQLite changeset: {message}"),
             Self::Conflict(message) => write!(formatter, "changeset conflict: {message}"),

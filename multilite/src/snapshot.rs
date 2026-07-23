@@ -1,15 +1,11 @@
 //! Logical transaction coordinates independent of the physical SQLite image.
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by owned commit proposals in the next batch"
-    )
-)]
-
 use homebase_client::meta::OplogCursors;
+use homebase_core::reader::Reader;
 use homebase_core::tag::AdmissionSeq;
+use homebase_core::writer::Writer;
+
+const SNAPSHOT_FRAME_VERSION: u8 = 1;
 
 /// Monotone canonical SQLite commit coordinate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,6 +17,62 @@ pub struct SnapshotDescriptor {
     pub local_generation: LocalGeneration,
     pub authority_applied_through: AdmissionSeq,
     pub submit_cursors: OplogCursors,
+}
+
+impl SnapshotDescriptor {
+    /// Encode one complete logical transaction-start frontier.
+    pub fn encode(self) -> Vec<u8> {
+        let mut writer = Writer::with_capacity(42);
+        writer.u8(SNAPSHOT_FRAME_VERSION);
+        writer.u64(self.local_generation.0);
+        writer.u64(self.authority_applied_through.0);
+        writer.bytes(&self.submit_cursors.encode());
+        writer.finish()
+    }
+
+    /// Decode and validate one complete logical transaction-start frontier.
+    pub fn decode(frame: &[u8]) -> Result<Self, SnapshotCodecError> {
+        let mut reader = Reader::new(frame);
+        if reader.u8() != Some(SNAPSHOT_FRAME_VERSION) {
+            return Err(SnapshotCodecError::UnknownVersion);
+        }
+        let local_generation = LocalGeneration(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
+        let authority_applied_through =
+            AdmissionSeq(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
+        let submit_cursors =
+            OplogCursors::decode(reader.rest()).ok_or(SnapshotCodecError::InvalidSubmitCursors)?;
+        if submit_cursors.head.0 == 0
+            || submit_cursors.head > submit_cursors.neck
+            || submit_cursors.neck > submit_cursors.tail
+        {
+            return Err(SnapshotCodecError::InvalidSubmitCursors);
+        }
+        Ok(Self {
+            local_generation,
+            authority_applied_through,
+            submit_cursors,
+        })
+    }
+}
+
+/// Failure to decode a logical snapshot descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotCodecError {
+    UnknownVersion,
+    Truncated,
+    InvalidSubmitCursors,
+}
+
+impl std::fmt::Display for SnapshotCodecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownVersion => formatter.write_str("unknown snapshot descriptor version"),
+            Self::Truncated => formatter.write_str("snapshot descriptor is truncated"),
+            Self::InvalidSubmitCursors => {
+                formatter.write_str("snapshot descriptor has invalid submit cursors")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -45,5 +97,31 @@ mod tests {
         assert_eq!(descriptor.local_generation, LocalGeneration(41));
         assert_eq!(descriptor.authority_applied_through, AdmissionSeq(17));
         assert_eq!(descriptor.submit_cursors, cursors);
+        assert_eq!(
+            SnapshotDescriptor::decode(&descriptor.encode()),
+            Ok(descriptor)
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_malformed_and_reversed_submit_frontiers() {
+        assert_eq!(
+            SnapshotDescriptor::decode(&[]),
+            Err(SnapshotCodecError::UnknownVersion)
+        );
+
+        let descriptor = SnapshotDescriptor {
+            local_generation: LocalGeneration(1),
+            authority_applied_through: AdmissionSeq(2),
+            submit_cursors: OplogCursors {
+                head: DeviceSeq(4),
+                neck: DeviceSeq(3),
+                tail: DeviceSeq(5),
+            },
+        };
+        assert_eq!(
+            SnapshotDescriptor::decode(&descriptor.encode()),
+            Err(SnapshotCodecError::InvalidSubmitCursors)
+        );
     }
 }

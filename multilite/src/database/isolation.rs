@@ -93,19 +93,61 @@ impl ConflictFootprint {
         self.reads.extend(other.reads);
     }
 
-    #[cfg(test)]
+    /// Mandatory row and schema writes made by this transaction.
     pub fn writes(&self) -> &BTreeSet<Key> {
         self.writes.as_set()
     }
 
-    #[cfg(test)]
+    /// Invariants that must remain unchanged since the transaction snapshot.
     pub fn constraints(&self) -> &BTreeSet<Key> {
         self.constraints.as_set()
     }
 
-    #[cfg(test)]
+    /// Ordinary logical reads used only by serializable transactions.
     pub fn reads(&self) -> &BTreeSet<Key> {
         self.reads.as_set()
+    }
+
+    /// Rebuild a typed footprint while retaining its prefix-antichain form.
+    pub fn from_parts(
+        writes: impl IntoIterator<Item = Key>,
+        constraints: impl IntoIterator<Item = Key>,
+        reads: impl IntoIterator<Item = Key>,
+    ) -> Self {
+        let mut footprint = Self::new();
+        for key in writes {
+            footprint.add_write(key);
+        }
+        for key in constraints {
+            footprint.add_constraint(key);
+        }
+        for key in reads {
+            footprint.add_read(key);
+        }
+        footprint
+    }
+
+    /// True when writes committed after this snapshot invalidate this proposal.
+    pub fn conflicts_with_writes(
+        &self,
+        isolation: IsolationLevel,
+        committed: &ConflictFootprint,
+    ) -> bool {
+        self.asserted_keys(isolation).any(|asserted| {
+            committed
+                .writes()
+                .iter()
+                .any(|written| prefixes_overlap(asserted, written))
+        })
+    }
+
+    fn asserted_keys(&self, isolation: IsolationLevel) -> impl Iterator<Item = &Key> {
+        self.writes().iter().chain(self.constraints()).chain(
+            (isolation == IsolationLevel::Serializable)
+                .then_some(self.reads())
+                .into_iter()
+                .flatten(),
+        )
     }
 
     /// Merge typed antichains and bind them to one authority frontier.
@@ -121,6 +163,10 @@ impl ConflictFootprint {
             .map(|prefix| RangeAssert { prefix, upto })
             .collect()
     }
+}
+
+fn prefixes_overlap(left: &Key, right: &Key) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -168,7 +214,6 @@ impl PrefixSet {
         }
     }
 
-    #[cfg(test)]
     fn as_set(&self) -> &BTreeSet<Key> {
         &self.keys
     }

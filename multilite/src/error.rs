@@ -46,6 +46,10 @@ pub enum Error {
     InvalidMultiliteOp(String),
     /// A transaction manifest or its lowered Homebase batch was malformed.
     InvalidMultiliteTransaction(String),
+    /// An owned branch commit proposal is malformed or internally inconsistent.
+    InvalidCommitProposal(String),
+    /// A valid branch proposal no longer applies to the canonical snapshot.
+    CommitConflict(String),
     /// Fetched admissions cannot be rebased over speculative local work.
     RebasePendingSubmissions,
     /// Local submit or admit cursors changed during rebase preparation.
@@ -99,6 +103,10 @@ impl fmt::Display for Error {
             Self::InvalidMultiliteTransaction(message) => {
                 write!(f, "invalid Multilite transaction: {message}")
             }
+            Self::InvalidCommitProposal(message) => {
+                write!(f, "invalid commit proposal: {message}")
+            }
+            Self::CommitConflict(message) => write!(f, "commit conflict: {message}"),
             Self::RebasePendingSubmissions => {
                 f.write_str("rebase requires the local submit log to be empty")
             }
@@ -132,6 +140,8 @@ impl std::error::Error for Error {
             | Self::Entropy(_)
             | Self::InvalidMultiliteOp(_)
             | Self::InvalidMultiliteTransaction(_)
+            | Self::InvalidCommitProposal(_)
+            | Self::CommitConflict(_)
             | Self::RebasePendingSubmissions
             | Self::RebaseStateChanged
             | Self::StalePushRejection => None,
