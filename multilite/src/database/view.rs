@@ -11,16 +11,12 @@ use crate::{Error, Params, Result};
 
 /// One managed, read-only SQLite snapshot.
 pub struct ViewTransaction<'a> {
-    runtime: &'a DatabaseRuntime,
     connection: &'a Connection,
 }
 
 impl<'a> ViewTransaction<'a> {
-    fn new(runtime: &'a DatabaseRuntime, connection: &'a Connection) -> Self {
-        Self {
-            runtime,
-            connection,
-        }
+    fn new(connection: &'a Connection) -> Self {
+        Self { connection }
     }
 
     /// Execute a read-only statement and eagerly map every result row.
@@ -44,7 +40,7 @@ impl<'a> ViewTransaction<'a> {
 
     /// Prepare one read-only statement bound to this managed snapshot.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        TransactionStatement::new(self.runtime, self.connection, sql, None)
+        TransactionStatement::new_direct(self.connection, sql)
     }
 }
 
@@ -169,15 +165,17 @@ fn ensure_read_only_events(events: Vec<super::row::CapturedRow>) -> Result<()> {
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     /// Refresh once, then run a closure inside one read-only SQLite snapshot.
     pub fn view<T>(
-        &self,
+        self: &std::sync::Arc<Self>,
         runtime: &DatabaseRuntime,
         operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let _operation = self.enter_operation()?;
-        self.refresh_read_serial(runtime)?;
-        self.owner
-            .with_savepoint("__multilite__view", |connection| {
-                operation(&ViewTransaction::new(runtime, connection))
-            })
+        {
+            let _operation = self.enter_operation()?;
+            self.refresh_read_serial(runtime)?;
+        }
+        let snapshot = self.issue_branch_snapshot()?;
+        let branch = crate::branch::ReadBranch::open(snapshot.physical)
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        operation(&ViewTransaction::new(branch.connection()))
     }
 }

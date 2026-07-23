@@ -178,6 +178,36 @@ fn managed_update_and_view_share_sqlite_shaped_query_methods() {
 }
 
 #[test]
+fn managed_view_keeps_its_branch_while_same_database_update_commits() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("concurrent-view.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1)", ()).unwrap();
+
+    let observed = db
+        .view(|view| {
+            let before = view.query("SELECT id FROM notes ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            db.execute("INSERT INTO notes VALUES (2)", ())?;
+            let after = view.query("SELECT id FROM notes ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            Ok((before, after))
+        })
+        .unwrap();
+
+    assert_eq!(observed, (vec![1], vec![1]));
+    assert_eq!(
+        db.query("SELECT id FROM notes ORDER BY id", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1, 2]
+    );
+}
+
+#[test]
 fn managed_update_rolls_back_on_error_and_panic_and_remains_usable() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("managed-rollback.sqlite")).unwrap();

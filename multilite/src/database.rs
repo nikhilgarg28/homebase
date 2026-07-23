@@ -719,20 +719,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let _operation = self.database.enter_operation()?;
-        self.database.refresh_read_serial(&self.runtime)?;
         self.database
-            .owner
-            .with_savepoint("__multilite__statement_view", |connection| {
-                let mut statement = connection.prepare(&self.sql)?;
-                if !statement.readonly() {
-                    return Err(Error::PreparedWrite);
-                }
-                statement
-                    .query_map(params, map)?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(Into::into)
-            })
+            .view(&self.runtime, |view| view.query(&self.sql, params, map))
     }
 }
 
