@@ -1,4 +1,4 @@
-//! Managed serialized local update execution.
+//! Managed local update execution.
 
 use homebase_client::{ClientError, ServerHandle};
 use homebase_core::tag::AdmissionSeq;
@@ -12,30 +12,48 @@ use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
 use super::{
-    Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog, pending,
-    pin_snapshot,
+    BranchSnapshot, Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog,
+    pending, pin_snapshot,
 };
+use crate::branch::changeset::ChangesetCapture;
+use crate::branch::{OverlayOptions, WritableBranch};
+use crate::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
-/// One serialized SQLite update accumulating a single durable transaction.
+enum UpdateBackend<'a, H: ServerHandle> {
+    Branch {
+        connection: &'a Connection,
+    },
+    Serialized {
+        database: &'a Database<H>,
+        runtime: &'a DatabaseRuntime,
+        connection: &'a Connection,
+        authority_frontier: AdmissionSeq,
+        read_trace: ReadTrace,
+        operations: Vec<MultiliteOp>,
+    },
+}
+
+/// One managed update accumulating a single durable transaction.
 ///
-/// The database actor permit and outer SQLite savepoint are owned by
-/// `Database::update`. Individual statements use nested runtime
-/// savepoints only to attribute hook events; no Homebase state is submitted
-/// until the complete operation list has succeeded.
+/// Snapshot-isolated DML executes on a private SQLite branch. Serializable
+/// work and the temporary DDL path retain the canonical serialized runtime
+/// until native branch read tracing and stop-the-world DDL are complete.
 pub struct UpdateTransaction<'a, H: ServerHandle> {
-    database: &'a Database<H>,
-    runtime: &'a DatabaseRuntime,
-    connection: &'a Connection,
-    authority_frontier: AdmissionSeq,
     isolation: IsolationLevel,
-    read_trace: ReadTrace,
-    operations: Vec<MultiliteOp>,
+    backend: UpdateBackend<'a, H>,
 }
 
 impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
-    fn new(
+    fn branch(connection: &'a Connection, isolation: IsolationLevel) -> Self {
+        Self {
+            isolation,
+            backend: UpdateBackend::Branch { connection },
+        }
+    }
+
+    fn serialized(
         database: &'a Database<H>,
         runtime: &'a DatabaseRuntime,
         connection: &'a Connection,
@@ -43,13 +61,15 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         isolation: IsolationLevel,
     ) -> Self {
         Self {
-            database,
-            runtime,
-            connection,
-            authority_frontier,
             isolation,
-            read_trace: ReadTrace::new(),
-            operations: Vec::new(),
+            backend: UpdateBackend::Serialized {
+                database,
+                runtime,
+                connection,
+                authority_frontier,
+                read_trace: ReadTrace::new(),
+                operations: Vec::new(),
+            },
         }
     }
 
@@ -86,49 +106,87 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     /// Prepare one read-only statement bound to this managed update.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        let trace =
-            (self.isolation == IsolationLevel::Serializable).then(|| self.read_trace.clone());
-        TransactionStatement::new(self.runtime, self.connection, sql, trace)
+        match &self.backend {
+            UpdateBackend::Branch { connection } => {
+                TransactionStatement::new_direct(connection, sql)
+            }
+            UpdateBackend::Serialized {
+                runtime,
+                connection,
+                read_trace,
+                ..
+            } => {
+                let trace =
+                    (self.isolation == IsolationLevel::Serializable).then(|| read_trace.clone());
+                TransactionStatement::new(runtime, connection, sql, trace)
+            }
+        }
     }
 
-    /// Execute one statement validated before the outer update began.
+    /// Execute one statement validated before the transaction began.
     pub(super) fn execute_validated<Q: Params>(
         &mut self,
         sql: &str,
         params: Q,
         validated: ValidatedExecute,
     ) -> Result<usize> {
-        match validated {
-            ValidatedExecute::CreateTable(table) => self.execute_create_table(sql, params, table),
-            ValidatedExecute::Insert => self.execute_insert(sql, params),
+        match &mut self.backend {
+            UpdateBackend::Branch { connection } => match validated {
+                ValidatedExecute::Insert => Ok(connection.execute(sql, params)?),
+                ValidatedExecute::CreateTable(_) => Err(Error::UnsupportedSql(
+                    "DDL inside snapshot updates is not supported; execute it directly",
+                )),
+            },
+            UpdateBackend::Serialized { .. } => match validated {
+                ValidatedExecute::CreateTable(table) => {
+                    self.execute_serialized_create_table(sql, params, table)
+                }
+                ValidatedExecute::Insert => self.execute_serialized_insert(sql, params),
+            },
         }
     }
 
-    fn execute_create_table<Q: Params>(
+    fn execute_serialized_create_table<Q: Params>(
         &mut self,
         sql: &str,
         params: Q,
         table: super::schema::CreateTableSpec,
     ) -> Result<usize> {
+        let UpdateBackend::Serialized {
+            runtime,
+            operations,
+            ..
+        } = &mut self.backend
+        else {
+            unreachable!("serialized CREATE TABLE used on a branch")
+        };
         let operation = MultiliteOp::create_table(sql, table);
         let MultiliteOp::CreateTable(created) = &operation else {
             unreachable!("create-table constructor returned another operation")
         };
-        let (changed, _) = self.runtime.run(ExecutionMode::Public, |connection| {
+        let (changed, _) = runtime.run(ExecutionMode::Public, |connection| {
             let changed = connection.execute(sql, params)?;
-            self.runtime
-                .with_internal_metadata(|| catalog::insert(connection, created))?;
+            runtime.with_internal_metadata(|| catalog::insert(connection, created))?;
             Ok(changed)
         })?;
-        self.operations.push(operation);
+        operations.push(operation);
         Ok(changed)
     }
 
-    fn execute_insert<Q: Params>(&mut self, sql: &str, params: Q) -> Result<usize> {
-        let (changed, events) = self.runtime.run(ExecutionMode::Public, |connection| {
+    fn execute_serialized_insert<Q: Params>(&mut self, sql: &str, params: Q) -> Result<usize> {
+        let UpdateBackend::Serialized {
+            runtime,
+            connection,
+            operations,
+            ..
+        } = &mut self.backend
+        else {
+            unreachable!("serialized INSERT used on a branch")
+        };
+        let (changed, events) = runtime.run(ExecutionMode::Public, |connection| {
             Ok(connection.execute(sql, params)?)
         })?;
-        let Some(inserted) = InsertRows::from_captured(self.connection, &events)? else {
+        let Some(inserted) = InsertRows::from_captured(connection, &events)? else {
             if events.is_empty() {
                 return Ok(changed);
             }
@@ -136,24 +194,34 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 "INSERT target has no synchronized schema identity",
             ));
         };
-        self.operations.push(MultiliteOp::InsertRows(inserted));
+        operations.push(MultiliteOp::InsertRows(inserted));
         Ok(changed)
     }
 
-    fn finalize(self) -> Result<()> {
-        if self.operations.is_empty() {
+    fn finalize_serialized(self) -> Result<()> {
+        let UpdateBackend::Serialized {
+            database,
+            runtime,
+            connection,
+            authority_frontier,
+            read_trace,
+            operations,
+        } = self.backend
+        else {
+            return Ok(());
+        };
+        if operations.is_empty() {
             return Ok(());
         }
-        let transaction = MultiliteTransaction::new(self.operations)?;
+        let transaction = MultiliteTransaction::new(operations)?;
         let mut homebase = transaction.to_homebase()?;
-        homebase.include_read_trace(&self.read_trace);
-        let (mutations, assertions) = homebase.plan(self.isolation, self.authority_frontier);
-        self.runtime.with_internal_metadata(|| {
+        homebase.include_read_trace(&read_trace);
+        let (mutations, assertions) = homebase.plan(self.isolation, authority_frontier);
+        runtime.with_internal_metadata(|| {
             let sequence = block_on(async {
-                let space = self
-                    .database
+                let space = database
                     .client
-                    .space(self.database.database_id.space_id())
+                    .space(database.database_id.space_id())
                     .await?;
                 let submission = space
                     .submit_unchecked(mutations, assertions)
@@ -161,15 +229,15 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     .map_err(ClientError::from)?;
                 Ok::<_, Error>(submission.seq)
             })?;
-            pending::insert(self.connection, sequence, &transaction)
+            pending::insert(connection, sequence, &transaction)
         })
     }
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
-    /// Run a complete serialized update in one SQLite and Homebase atomic unit.
+    /// Run one complete update using the database's default isolation.
     pub fn update<T>(
-        &self,
+        self: &std::sync::Arc<Self>,
         runtime: &DatabaseRuntime,
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
@@ -178,7 +246,67 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     /// Run one managed update with an explicit isolation override.
     pub fn update_with<T>(
-        &self,
+        self: &std::sync::Arc<Self>,
+        runtime: &DatabaseRuntime,
+        options: UpdateOptions,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
+        match options.isolation_level() {
+            IsolationLevel::Snapshot => self.update_on_branch(runtime, options, operation),
+            IsolationLevel::Serializable => self.update_serialized(runtime, options, operation),
+        }
+    }
+
+    pub(super) fn execute_serialized<T>(
+        self: &std::sync::Arc<Self>,
+        runtime: &DatabaseRuntime,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
+        self.update_serialized(runtime, UpdateOptions::new(self.isolation_level), operation)
+    }
+
+    fn update_on_branch<T>(
+        self: &std::sync::Arc<Self>,
+        runtime: &DatabaseRuntime,
+        options: UpdateOptions,
+        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+    ) -> Result<T> {
+        {
+            let _operation = self.enter_operation()?;
+            self.refresh_read_serial(runtime)?;
+        }
+        let BranchSnapshot {
+            physical,
+            logical,
+            tables,
+        } = self.issue_branch_snapshot()?;
+        let branch = WritableBranch::open(physical, OverlayOptions::default())
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        let table_refs = tables.iter().map(String::as_str).collect::<Vec<_>>();
+        let capture = ChangesetCapture::start(&branch, &table_refs)
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        let mut update = UpdateTransaction::branch(branch.connection(), options.isolation_level());
+        let value = operation(&mut update)?;
+        drop(update);
+        let changeset = capture
+            .finish()
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        let proposal = CommitProposal::from_captured(
+            logical,
+            options.isolation_level(),
+            changeset,
+            branch.connection(),
+            std::iter::empty(),
+        )?;
+        if let Some(proposal) = proposal {
+            self.commit_proposal(proposal)?;
+            self.finish_branch_write()?;
+        }
+        Ok(value)
+    }
+
+    fn update_serialized<T>(
+        self: &std::sync::Arc<Self>,
         runtime: &DatabaseRuntime,
         options: UpdateOptions,
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
@@ -190,7 +318,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             .owner
             .with_savepoint("__multilite__serialized_update", |connection| {
                 pin_snapshot(connection)?;
-                let mut update = UpdateTransaction::new(
+                let mut update = UpdateTransaction::serialized(
                     self,
                     runtime,
                     connection,
@@ -198,7 +326,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     options.isolation_level(),
                 );
                 let value = operation(&mut update)?;
-                update.finalize()?;
+                update.finalize_serialized()?;
                 Ok(value)
             })?;
 
@@ -208,6 +336,25 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             SyncPolicy::Remote => self.finish_remote_write()?,
         }
         Ok(value)
+    }
+
+    fn finish_branch_write(self: &std::sync::Arc<Self>) -> Result<()> {
+        match self.policy.policy() {
+            SyncPolicy::LocalOnly => Ok(()),
+            SyncPolicy::LocalFirst { write_delay, .. } => {
+                self.scheduler.schedule(write_delay);
+                Ok(())
+            }
+            SyncPolicy::Remote => match self.push()? {
+                super::PushOutcome::Drained => Ok(()),
+                super::PushOutcome::Rejected(rejection) => {
+                    let error = rejection.error.clone();
+                    self.rollback(&rejection)?;
+                    let _ = self.push();
+                    Err(Error::AuthorityRejected(error))
+                }
+            },
+        }
     }
 
     fn authority_frontier(&self) -> Result<AdmissionSeq> {

@@ -3,6 +3,7 @@
 //! Not published for use yet.
 
 mod branch;
+mod committer;
 mod connection;
 mod database;
 mod error;

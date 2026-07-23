@@ -1,6 +1,5 @@
 //! General Multilite database identity and Homebase lifecycle.
 
-mod actor;
 pub(crate) mod catalog;
 mod codes;
 mod connection;
@@ -19,7 +18,7 @@ mod view;
 mod vtab;
 
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
@@ -34,13 +33,14 @@ use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
+use crate::committer::{CommitPermit, Committer};
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
-use crate::proposal;
+use crate::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
+use crate::snapshot::SnapshotDescriptor;
 use crate::{Error, Params, Result};
 
-use self::actor::{ActorPermit, SerialActor};
 use self::policy::{PolicyState, PushScheduler};
 use self::row::{CapturedRow, StoredValue};
 use self::store::DatabaseMetaStore;
@@ -331,11 +331,13 @@ fn capture_insert(
 /// An opened general Multilite database.
 pub(crate) struct Database<H: ServerHandle> {
     owner: ConnectionOwner,
+    path: PathBuf,
+    wal_path: PathBuf,
     database_id: DatabaseId,
     client: DatabaseClient<H>,
     policy: PolicyState,
     isolation_level: IsolationLevel,
-    actor: SerialActor,
+    committer: Committer,
     scheduler: PushScheduler,
 }
 
@@ -348,8 +350,14 @@ impl Database<OfflineServer> {
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Arc<Self>> {
         options.validate()?;
-        let owner = ConnectionOwner::open(path)?;
-        let database = open_on(owner, options)?;
+        let path = path.as_ref().to_owned();
+        let owner = ConnectionOwner::open(&path)?;
+        owner.with_connection(|connection| {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+            Ok::<_, rusqlite::Error>(())
+        })?;
+        let database = open_on(owner, path, options)?;
         Ok(Arc::new(database))
     }
 
@@ -389,22 +397,29 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) fn execute<Q: Params>(
-        &self,
+        self: &Arc<Self>,
         runtime: &DatabaseRuntime,
         sql: &str,
         params: Q,
     ) -> Result<usize> {
         let validated = sql::validate_execute(sql)?;
-        self.update(runtime, |update| {
-            update.execute_validated(sql, params, validated)
-        })
+        match validated {
+            sql::ValidatedExecute::CreateTable(table) => {
+                self.execute_serialized(runtime, |update| {
+                    update.execute_validated(sql, params, sql::ValidatedExecute::CreateTable(table))
+                })
+            }
+            sql::ValidatedExecute::Insert => self.update(runtime, |update| {
+                update.execute_validated(sql, params, sql::ValidatedExecute::Insert)
+            }),
+        }
     }
 
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
         let database = Arc::clone(self);
-        self.actor
+        self.committer
             .call_blocking(move || database.push_serial())
-            .map_err(actor_error)?
+            .map_err(committer_error)?
     }
 
     fn push_serial(&self) -> Result<PushOutcome> {
@@ -435,9 +450,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) fn rollback(self: &Arc<Self>, rejection: &PushRejection) -> Result<()> {
         let database = Arc::clone(self);
         let rejection = rejection.clone();
-        self.actor
+        self.committer
             .call_blocking(move || database.rollback_serial(&rejection))
-            .map_err(actor_error)?
+            .map_err(committer_error)?
     }
 
     fn rollback_serial(&self, rejection: &PushRejection) -> Result<()> {
@@ -461,9 +476,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     pub(crate) fn pull(self: &Arc<Self>) -> Result<PullOutcome> {
         let database = Arc::clone(self);
-        self.actor
+        self.committer
             .call_blocking(move || database.pull_serial())
-            .map_err(actor_error)?
+            .map_err(committer_error)?
     }
 
     fn pull_serial(&self) -> Result<PullOutcome> {
@@ -524,6 +539,75 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
+    fn capture_branch_snapshot(&self) -> Result<BranchSnapshot> {
+        let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        let (apply_seq, tables) = self.owner.with_connection(|connection| {
+            Ok::<_, Error>((
+                proposal::current_apply_seq(connection)?,
+                catalog::table_names(connection)?,
+            ))
+        })?;
+        let store = DatabaseMetaStore::new(self.owner.clone());
+        let (submit_cursors, admits) = block_on(async {
+            Ok::<_, Error>((
+                store.oplog_cursors(self.database_id.space_id()).await?,
+                store.admit_cursors(self.database_id.space_id()).await?,
+            ))
+        })?;
+        let authority_applied_through = AdmissionSeq(
+            admits
+                .neck
+                .0
+                .checked_sub(1)
+                .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
+        );
+        Ok(BranchSnapshot {
+            physical,
+            logical: SnapshotDescriptor {
+                apply_seq,
+                authority_applied_through,
+                submit_cursors,
+            },
+            tables,
+        })
+    }
+
+    fn issue_branch_snapshot(self: &Arc<Self>) -> Result<BranchSnapshot> {
+        let database = Arc::clone(self);
+        self.committer
+            .call_blocking(move || database.capture_branch_snapshot())
+            .map_err(committer_error)?
+    }
+
+    fn commit_proposal(self: &Arc<Self>, proposal: CommitProposal) -> Result<CommitReceipt> {
+        let database = Arc::clone(self);
+        self.committer
+            .call_blocking(move || database.commit_proposal_serial(&proposal))
+            .map_err(committer_error)?
+    }
+
+    fn commit_proposal_serial(&self, proposal: &CommitProposal) -> Result<CommitReceipt> {
+        self.owner
+            .with_savepoint("__multilite__branch_commit", |connection| {
+                let receipt = proposal::apply(connection, proposal)?;
+                if receipt.disposition == CommitDisposition::AlreadyCommitted {
+                    return Ok(receipt);
+                }
+                let (mutations, assertions) = proposal.to_homebase()?;
+                let sequence = block_on(async {
+                    let space = self.client.space(self.database_id.space_id()).await?;
+                    let submission = space
+                        .submit_unchecked(mutations, assertions)
+                        .await
+                        .map_err(ClientError::from)?;
+                    Ok::<_, Error>(submission.seq)
+                })?;
+                pending::insert(connection, sequence, proposal.transaction())?;
+                Ok(receipt)
+            })
+    }
+
     fn refresh_read_serial(&self, runtime: &DatabaseRuntime) -> Result<()> {
         if !self.policy.read_requires_refresh() {
             return Ok(());
@@ -543,8 +627,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(())
     }
 
-    fn enter_operation(&self) -> Result<ActorPermit> {
-        self.actor.enter_blocking().map_err(actor_error)
+    fn enter_operation(&self) -> Result<CommitPermit> {
+        self.committer.enter_blocking().map_err(committer_error)
     }
 }
 
@@ -661,6 +745,7 @@ fn pin_snapshot(connection: &SqliteConnection) -> Result<()> {
 
 fn open_on<H: ServerHandle + Send + Sync + 'static>(
     owner: ConnectionOwner,
+    path: PathBuf,
     options: OpenOptions<H>,
 ) -> Result<Database<H>> {
     let OpenOptions {
@@ -680,13 +765,27 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         })?;
     Ok(Database {
         owner,
+        wal_path: wal_path_for(&path),
+        path,
         database_id,
         client,
         policy: PolicyState::new(sync_policy),
         isolation_level,
-        actor: SerialActor::new().map_err(actor_error)?,
+        committer: Committer::new().map_err(committer_error)?,
         scheduler: PushScheduler::new(),
     })
+}
+
+struct BranchSnapshot {
+    physical: crate::branch::snapshot::PinnedSnapshot,
+    logical: SnapshotDescriptor,
+    tables: Vec<String>,
+}
+
+fn wal_path_for(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    wal.into()
 }
 
 fn initialize<H: ServerHandle>(
@@ -808,8 +907,8 @@ fn offline_server(_: &SpaceId) -> Option<UnreachableSpace> {
     None
 }
 
-fn actor_error(error: actor::ActorError) -> Error {
-    Error::DatabaseActor(error.to_string())
+fn committer_error(error: crate::committer::CommitterError) -> Error {
+    Error::Committer(error.to_string())
 }
 
 #[cfg(test)]

@@ -50,7 +50,7 @@ impl<'a> ViewTransaction<'a> {
 
 /// A read-only prepared statement that cannot outlive its managed transaction.
 pub struct TransactionStatement<'a> {
-    runtime: &'a DatabaseRuntime,
+    runtime: Option<&'a DatabaseRuntime>,
     connection: &'a Connection,
     read_trace: Option<ReadTrace>,
     vtab_read_plan: Option<Plan>,
@@ -84,10 +84,25 @@ impl<'a> TransactionStatement<'a> {
             ));
         }
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             connection,
             read_trace,
             vtab_read_plan,
+            sql: sql.to_owned(),
+        })
+    }
+
+    pub(crate) fn new_direct(connection: &'a Connection, sql: &str) -> Result<Self> {
+        sql::validate_managed_statement(sql)?;
+        let statement = connection.prepare(sql)?;
+        if !statement.readonly() {
+            return Err(Error::PreparedWrite);
+        }
+        Ok(Self {
+            runtime: None,
+            connection,
+            read_trace: None,
+            vtab_read_plan: None,
             sql: sql.to_owned(),
         })
     }
@@ -98,6 +113,16 @@ impl<'a> TransactionStatement<'a> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
+        let Some(runtime) = self.runtime else {
+            let mut statement = self.connection.prepare(&self.sql)?;
+            if !statement.readonly() {
+                return Err(Error::PreparedWrite);
+            }
+            return statement
+                .query_map(params, map)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into);
+        };
         let (sql, mode, _bindings) = match &self.vtab_read_plan {
             Some(plan) => {
                 let trace = self
@@ -105,8 +130,7 @@ impl<'a> TransactionStatement<'a> {
                     .as_ref()
                     .expect("read plans carry an update trace")
                     .clone();
-                let (bindings, events) = self
-                    .runtime
+                let (bindings, events) = runtime
                     .run(ExecutionMode::InternalMetadata, |connection| {
                         plan.bind(connection, trace)
                     })?;
@@ -116,7 +140,7 @@ impl<'a> TransactionStatement<'a> {
             None => (self.sql.as_str(), ExecutionMode::Public, None),
         };
         let expected_connection = self.connection;
-        let (rows, events) = self.runtime.run(mode, |connection| {
+        let (rows, events) = runtime.run(mode, |connection| {
             debug_assert!(std::ptr::eq(connection, expected_connection));
             let mut statement = connection.prepare(sql)?;
             if !statement.readonly() {

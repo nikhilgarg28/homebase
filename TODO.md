@@ -14,7 +14,7 @@
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
-  remains one cooperating Multilite writer actor per file. The WAL-derived map,
+  remains one cooperating Multilite committer per file. The WAL-derived map,
   cold-parse == incremental-parse invariant, and per-snapshot companion SQLite
   reader pins have landed. Remaining work is to fence writer apply against an
   unexpected WAL tip while holding SQLite's real write lock, poison stale
@@ -53,15 +53,15 @@ format so the cleanup cannot accidentally change durable or wire encodings.
 
 Handle multi-schema / attach etc
 
-Async-first Multilite/database actor completion (the bounded channel, oneshot
+Async-first Multilite committer completion (the bounded channel, oneshot
 replies, and borrowed-scope permits landed in `b763fee`):
 - After Branch VFS updates produce owned `CommitProposal`s, move canonical
   SQLite materialization, Homebase metadata, pending effects, sync-policy state,
-  and submit/push/pull/rebase/rollback workflows fully behind actor commands.
+  and submit/push/pull/rebase/rollback workflows fully behind committer commands.
   Local rows and Homebase metadata must remain in the same SQLite transaction.
 - Make the primary internal API async and keep SQLite-compatible synchronous
   methods as blocking wrappers over the same command/reply path.
-- Return owned query rows and column metadata across the actor boundary; perform
+- Return owned query rows and column metadata across the committer boundary; perform
   public mapping and `FromSql` conversion on the caller side.
 - Preserve cancellation, backpressure, shutdown, and durable-side-effect rules:
   dropping a caller never cancels work after it may have committed, and network

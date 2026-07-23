@@ -23,8 +23,8 @@ pub enum Error {
     RefreshPushRejected(PushRejection),
     /// An internal background worker could not be started.
     BackgroundWorker(String),
-    /// The serial database actor could not accept or complete an operation.
-    DatabaseActor(String),
+    /// The serial committer could not accept or complete an operation.
+    Committer(String),
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
     /// Durable Homebase metadata storage failed.
@@ -50,6 +50,8 @@ pub enum Error {
     InvalidCommitProposal(String),
     /// A valid branch proposal no longer applies to the canonical snapshot.
     CommitConflict(String),
+    /// A private SQLite branch could not be captured or opened.
+    Branch(String),
     /// Fetched admissions cannot be rebased over speculative local work.
     RebasePendingSubmissions,
     /// Local submit or admit cursors changed during rebase preparation.
@@ -83,7 +85,7 @@ impl fmt::Display for Error {
             Self::BackgroundWorker(message) => {
                 write!(f, "could not start Multilite background worker: {message}")
             }
-            Self::DatabaseActor(message) => write!(f, "database actor error: {message}"),
+            Self::Committer(message) => write!(f, "committer error: {message}"),
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
@@ -107,6 +109,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid commit proposal: {message}")
             }
             Self::CommitConflict(message) => write!(f, "commit conflict: {message}"),
+            Self::Branch(message) => write!(f, "branch error: {message}"),
             Self::RebasePendingSubmissions => {
                 f.write_str("rebase requires the local submit log to be empty")
             }
@@ -131,7 +134,7 @@ impl std::error::Error for Error {
             | Self::AuthorityRejected(_)
             | Self::RefreshPushRejected(_)
             | Self::BackgroundWorker(_)
-            | Self::DatabaseActor(_) => None,
+            | Self::Committer(_) => None,
             Self::CaptureInvariant(_) => None,
             Self::Storage(error) => Some(error),
             Self::InvalidDatabase(_)
@@ -142,6 +145,7 @@ impl std::error::Error for Error {
             | Self::InvalidMultiliteTransaction(_)
             | Self::InvalidCommitProposal(_)
             | Self::CommitConflict(_)
+            | Self::Branch(_)
             | Self::RebasePendingSubmissions
             | Self::RebaseStateChanged
             | Self::StalePushRejection => None,

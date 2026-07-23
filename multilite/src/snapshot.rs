@@ -13,13 +13,13 @@ const SNAPSHOT_FRAME_VERSION: u8 = 1;
 /// rejection repairs can change canonical SQLite without creating a local
 /// submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CanonicalGeneration(pub u64);
+pub struct ApplySeq(pub u64);
 
 /// Complete logical transaction-start cut across SQLite and Homebase state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotDescriptor {
     /// Canonical SQLite image observed when the branch began.
-    pub canonical_generation: CanonicalGeneration,
+    pub apply_seq: ApplySeq,
     pub authority_applied_through: AdmissionSeq,
     pub submit_cursors: OplogCursors,
 }
@@ -33,7 +33,7 @@ impl SnapshotDescriptor {
     pub fn encode(self) -> Vec<u8> {
         let mut writer = Writer::with_capacity(42);
         writer.u8(SNAPSHOT_FRAME_VERSION);
-        writer.u64(self.canonical_generation.0);
+        writer.u64(self.apply_seq.0);
         writer.u64(self.authority_applied_through.0);
         writer.bytes(&self.submit_cursors.encode());
         writer.finish()
@@ -45,8 +45,7 @@ impl SnapshotDescriptor {
         if reader.u8() != Some(SNAPSHOT_FRAME_VERSION) {
             return Err(SnapshotCodecError::UnknownVersion);
         }
-        let canonical_generation =
-            CanonicalGeneration(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
+        let apply_seq = ApplySeq(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
         let authority_applied_through =
             AdmissionSeq(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
         let submit_cursors =
@@ -58,7 +57,7 @@ impl SnapshotDescriptor {
             return Err(SnapshotCodecError::InvalidSubmitCursors);
         }
         Ok(Self {
-            canonical_generation,
+            apply_seq,
             authority_applied_through,
             submit_cursors,
         })
@@ -99,12 +98,12 @@ mod tests {
             tail: DeviceSeq(8),
         };
         let descriptor = SnapshotDescriptor {
-            canonical_generation: CanonicalGeneration(41),
+            apply_seq: ApplySeq(41),
             authority_applied_through: AdmissionSeq(17),
             submit_cursors: cursors,
         };
 
-        assert_eq!(descriptor.canonical_generation, CanonicalGeneration(41));
+        assert_eq!(descriptor.apply_seq, ApplySeq(41));
         assert_eq!(descriptor.authority_applied_through, AdmissionSeq(17));
         assert_eq!(descriptor.submit_cursors, cursors);
         assert_eq!(
@@ -121,7 +120,7 @@ mod tests {
         );
 
         let descriptor = SnapshotDescriptor {
-            canonical_generation: CanonicalGeneration(1),
+            apply_seq: ApplySeq(1),
             authority_applied_through: AdmissionSeq(2),
             submit_cursors: OplogCursors {
                 head: DeviceSeq(4),

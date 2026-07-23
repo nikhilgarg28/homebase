@@ -2,8 +2,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use homebase::Server;
@@ -262,19 +262,23 @@ fn remote_rejection_undoes_sqlite_before_returning_the_error() {
     .unwrap();
     let second_runtime = second.runtime().unwrap();
     let error = second
-        .update(&second_runtime, |update| {
-            update.execute(
-                "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
-                (),
-            )?;
-            first.execute(
-                &first_runtime,
-                "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
-                (),
-            )?;
-            assert_eq!(first.push()?, PushOutcome::Drained);
-            Ok(())
-        })
+        .update_with(
+            &second_runtime,
+            UpdateOptions::new(IsolationLevel::Serializable),
+            |update| {
+                update.execute(
+                    "CREATE TABLE NOTES (id INTEGER PRIMARY KEY, payload BLOB)",
+                    (),
+                )?;
+                first.execute(
+                    &first_runtime,
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+                    (),
+                )?;
+                assert_eq!(first.push()?, PushOutcome::Drained);
+                Ok(())
+            },
+        )
         .unwrap_err();
 
     assert!(matches!(
@@ -393,11 +397,14 @@ fn managed_view_and_update_refresh_once_then_keep_one_snapshot() {
     assert!(server.create_space(source.database_id().space_id()));
     let source_runtime = source.runtime().unwrap();
     source
-        .update(&source_runtime, |update| {
-            update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
-            update.execute("INSERT INTO notes VALUES (1)", ())?;
-            Ok(())
-        })
+        .execute(
+            &source_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+            (),
+        )
+        .unwrap();
+    source
+        .execute(&source_runtime, "INSERT INTO notes VALUES (1)", ())
         .unwrap();
 
     let replica = Database::open_with(
@@ -804,16 +811,20 @@ fn serialized_update_is_one_sqlite_unit_submission_pending_record_and_admission(
     let replica_runtime = replica.runtime().unwrap();
 
     let changed = database
-        .update(&runtime, |update| {
-            Ok([
-                update.execute(
-                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
-                    (),
-                )?,
-                update.execute("INSERT INTO notes VALUES (1, 'one')", ())?,
-                update.execute("INSERT INTO notes VALUES (2, 'two')", ())?,
-            ])
-        })
+        .update_with(
+            &runtime,
+            UpdateOptions::new(IsolationLevel::Serializable),
+            |update| {
+                Ok([
+                    update.execute(
+                        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                        (),
+                    )?,
+                    update.execute("INSERT INTO notes VALUES (1, 'one')", ())?,
+                    update.execute("INSERT INTO notes VALUES (2, 'two')", ())?,
+                ])
+            },
+        )
         .unwrap();
     assert_eq!(changed, [1, 1, 1]);
 
@@ -898,16 +909,19 @@ fn managed_update_reads_are_asserted_only_for_serializable_isolation() {
         let database = Database::open(directory.path().join(filename)).unwrap();
         let runtime = database.runtime().unwrap();
         database
+            .execute(
+                &runtime,
+                &format!(
+                    "CREATE TABLE {table} (
+                        id INTEGER PRIMARY KEY,
+                        day TEXT NOT NULL
+                     )"
+                ),
+                (),
+            )
+            .unwrap();
+        database
             .update_with(&runtime, UpdateOptions::new(isolation), |update| {
-                update.execute(
-                    &format!(
-                        "CREATE TABLE {table} (
-                                id INTEGER PRIMARY KEY,
-                                day TEXT NOT NULL
-                             )"
-                    ),
-                    (),
-                )?;
                 assert_eq!(
                     update.query(
                         &format!("SELECT count(*) FROM {table} WHERE day = ?1"),
@@ -927,7 +941,7 @@ fn managed_update_reads_are_asserted_only_for_serializable_isolation() {
         });
         let state = client_state(&database);
         let space = &state.spaces[&database.database_id.space_id()];
-        (space.oplog[&DeviceSeq(1)].range_asserts().to_vec(), traced)
+        (space.oplog[&DeviceSeq(2)].range_asserts().to_vec(), traced)
     };
 
     let (snapshot, snapshot_read) =
@@ -959,12 +973,16 @@ fn statement_failure_rolls_back_the_complete_serialized_update() {
     let runtime = database.runtime().unwrap();
 
     let error = database
-        .update(&runtime, |update| {
-            update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
-            update.execute("INSERT INTO notes VALUES (1)", ())?;
-            update.execute("INSERT INTO notes VALUES (1)", ())?;
-            Ok(())
-        })
+        .update_with(
+            &runtime,
+            UpdateOptions::new(IsolationLevel::Serializable),
+            |update| {
+                update.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
+                update.execute("INSERT INTO notes VALUES (1)", ())?;
+                update.execute("INSERT INTO notes VALUES (1)", ())?;
+                Ok(())
+            },
+        )
         .unwrap_err();
     assert!(matches!(error, Error::Sqlite(_)));
     assert!(!table_exists(&database, "notes"));
@@ -2186,6 +2204,119 @@ fn two_replicas_converge_rows_and_reject_only_a_conflicting_insert() {
 }
 
 #[test]
+fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("concurrent-disjoint.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .execute(
+            &runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+    let rendezvous = Arc::new(Barrier::new(3));
+    let handles = [(1_i64, "one"), (2_i64, "two")]
+        .into_iter()
+        .map(|(id, body)| {
+            let database = Arc::clone(&database);
+            let rendezvous = Arc::clone(&rendezvous);
+            std::thread::spawn(move || {
+                let runtime = database.runtime().unwrap();
+                database.update(&runtime, |update| {
+                    rendezvous.wait();
+                    update.execute("INSERT INTO notes VALUES (?1, ?2)", (id, body))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    rendezvous.wait();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap().unwrap(), 1);
+    }
+
+    let rows = database.with_connection(|connection| {
+        connection
+            .prepare("SELECT id, body FROM notes ORDER BY id")
+            .unwrap()
+            .query_map((), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    });
+    assert_eq!(rows, [(1, "one".into()), (2, "two".into())]);
+    assert_eq!(
+        database
+            .with_connection(proposal::current_apply_seq)
+            .unwrap(),
+        crate::snapshot::ApplySeq(2)
+    );
+    assert_eq!(pending_ops(&database).len(), 3);
+}
+
+#[test]
+fn concurrent_snapshot_updates_reject_one_primary_key_collision() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("concurrent-collision.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .execute(
+            &runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+    let rendezvous = Arc::new(Barrier::new(3));
+    let handles = ["first", "second"]
+        .into_iter()
+        .map(|body| {
+            let database = Arc::clone(&database);
+            let rendezvous = Arc::clone(&rendezvous);
+            std::thread::spawn(move || {
+                let runtime = database.runtime().unwrap();
+                database.update(&runtime, |update| {
+                    rendezvous.wait();
+                    update.execute("INSERT INTO notes VALUES (7, ?1)", [body])
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    rendezvous.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(Error::CommitConflict(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        database.with_connection(|connection| {
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap()
+        }),
+        1
+    );
+    assert_eq!(
+        database
+            .with_connection(proposal::current_apply_seq)
+            .unwrap(),
+        crate::snapshot::ApplySeq(1)
+    );
+    assert_eq!(pending_ops(&database).len(), 2);
+}
+
+#[test]
 fn failed_general_bootstrap_rolls_back_all_metadata() {
     let owner = ConnectionOwner::open_in_memory().unwrap();
     let metadata_inserts = Arc::new(AtomicUsize::new(0));
@@ -2201,7 +2332,11 @@ fn failed_general_bootstrap_rolls_back_all_metadata() {
             .unwrap();
     });
 
-    let error = match open_on(owner.clone(), OpenOptions::new().server(offline_router())) {
+    let error = match open_on(
+        owner.clone(),
+        PathBuf::from(":memory:"),
+        OpenOptions::new().server(offline_router()),
+    ) {
         Ok(_) => panic!("bootstrap unexpectedly succeeded"),
         Err(error) => error,
     };

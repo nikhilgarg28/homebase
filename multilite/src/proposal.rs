@@ -67,7 +67,7 @@ pub struct CommitProposal {
 /// One proposal retained as canonical OCC and retry history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedProposal {
-    pub generation: crate::snapshot::CanonicalGeneration,
+    pub apply_seq: crate::snapshot::ApplySeq,
     pub proposal: CommitProposal,
 }
 
@@ -81,7 +81,7 @@ pub enum CommitDisposition {
 /// Stable result of canonically committing one proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitReceipt {
-    pub generation: crate::snapshot::CanonicalGeneration,
+    pub apply_seq: crate::snapshot::ApplySeq,
     pub disposition: CommitDisposition,
 }
 
@@ -134,6 +134,10 @@ impl CommitProposal {
 
     pub fn footprint(&self) -> &ConflictFootprint {
         &self.footprint
+    }
+
+    pub(crate) fn transaction(&self) -> &MultiliteTransaction {
+        &self.transaction
     }
 
     /// Produce the exact Homebase commit represented by this proposal.
@@ -280,7 +284,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
         "CREATE TABLE {TABLE} (
             proposal_id BLOB PRIMARY KEY NOT NULL CHECK(length(proposal_id) = 16),
-            canonical_generation BLOB NOT NULL UNIQUE CHECK(length(canonical_generation) = 8),
+            apply_seq BLOB NOT NULL UNIQUE CHECK(length(apply_seq) = 8),
             record BLOB NOT NULL
         ) WITHOUT ROWID"
     ))?;
@@ -325,12 +329,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let expected = vec![
         (String::from("proposal_id"), String::from("BLOB"), true, 1),
-        (
-            String::from("canonical_generation"),
-            String::from("BLOB"),
-            true,
-            0,
-        ),
+        (String::from("apply_seq"), String::from("BLOB"), true, 0),
         (String::from("record"), String::from("BLOB"), true, 0),
     ];
     if columns != expected {
@@ -348,46 +347,46 @@ pub fn validate(connection: &Connection) -> Result<()> {
             "commit history table must use WITHOUT ROWID",
         ));
     }
-    let history = history_after(connection, crate::snapshot::CanonicalGeneration(0))?;
+    let history = history_after(connection, crate::snapshot::ApplySeq(0))?;
     if history
         .windows(2)
-        .any(|pair| pair[0].generation >= pair[1].generation)
+        .any(|pair| pair[0].apply_seq >= pair[1].apply_seq)
     {
         return Err(Error::InvalidDatabase(
-            "commit history generations are not increasing",
+            "commit history apply sequences are not increasing",
         ));
     }
     Ok(())
 }
 
-/// Last canonical generation, or zero before the first branch proposal.
-pub fn current_generation(connection: &Connection) -> Result<crate::snapshot::CanonicalGeneration> {
+/// Last canonical apply sequence, or zero before the first branch proposal.
+pub fn current_apply_seq(connection: &Connection) -> Result<crate::snapshot::ApplySeq> {
     let encoded = connection
         .query_row(
             &format!(
-                "SELECT canonical_generation FROM {TABLE}
-                 ORDER BY canonical_generation DESC LIMIT 1"
+                "SELECT apply_seq FROM {TABLE}
+                 ORDER BY apply_seq DESC LIMIT 1"
             ),
             (),
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()?;
     encoded
-        .map(|bytes| decode_generation(&bytes))
+        .map(|bytes| decode_apply_seq(&bytes))
         .transpose()
-        .map(|generation| generation.unwrap_or(crate::snapshot::CanonicalGeneration(0)))
+        .map(|apply_seq| apply_seq.unwrap_or(crate::snapshot::ApplySeq(0)))
 }
 
-/// Load canonical proposals strictly newer than a snapshot generation.
+/// Load canonical proposals strictly newer than a snapshot apply sequence.
 pub fn history_after(
     connection: &Connection,
-    generation: crate::snapshot::CanonicalGeneration,
+    apply_seq: crate::snapshot::ApplySeq,
 ) -> Result<Vec<CommittedProposal>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT proposal_id, canonical_generation, record FROM {TABLE}
-         WHERE canonical_generation > ?1 ORDER BY canonical_generation"
+        "SELECT proposal_id, apply_seq, record FROM {TABLE}
+         WHERE apply_seq > ?1 ORDER BY apply_seq"
     ))?;
-    let rows = statement.query_map([generation.0.to_be_bytes().as_slice()], |row| {
+    let rows = statement.query_map([apply_seq.0.to_be_bytes().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -395,9 +394,9 @@ pub fn history_after(
         ))
     })?;
     rows.map(|row| {
-        let (id, generation, record) = row?;
+        let (id, apply_seq, record) = row?;
         let id = decode_proposal_id(&id)?;
-        let generation = decode_generation(&generation)?;
+        let apply_seq = decode_apply_seq(&apply_seq)?;
         let proposal = CommitProposal::decode(&record)
             .map_err(|error| Error::InvalidCommitProposal(error.to_string()))?;
         if proposal.id() != id {
@@ -406,7 +405,7 @@ pub fn history_after(
             ));
         }
         Ok(CommittedProposal {
-            generation,
+            apply_seq,
             proposal,
         })
     })
@@ -443,26 +442,26 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
             ));
         }
         return Ok(CommitReceipt {
-            generation: committed.generation,
+            apply_seq: committed.apply_seq,
             disposition: CommitDisposition::AlreadyCommitted,
         });
     }
 
-    let current = current_generation(connection)?;
-    if proposal.snapshot().canonical_generation > current {
+    let current = current_apply_seq(connection)?;
+    if proposal.snapshot().apply_seq > current {
         return Err(Error::CommitConflict(
             "proposal snapshot is newer than canonical SQLite".into(),
         ));
     }
     proposal.validate_against(connection)?;
-    for committed in history_after(connection, proposal.snapshot().canonical_generation)? {
+    for committed in history_after(connection, proposal.snapshot().apply_seq)? {
         if proposal
             .footprint()
             .conflicts_with_writes(proposal.isolation(), committed.proposal.footprint())
         {
             return Err(Error::CommitConflict(format!(
-                "proposal conflicts with local generation {}",
-                committed.generation.0
+                "proposal conflicts with local apply sequence {}",
+                committed.apply_seq.0
             )));
         }
     }
@@ -471,25 +470,25 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
         .changeset()
         .apply(connection)
         .map_err(commit_changeset)?;
-    let generation = crate::snapshot::CanonicalGeneration(
+    let apply_seq = crate::snapshot::ApplySeq(
         current
             .0
             .checked_add(1)
-            .ok_or_else(|| Error::CommitConflict("local generation is exhausted".into()))?,
+            .ok_or_else(|| Error::CommitConflict("local apply sequence is exhausted".into()))?,
     );
     connection.execute(
         &format!(
-            "INSERT INTO {TABLE} (proposal_id, canonical_generation, record)
+            "INSERT INTO {TABLE} (proposal_id, apply_seq, record)
              VALUES (?1, ?2, ?3)"
         ),
         params![
             proposal.id().to_bytes().as_slice(),
-            generation.0.to_be_bytes().as_slice(),
+            apply_seq.0.to_be_bytes().as_slice(),
             proposal.encode()?,
         ],
     )?;
     Ok(CommitReceipt {
-        generation,
+        apply_seq,
         disposition: CommitDisposition::Applied,
     })
 }
@@ -497,12 +496,12 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
 fn committed_by_id(connection: &Connection, id: ProposalId) -> Result<Option<CommittedProposal>> {
     let row = connection
         .query_row(
-            &format!("SELECT canonical_generation, record FROM {TABLE} WHERE proposal_id = ?1"),
+            &format!("SELECT apply_seq, record FROM {TABLE} WHERE proposal_id = ?1"),
             [id.to_bytes().as_slice()],
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(generation, record)| {
+    row.map(|(apply_seq, record)| {
         let proposal = CommitProposal::decode(&record)
             .map_err(|error| Error::InvalidCommitProposal(error.to_string()))?;
         if proposal.id() != id {
@@ -511,7 +510,7 @@ fn committed_by_id(connection: &Connection, id: ProposalId) -> Result<Option<Com
             ));
         }
         Ok(CommittedProposal {
-            generation: decode_generation(&generation)?,
+            apply_seq: decode_apply_seq(&apply_seq)?,
             proposal,
         })
     })
@@ -524,17 +523,17 @@ fn decode_proposal_id(bytes: &[u8]) -> Result<ProposalId> {
         .map_err(|error| Error::InvalidCommitProposal(error.to_string()))
 }
 
-fn decode_generation(bytes: &[u8]) -> Result<crate::snapshot::CanonicalGeneration> {
+fn decode_apply_seq(bytes: &[u8]) -> Result<crate::snapshot::ApplySeq> {
     let bytes: [u8; 8] = bytes
         .try_into()
-        .map_err(|_| Error::InvalidDatabase("commit generation is malformed"))?;
-    let generation = u64::from_be_bytes(bytes);
-    if generation == 0 {
+        .map_err(|_| Error::InvalidDatabase("commit apply sequence is malformed"))?;
+    let apply_seq = u64::from_be_bytes(bytes);
+    if apply_seq == 0 {
         return Err(Error::InvalidDatabase(
-            "committed generation must be greater than zero",
+            "committed apply sequence must be greater than zero",
         ));
     }
-    Ok(crate::snapshot::CanonicalGeneration(generation))
+    Ok(crate::snapshot::ApplySeq(apply_seq))
 }
 
 fn lower_insert_operations(
@@ -711,7 +710,7 @@ mod tests {
     use crate::database::schema::{
         CreateColumn, CreateTable, CreateTableSpec, DeclaredType, SqlName,
     };
-    use crate::snapshot::CanonicalGeneration;
+    use crate::snapshot::ApplySeq;
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -766,7 +765,7 @@ mod tests {
 
     fn descriptor() -> SnapshotDescriptor {
         SnapshotDescriptor {
-            canonical_generation: CanonicalGeneration(0),
+            apply_seq: ApplySeq(0),
             authority_applied_through: AdmissionSeq(7),
             submit_cursors: OplogCursors::default(),
         }
@@ -923,25 +922,22 @@ mod tests {
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
             CommitReceipt {
-                generation: CanonicalGeneration(1),
+                apply_seq: ApplySeq(1),
                 disposition: CommitDisposition::Applied,
             }
         );
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
             CommitReceipt {
-                generation: CanonicalGeneration(1),
+                apply_seq: ApplySeq(1),
                 disposition: CommitDisposition::AlreadyCommitted,
             }
         );
+        assert_eq!(current_apply_seq(&fixture.writer).unwrap(), ApplySeq(1));
         assert_eq!(
-            current_generation(&fixture.writer).unwrap(),
-            CanonicalGeneration(1)
-        );
-        assert_eq!(
-            history_after(&fixture.writer, CanonicalGeneration(0)).unwrap(),
+            history_after(&fixture.writer, ApplySeq(0)).unwrap(),
             vec![CommittedProposal {
-                generation: CanonicalGeneration(1),
+                apply_seq: ApplySeq(1),
                 proposal,
             }]
         );
@@ -981,21 +977,18 @@ mod tests {
         );
 
         assert_eq!(
-            apply(&fixture.writer, &first).unwrap().generation,
-            CanonicalGeneration(1)
+            apply(&fixture.writer, &first).unwrap().apply_seq,
+            ApplySeq(1)
         );
         assert_eq!(
-            apply(&fixture.writer, &disjoint).unwrap().generation,
-            CanonicalGeneration(2)
+            apply(&fixture.writer, &disjoint).unwrap().apply_seq,
+            ApplySeq(2)
         );
         assert!(matches!(
             apply(&fixture.writer, &collision),
-            Err(Error::CommitConflict(message)) if message.contains("generation 1")
+            Err(Error::CommitConflict(message)) if message.contains("apply sequence 1")
         ));
-        assert_eq!(
-            current_generation(&fixture.writer).unwrap(),
-            CanonicalGeneration(2)
-        );
+        assert_eq!(current_apply_seq(&fixture.writer).unwrap(), ApplySeq(2));
         assert_eq!(
             fixture
                 .writer
@@ -1049,8 +1042,8 @@ mod tests {
             Err(Error::CommitConflict(_))
         ));
         assert_eq!(
-            apply(&fixture.writer, &snapshot).unwrap().generation,
-            CanonicalGeneration(2)
+            apply(&fixture.writer, &snapshot).unwrap().apply_seq,
+            ApplySeq(2)
         );
     }
 
@@ -1080,10 +1073,7 @@ mod tests {
             apply(&fixture.writer, &proposal),
             Err(Error::Sqlite(_))
         ));
-        assert_eq!(
-            current_generation(&fixture.writer).unwrap(),
-            CanonicalGeneration(0)
-        );
+        assert_eq!(current_apply_seq(&fixture.writer).unwrap(), ApplySeq(0));
         assert_eq!(
             fixture
                 .writer

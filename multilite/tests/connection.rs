@@ -135,13 +135,14 @@ fn empty_push_drains_without_contacting_an_offline_server() {
 fn managed_update_and_view_share_sqlite_shaped_query_methods() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("managed.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
 
     let inserted = db
         .update(|tx| {
-            tx.execute(
-                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
-                (),
-            )?;
             let mut count = tx.prepare("SELECT count(*) FROM notes")?;
             assert_eq!(count.query_map((), |row| row.get::<_, i64>(0))?, [0]);
             tx.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())?;
@@ -180,10 +181,12 @@ fn managed_update_and_view_share_sqlite_shaped_query_methods() {
 fn managed_update_rolls_back_on_error_and_panic_and_remains_usable() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("managed-rollback.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
 
     let error = db
         .update(|tx| {
-            tx.execute("CREATE TABLE errored (id INTEGER PRIMARY KEY)", ())?;
+            tx.execute("INSERT INTO notes VALUES (1)", ())?;
             Err::<(), _>(Error::CaptureInvariant("injected closure error"))
         })
         .unwrap_err();
@@ -191,28 +194,27 @@ fn managed_update_rolls_back_on_error_and_panic_and_remains_usable() {
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
         let _ = db.update(|tx| -> Result<()> {
-            tx.execute("CREATE TABLE panicked (id INTEGER PRIMARY KEY)", ())?;
+            tx.execute("INSERT INTO notes VALUES (2)", ())?;
             panic!("injected closure panic")
         });
     }));
     assert!(panic.is_err());
 
-    for table in ["errored", "panicked"] {
-        assert_eq!(
-            db.query(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
-                [table],
-                |row| row.get::<_, bool>(0),
-            )
+    assert_eq!(
+        db.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
             .unwrap(),
-            [false]
-        );
-    }
+        [0]
+    );
     db.update(|tx| {
-        tx.execute("CREATE TABLE committed (id INTEGER PRIMARY KEY)", ())?;
+        tx.execute("INSERT INTO notes VALUES (3)", ())?;
         Ok(())
     })
     .unwrap();
+    assert_eq!(
+        db.query("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [3]
+    );
 }
 
 #[test]
