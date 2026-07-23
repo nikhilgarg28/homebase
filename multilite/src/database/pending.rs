@@ -279,7 +279,7 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
 
 /// Undo and retire the pending transactions represented by one exact active
 /// Homebase window. Transactions are unwound in reverse device order.
-pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) -> Result<()> {
+pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) -> Result<bool> {
     let expected = active
         .iter()
         .filter_map(|(seq, operation)| matches!(operation, DeviceOp::Commit { .. }).then_some(*seq))
@@ -301,7 +301,7 @@ pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) 
     if !pending.is_empty() {
         connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
     }
-    Ok(())
+    Ok(!pending.is_empty())
 }
 
 /// Verify that every pending transaction still belongs to the active submit log.

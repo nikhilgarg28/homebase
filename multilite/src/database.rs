@@ -33,7 +33,7 @@ use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
-use crate::committer::{CommitPermit, Committer};
+use crate::committer::{ActiveBranch, ActiveBranches, CommitPermit, Committer};
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
 use crate::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
@@ -338,6 +338,7 @@ pub(crate) struct Database<H: ServerHandle> {
     policy: PolicyState,
     isolation_level: IsolationLevel,
     committer: Committer,
+    active_branches: ActiveBranches,
     scheduler: PushScheduler,
 }
 
@@ -539,7 +540,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
-    fn capture_branch_snapshot(&self) -> Result<BranchSnapshot> {
+    fn capture_branch_snapshot(&self, track_for_commit: bool) -> Result<BranchSnapshot> {
         let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
             .map_err(|error| Error::Branch(error.to_string()))?;
         let (apply_seq, tables) = self.owner.with_connection(|connection| {
@@ -570,13 +571,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 submit_cursors,
             },
             tables,
+            active: track_for_commit.then(|| self.active_branches.register(apply_seq)),
         })
     }
 
-    fn issue_branch_snapshot(self: &Arc<Self>) -> Result<BranchSnapshot> {
+    fn issue_branch_snapshot(self: &Arc<Self>, track_for_commit: bool) -> Result<BranchSnapshot> {
         let database = Arc::clone(self);
         self.committer
-            .call_blocking(move || database.capture_branch_snapshot())
+            .call_blocking(move || database.capture_branch_snapshot(track_for_commit))
             .map_err(committer_error)?
     }
 
@@ -591,19 +593,23 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self.owner
             .with_savepoint("__multilite__branch_commit", |connection| {
                 let receipt = proposal::apply(connection, proposal)?;
-                if receipt.disposition == CommitDisposition::AlreadyCommitted {
-                    return Ok(receipt);
+                if receipt.disposition == CommitDisposition::Applied {
+                    let (mutations, assertions) = proposal.to_homebase()?;
+                    let sequence = block_on(async {
+                        let space = self.client.space(self.database_id.space_id()).await?;
+                        let submission = space
+                            .submit_unchecked(mutations, assertions)
+                            .await
+                            .map_err(ClientError::from)?;
+                        Ok::<_, Error>(submission.seq)
+                    })?;
+                    pending::insert(connection, sequence, proposal.transaction())?;
                 }
-                let (mutations, assertions) = proposal.to_homebase()?;
-                let sequence = block_on(async {
-                    let space = self.client.space(self.database_id.space_id()).await?;
-                    let submission = space
-                        .submit_unchecked(mutations, assertions)
-                        .await
-                        .map_err(ClientError::from)?;
-                    Ok::<_, Error>(submission.seq)
-                })?;
-                pending::insert(connection, sequence, proposal.transaction())?;
+                let through = match self.active_branches.oldest() {
+                    Some(oldest) => oldest,
+                    None => proposal::current_apply_seq(connection)?,
+                };
+                proposal::prune_history(connection, through)?;
                 Ok(receipt)
             })
     }
@@ -760,6 +766,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         policy: PolicyState::new(sync_policy),
         isolation_level,
         committer: Committer::new().map_err(committer_error)?,
+        active_branches: ActiveBranches::default(),
         scheduler: PushScheduler::new(),
     })
 }
@@ -768,6 +775,7 @@ struct BranchSnapshot {
     physical: crate::branch::snapshot::PinnedSnapshot,
     logical: SnapshotDescriptor,
     tables: Vec<String>,
+    active: Option<ActiveBranch>,
 }
 
 fn wal_path_for(path: &Path) -> PathBuf {

@@ -150,6 +150,13 @@ fn autoincrement_and_schema_conflict_policies_are_rejected_without_schema_change
 fn public_sql_cannot_access_or_create_reserved_tables() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("reserved.sqlite")).unwrap();
+    let internal_tables = || {
+        let mut statement = db
+            .prepare("SELECT count(*) FROM sqlite_schema WHERE name GLOB '__multilite__*'")
+            .unwrap();
+        statement.query_map((), |row| row.get::<_, i64>(0)).unwrap()[0]
+    };
+    let initial_internal_tables = internal_tables();
 
     assert!(db.prepare("SELECT value FROM __multilite__meta").is_err());
     assert!(
@@ -175,13 +182,7 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
         .is_err()
     );
 
-    let mut statement = db
-        .prepare("SELECT count(*) FROM sqlite_schema WHERE name GLOB '__multilite__*'")
-        .unwrap();
-    assert_eq!(
-        statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
-        [4]
-    );
+    assert_eq!(internal_tables(), initial_internal_tables);
 }
 
 fn read_note(db: &MultiliteConnection) -> String {

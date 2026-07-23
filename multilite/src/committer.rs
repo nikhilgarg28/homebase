@@ -1,13 +1,57 @@
 //! FIFO serialization for canonical SQLite commits and authority workflows.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
+use parking_lot::Mutex;
+
+use crate::snapshot::ApplySeq;
 
 const COMMAND_CAPACITY: usize = 64;
+
+/// In-process writable branches that still need OCC history after their cut.
+#[derive(Clone, Default)]
+pub struct ActiveBranches {
+    inner: Arc<Mutex<BTreeMap<ApplySeq, usize>>>,
+}
+
+impl ActiveBranches {
+    pub fn register(&self, apply_seq: ApplySeq) -> ActiveBranch {
+        *self.inner.lock().entry(apply_seq).or_default() += 1;
+        ActiveBranch {
+            apply_seq,
+            branches: self.clone(),
+        }
+    }
+
+    pub fn oldest(&self) -> Option<ApplySeq> {
+        self.inner.lock().first_key_value().map(|(seq, _)| *seq)
+    }
+}
+
+/// Registration held until one writable branch has received its disposition.
+pub struct ActiveBranch {
+    apply_seq: ApplySeq,
+    branches: ActiveBranches,
+}
+
+impl Drop for ActiveBranch {
+    fn drop(&mut self) {
+        let mut active = self.branches.inner.lock();
+        let count = active
+            .get_mut(&self.apply_seq)
+            .expect("active branch registration remains present");
+        *count -= 1;
+        if *count == 0 {
+            active.remove(&self.apply_seq);
+        }
+    }
+}
 
 trait ActorJob: Send {
     fn run(self: Box<Self>);
@@ -159,6 +203,21 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn active_branch_frontier_tracks_the_oldest_live_apply_sequence() {
+        let branches = ActiveBranches::default();
+        let later = branches.register(ApplySeq(9));
+        let first = branches.register(ApplySeq(3));
+        let second = branches.register(ApplySeq(3));
+        assert_eq!(branches.oldest(), Some(ApplySeq(3)));
+        drop(first);
+        assert_eq!(branches.oldest(), Some(ApplySeq(3)));
+        drop(second);
+        assert_eq!(branches.oldest(), Some(ApplySeq(9)));
+        drop(later);
+        assert_eq!(branches.oldest(), None);
+    }
 
     #[test]
     fn borrowed_permit_blocks_owned_work_until_drop() {

@@ -198,7 +198,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         Ok(changed)
     }
 
-    fn finalize_serialized(self) -> Result<()> {
+    fn finalize_serialized(self) -> Result<bool> {
         let UpdateBackend::Serialized {
             database,
             runtime,
@@ -208,10 +208,10 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             operations,
         } = self.backend
         else {
-            return Ok(());
+            return Ok(false);
         };
         if operations.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let transaction = MultiliteTransaction::new(operations)?;
         let mut homebase = transaction.to_homebase()?;
@@ -230,7 +230,8 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 Ok::<_, Error>(submission.seq)
             })?;
             pending::insert(connection, sequence, &transaction)
-        })
+        })?;
+        Ok(true)
     }
 }
 
@@ -279,7 +280,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             physical,
             logical,
             tables,
-        } = self.issue_branch_snapshot()?;
+            active: _active,
+        } = self.issue_branch_snapshot(true)?;
         let branch = WritableBranch::open(physical, OverlayOptions::default())
             .map_err(|error| Error::Branch(error.to_string()))?;
         let table_refs = tables.iter().map(String::as_str).collect::<Vec<_>>();
@@ -326,7 +328,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     options.isolation_level(),
                 );
                 let value = operation(&mut update)?;
-                update.finalize_serialized()?;
+                if update.finalize_serialized()? {
+                    crate::proposal::advance_apply_seq(connection)?;
+                }
                 Ok(value)
             })?;
 

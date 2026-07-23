@@ -173,7 +173,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             let _operation = self.enter_operation()?;
             self.refresh_read_serial(runtime)?;
         }
-        let snapshot = self.issue_branch_snapshot()?;
+        let snapshot = self.issue_branch_snapshot(false)?;
         let branch = crate::branch::ReadBranch::open(snapshot.physical)
             .map_err(|error| Error::Branch(error.to_string()))?;
         operation(&ViewTransaction::new(branch.connection()))

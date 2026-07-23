@@ -79,6 +79,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
         let apply_to = admit_range.end;
         let local_device = self.client.device();
+        let applied_foreign = transactions
+            .iter()
+            .any(|(device, _)| *device != local_device);
         runtime.run(ExecutionMode::RemoteApply, |connection| {
             runtime.with_internal_metadata(|| {
                 let current_submit = block_on(store.oplog_cursors(space_id))?;
@@ -94,6 +97,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             }
 
             runtime.with_internal_metadata(|| {
+                if applied_foreign {
+                    crate::proposal::advance_apply_seq(connection)?;
+                }
                 block_on(store.mark_admits_applied(space_id, apply_to))?;
                 Ok(())
             })?;
