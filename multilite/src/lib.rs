@@ -7,6 +7,7 @@ mod connection;
 mod database;
 mod error;
 mod metastore;
+mod proposal;
 mod runtime;
 mod snapshot;
 mod value;

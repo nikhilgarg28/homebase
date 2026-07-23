@@ -19,11 +19,11 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::{Uuid, Variant, Version};
 
-use super::isolation::{ConflictFootprint, IsolationLevel};
-use super::operation::MultiliteOp;
-use super::row::{CapturedRow, InsertRows};
-use super::transaction::MultiliteTransaction;
 use crate::branch::changeset::CapturedChangeset;
+use crate::database::isolation::{ConflictFootprint, IsolationLevel};
+use crate::database::operation::MultiliteOp;
+use crate::database::row::{CapturedRow, InsertRows};
+use crate::database::transaction::MultiliteTransaction;
 use crate::snapshot::SnapshotDescriptor;
 use crate::{Error, Result};
 
@@ -67,7 +67,7 @@ pub struct CommitProposal {
 /// One proposal retained as canonical OCC and retry history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedProposal {
-    pub generation: crate::snapshot::LocalGeneration,
+    pub generation: crate::snapshot::CanonicalGeneration,
     pub proposal: CommitProposal,
 }
 
@@ -81,7 +81,7 @@ pub enum CommitDisposition {
 /// Stable result of canonically committing one proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitReceipt {
-    pub generation: crate::snapshot::LocalGeneration,
+    pub generation: crate::snapshot::CanonicalGeneration,
     pub disposition: CommitDisposition,
 }
 
@@ -280,7 +280,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
         "CREATE TABLE {TABLE} (
             proposal_id BLOB PRIMARY KEY NOT NULL CHECK(length(proposal_id) = 16),
-            local_generation BLOB NOT NULL UNIQUE CHECK(length(local_generation) = 8),
+            canonical_generation BLOB NOT NULL UNIQUE CHECK(length(canonical_generation) = 8),
             record BLOB NOT NULL
         ) WITHOUT ROWID"
     ))?;
@@ -326,7 +326,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
     let expected = vec![
         (String::from("proposal_id"), String::from("BLOB"), true, 1),
         (
-            String::from("local_generation"),
+            String::from("canonical_generation"),
             String::from("BLOB"),
             true,
             0,
@@ -348,7 +348,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
             "commit history table must use WITHOUT ROWID",
         ));
     }
-    let history = history_after(connection, crate::snapshot::LocalGeneration(0))?;
+    let history = history_after(connection, crate::snapshot::CanonicalGeneration(0))?;
     if history
         .windows(2)
         .any(|pair| pair[0].generation >= pair[1].generation)
@@ -361,12 +361,12 @@ pub fn validate(connection: &Connection) -> Result<()> {
 }
 
 /// Last canonical generation, or zero before the first branch proposal.
-pub fn current_generation(connection: &Connection) -> Result<crate::snapshot::LocalGeneration> {
+pub fn current_generation(connection: &Connection) -> Result<crate::snapshot::CanonicalGeneration> {
     let encoded = connection
         .query_row(
             &format!(
-                "SELECT local_generation FROM {TABLE}
-                 ORDER BY local_generation DESC LIMIT 1"
+                "SELECT canonical_generation FROM {TABLE}
+                 ORDER BY canonical_generation DESC LIMIT 1"
             ),
             (),
             |row| row.get::<_, Vec<u8>>(0),
@@ -375,17 +375,17 @@ pub fn current_generation(connection: &Connection) -> Result<crate::snapshot::Lo
     encoded
         .map(|bytes| decode_generation(&bytes))
         .transpose()
-        .map(|generation| generation.unwrap_or(crate::snapshot::LocalGeneration(0)))
+        .map(|generation| generation.unwrap_or(crate::snapshot::CanonicalGeneration(0)))
 }
 
 /// Load canonical proposals strictly newer than a snapshot generation.
 pub fn history_after(
     connection: &Connection,
-    generation: crate::snapshot::LocalGeneration,
+    generation: crate::snapshot::CanonicalGeneration,
 ) -> Result<Vec<CommittedProposal>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT proposal_id, local_generation, record FROM {TABLE}
-         WHERE local_generation > ?1 ORDER BY local_generation"
+        "SELECT proposal_id, canonical_generation, record FROM {TABLE}
+         WHERE canonical_generation > ?1 ORDER BY canonical_generation"
     ))?;
     let rows = statement.query_map([generation.0.to_be_bytes().as_slice()], |row| {
         Ok((
@@ -449,13 +449,13 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
     }
 
     let current = current_generation(connection)?;
-    if proposal.snapshot().local_generation > current {
+    if proposal.snapshot().canonical_generation > current {
         return Err(Error::CommitConflict(
             "proposal snapshot is newer than canonical SQLite".into(),
         ));
     }
     proposal.validate_against(connection)?;
-    for committed in history_after(connection, proposal.snapshot().local_generation)? {
+    for committed in history_after(connection, proposal.snapshot().canonical_generation)? {
         if proposal
             .footprint()
             .conflicts_with_writes(proposal.isolation(), committed.proposal.footprint())
@@ -471,7 +471,7 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
         .changeset()
         .apply(connection)
         .map_err(commit_changeset)?;
-    let generation = crate::snapshot::LocalGeneration(
+    let generation = crate::snapshot::CanonicalGeneration(
         current
             .0
             .checked_add(1)
@@ -479,7 +479,7 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
     );
     connection.execute(
         &format!(
-            "INSERT INTO {TABLE} (proposal_id, local_generation, record)
+            "INSERT INTO {TABLE} (proposal_id, canonical_generation, record)
              VALUES (?1, ?2, ?3)"
         ),
         params![
@@ -497,7 +497,7 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
 fn committed_by_id(connection: &Connection, id: ProposalId) -> Result<Option<CommittedProposal>> {
     let row = connection
         .query_row(
-            &format!("SELECT local_generation, record FROM {TABLE} WHERE proposal_id = ?1"),
+            &format!("SELECT canonical_generation, record FROM {TABLE} WHERE proposal_id = ?1"),
             [id.to_bytes().as_slice()],
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
@@ -524,7 +524,7 @@ fn decode_proposal_id(bytes: &[u8]) -> Result<ProposalId> {
         .map_err(|error| Error::InvalidCommitProposal(error.to_string()))
 }
 
-fn decode_generation(bytes: &[u8]) -> Result<crate::snapshot::LocalGeneration> {
+fn decode_generation(bytes: &[u8]) -> Result<crate::snapshot::CanonicalGeneration> {
     let bytes: [u8; 8] = bytes
         .try_into()
         .map_err(|_| Error::InvalidDatabase("commit generation is malformed"))?;
@@ -534,7 +534,7 @@ fn decode_generation(bytes: &[u8]) -> Result<crate::snapshot::LocalGeneration> {
             "committed generation must be greater than zero",
         ));
     }
-    Ok(crate::snapshot::LocalGeneration(generation))
+    Ok(crate::snapshot::CanonicalGeneration(generation))
 }
 
 fn lower_insert_operations(
@@ -711,7 +711,7 @@ mod tests {
     use crate::database::schema::{
         CreateColumn, CreateTable, CreateTableSpec, DeclaredType, SqlName,
     };
-    use crate::snapshot::LocalGeneration;
+    use crate::snapshot::CanonicalGeneration;
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -766,7 +766,7 @@ mod tests {
 
     fn descriptor() -> SnapshotDescriptor {
         SnapshotDescriptor {
-            local_generation: LocalGeneration(0),
+            canonical_generation: CanonicalGeneration(0),
             authority_applied_through: AdmissionSeq(7),
             submit_cursors: OplogCursors::default(),
         }
@@ -923,25 +923,25 @@ mod tests {
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
             CommitReceipt {
-                generation: LocalGeneration(1),
+                generation: CanonicalGeneration(1),
                 disposition: CommitDisposition::Applied,
             }
         );
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
             CommitReceipt {
-                generation: LocalGeneration(1),
+                generation: CanonicalGeneration(1),
                 disposition: CommitDisposition::AlreadyCommitted,
             }
         );
         assert_eq!(
             current_generation(&fixture.writer).unwrap(),
-            LocalGeneration(1)
+            CanonicalGeneration(1)
         );
         assert_eq!(
-            history_after(&fixture.writer, LocalGeneration(0)).unwrap(),
+            history_after(&fixture.writer, CanonicalGeneration(0)).unwrap(),
             vec![CommittedProposal {
-                generation: LocalGeneration(1),
+                generation: CanonicalGeneration(1),
                 proposal,
             }]
         );
@@ -982,11 +982,11 @@ mod tests {
 
         assert_eq!(
             apply(&fixture.writer, &first).unwrap().generation,
-            LocalGeneration(1)
+            CanonicalGeneration(1)
         );
         assert_eq!(
             apply(&fixture.writer, &disjoint).unwrap().generation,
-            LocalGeneration(2)
+            CanonicalGeneration(2)
         );
         assert!(matches!(
             apply(&fixture.writer, &collision),
@@ -994,7 +994,7 @@ mod tests {
         ));
         assert_eq!(
             current_generation(&fixture.writer).unwrap(),
-            LocalGeneration(2)
+            CanonicalGeneration(2)
         );
         assert_eq!(
             fixture
@@ -1050,7 +1050,7 @@ mod tests {
         ));
         assert_eq!(
             apply(&fixture.writer, &snapshot).unwrap().generation,
-            LocalGeneration(2)
+            CanonicalGeneration(2)
         );
     }
 
@@ -1082,7 +1082,7 @@ mod tests {
         ));
         assert_eq!(
             current_generation(&fixture.writer).unwrap(),
-            LocalGeneration(0)
+            CanonicalGeneration(0)
         );
         assert_eq!(
             fixture

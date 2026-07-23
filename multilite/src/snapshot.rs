@@ -7,14 +7,19 @@ use homebase_core::writer::Writer;
 
 const SNAPSHOT_FRAME_VERSION: u8 = 1;
 
-/// Monotone canonical SQLite commit coordinate.
+/// Monotone coordinate for every canonical SQLite materialization transition.
+///
+/// This is deliberately not a Homebase `DeviceSeq`: remote applies and local
+/// rejection repairs can change canonical SQLite without creating a local
+/// submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalGeneration(pub u64);
+pub struct CanonicalGeneration(pub u64);
 
 /// Complete logical transaction-start cut across SQLite and Homebase state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotDescriptor {
-    pub local_generation: LocalGeneration,
+    /// Canonical SQLite image observed when the branch began.
+    pub canonical_generation: CanonicalGeneration,
     pub authority_applied_through: AdmissionSeq,
     pub submit_cursors: OplogCursors,
 }
@@ -28,7 +33,7 @@ impl SnapshotDescriptor {
     pub fn encode(self) -> Vec<u8> {
         let mut writer = Writer::with_capacity(42);
         writer.u8(SNAPSHOT_FRAME_VERSION);
-        writer.u64(self.local_generation.0);
+        writer.u64(self.canonical_generation.0);
         writer.u64(self.authority_applied_through.0);
         writer.bytes(&self.submit_cursors.encode());
         writer.finish()
@@ -40,7 +45,8 @@ impl SnapshotDescriptor {
         if reader.u8() != Some(SNAPSHOT_FRAME_VERSION) {
             return Err(SnapshotCodecError::UnknownVersion);
         }
-        let local_generation = LocalGeneration(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
+        let canonical_generation =
+            CanonicalGeneration(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
         let authority_applied_through =
             AdmissionSeq(reader.u64().ok_or(SnapshotCodecError::Truncated)?);
         let submit_cursors =
@@ -52,7 +58,7 @@ impl SnapshotDescriptor {
             return Err(SnapshotCodecError::InvalidSubmitCursors);
         }
         Ok(Self {
-            local_generation,
+            canonical_generation,
             authority_applied_through,
             submit_cursors,
         })
@@ -93,12 +99,12 @@ mod tests {
             tail: DeviceSeq(8),
         };
         let descriptor = SnapshotDescriptor {
-            local_generation: LocalGeneration(41),
+            canonical_generation: CanonicalGeneration(41),
             authority_applied_through: AdmissionSeq(17),
             submit_cursors: cursors,
         };
 
-        assert_eq!(descriptor.local_generation, LocalGeneration(41));
+        assert_eq!(descriptor.canonical_generation, CanonicalGeneration(41));
         assert_eq!(descriptor.authority_applied_through, AdmissionSeq(17));
         assert_eq!(descriptor.submit_cursors, cursors);
         assert_eq!(
@@ -115,7 +121,7 @@ mod tests {
         );
 
         let descriptor = SnapshotDescriptor {
-            local_generation: LocalGeneration(1),
+            canonical_generation: CanonicalGeneration(1),
             authority_applied_through: AdmissionSeq(2),
             submit_cursors: OplogCursors {
                 head: DeviceSeq(4),

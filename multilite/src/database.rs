@@ -1,20 +1,19 @@
 //! General Multilite database identity and Homebase lifecycle.
 
 mod actor;
-mod catalog;
+pub(crate) mod catalog;
 mod codes;
 mod connection;
-mod isolation;
-mod operation;
+pub(crate) mod isolation;
+pub(crate) mod operation;
 mod pending;
 mod policy;
-mod proposal;
 mod rebase;
-mod row;
-mod schema;
+pub(crate) mod row;
+pub(crate) mod schema;
 mod sql;
 mod store;
-mod transaction;
+pub(crate) mod transaction;
 mod update;
 mod view;
 mod vtab;
@@ -37,6 +36,7 @@ use rusqlite::{Connection as SqliteConnection, Row};
 
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
+use crate::proposal;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
