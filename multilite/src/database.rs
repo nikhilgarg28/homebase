@@ -1011,7 +1011,6 @@ fn initialize<H: ServerHandle>(
     SqliteOrderedStore::initialize(owner)?;
     owner.with_connection(pending::initialize)?;
     owner.with_connection(catalog::initialize)?;
-    owner.with_connection(proposal::initialize)?;
     owner.with_connection(history::initialize)?;
     let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
     let client = block_on(Client::open(
@@ -1071,7 +1070,6 @@ fn reopen<H: ServerHandle>(
     owner.with_connection(|connection| {
         catalog::validate(connection)?;
         history::validate(connection)?;
-        proposal::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)?;
         commit_history.prune(connection)?;
         Ok::<_, Error>(())
@@ -1098,11 +1096,10 @@ fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let metadata = SqliteOrderedStore::is_initialized(connection)?;
     let pending = pending::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
-    let receipts = proposal::is_initialized(connection)?;
     let history = history::is_initialized(connection)?;
-    match (metadata, pending, catalog, receipts, history) {
-        (false, false, false, false, false) => Ok(DatabaseState::Fresh),
-        (true, true, true, true, true) => {
+    match (metadata, pending, catalog, history) {
+        (false, false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
             catalog::validate(connection)?;

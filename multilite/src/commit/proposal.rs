@@ -22,7 +22,7 @@ use homebase_core::tag::{
     DeviceSeq, DeviceTag, Mutation, OpaqueValue, Ver,
 };
 use homebase_core::writer::Writer;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
@@ -61,8 +61,6 @@ const APPLY_ADMISSIONS_PROPOSAL: u8 = 2;
 const REJECT_SUBMISSIONS_PROPOSAL: u8 = 3;
 const ACCEPT_SUBMISSIONS_PROPOSAL: u8 = 4;
 const APPEND_ADMISSIONS_PROPOSAL: u8 = 5;
-
-const RECEIPT_TABLE: &str = "__multilite__commits";
 
 /// Stable identity used to deduplicate an uncertain canonical commit reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -801,125 +799,6 @@ impl AppendAdmissionsProposal {
     }
 }
 
-/// Create the durable proposal-receipt table as part of database bootstrap.
-pub fn initialize(connection: &Connection) -> Result<()> {
-    connection.execute_batch(&format!(
-        "CREATE TABLE {RECEIPT_TABLE} (
-            proposal_id BLOB PRIMARY KEY NOT NULL CHECK(length(proposal_id) = 16),
-            commit_seq BLOB NOT NULL CHECK(length(commit_seq) = 8),
-            proposal_hash BLOB NOT NULL CHECK(length(proposal_hash) = 32),
-            device_seq BLOB CHECK(device_seq IS NULL OR length(device_seq) = 8)
-        ) WITHOUT ROWID"
-    ))?;
-    Ok(())
-}
-
-/// Check whether the proposal-receipt namespace is present.
-pub fn is_initialized(connection: &Connection) -> Result<bool> {
-    table_initialized(connection, RECEIPT_TABLE)
-}
-
-fn table_initialized(connection: &Connection, table: &'static str) -> Result<bool> {
-    let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_schema
-         WHERE type = 'table'
-           AND substr(name, 1, length(?1)) = ?1 COLLATE NOCASE
-         ORDER BY name",
-    )?;
-    let tables = statement
-        .query_map([table], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    match tables.as_slice() {
-        [] => Ok(false),
-        [found] if found == table => Ok(true),
-        _ => Err(Error::InvalidDatabase(
-            "commit receipt namespace contains unexpected tables",
-        )),
-    }
-}
-
-/// Validate the receipt schema and every retained proposal identity.
-pub fn validate(connection: &Connection) -> Result<()> {
-    if !is_initialized(connection)? {
-        return Err(Error::InvalidDatabase("commit receipt table is missing"));
-    }
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({RECEIPT_TABLE})"))?;
-    let columns = statement
-        .query_map((), |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-                row.get::<_, u32>(5)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let expected = vec![
-        (String::from("proposal_id"), String::from("BLOB"), true, 1),
-        (String::from("commit_seq"), String::from("BLOB"), true, 0),
-        (String::from("proposal_hash"), String::from("BLOB"), true, 0),
-        (String::from("device_seq"), String::from("BLOB"), false, 0),
-    ];
-    if columns != expected {
-        return Err(Error::InvalidDatabase(
-            "commit receipt table schema is invalid",
-        ));
-    }
-    validate_without_rowid(
-        connection,
-        RECEIPT_TABLE,
-        "commit receipt table must use WITHOUT ROWID",
-    )?;
-    let current = history::current(connection)?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT proposal_id, commit_seq, proposal_hash, device_seq
-         FROM {RECEIPT_TABLE} ORDER BY commit_seq"
-    ))?;
-    let receipts = statement
-        .query_map((), |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, commit_seq, hash, device_seq) in receipts {
-        if uuid_bytes(&id).is_err() {
-            return Err(Error::InvalidDatabase(
-                "commit receipt proposal id is malformed",
-            ));
-        }
-        let commit_seq = history::decode_commit_seq(&commit_seq, false)?;
-        if commit_seq > current
-            || hash.len() != 32
-            || device_seq
-                .as_deref()
-                .is_some_and(|bytes| decode_device_seq(bytes).is_err())
-        {
-            return Err(Error::InvalidDatabase("commit receipt is malformed"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_without_rowid(
-    connection: &Connection,
-    table: &str,
-    message: &'static str,
-) -> Result<()> {
-    let schema_sql: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    if !schema_sql.to_ascii_uppercase().contains("WITHOUT ROWID") {
-        return Err(Error::InvalidDatabase(message));
-    }
-    Ok(())
-}
-
 /// Validate, replay, and receipt one proposal in a single SQLite savepoint.
 pub fn apply(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {
     connection.execute_batch("SAVEPOINT __multilite__commit_proposal")?;
@@ -1028,88 +907,43 @@ pub fn finalize_group(
             "cannot finalize an empty commit group",
         ));
     }
-    let mut ids = BTreeSet::new();
-    let mut writes = BTreeSet::new();
-    for commit in prepared {
-        if !ids.insert(commit.id) {
-            return Err(Error::InvalidCommitProposal(
-                "commit group contains a duplicate proposal id".into(),
-            ));
-        }
-        writes.extend(commit.writes.iter().cloned());
-    }
-    let commit_seq = history.record(connection, writes.into_iter().collect())?;
-    for commit in prepared {
-        connection.execute(
-            &format!(
-                "INSERT INTO {RECEIPT_TABLE} (
-                    proposal_id, commit_seq, proposal_hash, device_seq
-                 ) VALUES (?1, ?2, ?3, ?4)"
-            ),
-            params![
-                commit.id.to_bytes().as_slice(),
-                commit_seq.0.to_be_bytes().as_slice(),
-                commit.hash.as_slice(),
-                commit
-                    .submitted
-                    .map(|sequence| sequence.0.to_be_bytes().to_vec()),
-            ],
-        )?;
-    }
-    Ok(commit_seq)
+    history.record_group(
+        connection,
+        prepared
+            .iter()
+            .map(|commit| history::PreparedRecord {
+                proposal_id: commit.id.to_bytes(),
+                proposal_hash: commit.hash,
+                submitted: commit.submitted,
+                writes: commit.writes.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn committed_receipt(
     connection: &Connection,
     proposal: &CommitProposal,
 ) -> Result<Option<CommitReceipt>> {
-    let row = connection
-        .query_row(
-            &format!(
-                "SELECT commit_seq, proposal_hash, device_seq
-                 FROM {RECEIPT_TABLE} WHERE proposal_id = ?1"
-            ),
-            [proposal.id().to_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    row.map(|(commit_seq, expected_hash, submitted)| {
-        let encoded = proposal.encode()?;
-        if expected_hash != proposal_hash(&encoded) {
-            return Err(Error::InvalidCommitProposal(
-                "proposal id is already committed with another payload".into(),
-            ));
-        }
-        Ok(CommitReceipt {
-            commit_seq: history::decode_commit_seq(&commit_seq, false)?,
-            disposition: CommitDisposition::AlreadyCommitted,
-            submitted: submitted.as_deref().map(decode_device_seq).transpose()?,
+    history::committed(connection, proposal.id().to_bytes())?
+        .map(|stored| {
+            let encoded = proposal.encode()?;
+            if stored.proposal_hash != proposal_hash(&encoded) {
+                return Err(Error::InvalidCommitProposal(
+                    "proposal id is already committed with another payload".into(),
+                ));
+            }
+            Ok(CommitReceipt {
+                commit_seq: stored.commit_seq,
+                disposition: CommitDisposition::AlreadyCommitted,
+                submitted: stored.submitted,
+            })
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 fn proposal_hash(encoded: &[u8]) -> [u8; 32] {
     Sha256::digest(encoded).into()
-}
-
-fn decode_device_seq(encoded: &[u8]) -> Result<DeviceSeq> {
-    let bytes: [u8; 8] = encoded
-        .try_into()
-        .map_err(|_| Error::InvalidDatabase("commit receipt device sequence is malformed"))?;
-    let sequence = DeviceSeq(u64::from_be_bytes(bytes));
-    if sequence.0 == 0 {
-        return Err(Error::InvalidDatabase(
-            "commit receipt device sequence is malformed",
-        ));
-    }
-    Ok(sequence)
 }
 
 fn lower_insert_operations(
@@ -1644,7 +1478,6 @@ mod tests {
             writer.pragma_update(None, "journal_mode", "WAL").unwrap();
             writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
             catalog::initialize(&writer).unwrap();
-            initialize(&writer).unwrap();
             history::initialize(&writer).unwrap();
             let created = CreateTable::new(
                 "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
@@ -2052,12 +1885,11 @@ mod tests {
                 .unwrap(),
             1
         );
-        validate(&fixture.writer).unwrap();
         history::validate(&fixture.writer).unwrap();
     }
 
     #[test]
-    fn pruning_occ_history_retains_idempotent_receipts() {
+    fn pruning_commit_log_retires_receipt_and_occ_evidence_together() {
         let fixture = Fixture::new();
         let proposal = proposal_for_sql(
             &fixture,
@@ -2076,13 +1908,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            apply(&fixture.writer, &proposal).unwrap(),
-            CommitReceipt {
-                commit_seq: CommitSeq(1),
-                disposition: CommitDisposition::AlreadyCommitted,
-                submitted: None,
-            }
+        assert!(
+            committed_receipt(&fixture.writer, &proposal)
+                .unwrap()
+                .is_none()
         );
         assert_eq!(
             fixture
@@ -2091,56 +1920,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        validate(&fixture.writer).unwrap();
-    }
-
-    #[test]
-    fn validation_requires_without_rowid_for_receipts() {
-        let connection = Connection::open_in_memory().unwrap();
-        history::initialize(&connection).unwrap();
-        initialize(&connection).unwrap();
-        connection
-            .execute_batch(&format!(
-                "DROP TABLE {RECEIPT_TABLE};
-                 CREATE TABLE {RECEIPT_TABLE} (
-                    proposal_id BLOB PRIMARY KEY NOT NULL,
-                    commit_seq BLOB NOT NULL,
-                    proposal_hash BLOB NOT NULL,
-                    device_seq BLOB
-                 )"
-            ))
-            .unwrap();
-        assert!(matches!(
-            validate(&connection),
-            Err(Error::InvalidDatabase(
-                "commit receipt table must use WITHOUT ROWID"
-            ))
-        ));
-    }
-
-    #[test]
-    fn validation_rejects_receipts_newer_than_canonical_state() {
-        let fixture = Fixture::new();
-        let proposal = proposal_for_sql(
-            &fixture,
-            "INSERT INTO notes VALUES (7, 'once')",
-            IsolationLevel::Snapshot,
-            descriptor(),
-            [],
-        );
-        apply(&fixture.writer, &proposal).unwrap();
-        fixture
-            .writer
-            .execute(
-                &format!("UPDATE {RECEIPT_TABLE} SET commit_seq = x'0000000000000002'"),
-                (),
-            )
-            .unwrap();
-
-        assert!(matches!(
-            validate(&fixture.writer),
-            Err(Error::InvalidDatabase("commit receipt is malformed"))
-        ));
+        history::validate(&fixture.writer).unwrap();
     }
 
     #[test]
@@ -2248,7 +2028,7 @@ mod tests {
                 "CREATE TABLE failure_switch (enabled INTEGER NOT NULL);
                  INSERT INTO failure_switch VALUES (1);
                  CREATE TRIGGER fail_commit_receipt
-                 BEFORE INSERT ON {RECEIPT_TABLE}
+                 BEFORE INSERT ON __multilite__commits
                  WHEN (SELECT enabled FROM failure_switch) = 1
                  BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END"
             ))
@@ -2314,23 +2094,6 @@ mod tests {
         assert!(matches!(
             apply(&fixture.writer, &impostor),
             Err(Error::InvalidCommitProposal(message)) if message.contains("another payload")
-        ));
-    }
-
-    #[test]
-    fn commit_namespace_validation_rejects_lookalike_tables() {
-        let fixture = Fixture::new();
-        assert!(is_initialized(&fixture.writer).unwrap());
-        validate(&fixture.writer).unwrap();
-        fixture
-            .writer
-            .execute_batch("CREATE TABLE __multilite__commits_future (value BLOB NOT NULL)")
-            .unwrap();
-        assert!(matches!(
-            is_initialized(&fixture.writer),
-            Err(Error::InvalidDatabase(
-                "commit receipt namespace contains unexpected tables"
-            ))
         ));
     }
 }

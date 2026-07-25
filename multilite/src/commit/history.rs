@@ -6,14 +6,15 @@ use std::fmt;
 use homebase_core::key::Key;
 use homebase_core::range::Range;
 use homebase_core::reader::Reader;
-use homebase_core::tag::Mutation;
+use homebase_core::tag::{DeviceSeq, Mutation};
 use homebase_core::writer::Writer;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::{Uuid, Variant, Version};
 
 use super::snapshot::CommitSeq;
 use crate::{Error, Result};
 
-const HISTORY_TABLE: &str = "__multilite__history";
+const COMMIT_LOG_TABLE: &str = "__multilite__commits";
 const COMMIT_STATE_TABLE: &str = "__multilite__commit_state";
 const WRITE_SET_VERSION: u8 = 2;
 const LEGACY_WRITE_SET_VERSION: u8 = 1;
@@ -47,6 +48,21 @@ pub struct CommitRecord {
     pub writes: Vec<WriteRegion>,
 }
 
+/// One accepted proposal ready to be published in the canonical commit log.
+pub struct PreparedRecord {
+    pub proposal_id: [u8; 16],
+    pub proposal_hash: [u8; 32],
+    pub submitted: Option<DeviceSeq>,
+    pub writes: Vec<WriteRegion>,
+}
+
+/// Durable identity retained for a recently committed proposal.
+pub struct StoredReceipt {
+    pub commit_seq: CommitSeq,
+    pub proposal_hash: [u8; 32],
+    pub submitted: Option<DeviceSeq>,
+}
+
 /// Build the canonical logical writes represented by lowered mutations.
 pub fn writes_from_mutations<'a>(
     mutations: impl IntoIterator<Item = &'a Mutation>,
@@ -65,12 +81,17 @@ pub fn writes_from_mutations<'a>(
     writes.into_iter().collect()
 }
 
-/// Create the canonical-history tables as part of database bootstrap.
+/// Create the canonical commit-log tables as part of database bootstrap.
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
-        "CREATE TABLE {HISTORY_TABLE} (
-            commit_seq BLOB PRIMARY KEY NOT NULL CHECK(length(commit_seq) = 8),
-            writes BLOB NOT NULL
+        "CREATE TABLE {COMMIT_LOG_TABLE} (
+            proposal_id BLOB NOT NULL CHECK(length(proposal_id) = 16),
+            commit_seq BLOB NOT NULL CHECK(length(commit_seq) = 8),
+            proposal_hash BLOB NOT NULL CHECK(length(proposal_hash) = 32),
+            device_seq BLOB CHECK(device_seq IS NULL OR length(device_seq) = 8),
+            writes BLOB NOT NULL,
+            PRIMARY KEY (commit_seq, proposal_id),
+            UNIQUE (proposal_id)
         ) WITHOUT ROWID;
         CREATE TABLE {COMMIT_STATE_TABLE} (
             singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
@@ -83,34 +104,38 @@ pub fn initialize(connection: &Connection) -> Result<()> {
 
 /// Check whether the complete canonical-history namespace is present.
 pub fn is_initialized(connection: &Connection) -> Result<bool> {
-    let history = table_initialized(connection, HISTORY_TABLE)?;
+    let history = table_initialized(connection, COMMIT_LOG_TABLE)?;
     let commit_state = table_initialized(connection, COMMIT_STATE_TABLE)?;
     match (history, commit_state) {
         (false, false) => Ok(false),
         (true, true) => Ok(true),
         _ => Err(Error::InvalidDatabase(
-            "canonical history tables are only partially initialized",
+            "canonical commit-log tables are only partially initialized",
         )),
     }
 }
 
-/// Validate table shape, the current sequence, and every retained write set.
+/// Validate table shape, the current sequence, and every retained commit row.
 pub fn validate(connection: &Connection) -> Result<()> {
     if !is_initialized(connection)? {
-        return Err(Error::InvalidDatabase(
-            "canonical commit history is missing",
-        ));
+        return Err(Error::InvalidDatabase("canonical commit log is missing"));
     }
     validate_columns(
         connection,
-        HISTORY_TABLE,
-        &[("commit_seq", "BLOB", true, 1), ("writes", "BLOB", true, 0)],
-        "canonical history table schema is invalid",
+        COMMIT_LOG_TABLE,
+        &[
+            ("proposal_id", "BLOB", true, 2),
+            ("commit_seq", "BLOB", true, 1),
+            ("proposal_hash", "BLOB", true, 0),
+            ("device_seq", "BLOB", false, 0),
+            ("writes", "BLOB", true, 0),
+        ],
+        "canonical commit log schema is invalid",
     )?;
     validate_without_rowid(
         connection,
-        HISTORY_TABLE,
-        "canonical history table must use WITHOUT ROWID",
+        COMMIT_LOG_TABLE,
+        "canonical commit log must use WITHOUT ROWID",
     )?;
     validate_columns(
         connection,
@@ -137,11 +162,11 @@ pub fn validate(connection: &Connection) -> Result<()> {
     }
     let current = decode_commit_seq(&row.1, true)?;
     if history_after(connection, CommitSeq(0))?
-        .last()
-        .is_some_and(|record| record.commit_seq > current)
+        .iter()
+        .any(|record| record.commit_seq > current)
     {
         return Err(Error::InvalidDatabase(
-            "canonical history is newer than canonical SQLite",
+            "canonical commit log is newer than canonical SQLite",
         ));
     }
     Ok(())
@@ -157,10 +182,10 @@ pub fn current(connection: &Connection) -> Result<CommitSeq> {
     decode_commit_seq(&encoded, true)
 }
 
-/// Advance canonical state and retain its writes in the caller's transaction.
-pub fn record(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
+/// Advance canonical state and retain one row per accepted proposal.
+pub fn record_group(connection: &Connection, records: Vec<PreparedRecord>) -> Result<CommitSeq> {
     connection.execute_batch("SAVEPOINT __multilite__commit_history")?;
-    let result = record_inner(connection, writes);
+    let result = record_group_inner(connection, records);
     match result {
         Ok(commit_seq) => {
             connection.execute_batch("RELEASE __multilite__commit_history")?;
@@ -179,11 +204,29 @@ pub fn record(connection: &Connection, writes: Vec<WriteRegion>) -> Result<Commi
     }
 }
 
-fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
-    if !canonical_writes(&writes) {
+fn record_group_inner(connection: &Connection, records: Vec<PreparedRecord>) -> Result<CommitSeq> {
+    if records.is_empty() {
         return Err(Error::CaptureInvariant(
-            "canonical commit writes are not sorted and unique",
+            "cannot record an empty canonical commit group",
         ));
+    }
+    let mut proposal_ids = BTreeSet::new();
+    for record in &records {
+        if !proposal_ids.insert(record.proposal_id) {
+            return Err(Error::InvalidCommitProposal(
+                "commit group contains a duplicate proposal id".into(),
+            ));
+        }
+        if !valid_uuid(record.proposal_id) {
+            return Err(Error::InvalidCommitProposal(
+                "commit proposal id is not a UUID v4".into(),
+            ));
+        }
+        if !canonical_writes(&record.writes) {
+            return Err(Error::CaptureInvariant(
+                "canonical commit writes are not sorted and unique",
+            ));
+        }
     }
     let current = current(connection)?;
     let next = CommitSeq(
@@ -196,11 +239,23 @@ fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<Com
         &format!("UPDATE {COMMIT_STATE_TABLE} SET commit_seq = ?1 WHERE singleton = 1"),
         [next.0.to_be_bytes().as_slice()],
     )?;
-    if !writes.is_empty() {
-        let encoded = encode_writes(&writes)?;
+    for record in records {
+        let encoded = encode_writes(&record.writes)?;
         connection.execute(
-            &format!("INSERT INTO {HISTORY_TABLE} (commit_seq, writes) VALUES (?1, ?2)"),
-            rusqlite::params![next.0.to_be_bytes().as_slice(), encoded],
+            &format!(
+                "INSERT INTO {COMMIT_LOG_TABLE} (
+                    proposal_id, commit_seq, proposal_hash, device_seq, writes
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)"
+            ),
+            params![
+                record.proposal_id.as_slice(),
+                next.0.to_be_bytes().as_slice(),
+                record.proposal_hash.as_slice(),
+                record
+                    .submitted
+                    .map(|sequence| sequence.0.to_be_bytes().to_vec()),
+                encoded,
+            ],
         )?;
     }
     Ok(next)
@@ -209,27 +264,64 @@ fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<Com
 /// Load retained canonical writes strictly newer than `commit_seq`.
 pub fn history_after(connection: &Connection, commit_seq: CommitSeq) -> Result<Vec<CommitRecord>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT commit_seq, writes FROM {HISTORY_TABLE}
-         WHERE commit_seq > ?1 ORDER BY commit_seq"
+        "SELECT proposal_id, commit_seq, device_seq, writes FROM {COMMIT_LOG_TABLE}
+         WHERE commit_seq > ?1 ORDER BY commit_seq, proposal_id"
     ))?;
     let rows = statement.query_map([commit_seq.0.to_be_bytes().as_slice()], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
     })?;
     rows.map(|row| {
-        let (commit_seq, encoded_keys) = row?;
+        let (proposal_id, commit_seq, submitted, encoded_writes) = row?;
+        decode_proposal_id(&proposal_id)?;
+        submitted.as_deref().map(decode_device_seq).transpose()?;
         Ok(CommitRecord {
             commit_seq: decode_commit_seq(&commit_seq, false)?,
-            writes: decode_writes(&encoded_keys)
-                .map_err(|_| Error::InvalidDatabase("canonical write record is malformed"))?,
+            writes: decode_writes(&encoded_writes)
+                .map_err(|_| Error::InvalidDatabase("canonical commit log is malformed"))?,
         })
     })
     .collect()
 }
 
-/// Remove OCC evidence no newer than the oldest live writable snapshot.
+/// Find a retained receipt by its stable proposal identity.
+pub fn committed(connection: &Connection, proposal_id: [u8; 16]) -> Result<Option<StoredReceipt>> {
+    let row = connection
+        .query_row(
+            &format!(
+                "SELECT commit_seq, proposal_hash, device_seq
+                 FROM {COMMIT_LOG_TABLE} WHERE proposal_id = ?1"
+            ),
+            [proposal_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(commit_seq, proposal_hash, submitted)| {
+        Ok(StoredReceipt {
+            commit_seq: decode_commit_seq(&commit_seq, false)?,
+            proposal_hash: proposal_hash
+                .try_into()
+                .map_err(|_| Error::InvalidDatabase("canonical commit log is malformed"))?,
+            submitted: submitted.as_deref().map(decode_device_seq).transpose()?,
+        })
+    })
+    .transpose()
+}
+
+/// Remove commit rows no newer than the supplied safe frontier.
 pub fn prune(connection: &Connection, through: CommitSeq) -> Result<usize> {
     Ok(connection.execute(
-        &format!("DELETE FROM {HISTORY_TABLE} WHERE commit_seq <= ?1"),
+        &format!("DELETE FROM {COMMIT_LOG_TABLE} WHERE commit_seq <= ?1"),
         [through.0.to_be_bytes().as_slice()],
     )?)
 }
@@ -265,9 +357,6 @@ fn decode_writes(frame: &[u8]) -> std::result::Result<Vec<WriteRegion>, HistoryC
         _ => return Err(HistoryCodecError::UnknownVersion),
     };
     let count = reader.u32().ok_or(HistoryCodecError::Truncated)?;
-    if count == 0 {
-        return Err(HistoryCodecError::Empty);
-    }
     let mut writes =
         Vec::with_capacity(usize::try_from(count).map_err(|_| HistoryCodecError::InvalidLength)?);
     for _ in 0..count {
@@ -315,6 +404,34 @@ pub fn decode_commit_seq(bytes: &[u8], allow_zero: bool) -> Result<CommitSeq> {
     Ok(CommitSeq(commit_seq))
 }
 
+fn decode_proposal_id(bytes: &[u8]) -> Result<[u8; 16]> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidDatabase("canonical proposal id is malformed"))?;
+    if !valid_uuid(bytes) {
+        return Err(Error::InvalidDatabase("canonical proposal id is malformed"));
+    }
+    Ok(bytes)
+}
+
+fn valid_uuid(bytes: [u8; 16]) -> bool {
+    let uuid = Uuid::from_bytes(bytes);
+    uuid.get_version() == Some(Version::Random) && uuid.get_variant() == Variant::RFC4122
+}
+
+fn decode_device_seq(bytes: &[u8]) -> Result<DeviceSeq> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidDatabase("canonical device sequence is malformed"))?;
+    let sequence = u64::from_be_bytes(bytes);
+    if sequence == 0 {
+        return Err(Error::InvalidDatabase(
+            "canonical device sequence is malformed",
+        ));
+    }
+    Ok(DeviceSeq(sequence))
+}
+
 fn table_initialized(connection: &Connection, table: &'static str) -> Result<bool> {
     let mut statement = connection.prepare(
         "SELECT name FROM sqlite_schema
@@ -329,7 +446,7 @@ fn table_initialized(connection: &Connection, table: &'static str) -> Result<boo
         [] => Ok(false),
         [found] if found == table => Ok(true),
         _ => Err(Error::InvalidDatabase(
-            "canonical history namespace contains unexpected tables",
+            "canonical commit-log namespace contains unexpected tables",
         )),
     }
 }
@@ -387,7 +504,6 @@ enum HistoryCodecError {
     InvalidKey,
     InvalidRange,
     UnknownKind,
-    Empty,
     NonCanonical,
     TrailingBytes,
 }
@@ -406,6 +522,27 @@ mod tests {
 
     fn key(parts: &[&[u8]]) -> Key {
         Key::from_bytes(parts.iter().copied()).unwrap()
+    }
+
+    fn proposal_id(byte: u8) -> [u8; 16] {
+        let mut id = [byte; 16];
+        id[6] = (id[6] & 0x0f) | 0x40;
+        id[8] = (id[8] & 0x3f) | 0x80;
+        id
+    }
+
+    fn record(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
+        let byte = u8::try_from(current(connection)?.0 + 1)
+            .map_err(|_| Error::CaptureInvariant("test commit sequence is too large"))?;
+        record_group(
+            connection,
+            vec![PreparedRecord {
+                proposal_id: proposal_id(byte),
+                proposal_hash: [byte; 32],
+                submitted: None,
+                writes,
+            }],
+        )
     }
 
     #[test]
@@ -455,21 +592,32 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                &format!("INSERT INTO {HISTORY_TABLE} VALUES (?1, x'01')"),
-                [1_u64.to_be_bytes().as_slice()],
+                &format!(
+                    "INSERT INTO {COMMIT_LOG_TABLE}
+                     VALUES (?1, ?2, ?3, NULL, x'01')"
+                ),
+                params![
+                    proposal_id(1).as_slice(),
+                    1_u64.to_be_bytes().as_slice(),
+                    [1_u8; 32].as_slice(),
+                ],
             )
             .unwrap();
         assert!(matches!(
             history_after(&connection, CommitSeq(0)),
-            Err(Error::InvalidDatabase(
-                "canonical write record is malformed"
-            ))
+            Err(Error::InvalidDatabase("canonical commit log is malformed"))
         ));
         let metadata = Connection::open_in_memory().unwrap();
         initialize(&metadata).unwrap();
         assert_eq!(record(&metadata, Vec::new()).unwrap(), CommitSeq(1));
         assert_eq!(current(&metadata).unwrap(), CommitSeq(1));
-        assert!(history_after(&metadata, CommitSeq(0)).unwrap().is_empty());
+        assert_eq!(
+            history_after(&metadata, CommitSeq(0)).unwrap(),
+            [CommitRecord {
+                commit_seq: CommitSeq(1),
+                writes: Vec::new(),
+            }]
+        );
     }
 
     #[test]
@@ -507,7 +655,7 @@ mod tests {
         connection
             .execute_batch(&format!(
                 "CREATE TRIGGER reject_history
-                 BEFORE INSERT ON {HISTORY_TABLE}
+                 BEFORE INSERT ON {COMMIT_LOG_TABLE}
                  BEGIN SELECT RAISE(ABORT, 'injected'); END"
             ))
             .unwrap();
@@ -527,14 +675,19 @@ mod tests {
     fn validation_requires_without_rowid_for_history_tables() {
         for (table, replacement, expected) in [
             (
-                HISTORY_TABLE,
+                COMMIT_LOG_TABLE,
                 format!(
-                    "CREATE TABLE {HISTORY_TABLE} (
-                        commit_seq BLOB PRIMARY KEY NOT NULL,
-                        writes BLOB NOT NULL
+                    "CREATE TABLE {COMMIT_LOG_TABLE} (
+                        proposal_id BLOB NOT NULL,
+                        commit_seq BLOB NOT NULL,
+                        proposal_hash BLOB NOT NULL,
+                        device_seq BLOB,
+                        writes BLOB NOT NULL,
+                        PRIMARY KEY (commit_seq, proposal_id),
+                        UNIQUE (proposal_id)
                     )"
                 ),
-                "canonical history table must use WITHOUT ROWID",
+                "canonical commit log must use WITHOUT ROWID",
             ),
             (
                 COMMIT_STATE_TABLE,
@@ -561,6 +714,36 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_invalid_id_sequence_and_future_rows() {
+        for mutation in [
+            "UPDATE __multilite__commits SET proposal_id = zeroblob(16)",
+            "UPDATE __multilite__commits SET device_seq = zeroblob(8)",
+            "UPDATE __multilite__commits SET commit_seq = x'0000000000000002'",
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            initialize(&connection).unwrap();
+            record(&connection, Vec::new()).unwrap();
+            connection.execute(mutation, ()).unwrap();
+            assert!(validate(&connection).is_err());
+        }
+    }
+
+    #[test]
+    fn commit_log_namespace_rejects_lookalike_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        connection
+            .execute_batch("CREATE TABLE __multilite__commits_future(value BLOB NOT NULL)")
+            .unwrap();
+        assert!(matches!(
+            is_initialized(&connection),
+            Err(Error::InvalidDatabase(
+                "canonical commit-log namespace contains unexpected tables"
+            ))
+        ));
+    }
+
+    #[test]
     fn pruning_retains_records_newer_than_the_oldest_snapshot() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
@@ -581,5 +764,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             [CommitSeq(2), CommitSeq(3)]
         );
+    }
+
+    #[test]
+    fn grouped_proposals_share_a_sequence_but_keep_distinct_receipts_and_writes() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let first = proposal_id(1);
+        let second = proposal_id(2);
+        let commit_seq = record_group(
+            &connection,
+            vec![
+                PreparedRecord {
+                    proposal_id: first,
+                    proposal_hash: [1; 32],
+                    submitted: Some(DeviceSeq(7)),
+                    writes: vec![WriteRegion::Point(key(&[b"rows", b"one"]))],
+                },
+                PreparedRecord {
+                    proposal_id: second,
+                    proposal_hash: [2; 32],
+                    submitted: None,
+                    writes: Vec::new(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(commit_seq, CommitSeq(1));
+        assert_eq!(
+            history_after(&connection, CommitSeq(0)).unwrap(),
+            [
+                CommitRecord {
+                    commit_seq,
+                    writes: vec![WriteRegion::Point(key(&[b"rows", b"one"]))],
+                },
+                CommitRecord {
+                    commit_seq,
+                    writes: Vec::new(),
+                },
+            ]
+        );
+        let first_receipt = committed(&connection, first).unwrap().unwrap();
+        assert_eq!(first_receipt.commit_seq, commit_seq);
+        assert_eq!(first_receipt.proposal_hash, [1; 32]);
+        assert_eq!(first_receipt.submitted, Some(DeviceSeq(7)));
+        assert!(committed(&connection, second).unwrap().is_some());
     }
 }

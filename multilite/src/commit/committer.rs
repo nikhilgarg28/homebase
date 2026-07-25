@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use crate::branch::snapshot::PinnedSnapshot;
-use crate::commit::history::{self, WriteRegion};
+use crate::commit::history::{self, PreparedRecord};
 use crate::commit::proposal::{CommitProposal, CommitReceipt};
 use crate::commit::snapshot::{CommitSeq, SnapshotDescriptor};
 use crate::{Error, Result};
@@ -62,17 +62,27 @@ impl CommitHistory {
         self.pins.register(commit_seq)
     }
 
-    /// Publish one canonical transition in the caller's SQLite transaction.
-    pub fn record(&self, connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
-        history::record(connection, writes)
+    /// Publish one proposal-granular canonical transition.
+    pub fn record_group(
+        &self,
+        connection: &Connection,
+        records: Vec<PreparedRecord>,
+    ) -> Result<CommitSeq> {
+        history::record_group(connection, records)
     }
 
-    /// Prune through the oldest writable snapshot, or through current if idle.
+    /// Prune evidence no branch needs while retaining the newest receipts.
+    ///
+    /// The committer sends every reply before it can process the next group.
+    /// Keeping the current sequence therefore covers immediate retry and
+    /// reply-delivery ambiguity without a second receipt-retention frontier.
     pub fn prune(&self, connection: &Connection) -> Result<usize> {
-        let through = match self.pins.oldest() {
-            Some(oldest) => oldest,
-            None => history::current(connection)?,
-        };
+        let current = history::current(connection)?;
+        let before_current = CommitSeq(current.0.saturating_sub(1));
+        let through = self
+            .pins
+            .oldest()
+            .map_or(before_current, |oldest| oldest.min(before_current));
         history::prune(connection, through)
     }
 }
@@ -457,5 +467,53 @@ mod tests {
         assert_eq!(history.pins.oldest(), Some(CommitSeq(5)));
         drop(later);
         assert_eq!(history.pins.oldest(), None);
+    }
+
+    #[test]
+    fn pruning_keeps_the_current_receipts_and_respects_branch_pins() {
+        fn record(byte: u8) -> PreparedRecord {
+            let mut proposal_id = [byte; 16];
+            proposal_id[6] = (proposal_id[6] & 0x0f) | 0x40;
+            proposal_id[8] = (proposal_id[8] & 0x3f) | 0x80;
+            PreparedRecord {
+                proposal_id,
+                proposal_hash: [byte; 32],
+                submitted: None,
+                writes: vec![history::WriteRegion::Point(
+                    homebase_core::key::Key::from_bytes([b"rows".as_slice(), [byte].as_slice()])
+                        .unwrap(),
+                )],
+            }
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        history::initialize(&connection).unwrap();
+        let commits = CommitHistory::default();
+
+        commits.record_group(&connection, vec![record(1)]).unwrap();
+        assert_eq!(commits.prune(&connection).unwrap(), 0);
+
+        let oldest = commits.pin(CommitSeq(0));
+        commits.record_group(&connection, vec![record(2)]).unwrap();
+        assert_eq!(commits.prune(&connection).unwrap(), 0);
+        assert_eq!(
+            history::history_after(&connection, CommitSeq(0))
+                .unwrap()
+                .into_iter()
+                .map(|record| record.commit_seq)
+                .collect::<Vec<_>>(),
+            [CommitSeq(1), CommitSeq(2)]
+        );
+
+        drop(oldest);
+        assert_eq!(commits.prune(&connection).unwrap(), 1);
+        assert_eq!(
+            history::history_after(&connection, CommitSeq(0))
+                .unwrap()
+                .into_iter()
+                .map(|record| record.commit_seq)
+                .collect::<Vec<_>>(),
+            [CommitSeq(2)]
+        );
     }
 }

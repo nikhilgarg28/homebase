@@ -2850,16 +2850,23 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
     assert!(table_exists(&database, "notes"));
     assert!(table_exists(&database, "tasks"));
     assert_eq!(pending_ops(&database).len(), 2);
+    let committed = database
+        .with_connection(|connection| {
+            history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
+        })
+        .unwrap();
+    assert_eq!(committed.len(), 2);
+    assert!(
+        committed
+            .iter()
+            .all(|record| record.commit_seq == crate::commit::snapshot::CommitSeq(1))
+    );
     assert_eq!(
-        database
-            .with_connection(|connection| {
-                history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
-            })
-            .unwrap(),
-        [history::CommitRecord {
-            commit_seq: crate::commit::snapshot::CommitSeq(1),
-            writes: expected_writes,
-        }]
+        committed
+            .into_iter()
+            .flat_map(|record| record.writes)
+            .collect::<BTreeSet<_>>(),
+        expected_writes.into_iter().collect()
     );
     assert_eq!(
         database.commit_proposal(first.clone()).unwrap(),
@@ -2903,13 +2910,16 @@ fn remote_apply_and_disjoint_local_transaction_share_one_commit_sequence() {
         replica.with_connection(history::current).unwrap(),
         crate::commit::snapshot::CommitSeq(1)
     );
-    assert!(
+    assert_eq!(
         replica
             .with_connection(|connection| {
                 history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
             })
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [history::CommitRecord {
+            commit_seq: crate::commit::snapshot::CommitSeq(1),
+            writes: Vec::new(),
+        }]
     );
 
     let apply = pending_apply_proposal(&replica);
@@ -3021,11 +3031,19 @@ fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
             database
                 .owner
                 .with_savepoint("__multilite__snapshot_race", |connection| {
-                    backend.commit_history.record(
+                    let mut proposal_id = [5; 16];
+                    proposal_id[6] = (proposal_id[6] & 0x0f) | 0x40;
+                    proposal_id[8] = (proposal_id[8] & 0x3f) | 0x80;
+                    backend.commit_history.record_group(
                         connection,
-                        vec![history::WriteRegion::Point(
-                            Key::from_bytes([b"test".as_slice(), b"write".as_slice()]).unwrap(),
-                        )],
+                        vec![history::PreparedRecord {
+                            proposal_id,
+                            proposal_hash: [5; 32],
+                            submitted: None,
+                            writes: vec![history::WriteRegion::Point(
+                                Key::from_bytes([b"test".as_slice(), b"write".as_slice()]).unwrap(),
+                            )],
+                        }],
                     )?;
                     let metadata =
                         OrderedMetaStore::new(SqliteOrderedStore::new(database.owner.clone()));
