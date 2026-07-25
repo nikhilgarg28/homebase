@@ -108,7 +108,7 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         &self,
         mode: ExecutionMode,
         operation: impl FnOnce(&Connection) -> Result<T>,
-        finalize: impl FnOnce(&Connection, &[P::Event]) -> Result<()>,
+        finalize: impl FnOnce(&Connection, &mut Vec<P::Event>) -> Result<()>,
     ) -> Result<(T, Vec<P::Event>)> {
         let _operation_guard = OperationGuard::enter(Arc::clone(&self.state))?;
         let event_checkpoint = self.event_count();
@@ -125,8 +125,8 @@ impl<P: HookPolicy> RuntimeConnection<P> {
             };
             match result {
                 Ok(value) => {
-                    let events = self.split_events(event_checkpoint);
-                    let finalized = finalize(connection, &events);
+                    let mut events = self.split_events(event_checkpoint);
+                    let finalized = finalize(connection, &mut events);
                     let finalized = match self.take_callback_error() {
                         Some(error) => Err(error),
                         None => finalized,

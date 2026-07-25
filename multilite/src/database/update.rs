@@ -1,16 +1,15 @@
 //! Managed local update execution.
 
-use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use homebase_client::{ClientError, ServerHandle};
-use homebase_core::key::Key;
 use homebase_core::tag::AdmissionSeq;
 use pollster::block_on;
+use rusqlite::hooks::PreUpdateCase;
 use rusqlite::{Connection, Row};
 
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
-use super::schema::CreateTableSpec;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
@@ -18,10 +17,9 @@ use super::{
     BranchSnapshot, Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog,
     pending, pin_snapshot,
 };
-use crate::branch::changeset::ChangesetCapture;
 use crate::branch::{OverlayOptions, WritableBranch};
 use crate::commit::footprint::ReadTrace;
-use crate::commit::history;
+use crate::commit::history::{self, WriteRegion};
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
@@ -29,6 +27,8 @@ use crate::{Error, Params, Result};
 enum UpdateBackend<'a, H: ServerHandle> {
     Branch {
         connection: &'a Connection,
+        capture: BranchCapture<'a>,
+        operations: Vec<MultiliteOp>,
     },
     Serialized {
         database: &'a Database<H>,
@@ -51,11 +51,15 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
 }
 
 impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
-    fn branch(connection: &'a Connection, isolation: IsolationLevel) -> Self {
-        Self {
+    fn branch(connection: &'a Connection, isolation: IsolationLevel) -> Result<Self> {
+        Ok(Self {
             isolation,
-            backend: UpdateBackend::Branch { connection },
-        }
+            backend: UpdateBackend::Branch {
+                connection,
+                capture: BranchCapture::install(connection)?,
+                operations: Vec::new(),
+            },
+        })
     }
 
     fn serialized(
@@ -112,7 +116,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     /// Prepare one read-only statement bound to this managed update.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
         match &self.backend {
-            UpdateBackend::Branch { connection } => {
+            UpdateBackend::Branch { connection, .. } => {
                 TransactionStatement::new_direct(connection, sql)
             }
             UpdateBackend::Serialized {
@@ -136,11 +140,48 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         validated: ValidatedExecute,
     ) -> Result<usize> {
         match &mut self.backend {
-            UpdateBackend::Branch { connection } => match validated {
-                ValidatedExecute::Insert => Ok(connection.execute(sql, params)?),
-                ValidatedExecute::CreateTable(_) => Err(Error::UnsupportedSql(
-                    "DDL inside snapshot updates is not supported; execute it directly",
-                )),
+            UpdateBackend::Branch {
+                connection,
+                capture,
+                operations,
+            } => match validated {
+                ValidatedExecute::CreateTable(table) => {
+                    let operation = MultiliteOp::create_table(sql, table);
+                    let MultiliteOp::CreateTable(created) = &operation else {
+                        unreachable!("create-table constructor returned another operation")
+                    };
+                    let (changed, events) = capture.run(
+                        || {
+                            let changed = connection.execute(sql, params)?;
+                            catalog::insert(connection, created)?;
+                            Ok(changed)
+                        },
+                        |_| Ok(()),
+                    )?;
+                    if !events.is_empty() {
+                        return Err(Error::CaptureInvariant(
+                            "CREATE TABLE captured application rows",
+                        ));
+                    }
+                    operations.push(operation);
+                    Ok(changed)
+                }
+                ValidatedExecute::Insert => {
+                    let (changed, events) = capture.run(
+                        || Ok(connection.execute(sql, params)?),
+                        |events| super::row::normalize_hidden_rowids(connection, events),
+                    )?;
+                    let Some(inserted) = InsertRows::from_captured(connection, &events)? else {
+                        if events.is_empty() {
+                            return Ok(changed);
+                        }
+                        return Err(Error::UnsupportedSql(
+                            "INSERT target has no synchronized schema identity",
+                        ));
+                    };
+                    operations.push(MultiliteOp::InsertRows(inserted));
+                    Ok(changed)
+                }
             },
             UpdateBackend::Serialized { .. } => match validated {
                 ValidatedExecute::CreateTable(table) => {
@@ -188,9 +229,11 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         else {
             unreachable!("serialized INSERT used on a branch")
         };
-        let (changed, events) = runtime.run(ExecutionMode::Public, |connection| {
-            Ok(connection.execute(sql, params)?)
-        })?;
+        let (changed, events) = runtime.run_captured(
+            ExecutionMode::Public,
+            |connection| Ok(connection.execute(sql, params)?),
+            |connection, events| super::row::normalize_hidden_rowids(connection, events),
+        )?;
         let Some(inserted) = InsertRows::from_captured(connection, &events)? else {
             if events.is_empty() {
                 return Ok(changed);
@@ -203,7 +246,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         Ok(changed)
     }
 
-    fn finalize_serialized(self) -> Result<Option<BTreeSet<Key>>> {
+    fn finalize_serialized(self) -> Result<Option<Vec<WriteRegion>>> {
         let UpdateBackend::Serialized {
             database,
             runtime,
@@ -222,7 +265,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         let mut homebase = transaction.to_homebase()?;
         homebase.include_read_trace(&read_trace);
         let (mutations, footprint) = homebase.into_parts();
-        let writes = history::writes_from_mutations(&mutations)?;
+        let writes = history::writes_from_mutations(&mutations);
         let assertions = footprint.plan(self.isolation, authority_frontier);
         runtime.with_internal_metadata(|| {
             let sequence = block_on(async {
@@ -240,6 +283,98 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         })?;
         Ok(Some(writes))
     }
+
+    fn into_branch_operations(self) -> Vec<MultiliteOp> {
+        match self.backend {
+            UpdateBackend::Branch { operations, .. } => operations,
+            UpdateBackend::Serialized { .. } => Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BranchCaptureState {
+    events: Vec<super::row::CapturedRow>,
+    error: Option<Error>,
+    suppress: bool,
+}
+
+struct BranchCapture<'connection> {
+    connection: &'connection Connection,
+    state: Arc<Mutex<BranchCaptureState>>,
+}
+
+impl<'connection> BranchCapture<'connection> {
+    fn install(connection: &'connection Connection) -> Result<Self> {
+        let state = Arc::new(Mutex::new(BranchCaptureState::default()));
+        let callback = Arc::clone(&state);
+        connection.preupdate_hook(Some(
+            move |_action, database: &str, table: &str, update: &PreUpdateCase| {
+                let mut state = lock(&callback);
+                if state.suppress || state.error.is_some() {
+                    return;
+                }
+                match super::capture_insert(ExecutionMode::Public, database, table, update) {
+                    Ok(Some(event)) => state.events.push(event),
+                    Ok(None) => {}
+                    Err(error) => state.error = Some(error),
+                }
+            },
+        ))?;
+        Ok(Self { connection, state })
+    }
+
+    fn run<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+        finalize: impl FnOnce(&mut Vec<super::row::CapturedRow>) -> Result<()>,
+    ) -> Result<(T, Vec<super::row::CapturedRow>)> {
+        let checkpoint = lock(&self.state).events.len();
+        self.connection
+            .execute_batch("SAVEPOINT __multilite__branch_statement")?;
+        let result = operation();
+        let callback_error = lock(&self.state).error.take();
+        match result.and_then(|value| callback_error.map_or(Ok(value), Err)) {
+            Ok(value) => {
+                let mut events = lock(&self.state).events.split_off(checkpoint);
+                lock(&self.state).suppress = true;
+                let finalized = finalize(&mut events);
+                lock(&self.state).suppress = false;
+                if let Err(error) = finalized {
+                    self.connection.execute_batch(
+                        "ROLLBACK TO __multilite__branch_statement;
+                         RELEASE __multilite__branch_statement",
+                    )?;
+                    return Err(error);
+                }
+                self.connection
+                    .execute_batch("RELEASE __multilite__branch_statement")?;
+                Ok((value, events))
+            }
+            Err(error) => {
+                lock(&self.state).events.truncate(checkpoint);
+                self.connection.execute_batch(
+                    "ROLLBACK TO __multilite__branch_statement;
+                     RELEASE __multilite__branch_statement",
+                )?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for BranchCapture<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .connection
+            .preupdate_hook::<fn(rusqlite::hooks::Action, &str, &str, &PreUpdateCase)>(None);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
@@ -265,38 +400,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         }
     }
 
-    pub(super) fn execute_owned_create_table<Q: Params>(
-        self: &std::sync::Arc<Self>,
-        runtime: &DatabaseRuntime,
-        sql: &str,
-        params: Q,
-        table: CreateTableSpec,
-    ) -> Result<usize> {
-        {
-            let _operation = self.enter_operation()?;
-            self.refresh_read_serial(runtime)?;
-        }
-        let BranchSnapshot {
-            physical,
-            logical,
-            tables: _,
-            history_pin: _history_pin,
-        } = self.issue_branch_snapshot(true)?;
-        let branch = WritableBranch::open(physical, OverlayOptions::default())
-            .map_err(|error| Error::Branch(error.to_string()))?;
-        let operation = MultiliteOp::create_table(sql, table);
-        let MultiliteOp::CreateTable(created) = &operation else {
-            unreachable!("create-table constructor returned another operation")
-        };
-        let changed = branch.connection().execute(sql, params)?;
-        catalog::insert(branch.connection(), created)?;
-        let proposal =
-            CommitProposal::create_table(logical, self.isolation_level, created.clone())?;
-        self.commit_proposal(proposal)?;
-        self.finish_branch_write()?;
-        Ok(changed)
-    }
-
     fn update_on_branch<T>(
         self: &std::sync::Arc<Self>,
         runtime: &DatabaseRuntime,
@@ -310,28 +413,21 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         let BranchSnapshot {
             physical,
             logical,
-            tables,
             history_pin: _history_pin,
         } = self.issue_branch_snapshot(true)?;
         let branch = WritableBranch::open(physical, OverlayOptions::default())
             .map_err(|error| Error::Branch(error.to_string()))?;
-        let table_refs = tables.iter().map(String::as_str).collect::<Vec<_>>();
-        let capture = ChangesetCapture::start(&branch, &table_refs)
-            .map_err(|error| Error::Branch(error.to_string()))?;
-        let mut update = UpdateTransaction::branch(branch.connection(), options.isolation_level());
+        let mut update = UpdateTransaction::branch(branch.connection(), options.isolation_level())?;
         let value = operation(&mut update)?;
-        drop(update);
-        let changeset = capture
-            .finish()
-            .map_err(|error| Error::Branch(error.to_string()))?;
-        let proposal = CommitProposal::from_captured(
-            logical,
-            options.isolation_level(),
-            changeset,
-            branch.connection(),
-            std::iter::empty(),
-        )?;
-        if let Some(proposal) = proposal {
+        let operations = update.into_branch_operations();
+        if !operations.is_empty() {
+            let transaction = MultiliteTransaction::new(operations)?;
+            let proposal = CommitProposal::from_transaction(
+                logical,
+                options.isolation_level(),
+                transaction,
+                std::iter::empty(),
+            )?;
             self.commit_proposal(proposal)?;
             self.finish_branch_write()?;
         }
@@ -360,7 +456,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 );
                 let value = operation(&mut update)?;
                 if let Some(writes) = update.finalize_serialized()? {
-                    history::record(connection, writes)?;
+                    self.commit_history.record(connection, writes)?;
                 }
                 Ok(value)
             })?;

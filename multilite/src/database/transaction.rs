@@ -7,6 +7,7 @@ use homebase_core::messages::{AdmittedBatch, RangeAssert};
 use homebase_core::reader::Reader;
 use homebase_core::tag::{AdmissionSeq, Mutation};
 use homebase_core::writer::Writer;
+use rusqlite::Connection;
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
@@ -142,6 +143,14 @@ impl MultiliteTransaction {
             mutations,
             footprint,
         })
+    }
+
+    /// Materialize every operation in manifest order.
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        for operation in &self.operations {
+            operation.apply(connection)?;
+        }
+        Ok(())
     }
 
     /// Raise and authenticate one complete admitted transaction batch.
@@ -294,6 +303,7 @@ mod tests {
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
+                rowid: 7,
                 values: vec![StoredValue::Integer(7)],
             }],
         )

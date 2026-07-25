@@ -7,6 +7,7 @@ use homebase_core::key::Key;
 use homebase_core::messages::RangeAssert;
 use homebase_core::tag::AdmissionSeq;
 
+use crate::commit::history::WriteRegion;
 use crate::database::isolation::IsolationLevel;
 
 /// Logical conflicts accumulated by one Multilite transaction.
@@ -114,15 +115,16 @@ impl ConflictFootprint {
         dead_code,
         reason = "used by the proposal journal before actor integration"
     )]
-    pub fn conflicts_with_writes(
+    pub fn conflicts_with_writes<'a>(
         &self,
         isolation: IsolationLevel,
-        committed: &BTreeSet<Key>,
+        committed: impl IntoIterator<Item = &'a WriteRegion>,
     ) -> bool {
+        let committed = committed.into_iter().collect::<Vec<_>>();
         self.asserted_keys(isolation).any(|asserted| {
             committed
                 .iter()
-                .any(|written| written.starts_with(asserted))
+                .any(|written| written.overlaps_prefix(asserted))
         })
     }
 
@@ -314,22 +316,37 @@ mod tests {
     }
 
     #[test]
-    fn exact_committed_keys_are_checked_directionally_against_asserted_prefixes() {
+    fn point_writes_are_checked_directionally_against_asserted_prefixes() {
         let parent = key(&[b"tables", b"one"]);
         let child = key(&[b"tables", b"one", b"rows", b"7"]);
 
         let mut child_assertion = ConflictFootprint::new();
         child_assertion.add_write(child.clone());
-        assert!(
-            !child_assertion
-                .conflicts_with_writes(IsolationLevel::Snapshot, &BTreeSet::from([parent.clone()]))
-        );
+        assert!(!child_assertion.conflicts_with_writes(
+            IsolationLevel::Snapshot,
+            &[WriteRegion::Point(parent.clone())]
+        ));
 
         let mut parent_assertion = ConflictFootprint::new();
         parent_assertion.add_constraint(parent);
         assert!(
             parent_assertion
-                .conflicts_with_writes(IsolationLevel::Snapshot, &BTreeSet::from([child]))
+                .conflicts_with_writes(IsolationLevel::Snapshot, &[WriteRegion::Point(child)])
         );
+    }
+
+    #[test]
+    fn range_writes_overlap_parent_and_child_assertions() {
+        let rows = key(&[b"tables", b"one", b"rows"]);
+        let row = key(&[b"tables", b"one", b"rows", b"7"]);
+        let mut footprint = ConflictFootprint::new();
+        footprint.add_write(row);
+
+        assert!(footprint.conflicts_with_writes(
+            IsolationLevel::Snapshot,
+            &[WriteRegion::Range(homebase_core::range::Range::Prefix(
+                rows
+            ))]
+        ));
     }
 }

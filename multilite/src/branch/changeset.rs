@@ -46,6 +46,7 @@ pub struct CapturedChangeset {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedInsert {
     pub table: String,
+    pub rowid: i64,
     pub values: Vec<StoredValue>,
 }
 
@@ -73,7 +74,8 @@ impl CapturedChangeset {
     pub fn inserted_rows(&self) -> Result<Vec<CapturedInsert>, ChangesetError> {
         decode_changeset(&self.sqlite)?
             .into_iter()
-            .map(|change| {
+            .zip(&self.rowids)
+            .map(|(change, rowid)| {
                 if change.kind != ChangeKind::Insert {
                     return Err(ChangesetError::UnsupportedChange {
                         table: change.table,
@@ -91,6 +93,9 @@ impl CapturedChangeset {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(CapturedInsert {
                     table: change.table,
+                    rowid: rowid.after.ok_or(ChangesetError::Malformed(
+                        "insert changeset is missing its final rowid",
+                    ))?,
                     values,
                 })
             })

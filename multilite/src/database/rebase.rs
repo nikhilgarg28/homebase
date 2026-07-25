@@ -5,8 +5,6 @@ use homebase_client::{ClientError, ServerHandle};
 use pollster::block_on;
 use rusqlite::Connection;
 
-use super::catalog;
-use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
 use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
@@ -42,7 +40,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let space_id = self.database_id.space_id();
-        let store = DatabaseMetaStore::new(self.owner.clone());
+        let store =
+            DatabaseMetaStore::with_history(self.owner.clone(), self.commit_history.clone());
         let (initial_submit, initial_admits) = block_on(async {
             let submit = store.oplog_cursors(space_id).await?;
             let admits = store.admit_cursors(space_id).await?;
@@ -86,7 +85,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             .filter(|(device, _)| *device != local_device)
         {
             let lowered = transaction.to_homebase()?;
-            foreign_writes.extend(history::writes_from_mutations(&lowered.mutations)?);
+            foreign_writes.extend(history::writes_from_mutations(&lowered.mutations));
         }
         runtime.run(ExecutionMode::RemoteApply, |connection| {
             runtime.with_internal_metadata(|| {
@@ -104,7 +103,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
             runtime.with_internal_metadata(|| {
                 if !foreign_writes.is_empty() {
-                    history::record(connection, foreign_writes)?;
+                    self.commit_history
+                        .record(connection, foreign_writes.iter().cloned().collect())?;
                 }
                 block_on(store.mark_admits_applied(space_id, apply_to))?;
                 Ok(())
@@ -128,26 +128,14 @@ fn apply_transaction(
         return Ok(());
     }
 
-    for operation in transaction.operations() {
-        apply_operation(connection, operation)?;
-    }
-    Ok(())
-}
-
-fn apply_operation(connection: &Connection, operation: &MultiliteOp) -> Result<()> {
-    match operation {
-        MultiliteOp::CreateTable(created) => {
-            connection.execute(created.sql(), ())?;
-            catalog::insert(connection, created)?;
-            Ok(())
-        }
-        MultiliteOp::InsertRows(inserted) => inserted.apply(connection),
-    }
+    transaction.apply(connection)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::catalog;
+    use crate::database::operation::MultiliteOp;
     use crate::database::row::{CapturedRow, InsertRows, StoredValue};
     use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
 
@@ -176,6 +164,7 @@ mod tests {
             &source,
             &[CapturedRow {
                 table: "notes".into(),
+                rowid: 7,
                 values: vec![StoredValue::Integer(7)],
             }],
         )

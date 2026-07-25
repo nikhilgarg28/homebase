@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use homebase::Server;
 use homebase::actor::{SpaceHandle, Spawner};
 use homebase::storage::MemoryStore;
-use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, SubmitMode};
+use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, OrderedMetaStore, SubmitMode};
 use homebase_client::server::offline_router;
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::{Key, MAX_COMPONENT_LEN};
-use homebase_core::tag::{DeviceSeq, Mutation};
+use homebase_core::tag::{DeviceChecksum, DeviceSeq, Mutation};
 use rusqlite::OptionalExtension;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
@@ -129,10 +129,14 @@ fn create_operation(name: &str) -> MultiliteOp {
 }
 
 fn create_proposal(snapshot: SnapshotDescriptor, name: &str) -> CommitProposal {
-    let MultiliteOp::CreateTable(created) = create_operation(name) else {
-        unreachable!("create operation returned another operation kind")
-    };
-    CommitProposal::create_table(snapshot, IsolationLevel::Snapshot, created).unwrap()
+    let transaction = MultiliteTransaction::new(vec![create_operation(name)]).unwrap();
+    CommitProposal::from_transaction(
+        snapshot,
+        IsolationLevel::Snapshot,
+        transaction,
+        std::iter::empty(),
+    )
+    .unwrap()
 }
 
 fn submit_direct<H: ServerHandle + Send + Sync + 'static>(
@@ -702,12 +706,10 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].seq, DeviceSeq(1));
     assert!(pending[0].on_accept.is_empty());
-    assert_eq!(
-        pending[0].on_reject,
-        [pending::Effect::DropTable {
-            name: "notes".into()
-        }]
-    );
+    assert!(matches!(
+        pending[0].on_reject.as_slice(),
+        [pending::Effect::DropTable { created }] if created.table_name() == "notes"
+    ));
 
     drop(runtime);
     drop(database);
@@ -2321,11 +2323,11 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
     let first = create_proposal(snapshot.logical, "notes");
     let conflict = create_proposal(snapshot.logical, "NOTES");
     let last = create_proposal(snapshot.logical, "tasks");
-    let expected_keys = [&first, &last]
+    let expected_mutations = [&first, &last]
         .into_iter()
         .flat_map(|proposal| proposal.to_homebase().unwrap().0)
-        .map(|mutation| mutation.key().clone())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<Vec<_>>();
+    let expected_writes = history::writes_from_mutations(&expected_mutations);
 
     let results = database
         .commit_proposal_group_serial(&[&first, &first, &conflict, &last])
@@ -2360,7 +2362,7 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
             .unwrap(),
         [history::CommitRecord {
             commit_seq: crate::commit::snapshot::CommitSeq(1),
-            keys: expected_keys,
+            writes: expected_writes,
         }]
     );
     assert_eq!(
@@ -2370,6 +2372,70 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
             disposition: CommitDisposition::AlreadyCommitted,
         }
     );
+}
+
+#[test]
+fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("atomic-snapshot.sqlite")).unwrap();
+    let space = database.database_id.space_id();
+    let device = database.client.device();
+
+    let snapshot = database
+        .capture_branch_snapshot_after_physical(true, || {
+            database
+                .owner
+                .with_savepoint("__multilite__snapshot_race", |connection| {
+                    database.commit_history.record(
+                        connection,
+                        vec![history::WriteRegion::Point(
+                            Key::from_bytes([b"test".as_slice(), b"write".as_slice()]).unwrap(),
+                        )],
+                    )?;
+                    let metadata =
+                        OrderedMetaStore::new(SqliteOrderedStore::new(database.owner.clone()));
+                    block_on(async {
+                        let reserved = metadata
+                            .reserve_commit(space, 0, Vec::new(), SubmitMode::Unchecked)
+                            .await?;
+                        metadata.commit(space, reserved, Vec::new()).await?;
+                        metadata
+                            .append_admits(
+                                space,
+                                &homebase_core::messages::PullResponse {
+                                    after: AdmissionSeq(0),
+                                    through: AdmissionSeq(1),
+                                    batches: vec![homebase_core::messages::AdmittedBatch {
+                                        admission_seq: AdmissionSeq(1),
+                                        device,
+                                        device_seq: DeviceSeq(1),
+                                        checksum: DeviceChecksum::EMPTY,
+                                        entries: Vec::new(),
+                                    }],
+                                },
+                            )
+                            .await?;
+                        metadata.mark_admits_applied(space, AdmissionSeq(2)).await?;
+                        Ok::<_, Error>(())
+                    })
+                })
+        })
+        .unwrap();
+
+    assert_eq!(
+        snapshot.logical.commit_seq,
+        crate::commit::snapshot::CommitSeq(0)
+    );
+    assert_eq!(snapshot.logical.submit_cursors, OplogCursors::default());
+    assert_eq!(snapshot.logical.authority_applied_through, AdmissionSeq(0));
+
+    let current = database.capture_branch_snapshot(false).unwrap();
+    assert_eq!(
+        current.logical.commit_seq,
+        crate::commit::snapshot::CommitSeq(1)
+    );
+    assert_eq!(current.logical.submit_cursors.tail, DeviceSeq(2));
+    assert_eq!(current.logical.authority_applied_through, AdmissionSeq(1));
 }
 
 #[test]

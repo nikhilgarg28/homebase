@@ -148,19 +148,6 @@ pub fn by_id(connection: &Connection, table: TableId) -> Result<Option<CreateTab
         .transpose()
 }
 
-/// Application tables currently carrying stable Multilite schema identities.
-pub fn table_names(connection: &Connection) -> Result<Vec<String>> {
-    let mut statement = connection.prepare(&format!(
-        "SELECT definition FROM {TABLE} WHERE schema_name = ?1 ORDER BY table_name"
-    ))?;
-    statement
-        .query_map([MAIN_SCHEMA], |row| row.get::<_, Vec<u8>>(0))?
-        .map(|definition| {
-            decode_definition(&definition?).map(|created| created.table_name().to_owned())
-        })
-        .collect()
-}
-
 fn decode_definition(frame: &[u8]) -> Result<CreateTable> {
     CreateTable::decode(frame).map_err(|_| Error::InvalidDatabase("schema catalog is malformed"))
 }

@@ -25,19 +25,34 @@ multilite
   quarantine state until a logical import/diff exists, since repairing the page
   map alone cannot create the missing Homebase operation.
 
-- Generalize canonical OCC history before branch support expands beyond
-  insert-only snapshot updates. Every canonical transaction advances
-  `ApplySeq`, including serialized DDL/DML, remote replay, and rejection repair.
-  Today stale INSERT collisions are also rejected by typed proposal history,
-  schema fingerprints, or SQLite constraint replay. UPDATE, DELETE, richer
-  constraints, and concurrent DDL need one typed local-apply record (or an
-  explicit all-range barrier) for every canonical transaction so no `ApplySeq`
-  interval is invisible to local OCC.
+- Centralize local physical-schema validation under that foreign-writer and
+  corruption boundary. Logical `MultiliteOp`s now completely describe canonical
+  materialization, so proposals no longer carry touched-table fingerprints or a
+  SQLite changeset. Have the committer maintain and validate one physical
+  schema/catalog generation at snapshot issue and canonical apply. A mismatch
+  should detect an out-of-band SQLite schema change and enter the same
+  externally-modified/quarantine path; schema revision and keyspace IDs plus
+  range assertions remain the distributed DDL/DML conflict mechanism.
 
-- Support DDL inside managed snapshot updates only after it has a stop-the-world
-  committer path and a logical schema proposal. It currently remains available
-  through direct serialized execution; private branch proposals deliberately
-  reject schema changes.
+- Measure and reduce private-transaction startup overhead before pooling branch
+  connections blindly. The normal writable path still opens an unused baseline
+  Branch VFS connection retained for SQLite Session capture; split that into an
+  opt-in capture constructor. Drop the physical branch as soon as its logical
+  manifest is owned instead of retaining it through commit disposition or
+  authority work. Benchmark small and large schemas, then consider pooling
+  companion canonical readers, incrementally caching WAL-derived snapshot maps,
+  and replacing per-branch VFS registration with one process-wide routing VFS.
+  Reusing a branch SQLite handle itself requires a proven reset/rebind protocol
+  for schema caches, hooks, temp state, overlays, and snapshot identity.
+
+- Add one async authority actor per database/space alongside the SQLite
+  committer. It owns transport state, push/pull coalescing, retry/backoff, and
+  authority request ordering; public push/pull sends commands with oneshot
+  replies. Split each workflow into committer-owned prepare, actor-owned network
+  I/O, and committer-owned checked completion/apply phases. The committer must
+  never await the authority actor while the actor is waiting for a committer
+  reply; completion messages carry operation ids and expected cursor snapshots
+  so stale responses are rejected or retried idempotently.
 
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?
@@ -81,13 +96,12 @@ replies, and borrowed-scope permits landed in `b763fee`):
   dropping a caller never cancels work after it may have committed, and network
   I/O is never awaited while a canonical SQLite transaction is open.
 
-Live queries
+Live queries, add db.watch api
 
 Conformance suite
 
 Store a single metadata table and put everything in it as triples of namespace, key, value
 
-use db.view, db.update, db.watch api
 
 Change name of column from name-{name} to just <name> or <name>...[hash]
 

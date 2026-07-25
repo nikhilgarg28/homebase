@@ -9,7 +9,10 @@ use std::sync::mpsc;
 use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use parking_lot::Mutex;
+use rusqlite::Connection;
 
+use crate::Result;
+use crate::commit::history::{self, WriteRegion};
 use crate::commit::snapshot::CommitSeq;
 
 const COMMAND_CAPACITY: usize = 64;
@@ -38,6 +41,38 @@ impl HistoryPins {
 pub struct HistoryPin {
     commit_seq: CommitSeq,
     pins: HistoryPins,
+}
+
+/// Shared owner of canonical sequence advancement, OCC retention, and pins.
+#[derive(Clone, Default)]
+pub struct CommitHistory {
+    pins: HistoryPins,
+}
+
+impl CommitHistory {
+    /// Current canonical visibility sequence.
+    pub fn current(&self, connection: &Connection) -> Result<CommitSeq> {
+        history::current(connection)
+    }
+
+    /// Pin retained OCC evidence for one writable branch.
+    pub fn pin(&self, commit_seq: CommitSeq) -> HistoryPin {
+        self.pins.register(commit_seq)
+    }
+
+    /// Publish one canonical transition in the caller's SQLite transaction.
+    pub fn record(&self, connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
+        history::record(connection, writes)
+    }
+
+    /// Prune through the oldest writable snapshot, or through current if idle.
+    pub fn prune(&self, connection: &Connection) -> Result<usize> {
+        let through = match self.pins.oldest() {
+            Some(oldest) => oldest,
+            None => history::current(connection)?,
+        };
+        history::prune(connection, through)
+    }
 }
 
 impl Drop for HistoryPin {

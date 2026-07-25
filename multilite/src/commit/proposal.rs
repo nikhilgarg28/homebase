@@ -21,22 +21,20 @@ use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
 use crate::branch::changeset::CapturedChangeset;
+use crate::commit::committer::CommitHistory;
 use crate::commit::footprint::ConflictFootprint;
-use crate::commit::history;
+use crate::commit::history::{self, WriteRegion};
 use crate::commit::snapshot::SnapshotDescriptor;
-use crate::database::catalog;
 use crate::database::isolation::IsolationLevel;
 use crate::database::operation::MultiliteOp;
 use crate::database::row::{CapturedRow, InsertRows};
-use crate::database::schema::CreateTable;
 use crate::database::transaction::MultiliteTransaction;
 use crate::{Error, Result};
 
-const PROPOSAL_FRAME_VERSION: u8 = 2;
+const PROPOSAL_FRAME_VERSION: u8 = 3;
 const TAG_PROPOSAL_ID: u8 = 1;
 const TAG_SNAPSHOT: u8 = 2;
 const TAG_ISOLATION: u8 = 3;
-const TAG_CHANGESET: u8 = 4;
 const TAG_TRANSACTION: u8 = 5;
 const TAG_WRITE: u8 = 10;
 const TAG_CONSTRAINT: u8 = 11;
@@ -64,7 +62,6 @@ pub struct CommitProposal {
     id: ProposalId,
     snapshot: SnapshotDescriptor,
     isolation: IsolationLevel,
-    changeset: Option<CapturedChangeset>,
     transaction: MultiliteTransaction,
     footprint: ConflictFootprint,
 }
@@ -87,11 +84,11 @@ pub struct CommitReceipt {
 pub struct PreparedCommit {
     id: ProposalId,
     hash: [u8; 32],
-    writes: BTreeSet<Key>,
+    writes: Vec<WriteRegion>,
 }
 
 impl PreparedCommit {
-    pub fn writes(&self) -> &BTreeSet<Key> {
+    pub fn writes(&self) -> &[WriteRegion] {
         &self.writes
     }
 }
@@ -103,7 +100,7 @@ pub enum PrepareOutcome {
 }
 
 impl CommitProposal {
-    /// Lower one insert-only captured branch into an owned commit proposal.
+    /// Lower one insert-only captured branch into an owned logical proposal.
     pub fn from_captured(
         snapshot: SnapshotDescriptor,
         isolation: IsolationLevel,
@@ -119,33 +116,24 @@ impl CommitProposal {
             .map_err(invalid_changeset)?;
         let operations = lower_insert_operations(&changeset, connection)?;
         let transaction = MultiliteTransaction::new(operations)?;
+        Self::from_transaction(snapshot, isolation, transaction, reads).map(Some)
+    }
+
+    /// Build one proposal from a complete ordered logical transaction.
+    pub fn from_transaction(
+        snapshot: SnapshotDescriptor,
+        isolation: IsolationLevel,
+        transaction: MultiliteTransaction,
+        reads: impl IntoIterator<Item = Key>,
+    ) -> Result<Self> {
         let (_, mut footprint) = transaction.to_homebase()?.into_parts();
         for read in reads {
             footprint.add_read(read);
         }
-        Ok(Some(Self {
-            id: ProposalId::new(),
-            snapshot,
-            isolation,
-            changeset: Some(changeset),
-            transaction,
-            footprint,
-        }))
-    }
-
-    /// Build one owned proposal for an already-validated table creation.
-    pub fn create_table(
-        snapshot: SnapshotDescriptor,
-        isolation: IsolationLevel,
-        created: CreateTable,
-    ) -> Result<Self> {
-        let transaction = MultiliteTransaction::new(vec![MultiliteOp::CreateTable(created)])?;
-        let (_, footprint) = transaction.to_homebase()?.into_parts();
         Ok(Self {
             id: ProposalId::new(),
             snapshot,
             isolation,
-            changeset: None,
             transaction,
             footprint,
         })
@@ -182,46 +170,13 @@ impl CommitProposal {
         Ok((mutations, assertions))
     }
 
-    /// Cross-check physical replay data against the logical operation envelope.
-    pub fn validate_against(&self, connection: &Connection) -> Result<()> {
-        if !has_valid_replay_shape(self) {
-            return Err(Error::InvalidCommitProposal(
-                "proposal has invalid canonical replay data".into(),
-            ));
-        }
-        match &self.changeset {
-            Some(changeset) => {
-                changeset
-                    .validate_tables(connection)
-                    .map_err(commit_changeset)?;
-                let operations = lower_insert_operations(changeset, connection)?;
-                if operations != self.transaction.operations() {
-                    return Err(Error::InvalidCommitProposal(
-                        "captured SQLite changes contradict the logical transaction".into(),
-                    ));
-                }
-            }
-            None => {
-                let [MultiliteOp::CreateTable(created)] = self.transaction.operations() else {
-                    unreachable!("replay shape checked above")
-                };
-                let decoded = CreateTable::decode(&created.encode()).map_err(|error| {
-                    Error::InvalidCommitProposal(format!(
-                        "invalid CREATE TABLE replay data: {error}"
-                    ))
-                })?;
-                if &decoded != created {
-                    return Err(Error::InvalidCommitProposal(
-                        "CREATE TABLE replay data is not canonical".into(),
-                    ));
-                }
-            }
-        }
+    /// Cross-check the typed footprint against the immutable transaction.
+    pub fn validate(&self) -> Result<()> {
         let (_, mandatory) = self.transaction.to_homebase()?.into_parts();
         self.validate_mandatory_footprint(&mandatory)
     }
 
-    /// Encode every input needed for validation, replay, and remote submission.
+    /// Encode every input needed for validation, materialization, and submission.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = Writer::new();
         writer.u8(PROPOSAL_FRAME_VERSION);
@@ -232,13 +187,6 @@ impl CommitProposal {
             TAG_ISOLATION,
             &[encode_isolation(self.isolation)],
         )?;
-        if let Some(changeset) = &self.changeset {
-            put_field(
-                &mut writer,
-                TAG_CHANGESET,
-                &changeset.encode().map_err(invalid_changeset)?,
-            )?;
-        }
         put_field(&mut writer, TAG_TRANSACTION, &self.transaction.encode())?;
         for key in self.footprint.writes() {
             put_field(&mut writer, TAG_WRITE, &key.encode())?;
@@ -261,7 +209,6 @@ impl CommitProposal {
         let mut id = None;
         let mut snapshot = None;
         let mut isolation = None;
-        let mut changeset = None;
         let mut transaction = None;
         let mut writes = Vec::new();
         let mut constraints = Vec::new();
@@ -276,12 +223,6 @@ impl CommitProposal {
                     tag,
                 )?,
                 TAG_ISOLATION => set_once(&mut isolation, decode_isolation(value)?, tag)?,
-                TAG_CHANGESET => set_once(
-                    &mut changeset,
-                    CapturedChangeset::decode(value)
-                        .map_err(|error| ProposalCodecError::InvalidChangeset(error.to_string()))?,
-                    tag,
-                )?,
                 TAG_TRANSACTION => set_once(
                     &mut transaction,
                     MultiliteTransaction::decode(value).map_err(|error| {
@@ -302,13 +243,9 @@ impl CommitProposal {
             id: id.ok_or(ProposalCodecError::MissingField(TAG_PROPOSAL_ID))?,
             snapshot: snapshot.ok_or(ProposalCodecError::MissingField(TAG_SNAPSHOT))?,
             isolation: isolation.ok_or(ProposalCodecError::MissingField(TAG_ISOLATION))?,
-            changeset,
             transaction: transaction.ok_or(ProposalCodecError::MissingField(TAG_TRANSACTION))?,
             footprint: ConflictFootprint::from_parts(writes, constraints, reads),
         };
-        if !has_valid_replay_shape(&proposal) {
-            return Err(ProposalCodecError::InvalidReplay);
-        }
         let (_, mandatory) = proposal
             .transaction
             .to_homebase()
@@ -475,7 +412,11 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
     match prepare(connection, proposal, &BTreeSet::new())? {
         PrepareOutcome::AlreadyCommitted(receipt) => Ok(receipt),
         PrepareOutcome::Prepared(prepared) => {
-            let commit_seq = finalize_group(connection, std::slice::from_ref(&prepared))?;
+            let commit_seq = finalize_group(
+                connection,
+                &CommitHistory::default(),
+                std::slice::from_ref(&prepared),
+            )?;
             Ok(CommitReceipt {
                 commit_seq,
                 disposition: CommitDisposition::Applied,
@@ -492,7 +433,7 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
 pub fn prepare(
     connection: &Connection,
     proposal: &CommitProposal,
-    accepted_writes: &BTreeSet<Key>,
+    accepted_writes: &BTreeSet<WriteRegion>,
 ) -> Result<PrepareOutcome> {
     if let Some(receipt) = committed_receipt(connection, proposal)? {
         return Ok(PrepareOutcome::AlreadyCommitted(receipt));
@@ -504,11 +445,11 @@ pub fn prepare(
             "proposal snapshot is newer than canonical SQLite".into(),
         ));
     }
-    proposal.validate_against(connection)?;
+    proposal.validate()?;
     for committed in history::history_after(connection, proposal.snapshot().commit_seq)? {
         if proposal
             .footprint()
-            .conflicts_with_writes(proposal.isolation(), &committed.keys)
+            .conflicts_with_writes(proposal.isolation(), &committed.writes)
         {
             return Err(Error::CommitConflict(format!(
                 "proposal conflicts with local commit sequence {}",
@@ -525,7 +466,7 @@ pub fn prepare(
         ));
     }
     let lowered = proposal.transaction().to_homebase()?;
-    let writes = history::writes_from_mutations(&lowered.mutations)?;
+    let writes = history::writes_from_mutations(&lowered.mutations);
     let encoded = proposal.encode()?;
     let hash = proposal_hash(&encoded);
     apply_canonical(connection, proposal)?;
@@ -539,6 +480,7 @@ pub fn prepare(
 /// Publish one canonical visibility transition and all proposal receipts.
 pub fn finalize_group(
     connection: &Connection,
+    history: &CommitHistory,
     prepared: &[PreparedCommit],
 ) -> Result<crate::commit::snapshot::CommitSeq> {
     if prepared.is_empty() {
@@ -556,7 +498,7 @@ pub fn finalize_group(
         }
         writes.extend(commit.writes.iter().cloned());
     }
-    let commit_seq = history::record(connection, writes)?;
+    let commit_seq = history.record(connection, writes.into_iter().collect())?;
     for commit in prepared {
         connection.execute(
             &format!(
@@ -574,31 +516,13 @@ pub fn finalize_group(
 }
 
 fn apply_canonical(connection: &Connection, proposal: &CommitProposal) -> Result<()> {
-    if let Some(changeset) = &proposal.changeset {
-        return changeset.apply(connection).map_err(commit_changeset);
-    }
-    let [MultiliteOp::CreateTable(created)] = proposal.transaction.operations() else {
-        return Err(Error::InvalidCommitProposal(
-            "proposal has no canonical replay data".into(),
-        ));
-    };
-    connection
-        .execute(created.sql(), ())
-        .map_err(|error| Error::CommitConflict(error.to_string()))?;
-    catalog::insert(connection, created).map_err(|error| match error {
-        Error::Sqlite(error) => Error::CommitConflict(error.to_string()),
-        error => error,
-    })
-}
-
-fn has_valid_replay_shape(proposal: &CommitProposal) -> bool {
-    match (&proposal.changeset, proposal.transaction.operations()) {
-        (None, [MultiliteOp::CreateTable(_)]) => true,
-        (Some(_), operations) => operations
-            .iter()
-            .all(|operation| matches!(operation, MultiliteOp::InsertRows(_))),
-        _ => false,
-    }
+    proposal
+        .transaction
+        .apply(connection)
+        .map_err(|error| match error {
+            Error::Sqlite(error) => Error::CommitConflict(error.to_string()),
+            error => error,
+        })
 }
 
 fn committed_receipt(
@@ -643,6 +567,7 @@ fn lower_insert_operations(
         canonical.make_ascii_lowercase();
         tables.entry(canonical).or_default().push(CapturedRow {
             table: inserted.table,
+            rowid: inserted.rowid,
             values: inserted.values,
         });
     }
@@ -665,24 +590,6 @@ fn lower_insert_operations(
 
 fn invalid_changeset(error: impl fmt::Display) -> Error {
     Error::InvalidCommitProposal(error.to_string())
-}
-
-fn commit_changeset(error: crate::branch::changeset::ChangesetError) -> Error {
-    use crate::branch::changeset::ChangesetError;
-
-    match error {
-        ChangesetError::Malformed(_)
-        | ChangesetError::UnknownTable(_)
-        | ChangesetError::TableWithoutPrimaryKey(_)
-        | ChangesetError::UnsupportedTable { .. }
-        | ChangesetError::UnsupportedChange { .. } => {
-            Error::InvalidCommitProposal(error.to_string())
-        }
-        ChangesetError::Sqlite(_)
-        | ChangesetError::SchemaChanged
-        | ChangesetError::Conflict(_)
-        | ChangesetError::ForeignKeyViolation => Error::CommitConflict(error.to_string()),
-    }
 }
 
 fn encode_isolation(isolation: IsolationLevel) -> u8 {
@@ -765,11 +672,9 @@ pub enum ProposalCodecError {
     InvalidUuid,
     InvalidIsolation,
     InvalidSnapshot(String),
-    InvalidChangeset(String),
     InvalidTransaction(String),
     InvalidKey(String),
     InvalidFootprint,
-    InvalidReplay,
 }
 
 impl fmt::Display for ProposalCodecError {
@@ -783,14 +688,10 @@ impl fmt::Display for ProposalCodecError {
             Self::InvalidUuid => formatter.write_str("proposal id is not a UUID v4"),
             Self::InvalidIsolation => formatter.write_str("proposal isolation level is invalid"),
             Self::InvalidSnapshot(error) => write!(formatter, "invalid snapshot: {error}"),
-            Self::InvalidChangeset(error) => write!(formatter, "invalid changeset: {error}"),
             Self::InvalidTransaction(error) => write!(formatter, "invalid transaction: {error}"),
             Self::InvalidKey(error) => write!(formatter, "invalid footprint key: {error}"),
             Self::InvalidFootprint => {
                 formatter.write_str("proposal footprint is non-canonical or contradictory")
-            }
-            Self::InvalidReplay => {
-                formatter.write_str("proposal has invalid canonical replay data")
             }
         }
     }
@@ -905,10 +806,8 @@ mod tests {
     }
 
     fn create_proposal(name: &str, snapshot: SnapshotDescriptor) -> CommitProposal {
-        CommitProposal::create_table(
-            snapshot,
-            IsolationLevel::Snapshot,
-            CreateTable::new(
+        let transaction =
+            MultiliteTransaction::new(vec![MultiliteOp::CreateTable(CreateTable::new(
                 &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
@@ -919,7 +818,13 @@ mod tests {
                         primary_key: true,
                     }],
                 },
-            ),
+            ))])
+            .unwrap();
+        CommitProposal::from_transaction(
+            snapshot,
+            IsolationLevel::Snapshot,
+            transaction,
+            std::iter::empty(),
         )
         .unwrap()
     }
@@ -950,13 +855,13 @@ mod tests {
     }
 
     #[test]
-    fn create_table_proposal_roundtrips_replays_and_deduplicates() {
+    fn create_table_proposal_roundtrips_materializes_and_deduplicates() {
         let fixture = Fixture::new();
         let proposal = create_proposal("tasks", descriptor());
         let decoded = CommitProposal::decode(&proposal.encode().unwrap()).unwrap();
         assert_eq!(decoded, proposal);
         let lowered = proposal.transaction().to_homebase().unwrap();
-        let expected_keys = history::writes_from_mutations(&lowered.mutations).unwrap();
+        let expected_writes = history::writes_from_mutations(&lowered.mutations);
 
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
@@ -981,7 +886,7 @@ mod tests {
             history::history_after(&fixture.writer, CommitSeq(0)).unwrap(),
             [history::CommitRecord {
                 commit_seq: CommitSeq(1),
-                keys: expected_keys,
+                writes: expected_writes,
             }]
         );
     }
@@ -1009,18 +914,6 @@ mod tests {
             catalog::by_name(&fixture.writer, "projects")
                 .unwrap()
                 .is_some()
-        );
-    }
-
-    #[test]
-    fn insert_proposal_without_its_changeset_is_rejected() {
-        let fixture = Fixture::new();
-        let mut proposal = insert_proposal(&fixture, IsolationLevel::Snapshot, None);
-        proposal.changeset = None;
-
-        assert_eq!(
-            CommitProposal::decode(&proposal.encode().unwrap()),
-            Err(ProposalCodecError::InvalidReplay)
         );
     }
 
@@ -1117,7 +1010,7 @@ mod tests {
             [],
         );
         let lowered = proposal.transaction().to_homebase().unwrap();
-        let expected_keys = history::writes_from_mutations(&lowered.mutations).unwrap();
+        let expected_writes = history::writes_from_mutations(&lowered.mutations);
 
         assert_eq!(
             apply(&fixture.writer, &proposal).unwrap(),
@@ -1138,7 +1031,7 @@ mod tests {
             history::history_after(&fixture.writer, CommitSeq(0)).unwrap(),
             vec![history::CommitRecord {
                 commit_seq: CommitSeq(1),
-                keys: expected_keys,
+                writes: expected_writes,
             }]
         );
         assert_eq!(

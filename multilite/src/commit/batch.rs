@@ -137,19 +137,15 @@ mod tests {
     use super::*;
     use crate::commit::snapshot::{CommitSeq, SnapshotDescriptor};
     use crate::database::isolation::IsolationLevel;
+    use crate::database::operation::MultiliteOp;
     use crate::database::schema::{
         CreateColumn, CreateTable, CreateTableSpec, DeclaredType, SqlName,
     };
+    use crate::database::transaction::MultiliteTransaction;
 
     fn proposal(name: &str) -> CommitProposal {
-        CommitProposal::create_table(
-            SnapshotDescriptor {
-                commit_seq: CommitSeq(0),
-                authority_applied_through: AdmissionSeq(0),
-                submit_cursors: OplogCursors::default(),
-            },
-            IsolationLevel::Snapshot,
-            CreateTable::new(
+        let transaction =
+            MultiliteTransaction::new(vec![MultiliteOp::CreateTable(CreateTable::new(
                 &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
@@ -160,7 +156,17 @@ mod tests {
                         primary_key: true,
                     }],
                 },
-            ),
+            ))])
+            .unwrap();
+        CommitProposal::from_transaction(
+            SnapshotDescriptor {
+                commit_seq: CommitSeq(0),
+                authority_applied_through: AdmissionSeq(0),
+                submit_cursors: OplogCursors::default(),
+            },
+            IsolationLevel::Snapshot,
+            transaction,
+            std::iter::empty(),
         )
         .unwrap()
     }

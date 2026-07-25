@@ -5,7 +5,9 @@ use std::fmt;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
+use rusqlite::Connection;
 
+use super::catalog;
 use super::row::{InsertRows, RowHomebaseOp};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::commit::footprint::ConflictFootprint;
@@ -99,6 +101,17 @@ impl MultiliteOp {
             footprint,
         })
     }
+
+    /// Materialize this logical operation in canonical SQLite.
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        match self {
+            Self::CreateTable(created) => {
+                connection.execute(created.sql(), ())?;
+                catalog::insert(connection, created)
+            }
+            Self::InsertRows(inserted) => inserted.apply(connection),
+        }
+    }
 }
 
 /// Failure to decode one logical operation frame.
@@ -169,6 +182,7 @@ mod tests {
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
+                rowid: 7,
                 values: vec![StoredValue::Integer(7)],
             }],
         )

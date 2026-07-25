@@ -131,3 +131,70 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
         );
     }
 }
+
+#[test]
+fn disjoint_mixed_schema_and_row_transactions_converge_in_manifest_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("mixed-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("mixed-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute("INSERT INTO notes VALUES (1, 'first')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    second
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE tasks (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute("INSERT INTO tasks VALUES ('a', 'second')", ())?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    assert_eq!(tables(&first), tables(&second));
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, body FROM notes", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(1, "first".into())]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, body FROM tasks", (), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [("a".into(), "second".into())]
+        );
+    }
+}

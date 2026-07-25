@@ -1,5 +1,7 @@
 //! Homebase metadata transitions joined to Multilite's local disposition log.
 
+use std::path::PathBuf;
+
 use homebase_client::meta::{
     AdmitCursors, ClientState, CodecRecord, Committed, DeviceOp, HeldLease, MetaStore,
     OplogCursors, OrderedMetaStore, ReservedCommit, SubmitMode,
@@ -14,7 +16,9 @@ use homebase_core::tag::{DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq};
 
 use super::pending;
 use crate::Error;
-use crate::commit::history;
+use crate::branch::snapshot::PinnedSnapshot;
+use crate::branch::{OverlayOptions, WritableBranch};
+use crate::commit::committer::CommitHistory;
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
 
@@ -22,13 +26,36 @@ use crate::metastore::SqliteOrderedStore;
 pub struct DatabaseMetaStore {
     owner: ConnectionOwner,
     inner: OrderedMetaStore<SqliteOrderedStore>,
+    commit_history: CommitHistory,
+    branch_files: Option<(PathBuf, PathBuf)>,
 }
 
 impl DatabaseMetaStore {
+    #[cfg(test)]
     pub fn new(owner: ConnectionOwner) -> Self {
+        Self::with_history(owner, CommitHistory::default())
+    }
+
+    pub fn with_history(owner: ConnectionOwner, commit_history: CommitHistory) -> Self {
         Self {
             inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
             owner,
+            commit_history,
+            branch_files: None,
+        }
+    }
+
+    pub fn with_database(
+        owner: ConnectionOwner,
+        commit_history: CommitHistory,
+        database_path: PathBuf,
+        wal_path: PathBuf,
+    ) -> Self {
+        Self {
+            inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
+            owner,
+            commit_history,
+            branch_files: Some((database_path, wal_path)),
         }
     }
 }
@@ -122,22 +149,42 @@ impl MetaStore for DatabaseMetaStore {
         to: DeviceSeq,
         expected: OplogCursors,
     ) -> Result<(), StorageError> {
+        let current = self.inner.oplog_cursors(space).await?;
+        let repair = if current == expected {
+            let through = DeviceSeq(
+                expected
+                    .tail
+                    .0
+                    .checked_sub(1)
+                    .ok_or_else(|| StorageError("submit tail cannot be zero".into()))?,
+            );
+            let active = self.inner.oplog(space, expected.neck, through).await?;
+            self.owner
+                .with_connection(|connection| pending::prepare_rejection(connection, &active))
+                .map_err(storage_error)?
+        } else {
+            None
+        };
+
+        if let (Some(repair), Some((database_path, wal_path))) =
+            (&repair, self.branch_files.as_ref())
+        {
+            let snapshot = PinnedSnapshot::capture(database_path, wal_path)
+                .map_err(|error| StorageError(error.to_string()))?;
+            let branch = WritableBranch::open(snapshot, OverlayOptions::default())
+                .map_err(|error| StorageError(error.to_string()))?;
+            repair.apply(branch.connection()).map_err(storage_error)?;
+        }
+
         self.owner
             .with_savepoint("__multilite__rollback", |connection| {
                 let current = pollster::block_on(self.inner.oplog_cursors(space))?;
-                if current == expected {
-                    let through = DeviceSeq(
-                        expected
-                            .tail
-                            .0
-                            .checked_sub(1)
-                            .ok_or(Error::InvalidDatabase("submit tail cannot be zero"))?,
-                    );
-                    let active =
-                        pollster::block_on(self.inner.oplog(space, expected.neck, through))?;
-                    if let Some(writes) = pending::reject_active(connection, &active)? {
-                        history::record(connection, writes)?;
-                    }
+                if current == expected
+                    && let Some(repair) = &repair
+                {
+                    repair.apply(connection)?;
+                    self.commit_history
+                        .record(connection, repair.writes().to_vec())?;
                 }
                 pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?;
                 Ok(())

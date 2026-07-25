@@ -176,6 +176,13 @@ impl Default for AdmitCursors {
     }
 }
 
+/// Outbound and inbound cursors observed from one ordered-store view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CursorSnapshot {
+    pub oplog: OplogCursors,
+    pub admits: AdmitCursors,
+}
+
 /// The ver high-water: every commit stamps its entries with consecutive
 /// vers above it and advances it past them; every pull raises it to the
 /// maximum ver observed.
@@ -703,6 +710,23 @@ pub struct OrderedMetaStore<S> {
 impl<S: OrderedStore> OrderedMetaStore<S> {
     pub fn new(store: S) -> Self {
         Self { store }
+    }
+
+    /// Read both cursor records through the caller's current store view.
+    ///
+    /// This inherent method intentionally does not require `S: Sync`, allowing
+    /// callers to bind it to a transaction-local read snapshot. Atomicity
+    /// across the two records follows from that supplied view.
+    pub async fn cursor_snapshot(&self, space: SpaceId) -> Result<CursorSnapshot, StorageError> {
+        let oplog = match self.store.get(&cursors_key(space)).await? {
+            Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
+            None => OplogCursors::default(),
+        };
+        let admits = match self.store.get(&admit_cursors_key(space)).await? {
+            Some(bytes) => AdmitCursors::decode(&bytes).expect("undecodable admit cursors"),
+            None => AdmitCursors::default(),
+        };
+        Ok(CursorSnapshot { oplog, admits })
     }
 }
 

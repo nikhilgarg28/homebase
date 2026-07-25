@@ -111,6 +111,11 @@ impl PinnedSnapshot {
         &self.wal_path
     }
 
+    /// Read metadata from the same SQLite transaction that pins this image.
+    pub(crate) fn with_reader<T>(&self, operation: impl FnOnce(&Connection) -> T) -> T {
+        operation(&self._reader)
+    }
+
     pub fn into_snapshot_and_pin(self) -> (SqliteSnapshot, SnapshotPin) {
         let Self {
             snapshot,

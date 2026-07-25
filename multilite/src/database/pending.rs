@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use homebase_client::meta::DeviceOp;
-use homebase_core::key::Key;
 use homebase_core::reader::Reader;
 use homebase_core::tag::DeviceSeq;
 use homebase_core::writer::Writer;
@@ -13,8 +12,9 @@ use rusqlite::{Connection, params};
 use super::catalog;
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
+use super::schema::CreateTable;
 use super::transaction::MultiliteTransaction;
-use crate::commit::history;
+use crate::commit::history::{self, WriteRegion};
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__pending";
@@ -25,14 +25,14 @@ const TAG_TRANSACTION: u8 = 2;
 const TAG_ACCEPT_EFFECT: u8 = 3;
 const TAG_REJECT_EFFECT: u8 = 4;
 
-const EFFECT_FRAME_VERSION: u8 = 1;
+const EFFECT_FRAME_VERSION: u8 = 2;
 const DROP_TABLE_EFFECT: u8 = 1;
 const DELETE_ROWS_EFFECT: u8 = 2;
 
 /// A local effect to run when a speculative transaction gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    DropTable { name: String },
+    DropTable { created: CreateTable },
     DeleteRows { inserted: InsertRows },
 }
 
@@ -43,6 +43,38 @@ pub struct PendingTransaction {
     pub transaction: MultiliteTransaction,
     pub on_accept: Vec<Effect>,
     pub on_reject: Vec<Effect>,
+}
+
+/// Exact inverse of one authenticated active submit window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectionRepair {
+    pending: Vec<PendingTransaction>,
+    writes: Vec<WriteRegion>,
+}
+
+impl RejectionRepair {
+    /// Logical regions changed when this speculative window is removed.
+    pub fn writes(&self) -> &[WriteRegion] {
+        &self.writes
+    }
+
+    /// Apply the inverse effects and retire their pending rows.
+    ///
+    /// This runs first on a private branch and then in the guarded canonical
+    /// rollback transaction. Re-loading makes the canonical application reject
+    /// a plan prepared for any other pending window.
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        if load(connection)? != self.pending {
+            return Err(Error::StalePushRejection);
+        }
+        for pending in self.pending.iter().rev() {
+            apply_effects(connection, &pending.on_reject)?;
+        }
+        if !self.pending.is_empty() {
+            connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
+        }
+        Ok(())
+    }
 }
 
 impl PendingTransaction {
@@ -121,9 +153,9 @@ impl PendingCodec {
         let mut writer = Writer::new();
         writer.u8(EFFECT_FRAME_VERSION);
         match effect {
-            Effect::DropTable { name } => {
+            Effect::DropTable { created } => {
                 writer.u8(DROP_TABLE_EFFECT);
-                writer.bytes(name.as_bytes());
+                writer.bytes(&created.encode());
             }
             Effect::DeleteRows { inserted } => {
                 writer.u8(DELETE_ROWS_EFFECT);
@@ -143,11 +175,9 @@ impl PendingCodec {
             });
         }
         match reader.u8().ok_or(PendingCodecError::Truncated)? {
-            DROP_TABLE_EFFECT => Ok(Effect::DropTable {
-                name: std::str::from_utf8(reader.rest())
-                    .map_err(|_| PendingCodecError::InvalidUtf8)?
-                    .to_owned(),
-            }),
+            DROP_TABLE_EFFECT => CreateTable::decode(reader.rest())
+                .map(|created| Effect::DropTable { created })
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             DELETE_ROWS_EFFECT => InsertRows::decode(reader.rest())
                 .map(|inserted| Effect::DeleteRows { inserted })
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
@@ -280,12 +310,11 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
     Ok(())
 }
 
-/// Undo and retire the pending transactions represented by one exact active
-/// Homebase window. Transactions are unwound in reverse device order.
-pub fn reject_active(
+/// Authenticate and prepare the inverse of one exact active Homebase window.
+pub fn prepare_rejection(
     connection: &Connection,
     active: &[(DeviceSeq, DeviceOp)],
-) -> Result<Option<BTreeSet<Key>>> {
+) -> Result<Option<RejectionRepair>> {
     let expected = active
         .iter()
         .filter_map(|(seq, operation)| matches!(operation, DeviceOp::Commit { .. }).then_some(*seq))
@@ -304,15 +333,28 @@ pub fn reject_active(
     let mut writes = BTreeSet::new();
     for pending in &pending {
         let lowered = pending.transaction.to_homebase()?;
-        writes.extend(history::writes_from_mutations(&lowered.mutations)?);
+        writes.extend(history::writes_from_mutations(&lowered.mutations));
     }
-    for pending in pending.iter().rev() {
-        apply_effects(connection, &pending.on_reject)?;
-    }
-    if !pending.is_empty() {
-        connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
-    }
-    Ok((!pending.is_empty()).then_some(writes))
+    Ok((!pending.is_empty()).then(|| RejectionRepair {
+        pending,
+        writes: writes.into_iter().collect(),
+    }))
+}
+
+/// Prepare and apply a rejection directly in the caller's transaction.
+///
+/// Kept as the narrow metadata-store boundary; production validates the same
+/// plan on a private branch before invoking it canonically.
+#[cfg(test)]
+pub fn reject_active(
+    connection: &Connection,
+    active: &[(DeviceSeq, DeviceOp)],
+) -> Result<Option<Vec<WriteRegion>>> {
+    let Some(repair) = prepare_rejection(connection, active)? else {
+        return Ok(None);
+    };
+    repair.apply(connection)?;
+    Ok(Some(repair.writes))
 }
 
 /// Verify that every pending transaction still belongs to the active submit log.
@@ -346,7 +388,7 @@ fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) 
         MultiliteOp::CreateTable(created) => (
             Vec::new(),
             vec![Effect::DropTable {
-                name: created.table_name().to_owned(),
+                created: created.clone(),
             }],
         ),
         MultiliteOp::InsertRows(inserted) => (
@@ -361,9 +403,17 @@ fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) 
 fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
     for effect in effects {
         match effect {
-            Effect::DropTable { name } => {
-                connection.execute_batch(&format!("DROP TABLE {}", quote_identifier(name)))?;
-                catalog::remove_by_name(connection, name)?;
+            Effect::DropTable { created } => {
+                if catalog::by_name(connection, created.table_name())?.as_ref() != Some(created) {
+                    return Err(Error::InvalidDatabase(
+                        "pending CREATE TABLE no longer matches SQLite state",
+                    ));
+                }
+                connection.execute_batch(&format!(
+                    "DROP TABLE {}",
+                    quote_identifier(created.table_name())
+                ))?;
+                catalog::remove_by_name(connection, created.table_name())?;
             }
             Effect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
         }
@@ -439,7 +489,6 @@ enum PendingCodecError {
     InvalidTransaction(String),
     InvalidOperation(String),
     UnknownEffect(u8),
-    InvalidUtf8,
     EffectsMismatch,
 }
 
@@ -458,7 +507,6 @@ impl fmt::Display for PendingCodecError {
             }
             Self::InvalidOperation(error) => write!(f, "invalid pending operation: {error}"),
             Self::UnknownEffect(kind) => write!(f, "unknown pending effect {kind}"),
-            Self::InvalidUtf8 => f.write_str("pending effect contains invalid UTF-8"),
             Self::EffectsMismatch => {
                 f.write_str("pending effects contradict their logical operation")
             }
@@ -501,6 +549,7 @@ mod tests {
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
+                rowid: 7,
                 values: vec![StoredValue::Integer(7)],
             }],
         )
@@ -519,29 +568,14 @@ mod tests {
         initialize(&connection).unwrap();
         let later = transaction(operation("tasks"));
         let earlier = transaction(operation("notes"));
+        let expected_later = PendingTransaction::new(DeviceSeq(9), later.clone());
+        let expected_earlier = PendingTransaction::new(DeviceSeq(3), earlier.clone());
         insert(&connection, DeviceSeq(9), &later).unwrap();
         insert(&connection, DeviceSeq(3), &earlier).unwrap();
 
         assert_eq!(
             load(&connection).unwrap(),
-            vec![
-                PendingTransaction {
-                    seq: DeviceSeq(3),
-                    transaction: earlier,
-                    on_accept: Vec::new(),
-                    on_reject: vec![Effect::DropTable {
-                        name: "notes".into()
-                    }],
-                },
-                PendingTransaction {
-                    seq: DeviceSeq(9),
-                    transaction: later,
-                    on_accept: Vec::new(),
-                    on_reject: vec![Effect::DropTable {
-                        name: "tasks".into()
-                    }],
-                },
-            ]
+            vec![expected_earlier, expected_later]
         );
     }
 
@@ -609,6 +643,7 @@ mod tests {
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
+                rowid: 7,
                 values: vec![StoredValue::Integer(7)],
             }],
         )
@@ -624,8 +659,8 @@ mod tests {
             pending[0].on_reject.as_slice(),
             [
                 Effect::DeleteRows { .. },
-                Effect::DropTable { name }
-            ] if name == "notes"
+                Effect::DropTable { created }
+            ] if created.table_name() == "notes"
         ));
         let active = vec![(
             DeviceSeq(1),
@@ -649,6 +684,36 @@ mod tests {
         );
         assert!(catalog::by_name(&connection, "notes").unwrap().is_none());
         assert!(load(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drop_effect_refuses_a_recreated_table_with_the_same_name() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let MultiliteOp::CreateTable(original) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(original.sql(), ()).unwrap();
+        catalog::insert(&connection, &original).unwrap();
+
+        connection.execute("DROP TABLE notes", ()).unwrap();
+        catalog::remove_by_name(&connection, "notes").unwrap();
+        let MultiliteOp::CreateTable(replacement) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(replacement.sql(), ()).unwrap();
+        catalog::insert(&connection, &replacement).unwrap();
+
+        assert!(matches!(
+            apply_effects(&connection, &[Effect::DropTable { created: original }],),
+            Err(Error::InvalidDatabase(
+                "pending CREATE TABLE no longer matches SQLite state"
+            ))
+        ));
+        assert_eq!(
+            catalog::by_name(&connection, "notes").unwrap(),
+            Some(replacement)
+        );
     }
 
     #[test]
@@ -693,7 +758,10 @@ mod tests {
             transaction: transaction(operation("notes")),
             on_accept: Vec::new(),
             on_reject: vec![Effect::DropTable {
-                name: "tasks".into(),
+                created: match operation("tasks") {
+                    MultiliteOp::CreateTable(created) => created,
+                    _ => unreachable!(),
+                },
             }],
         };
 

@@ -30,6 +30,17 @@ pub(crate) struct SqliteOrderedStore {
     owner: ConnectionOwner,
 }
 
+/// Read-only ordered-store view over one already-pinned SQLite transaction.
+pub(crate) struct SqliteSnapshotStore<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> SqliteSnapshotStore<'connection> {
+    pub(crate) fn new(connection: &'connection Connection) -> Self {
+        Self { connection }
+    }
+}
+
 impl SqliteOrderedStore {
     pub(crate) fn new(owner: ConnectionOwner) -> Self {
         Self { owner }
@@ -107,39 +118,12 @@ impl SqliteOrderedStore {
 
     fn get_now(&self, key: &[u8]) -> StoreResult<Option<Vec<u8>>> {
         self.owner
-            .with_connection(|connection| {
-                connection
-                    .query_row(
-                        &format!("SELECT value FROM {META_TABLE} WHERE key = ?1"),
-                        [key],
-                        |row| row.get(0),
-                    )
-                    .optional()
-            })
-            .map_err(storage_error)
+            .with_connection(|connection| get_on(connection, key))
     }
 
     fn scan_now(&self, start: &[u8], end: Option<&[u8]>) -> StoreResult<Vec<Entry>> {
-        self.owner.with_connection(|connection| {
-            let sql = match end {
-                Some(_) => format!(
-                    "SELECT key, value FROM {META_TABLE}
-                     WHERE key >= ?1 AND key < ?2 ORDER BY key"
-                ),
-                None => format!(
-                    "SELECT key, value FROM {META_TABLE}
-                     WHERE key >= ?1 ORDER BY key"
-                ),
-            };
-            let mut statement = connection.prepare(&sql).map_err(storage_error)?;
-            let rows = match end {
-                Some(end) => statement.query_map(params![start, end], read_entry),
-                None => statement.query_map(params![start], read_entry),
-            }
-            .map_err(storage_error)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(storage_error)
-        })
+        self.owner
+            .with_connection(|connection| scan_on(connection, start, end))
     }
 
     fn apply_now(&self, batch: WriteBatch) -> StoreResult<()> {
@@ -166,6 +150,38 @@ impl SqliteOrderedStore {
             }
         })
     }
+}
+
+fn get_on(connection: &Connection, key: &[u8]) -> StoreResult<Option<Vec<u8>>> {
+    connection
+        .query_row(
+            &format!("SELECT value FROM {META_TABLE} WHERE key = ?1"),
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)
+}
+
+fn scan_on(connection: &Connection, start: &[u8], end: Option<&[u8]>) -> StoreResult<Vec<Entry>> {
+    let sql = match end {
+        Some(_) => format!(
+            "SELECT key, value FROM {META_TABLE}
+             WHERE key >= ?1 AND key < ?2 ORDER BY key"
+        ),
+        None => format!(
+            "SELECT key, value FROM {META_TABLE}
+             WHERE key >= ?1 ORDER BY key"
+        ),
+    };
+    let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+    let rows = match end {
+        Some(end) => statement.query_map(params![start, end], read_entry),
+        None => statement.query_map(params![start], read_entry),
+    }
+    .map_err(storage_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_error)
 }
 
 fn metadata_tables(connection: &Connection) -> MultiliteResult<Vec<String>> {
@@ -282,6 +298,28 @@ impl OrderedStore for SqliteOrderedStore {
 
     fn apply(&self, batch: WriteBatch) -> impl Future<Output = StoreResult<()>> + Send {
         ready(self.apply_now(batch))
+    }
+}
+
+impl OrderedStore for SqliteSnapshotStore<'_> {
+    fn get(&self, key: &[u8]) -> impl Future<Output = StoreResult<Option<Vec<u8>>>> + Send {
+        ready(get_on(self.connection, key))
+    }
+
+    fn scan(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> impl ScanIter {
+        let result = match scan_on(self.connection, &start, end.as_deref()) {
+            Ok(entries) => entries.into_iter().map(Ok).collect(),
+            Err(error) => vec![Err(error)],
+        };
+        SqliteScan {
+            result: result.into_iter(),
+        }
+    }
+
+    fn apply(&self, _batch: WriteBatch) -> impl Future<Output = StoreResult<()>> + Send {
+        ready(Err(StorageError(
+            "SQLite snapshot metadata store is read-only".into(),
+        )))
     }
 }
 

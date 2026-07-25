@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
-use homebase_client::meta::{MetaStore, OplogCursors};
+use homebase_client::meta::{MetaStore, OplogCursors, OrderedMetaStore};
 use homebase_client::server::UnreachableSpace;
 use homebase_client::{Client, ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
 use homebase_core::clock::{Lineage, SystemHybridClock};
@@ -36,14 +36,14 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
 use crate::commit::batch::{CommitQueue, QueuedCommit};
-use crate::commit::committer::{CommitPermit, Committer, HistoryPin, HistoryPins};
+use crate::commit::committer::{CommitHistory, CommitPermit, Committer, HistoryPin};
 use crate::commit::history;
 use crate::commit::proposal::{
     self, CommitDisposition, CommitProposal, CommitReceipt, PrepareOutcome,
 };
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
-use crate::metastore::SqliteOrderedStore;
+use crate::metastore::{SqliteOrderedStore, SqliteSnapshotStore};
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
@@ -320,6 +320,7 @@ fn capture_insert(
             "writes caused by triggers are not supported",
         ));
     }
+    let rowid = values.get_new_row_id();
     let values = (0..values.get_column_count())
         .map(|index| {
             values
@@ -330,6 +331,7 @@ fn capture_insert(
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(CapturedRow {
         table: table.to_owned(),
+        rowid,
         values,
     }))
 }
@@ -345,7 +347,7 @@ pub(crate) struct Database<H: ServerHandle> {
     isolation_level: IsolationLevel,
     committer: Committer,
     commit_queue: CommitQueue,
-    history_pins: HistoryPins,
+    commit_history: CommitHistory,
     scheduler: PushScheduler,
 }
 
@@ -422,14 +424,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         params: Q,
     ) -> Result<usize> {
         let validated = sql::validate_execute(sql)?;
-        match validated {
-            sql::ValidatedExecute::CreateTable(table) => {
-                self.execute_owned_create_table(runtime, sql, params, table)
-            }
-            sql::ValidatedExecute::Insert => self.update(runtime, |update| {
-                update.execute_validated(sql, params, sql::ValidatedExecute::Insert)
-            }),
-        }
+        self.update(runtime, |update| {
+            update.execute_validated(sql, params, validated)
+        })
     }
 
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
@@ -552,28 +549,32 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     fn submit_cursors(&self) -> Result<OplogCursors> {
-        let store = DatabaseMetaStore::new(self.owner.clone());
+        let store =
+            DatabaseMetaStore::with_history(self.owner.clone(), self.commit_history.clone());
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
     fn capture_branch_snapshot(&self, track_for_commit: bool) -> Result<BranchSnapshot> {
+        self.capture_branch_snapshot_inner(track_for_commit, || Ok(()))
+    }
+
+    fn capture_branch_snapshot_inner(
+        &self,
+        track_for_commit: bool,
+        after_physical: impl FnOnce() -> Result<()>,
+    ) -> Result<BranchSnapshot> {
         let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
             .map_err(|error| Error::Branch(error.to_string()))?;
-        let (commit_seq, tables) = self.owner.with_connection(|connection| {
-            Ok::<_, Error>((
-                history::current(connection)?,
-                catalog::table_names(connection)?,
-            ))
-        })?;
-        let store = DatabaseMetaStore::new(self.owner.clone());
-        let (submit_cursors, admits) = block_on(async {
-            Ok::<_, Error>((
-                store.oplog_cursors(self.database_id.space_id()).await?,
-                store.admit_cursors(self.database_id.space_id()).await?,
-            ))
+        after_physical()?;
+        let (commit_seq, cursors) = physical.with_reader(|connection| {
+            let commit_seq = self.commit_history.current(connection)?;
+            let metadata = OrderedMetaStore::new(SqliteSnapshotStore::new(connection));
+            let cursors = block_on(metadata.cursor_snapshot(self.database_id.space_id()))?;
+            Ok::<_, Error>((commit_seq, cursors))
         })?;
         let authority_applied_through = AdmissionSeq(
-            admits
+            cursors
+                .admits
                 .neck
                 .0
                 .checked_sub(1)
@@ -584,11 +585,19 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             logical: SnapshotDescriptor {
                 commit_seq,
                 authority_applied_through,
-                submit_cursors,
+                submit_cursors: cursors.oplog,
             },
-            tables,
-            history_pin: track_for_commit.then(|| self.history_pins.register(commit_seq)),
+            history_pin: track_for_commit.then(|| self.commit_history.pin(commit_seq)),
         })
+    }
+
+    #[cfg(test)]
+    fn capture_branch_snapshot_after_physical(
+        &self,
+        track_for_commit: bool,
+        after_physical: impl FnOnce() -> Result<()>,
+    ) -> Result<BranchSnapshot> {
+        self.capture_branch_snapshot_inner(track_for_commit, after_physical)
     }
 
     fn issue_branch_snapshot(self: &Arc<Self>, track_for_commit: bool) -> Result<BranchSnapshot> {
@@ -727,7 +736,11 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 let commit_seq = if prepared.is_empty() {
                     None
                 } else {
-                    Some(proposal::finalize_group(connection, &prepared)?)
+                    Some(proposal::finalize_group(
+                        connection,
+                        &self.commit_history,
+                        &prepared,
+                    )?)
                 };
                 let results = slots
                     .into_iter()
@@ -744,11 +757,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     })
                     .collect();
 
-                let through = match self.history_pins.oldest() {
-                    Some(oldest) => oldest,
-                    None => history::current(connection)?,
-                };
-                history::prune(connection, through)?;
+                self.commit_history.prune(connection)?;
                 Ok(results)
             })
     }
@@ -756,11 +765,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(super) fn prune_commit_history(&self) -> Result<()> {
         self.owner
             .with_savepoint("__multilite__commit_history_gc", |connection| {
-                let through = match self.history_pins.oldest() {
-                    Some(oldest) => oldest,
-                    None => history::current(connection)?,
-                };
-                history::prune(connection, through)?;
+                self.commit_history.prune(connection)?;
                 Ok(())
             })
     }
@@ -901,16 +906,34 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         isolation_level,
     } = options;
     let lineage = Lineage(mint_id()?);
+    let commit_history = CommitHistory::default();
+    let wal_path = wal_path_for(&path);
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
             match classify(connection)? {
-                DatabaseState::Fresh => initialize(&owner, invitation, server, lineage),
-                DatabaseState::Initialized => reopen(&owner, invitation.as_ref(), server, lineage),
+                DatabaseState::Fresh => initialize(
+                    &owner,
+                    invitation,
+                    server,
+                    lineage,
+                    commit_history.clone(),
+                    path.clone(),
+                    wal_path.clone(),
+                ),
+                DatabaseState::Initialized => reopen(
+                    &owner,
+                    invitation.as_ref(),
+                    server,
+                    lineage,
+                    commit_history.clone(),
+                    path.clone(),
+                    wal_path.clone(),
+                ),
             }
         })?;
     Ok(Database {
         owner,
-        wal_path: wal_path_for(&path),
+        wal_path,
         path,
         database_id,
         client,
@@ -918,7 +941,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         isolation_level,
         committer: Committer::new().map_err(committer_error)?,
         commit_queue: CommitQueue::new(),
-        history_pins: HistoryPins::default(),
+        commit_history,
         scheduler: PushScheduler::new(),
     })
 }
@@ -926,7 +949,6 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
 struct BranchSnapshot {
     physical: crate::branch::snapshot::PinnedSnapshot,
     logical: SnapshotDescriptor,
-    tables: Vec<String>,
     history_pin: Option<HistoryPin>,
 }
 
@@ -941,6 +963,9 @@ fn initialize<H: ServerHandle>(
     invitation: Option<ReplicaInvitation>,
     server: H,
     lineage: Lineage,
+    commit_history: CommitHistory,
+    database_path: PathBuf,
+    wal_path: PathBuf,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
     let database_id = match invitation {
         Some(invitation) => invitation.database_id,
@@ -951,7 +976,8 @@ fn initialize<H: ServerHandle>(
     owner.with_connection(catalog::initialize)?;
     owner.with_connection(proposal::initialize)?;
     owner.with_connection(history::initialize)?;
-    let store = DatabaseMetaStore::new(owner.clone());
+    let store =
+        DatabaseMetaStore::with_database(owner.clone(), commit_history, database_path, wal_path);
     let client = block_on(Client::open(
         store,
         server,
@@ -968,8 +994,16 @@ fn reopen<H: ServerHandle>(
     invitation: Option<&ReplicaInvitation>,
     server: H,
     lineage: Lineage,
+    commit_history: CommitHistory,
+    database_path: PathBuf,
+    wal_path: PathBuf,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
-    let store = DatabaseMetaStore::new(owner.clone());
+    let store = DatabaseMetaStore::with_database(
+        owner.clone(),
+        commit_history.clone(),
+        database_path,
+        wal_path,
+    );
     let state = block_on(store.load())?;
     if state.device.is_none() {
         return Err(Error::InvalidDatabase("device identity is missing"));
@@ -1009,7 +1043,7 @@ fn reopen<H: ServerHandle>(
         history::validate(connection)?;
         proposal::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)?;
-        history::prune(connection, history::current(connection)?)?;
+        commit_history.prune(connection)?;
         Ok::<_, Error>(())
     })?;
 

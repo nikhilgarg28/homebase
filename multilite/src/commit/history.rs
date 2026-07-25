@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use homebase_core::key::Key;
+use homebase_core::range::Range;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
@@ -14,29 +15,54 @@ use crate::{Error, Result};
 
 const HISTORY_TABLE: &str = "__multilite__history";
 const COMMIT_STATE_TABLE: &str = "__multilite__commit_state";
-const WRITE_SET_VERSION: u8 = 1;
+const WRITE_SET_VERSION: u8 = 2;
+const LEGACY_WRITE_SET_VERSION: u8 = 1;
+const POINT_WRITE: u8 = 1;
+const RANGE_WRITE: u8 = 2;
+
+/// One exact point write or range deletion in canonical logical state.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WriteRegion {
+    Point(Key),
+    Range(Range),
+}
+
+impl WriteRegion {
+    /// True when this write can invalidate an assertion over `prefix`.
+    pub fn overlaps_prefix(&self, prefix: &Key) -> bool {
+        match self {
+            Self::Point(key) => key.starts_with(prefix),
+            Self::Range(Range::Full) => true,
+            Self::Range(Range::Prefix(written)) => {
+                written.starts_with(prefix) || prefix.starts_with(written)
+            }
+        }
+    }
+}
 
 /// Logical writes made by one canonical SQLite visibility transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitRecord {
     pub commit_seq: CommitSeq,
-    pub keys: BTreeSet<Key>,
+    pub writes: Vec<WriteRegion>,
 }
 
-/// Build the exact logical point-key writes represented by lowered mutations.
+/// Build the canonical logical writes represented by lowered mutations.
 pub fn writes_from_mutations<'a>(
     mutations: impl IntoIterator<Item = &'a Mutation>,
-) -> Result<BTreeSet<Key>> {
-    let mut keys = BTreeSet::new();
+) -> Vec<WriteRegion> {
+    let mut writes = BTreeSet::new();
     for mutation in mutations {
-        let Some(key) = mutation.point_key() else {
-            return Err(Error::CaptureInvariant(
-                "range mutations require range-aware commit history",
-            ));
-        };
-        keys.insert(key.clone());
+        match mutation {
+            Mutation::Set { key, .. } | Mutation::Delete { key } => {
+                writes.insert(WriteRegion::Point(key.clone()));
+            }
+            Mutation::DeleteRange { range } => {
+                writes.insert(WriteRegion::Range(range.clone()));
+            }
+        }
     }
-    Ok(keys)
+    writes.into_iter().collect()
 }
 
 /// Create the canonical-history tables as part of database bootstrap.
@@ -44,7 +70,7 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
         "CREATE TABLE {HISTORY_TABLE} (
             commit_seq BLOB PRIMARY KEY NOT NULL CHECK(length(commit_seq) = 8),
-            keys BLOB NOT NULL
+            writes BLOB NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE {COMMIT_STATE_TABLE} (
             singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
@@ -78,7 +104,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
     validate_columns(
         connection,
         HISTORY_TABLE,
-        &[("commit_seq", "BLOB", true, 1), ("keys", "BLOB", true, 0)],
+        &[("commit_seq", "BLOB", true, 1), ("writes", "BLOB", true, 0)],
         "canonical history table schema is invalid",
     )?;
     validate_without_rowid(
@@ -132,9 +158,9 @@ pub fn current(connection: &Connection) -> Result<CommitSeq> {
 }
 
 /// Advance canonical state and retain its writes in the caller's transaction.
-pub fn record(connection: &Connection, keys: BTreeSet<Key>) -> Result<CommitSeq> {
+pub fn record(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
     connection.execute_batch("SAVEPOINT __multilite__commit_history")?;
-    let result = record_inner(connection, keys);
+    let result = record_inner(connection, writes);
     match result {
         Ok(commit_seq) => {
             connection.execute_batch("RELEASE __multilite__commit_history")?;
@@ -153,10 +179,15 @@ pub fn record(connection: &Connection, keys: BTreeSet<Key>) -> Result<CommitSeq>
     }
 }
 
-fn record_inner(connection: &Connection, keys: BTreeSet<Key>) -> Result<CommitSeq> {
-    if keys.is_empty() {
+fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
+    if writes.is_empty() {
         return Err(Error::CaptureInvariant(
             "canonical commit has no logical writes",
+        ));
+    }
+    if !canonical_writes(&writes) {
+        return Err(Error::CaptureInvariant(
+            "canonical commit writes are not sorted and unique",
         ));
     }
     let current = current(connection)?;
@@ -166,13 +197,13 @@ fn record_inner(connection: &Connection, keys: BTreeSet<Key>) -> Result<CommitSe
             .checked_add(1)
             .ok_or_else(|| Error::CommitConflict("local commit sequence is exhausted".into()))?,
     );
-    let encoded = encode_keys(&keys)?;
+    let encoded = encode_writes(&writes)?;
     connection.execute(
         &format!("UPDATE {COMMIT_STATE_TABLE} SET commit_seq = ?1 WHERE singleton = 1"),
         [next.0.to_be_bytes().as_slice()],
     )?;
     connection.execute(
-        &format!("INSERT INTO {HISTORY_TABLE} (commit_seq, keys) VALUES (?1, ?2)"),
+        &format!("INSERT INTO {HISTORY_TABLE} (commit_seq, writes) VALUES (?1, ?2)"),
         rusqlite::params![next.0.to_be_bytes().as_slice(), encoded],
     )?;
     Ok(next)
@@ -181,7 +212,7 @@ fn record_inner(connection: &Connection, keys: BTreeSet<Key>) -> Result<CommitSe
 /// Load retained canonical writes strictly newer than `commit_seq`.
 pub fn history_after(connection: &Connection, commit_seq: CommitSeq) -> Result<Vec<CommitRecord>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT commit_seq, keys FROM {HISTORY_TABLE}
+        "SELECT commit_seq, writes FROM {HISTORY_TABLE}
          WHERE commit_seq > ?1 ORDER BY commit_seq"
     ))?;
     let rows = statement.query_map([commit_seq.0.to_be_bytes().as_slice()], |row| {
@@ -191,7 +222,7 @@ pub fn history_after(connection: &Connection, commit_seq: CommitSeq) -> Result<V
         let (commit_seq, encoded_keys) = row?;
         Ok(CommitRecord {
             commit_seq: decode_commit_seq(&commit_seq, false)?,
-            keys: decode_keys(&encoded_keys)
+            writes: decode_writes(&encoded_keys)
                 .map_err(|_| Error::InvalidDatabase("canonical write record is malformed"))?,
         })
     })
@@ -206,50 +237,72 @@ pub fn prune(connection: &Connection, through: CommitSeq) -> Result<usize> {
     )?)
 }
 
-fn encode_keys(keys: &BTreeSet<Key>) -> Result<Vec<u8>> {
+fn encode_writes(writes: &[WriteRegion]) -> Result<Vec<u8>> {
     let mut writer = Writer::new();
     writer.u8(WRITE_SET_VERSION);
     writer.u32(
-        u32::try_from(keys.len())
+        u32::try_from(writes.len())
             .map_err(|_| Error::CaptureInvariant("canonical write set is too large"))?,
     );
-    for key in keys {
-        let encoded = key.encode();
+    for write in writes {
+        let (kind, encoded) = match write {
+            WriteRegion::Point(key) => (POINT_WRITE, key.encode()),
+            WriteRegion::Range(range) => (RANGE_WRITE, range.encode()),
+        };
+        writer.u8(kind);
         writer.u32(
             u32::try_from(encoded.len())
-                .map_err(|_| Error::CaptureInvariant("canonical write key is too large"))?,
+                .map_err(|_| Error::CaptureInvariant("canonical write region is too large"))?,
         );
         writer.bytes(&encoded);
     }
     Ok(writer.finish())
 }
 
-fn decode_keys(frame: &[u8]) -> std::result::Result<BTreeSet<Key>, HistoryCodecError> {
+fn decode_writes(frame: &[u8]) -> std::result::Result<Vec<WriteRegion>, HistoryCodecError> {
     let mut reader = Reader::new(frame);
-    if reader.u8() != Some(WRITE_SET_VERSION) {
-        return Err(HistoryCodecError::UnknownVersion);
-    }
+    let version = reader.u8().ok_or(HistoryCodecError::Truncated)?;
+    let tagged = match version {
+        WRITE_SET_VERSION => true,
+        LEGACY_WRITE_SET_VERSION => false,
+        _ => return Err(HistoryCodecError::UnknownVersion),
+    };
     let count = reader.u32().ok_or(HistoryCodecError::Truncated)?;
     if count == 0 {
         return Err(HistoryCodecError::Empty);
     }
-    let mut keys = BTreeSet::new();
-    let mut previous = None::<Key>;
+    let mut writes =
+        Vec::with_capacity(usize::try_from(count).map_err(|_| HistoryCodecError::InvalidLength)?);
     for _ in 0..count {
+        let kind = tagged
+            .then(|| reader.u8().ok_or(HistoryCodecError::Truncated))
+            .transpose()?
+            .unwrap_or(POINT_WRITE);
         let length = reader.u32().ok_or(HistoryCodecError::Truncated)?;
         let length = usize::try_from(length).map_err(|_| HistoryCodecError::InvalidLength)?;
         let encoded = reader.take(length).ok_or(HistoryCodecError::Truncated)?;
-        let key = Key::decode(encoded).map_err(|_| HistoryCodecError::InvalidKey)?;
-        if previous.as_ref().is_some_and(|previous| previous >= &key) {
-            return Err(HistoryCodecError::NonCanonical);
-        }
-        previous = Some(key.clone());
-        keys.insert(key);
+        let write = match kind {
+            POINT_WRITE => {
+                WriteRegion::Point(Key::decode(encoded).map_err(|_| HistoryCodecError::InvalidKey)?)
+            }
+            RANGE_WRITE => {
+                WriteRegion::Range(Range::decode(encoded).ok_or(HistoryCodecError::InvalidRange)?)
+            }
+            _ => return Err(HistoryCodecError::UnknownKind),
+        };
+        writes.push(write);
+    }
+    if !canonical_writes(&writes) {
+        return Err(HistoryCodecError::NonCanonical);
     }
     if reader.end().is_none() {
         return Err(HistoryCodecError::TrailingBytes);
     }
-    Ok(keys)
+    Ok(writes)
+}
+
+fn canonical_writes(writes: &[WriteRegion]) -> bool {
+    writes.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 pub fn decode_commit_seq(bytes: &[u8], allow_zero: bool) -> Result<CommitSeq> {
@@ -335,6 +388,8 @@ enum HistoryCodecError {
     Truncated,
     InvalidLength,
     InvalidKey,
+    InvalidRange,
+    UnknownKind,
     Empty,
     NonCanonical,
     TrailingBytes,
@@ -357,10 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn records_roundtrip_as_sorted_exact_keys() {
+    fn records_roundtrip_as_sorted_write_regions() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
-        let keys = writes_from_mutations([
+        let writes = writes_from_mutations([
             &Mutation::Set {
                 key: key(&[b"tables", b"one", b"rows", b"7"]),
                 value: vec![],
@@ -373,20 +428,19 @@ mod tests {
                 key: key(&[b"tables", b"two"]),
                 value: vec![],
             },
-        ])
-        .unwrap();
+        ]);
 
-        assert_eq!(record(&connection, keys).unwrap(), CommitSeq(1));
+        assert_eq!(record(&connection, writes).unwrap(), CommitSeq(1));
         assert_eq!(current(&connection).unwrap(), CommitSeq(1));
         assert_eq!(
             history_after(&connection, CommitSeq(0)).unwrap(),
             vec![CommitRecord {
                 commit_seq: CommitSeq(1),
-                keys: BTreeSet::from([
-                    key(&[b"tables", b"one", b"rows", b"7"]),
-                    key(&[b"tables", b"one"]),
-                    key(&[b"tables", b"two"]),
-                ]),
+                writes: vec![
+                    WriteRegion::Point(key(&[b"tables", b"one"])),
+                    WriteRegion::Point(key(&[b"tables", b"one", b"rows", b"7"])),
+                    WriteRegion::Point(key(&[b"tables", b"two"])),
+                ],
             }]
         );
         validate(&connection).unwrap();
@@ -414,19 +468,35 @@ mod tests {
                 "canonical write record is malformed"
             ))
         ));
-        assert!(record(&connection, BTreeSet::new()).is_err());
+        assert!(record(&connection, Vec::new()).is_err());
     }
 
     #[test]
-    fn range_mutations_are_rejected_until_history_encodes_ranges_separately() {
-        assert!(matches!(
-            writes_from_mutations([&Mutation::DeleteRange {
-                range: homebase_core::range::Range::Full,
-            }]),
-            Err(Error::CaptureInvariant(
-                "range mutations require range-aware commit history"
-            ))
-        ));
+    fn range_mutations_roundtrip_and_overlap_prefixes_bidirectionally() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let table = key(&[b"tables", b"one"]);
+        let rows = key(&[b"tables", b"one", b"rows"]);
+        let writes = writes_from_mutations([
+            &Mutation::DeleteRange {
+                range: Range::Prefix(rows.clone()),
+            },
+            &Mutation::Set {
+                key: key(&[b"tables", b"two"]),
+                value: Vec::new(),
+            },
+        ]);
+
+        record(&connection, writes.clone()).unwrap();
+        assert_eq!(
+            history_after(&connection, CommitSeq(0)).unwrap()[0].writes,
+            writes
+        );
+        let range = WriteRegion::Range(Range::Prefix(rows.clone()));
+        assert!(range.overlaps_prefix(&table));
+        assert!(range.overlaps_prefix(&rows));
+        assert!(range.overlaps_prefix(&key(&[b"tables", b"one", b"rows", b"7"])));
+        assert!(!range.overlaps_prefix(&key(&[b"tables", b"two"])));
     }
 
     #[test]
@@ -441,7 +511,13 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(record(&connection, BTreeSet::from([key(&[b"tables", b"one"])])).is_err());
+        assert!(
+            record(
+                &connection,
+                vec![WriteRegion::Point(key(&[b"tables", b"one"]))]
+            )
+            .is_err()
+        );
         assert_eq!(current(&connection).unwrap(), CommitSeq(0));
         assert!(history_after(&connection, CommitSeq(0)).unwrap().is_empty());
     }
@@ -454,7 +530,7 @@ mod tests {
                 format!(
                     "CREATE TABLE {HISTORY_TABLE} (
                         commit_seq BLOB PRIMARY KEY NOT NULL,
-                        keys BLOB NOT NULL
+                        writes BLOB NOT NULL
                     )"
                 ),
                 "canonical history table must use WITHOUT ROWID",
@@ -488,7 +564,11 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
         for value in [1_u8, 2, 3] {
-            record(&connection, BTreeSet::from([key(&[b"rows", &[value]])])).unwrap();
+            record(
+                &connection,
+                vec![WriteRegion::Point(key(&[b"rows", &[value]]))],
+            )
+            .unwrap();
         }
 
         assert_eq!(prune(&connection, CommitSeq(1)).unwrap(), 1);
