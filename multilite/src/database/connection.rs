@@ -1,5 +1,6 @@
 //! Public SQLite-shaped connection over the general Multilite database.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +29,18 @@ impl Connection<OfflineServer> {
         let database = Database::open(path)?;
         Self::finish_open(database)
     }
+
+    /// Asynchronously open without blocking the caller's executor thread.
+    pub fn open_async(path: impl AsRef<Path>) -> impl Future<Output = Result<Self>> {
+        let path = path.as_ref().to_owned();
+        async move {
+            crate::blocking::run(move || {
+                let database = Database::open(path)?;
+                Self::finish_open(database)
+            })
+            .await
+        }
+    }
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
@@ -35,6 +48,21 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions<H>) -> Result<Self> {
         let database = Database::open_with(path, options)?;
         Self::finish_open(database)
+    }
+
+    /// Asynchronously open with explicit identity, authority, and policies.
+    pub fn open_with_async(
+        path: impl AsRef<Path>,
+        options: OpenOptions<H>,
+    ) -> impl Future<Output = Result<Self>> {
+        let path = path.as_ref().to_owned();
+        async move {
+            crate::blocking::run(move || {
+                let database = Database::open_with(path, options)?;
+                Self::finish_open(database)
+            })
+            .await
+        }
     }
 
     fn finish_open(database: Arc<Database<H>>) -> Result<Self> {
@@ -73,9 +101,19 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.push()
     }
 
+    /// Asynchronously push local submissions as far as possible.
+    pub async fn push_async(&self) -> Result<PushOutcome> {
+        self.database.push_async().await
+    }
+
     /// Fetch all currently available admissions without applying them.
     pub fn pull(&self) -> Result<PullOutcome> {
         self.database.pull()
+    }
+
+    /// Asynchronously fetch available admissions without applying them.
+    pub async fn pull_async(&self) -> Result<PullOutcome> {
+        self.database.pull_async().await
     }
 
     /// Undo and retire the exact speculative suffix named by a push rejection.
@@ -83,9 +121,19 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.rollback(rejection)
     }
 
+    /// Asynchronously undo and retire one exact rejected speculative suffix.
+    pub async fn rollback_async(&self, rejection: &PushRejection) -> Result<()> {
+        self.database.rollback_async(rejection.clone()).await
+    }
+
     /// Reconcile the currently fetched admit interval with local SQLite state.
     pub fn rebase(&self) -> Result<()> {
         self.database.rebase(&self.runtime)
+    }
+
+    /// Asynchronously apply the currently fetched admission interval.
+    pub async fn rebase_async(&self) -> Result<()> {
+        self.database.rebase_async().await
     }
 
     /// Execute one supported mutating SQLite statement.
@@ -93,9 +141,30 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.execute(&self.runtime, sql, params)
     }
 
+    /// Asynchronously execute one supported mutating statement.
+    ///
+    /// Parameters must be owned and sendable because SQLite executes on the
+    /// bounded blocking pool. Tuples and arrays of `rusqlite::types::Value`
+    /// work naturally for heterogeneous owned parameters.
+    pub async fn execute_async<P>(&self, sql: impl Into<String>, params: P) -> Result<usize>
+    where
+        P: Params + Send + 'static,
+    {
+        self.database.execute_async(sql.into(), params).await
+    }
+
     /// Run a closure inside one refreshed, read-only SQLite snapshot.
     pub fn view<T>(&self, operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>) -> Result<T> {
         self.database.view(&self.runtime, operation)
+    }
+
+    /// Asynchronously run an owned closure on one read-only SQLite snapshot.
+    pub async fn view_async<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Send + 'static + for<'a> FnOnce(&ViewTransaction<'a>) -> Result<T>,
+    {
+        self.database.view_async(operation).await
     }
 
     /// Run a closure as one SQLite and Homebase transaction.
@@ -106,6 +175,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.update(&self.runtime, operation)
     }
 
+    /// Asynchronously run one managed SQLite and Homebase transaction.
+    pub async fn update_async<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Send + 'static + for<'a> FnOnce(&mut UpdateTransaction<'a, H>) -> Result<T>,
+    {
+        self.database.update_async(operation).await
+    }
+
     /// Run one managed update with an explicit per-transaction override.
     pub fn update_with<T>(
         &self,
@@ -113,6 +191,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
         self.database.update_with(&self.runtime, options, operation)
+    }
+
+    /// Asynchronously run one managed update with an isolation override.
+    pub async fn update_with_async<T, F>(&self, options: UpdateOptions, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Send + 'static + for<'a> FnOnce(&mut UpdateTransaction<'a, H>) -> Result<T>,
+    {
+        self.database.update_with_async(options, operation).await
     }
 
     /// Execute one read-only statement as an implicit managed view.
@@ -133,8 +220,47 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.query(sql, params, map)
     }
 
+    /// Asynchronously execute one read-only statement and return owned values.
+    pub async fn query_async<T, P, F>(
+        &self,
+        sql: impl Into<String>,
+        params: P,
+        map: F,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        let sql = sql.into();
+        self.view_async(move |transaction| transaction.query(&sql, params, map))
+            .await
+    }
+
+    /// Async alias matching rusqlite's mapped-query vocabulary.
+    pub async fn query_map_async<T, P, F>(
+        &self,
+        sql: impl Into<String>,
+        params: P,
+        map: F,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        self.query_async(sql, params, map).await
+    }
+
     /// Prepare one read-only statement.
     pub fn prepare(&self, sql: &str) -> Result<Statement<H>> {
         self.database.prepare(&self.runtime, sql)
+    }
+
+    /// Asynchronously validate and prepare one reusable read-only statement.
+    pub async fn prepare_async(&self, sql: impl Into<String>) -> Result<Statement<H>> {
+        self.database
+            .prepare_async(Arc::clone(&self.runtime), sql.into())
+            .await
     }
 }

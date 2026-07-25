@@ -1706,7 +1706,7 @@ fn rebase_rejects_cursor_changes_between_snapshot_and_apply() {
                 (),
             )?;
             assert_eq!(source.push()?, PushOutcome::Drained);
-            replica.pull_via_authority()?;
+            replica.pull()?;
             Ok(())
         })
         .unwrap_err();

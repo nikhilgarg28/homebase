@@ -43,8 +43,8 @@ impl Authority {
         std::thread::Builder::new()
             .name("multilite-authority".into())
             // Multilite does not require an async runtime yet. The driver
-            // itself remains async so this thread can be replaced by a
-            // runtime-spawned task when the public API gains async variants.
+            // remains an async loop so a future runtime adapter can spawn it
+            // directly instead of dedicating this runtime-neutral thread.
             .spawn(move || pollster::block_on(run(inbox, client, space)))
             .map_err(|error| AuthorityError::Startup(error.to_string()))?;
         Ok(Self { outbox })
@@ -59,10 +59,6 @@ impl Authority {
         response.await.map_err(|_| unavailable())?
     }
 
-    pub fn push_blocking(&self) -> Result<PushOutcome> {
-        pollster::block_on(self.push())
-    }
-
     pub async fn push_until(&self, through: DeviceSeq) -> Result<PushOutcome> {
         let (reply, response) = oneshot::channel();
         self.outbox
@@ -70,10 +66,6 @@ impl Authority {
             .await
             .map_err(|_| unavailable())?;
         response.await.map_err(|_| unavailable())?
-    }
-
-    pub fn push_until_blocking(&self, through: DeviceSeq) -> Result<PushOutcome> {
-        pollster::block_on(self.push_until(through))
     }
 
     pub async fn pull(&self) -> Result<AdmissionSeq> {
@@ -84,10 +76,6 @@ impl Authority {
             .map_err(|_| unavailable())?;
         response.await.map_err(|_| unavailable())?
     }
-
-    pub fn pull_blocking(&self) -> Result<AdmissionSeq> {
-        pollster::block_on(self.pull())
-    }
 }
 
 async fn run<H>(inbox: Receiver<Request>, client: Arc<DatabaseClient<H>>, space: SpaceId)
@@ -97,29 +85,15 @@ where
     while let Ok(request) = inbox.recv().await {
         match request {
             Request::Push { reply } => {
-                let result = async {
-                    client
-                        .space(space)
-                        .await?
-                        .push()
-                        .await
-                        .map_err(ClientError::from)
-                }
-                .await
-                .map_err(Error::from);
+                let result = async { client.space(space).await?.push().await }
+                    .await
+                    .map_err(Error::from);
                 let _ = reply.send(result);
             }
             Request::PushUntil { through, reply } => {
-                let result = async {
-                    client
-                        .space(space)
-                        .await?
-                        .push_until(through)
-                        .await
-                        .map_err(ClientError::from)
-                }
-                .await
-                .map_err(Error::from);
+                let result = async { client.space(space).await?.push_until(through).await }
+                    .await
+                    .map_err(Error::from);
                 let _ = reply.send(result);
             }
             Request::Pull { reply } => {

@@ -2,23 +2,30 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use homebase_client::ClientError;
+use homebase_client::ServerHandle;
+#[cfg(test)]
 use homebase_client::meta::MetaStore;
-use homebase_client::{ClientError, ServerHandle};
 use pollster::block_on;
 #[cfg(test)]
 use rusqlite::Connection;
 
+#[cfg(test)]
 use super::store::DatabaseMetaStore;
+#[cfg(test)]
 use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
+#[cfg(test)]
+use crate::Error;
+use crate::Result;
+#[cfg(test)]
 use crate::commit::proposal::{AdmittedTransaction, CommitProposal};
-use crate::{Error, Result};
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) fn rebase(self: &Arc<Self>, runtime: &DatabaseRuntime) -> Result<()> {
-        self.rebase_inner(runtime, || Ok(()))?;
-        self.policy.mark_rebased();
-        Ok(())
+        let _ = runtime;
+        block_on(self.rebase_async())
     }
 
     #[cfg(test)]
@@ -30,6 +37,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self.rebase_inner(runtime, after_snapshot)
     }
 
+    #[cfg(test)]
     fn rebase_inner(
         self: &Arc<Self>,
         _runtime: &DatabaseRuntime,

@@ -15,9 +15,9 @@ use super::schema::table_prefix;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
-use super::{Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog};
+use super::{Database, DatabaseRuntime, IsolationLevel, UpdateOptions, catalog};
 use crate::branch::{OverlayOptions, WritableBranch};
-use crate::commit::committer::CommitSnapshot;
+use crate::commit::committer::{CommitSnapshot, HistoryPin};
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
@@ -307,6 +307,48 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+pub(super) struct BranchUpdate<T> {
+    pub value: T,
+    pub proposal: Option<CommitProposal>,
+    pub history_pin: Option<HistoryPin>,
+}
+
+pub(super) fn run_branch_update<H, T>(
+    snapshot: CommitSnapshot,
+    isolation: IsolationLevel,
+    operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
+) -> Result<BranchUpdate<T>>
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    let CommitSnapshot {
+        physical,
+        logical,
+        history_pin,
+    } = snapshot;
+    let branch = WritableBranch::open(physical, OverlayOptions::default())
+        .map_err(|error| Error::Branch(error.to_string()))?;
+    let mut update = UpdateTransaction::branch(branch.connection(), isolation)?;
+    let value = operation(&mut update)?;
+    let (operations, reads) = update.into_branch_parts()?;
+    let proposal = if operations.is_empty() {
+        None
+    } else {
+        let transaction = MultiliteTransaction::new(operations)?;
+        Some(CommitProposal::from_transaction(
+            logical,
+            isolation,
+            transaction,
+            reads,
+        )?)
+    };
+    Ok(BranchUpdate {
+        value,
+        proposal,
+        history_pin,
+    })
+}
+
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     /// Run one complete update using the database's default isolation.
     pub fn update<T>(
@@ -334,24 +376,13 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
         self.refresh_read(runtime)?;
-        let CommitSnapshot {
-            physical,
-            logical,
+        let snapshot = self.issue_branch_snapshot(true)?;
+        let BranchUpdate {
+            value,
+            proposal,
             history_pin: _history_pin,
-        } = self.issue_branch_snapshot(true)?;
-        let branch = WritableBranch::open(physical, OverlayOptions::default())
-            .map_err(|error| Error::Branch(error.to_string()))?;
-        let mut update = UpdateTransaction::branch(branch.connection(), options.isolation_level())?;
-        let value = operation(&mut update)?;
-        let (operations, reads) = update.into_branch_parts()?;
-        if !operations.is_empty() {
-            let transaction = MultiliteTransaction::new(operations)?;
-            let proposal = CommitProposal::from_transaction(
-                logical,
-                options.isolation_level(),
-                transaction,
-                reads,
-            )?;
+        } = run_branch_update(snapshot, options.isolation_level(), operation)?;
+        if let Some(proposal) = proposal {
             let receipt = self.commit_proposal(proposal)?;
             self.finish_branch_write(receipt)?;
         }
@@ -362,25 +393,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         self: &std::sync::Arc<Self>,
         receipt: crate::commit::proposal::CommitReceipt,
     ) -> Result<()> {
-        let sequence = receipt.submitted.ok_or(Error::CaptureInvariant(
-            "transaction commit receipt has no Homebase sequence",
-        ))?;
-        match self.policy.policy() {
-            SyncPolicy::LocalOnly => Ok(()),
-            SyncPolicy::LocalFirst { write_delay, .. } => {
-                self.scheduler
-                    .schedule_group(receipt.commit_seq, write_delay);
-                Ok(())
-            }
-            SyncPolicy::Remote => match self.push_submission(sequence)? {
-                super::PushOutcome::Drained => Ok(()),
-                super::PushOutcome::Rejected(rejection) => {
-                    let error = rejection.error.clone();
-                    self.rollback(&rejection)?;
-                    let _ = self.push();
-                    Err(Error::AuthorityRejected(error))
-                }
-            },
-        }
+        pollster::block_on(self.finish_branch_write_async(receipt))
     }
 }

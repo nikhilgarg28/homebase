@@ -1,5 +1,6 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod async_api;
 mod authority;
 pub(crate) mod catalog;
 mod codes;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 use homebase_client::cipher::{SpaceEnvelope, SystemNonceSource};
 use homebase_client::meta::{MetaStore, OplogCursors, OrderedMetaStore};
 use homebase_client::server::UnreachableSpace;
-use homebase_client::{Client, ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
+use homebase_client::{Client, ClientError, ServerHandle};
 use homebase_core::clock::{Lineage, SystemHybridClock};
 use homebase_core::messages::KernelError;
 use homebase_core::space::SpaceId;
@@ -429,56 +430,17 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
-        self.push_via_authority(None)
-    }
-
-    fn push_submission(&self, sequence: DeviceSeq) -> Result<PushOutcome> {
-        self.push_via_authority(Some(sequence))
-    }
-
-    fn push_via_authority(&self, through: Option<DeviceSeq>) -> Result<PushOutcome> {
-        let pushed = match through {
-            Some(sequence) => self.authority.push_until_blocking(sequence)?,
-            None => self.authority.push_blocking()?,
-        };
-        match pushed {
-            HomebasePushOutcome::Drained { .. } => Ok(PushOutcome::Drained),
-            HomebasePushOutcome::Stalled { at, error, .. } => {
-                let cursors = self.submit_cursors()?;
-                Ok(PushOutcome::Rejected(PushRejection {
-                    database_id: self.database_id,
-                    device_id: self.client.device(),
-                    failed_at: at,
-                    submit_cursors: cursors,
-                    error,
-                }))
-            }
-        }
+        block_on(self.push_async())
     }
 
     /// Undo the speculative SQLite effects covered by one definitive push
     /// rejection and retire that exact active submit window.
     pub(crate) fn rollback(self: &Arc<Self>, rejection: &PushRejection) -> Result<()> {
-        if rejection.database_id != self.database_id
-            || rejection.device_id != self.client.device()
-            || rejection.failed_at != rejection.submit_cursors.neck
-        {
-            return Err(Error::StalePushRejection);
-        }
-        let proposal =
-            CommitProposal::reject_submissions(rejection.failed_at, rejection.submit_cursors)?;
-        self.commit_proposal(proposal)?;
-        Ok(())
+        block_on(self.rollback_async(rejection.clone()))
     }
 
     pub(crate) fn pull(self: &Arc<Self>) -> Result<PullOutcome> {
-        self.pull_via_authority()
-    }
-
-    fn pull_via_authority(&self) -> Result<PullOutcome> {
-        let through = self.authority.pull_blocking()?;
-        self.policy.mark_pulled();
-        Ok(PullOutcome { through })
+        block_on(self.pull_async())
     }
 
     pub(crate) fn prepare(
@@ -521,22 +483,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     fn refresh_read(self: &Arc<Self>, runtime: &DatabaseRuntime) -> Result<()> {
-        if !self.policy.read_requires_refresh() {
-            return Ok(());
-        }
-        let submit = self.submit_cursors()?;
-        if submit.neck < submit.tail {
-            match self.push()? {
-                PushOutcome::Drained => {}
-                PushOutcome::Rejected(rejection) => {
-                    return Err(Error::RefreshPushRejected(rejection));
-                }
-            }
-        }
-        self.pull()?;
-        self.rebase(runtime)?;
-        self.policy.mark_rebased();
-        Ok(())
+        let _ = runtime;
+        block_on(self.refresh_read_async())
     }
 }
 
@@ -909,6 +857,29 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
     {
         self.database
             .view(&self.runtime, |view| view.query(&self.sql, params, map))
+    }
+
+    /// Asynchronously execute this statement and return owned mapped values.
+    pub async fn query_map_async<T, P, F>(&self, params: P, map: F) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        let sql = self.sql.clone();
+        self.database
+            .view_async(move |view| view.query(&sql, params, map))
+            .await
+    }
+
+    /// Async alias matching the connection's direct-query vocabulary.
+    pub async fn query_async<T, P, F>(&self, params: P, map: F) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        self.query_map_async(params, map).await
     }
 }
 

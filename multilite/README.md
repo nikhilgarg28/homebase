@@ -105,6 +105,26 @@ Homebase submission survives. Direct `execute` and `query` remain convenient
 one-statement managed transactions, and the existing reusable read-only
 `prepare` surface retains its SQLite-shaped parameter and conversion behavior.
 
+Every connection lifecycle and data operation also has a runtime-neutral async
+form: `open_async`, `open_with_async`, `execute_async`, `query_async`,
+`prepare_async`, `view_async`, `update_async`, `push_async`, `pull_async`,
+`rebase_async`, and `rollback_async`. These futures wait asynchronously on the
+typed committer and authority channels. Filesystem work, branch creation,
+SQLite execution, and row mapping run on a bounded process-wide blocking pool,
+so they do not occupy an async executor worker. Async parameters and returned
+values must be owned and `Send`; reusable statement queries eagerly map rows
+into owned values before crossing the worker boundary.
+
+The closure passed to `view_async` or `update_async` is synchronous. It runs on
+one blocking worker while borrowing a thread-bound SQLite transaction, and may
+execute any number of currently supported statements without blocking the
+caller's executor. Awaiting arbitrary application futures inside that closure
+is deliberately unsupported. Once blocking or canonical work has entered its
+bounded queue, dropping the caller's future does not cancel a possibly durable
+side effect. The synchronous APIs remain available for rusqlite-compatible
+borrowed parameters and closures and share the same branch, proposal, policy,
+and authority machinery.
+
 A required refresh first pushes a nonempty submit log, then pulls and
 atomically rebases the available admissions. A definitive push rejection fails
 the read and returns a rejection handle without implicitly rolling back

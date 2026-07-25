@@ -4,6 +4,7 @@ use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
 use super::{Database, DatabaseRuntime, sql};
+use crate::commit::committer::CommitSnapshot;
 use crate::{Error, Params, Result};
 
 /// One managed, read-only SQLite snapshot.
@@ -77,6 +78,15 @@ impl<'a> TransactionStatement<'a> {
     }
 }
 
+pub(super) fn run_branch_view<T>(
+    snapshot: CommitSnapshot,
+    operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>,
+) -> Result<T> {
+    let branch = crate::branch::ReadBranch::open(snapshot.physical)
+        .map_err(|error| Error::Branch(error.to_string()))?;
+    operation(&ViewTransaction::new(branch.connection()))
+}
+
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     /// Refresh once, then run a closure inside one read-only SQLite snapshot.
     pub fn view<T>(
@@ -86,8 +96,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     ) -> Result<T> {
         self.refresh_read(runtime)?;
         let snapshot = self.issue_branch_snapshot(false)?;
-        let branch = crate::branch::ReadBranch::open(snapshot.physical)
-            .map_err(|error| Error::Branch(error.to_string()))?;
-        operation(&ViewTransaction::new(branch.connection()))
+        run_branch_view(snapshot, operation)
     }
 }

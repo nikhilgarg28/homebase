@@ -83,22 +83,14 @@ format so the cleanup cannot accidentally change durable or wire encodings.
 
 Handle multi-schema / attach etc
 
-Async-first Multilite public API (typed committer and authority channels,
-owned proposals, exact submission receipts, and synchronous wrappers exist):
-- Make the primary internal API async and keep SQLite-compatible synchronous
-  methods as `pollster` wrappers over the same futures.
-- Run branch creation, native SQLite closures, and owned-row extraction on a
-  bounded blocking executor so an async caller never occupies a runtime worker
-  with SQLite or filesystem work.
-- Return owned query rows and column metadata across that worker boundary;
-  perform public mapping and `FromSql` conversion without lending a
-  `rusqlite::Row` across an await.
-- Expose async push, pull, rebase, rollback, execute, view/query, and update
-  surfaces while preserving the exact `DeviceSeq` policy semantics landed in
-  authority batch 18.
-- Preserve cancellation, backpressure, shutdown, and durable-side-effect rules:
-  dropping a caller never cancels work after it may have committed, and network
-  I/O is never awaited while a canonical SQLite transaction is open.
+Async-first Multilite public API landed in batch 19: runtime-neutral futures
+cover open, prepare, execute, query/view, update, push, pull, rebase, and
+rollback. Owned SQLite work runs on a bounded process-wide blocking pool and
+only owned mapped query results cross its boundary. The remaining follow-ups
+are configurable worker sizing/shutdown, streaming owned-row APIs if demanded
+by adapters, and cancellation/stress telemetry. Managed async transaction
+closures intentionally remain synchronous while they borrow one thread-bound
+SQLite connection.
 
 Live queries, add db.watch api
 

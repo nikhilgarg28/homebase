@@ -2,6 +2,7 @@
 //!
 //! Not published for use yet.
 
+mod blocking;
 mod branch;
 mod commit;
 mod connection;
