@@ -87,6 +87,10 @@ impl ConflictFootprint {
     }
 
     /// Rebuild a typed footprint while retaining its prefix-antichain form.
+    #[allow(
+        dead_code,
+        reason = "used when decoding durable queued commit proposals"
+    )]
     pub fn from_parts(
         writes: impl IntoIterator<Item = Key>,
         constraints: impl IntoIterator<Item = Key>,
@@ -113,13 +117,12 @@ impl ConflictFootprint {
     pub fn conflicts_with_writes(
         &self,
         isolation: IsolationLevel,
-        committed: &ConflictFootprint,
+        committed: &BTreeSet<Key>,
     ) -> bool {
         self.asserted_keys(isolation).any(|asserted| {
             committed
-                .writes()
                 .iter()
-                .any(|written| prefixes_overlap(asserted, written))
+                .any(|written| written.starts_with(asserted))
         })
     }
 
@@ -145,10 +148,6 @@ impl ConflictFootprint {
             .map(|prefix| RangeAssert { prefix, upto })
             .collect()
     }
-}
-
-fn prefixes_overlap(left: &Key, right: &Key) -> bool {
-    left.starts_with(right) || right.starts_with(left)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -309,5 +308,25 @@ mod tests {
         statement_trace.record(table.clone());
 
         assert_eq!(trace.footprint().reads(), &BTreeSet::from([table]));
+    }
+
+    #[test]
+    fn exact_committed_keys_are_checked_directionally_against_asserted_prefixes() {
+        let parent = key(&[b"tables", b"one"]);
+        let child = key(&[b"tables", b"one", b"rows", b"7"]);
+
+        let mut child_assertion = ConflictFootprint::new();
+        child_assertion.add_write(child.clone());
+        assert!(
+            !child_assertion
+                .conflicts_with_writes(IsolationLevel::Snapshot, &BTreeSet::from([parent.clone()]))
+        );
+
+        let mut parent_assertion = ConflictFootprint::new();
+        parent_assertion.add_constraint(parent);
+        assert!(
+            parent_assertion
+                .conflicts_with_writes(IsolationLevel::Snapshot, &BTreeSet::from([child]))
+        );
     }
 }

@@ -1,5 +1,13 @@
 //! Logical transaction coordinates independent of the physical SQLite image.
 
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "snapshot decoding is reserved for durable queued proposals"
+    )
+)]
+
 use homebase_client::meta::OplogCursors;
 use homebase_core::reader::Reader;
 use homebase_core::tag::AdmissionSeq;

@@ -34,6 +34,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
 use crate::commit::committer::{CommitPermit, Committer, HistoryPin, HistoryPins};
+use crate::commit::history;
 use crate::commit::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
@@ -469,7 +470,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             rejection.failed_at,
             rejection.submit_cursors,
         )) {
-            Ok(()) => Ok(()),
+            Ok(()) => self.prune_commit_history(),
             Err(ClientError::RollbackWindowChanged) => Err(Error::StalePushRejection),
             Err(error) => Err(error.into()),
         }
@@ -545,7 +546,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             .map_err(|error| Error::Branch(error.to_string()))?;
         let (commit_seq, tables) = self.owner.with_connection(|connection| {
             Ok::<_, Error>((
-                proposal::current_commit_seq(connection)?,
+                history::current(connection)?,
                 catalog::table_names(connection)?,
             ))
         })?;
@@ -607,10 +608,22 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 }
                 let through = match self.history_pins.oldest() {
                     Some(oldest) => oldest,
-                    None => proposal::current_commit_seq(connection)?,
+                    None => history::current(connection)?,
                 };
-                proposal::prune_history(connection, through)?;
+                history::prune(connection, through)?;
                 Ok(receipt)
+            })
+    }
+
+    pub(super) fn prune_commit_history(&self) -> Result<()> {
+        self.owner
+            .with_savepoint("__multilite__commit_history_gc", |connection| {
+                let through = match self.history_pins.oldest() {
+                    Some(oldest) => oldest,
+                    None => history::current(connection)?,
+                };
+                history::prune(connection, through)?;
+                Ok(())
             })
     }
 
@@ -798,6 +811,7 @@ fn initialize<H: ServerHandle>(
     owner.with_connection(pending::initialize)?;
     owner.with_connection(catalog::initialize)?;
     owner.with_connection(proposal::initialize)?;
+    owner.with_connection(history::initialize)?;
     let store = DatabaseMetaStore::new(owner.clone());
     let client = block_on(Client::open(
         store,
@@ -853,8 +867,11 @@ fn reopen<H: ServerHandle>(
 
     owner.with_connection(|connection| {
         catalog::validate(connection)?;
+        history::validate(connection)?;
         proposal::validate(connection)?;
-        pending::validate_active_from(connection, space.cursors.neck)
+        pending::validate_active_from(connection, space.cursors.neck)?;
+        history::prune(connection, history::current(connection)?)?;
+        Ok::<_, Error>(())
     })?;
 
     let client = block_on(Client::open(
@@ -878,10 +895,11 @@ fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let metadata = SqliteOrderedStore::is_initialized(connection)?;
     let pending = pending::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
-    let commits = proposal::is_initialized(connection)?;
-    match (metadata, pending, catalog, commits) {
-        (false, false, false, false) => Ok(DatabaseState::Fresh),
-        (true, true, true, true) => {
+    let receipts = proposal::is_initialized(connection)?;
+    let history = history::is_initialized(connection)?;
+    match (metadata, pending, catalog, receipts, history) {
+        (false, false, false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
             catalog::validate(connection)?;

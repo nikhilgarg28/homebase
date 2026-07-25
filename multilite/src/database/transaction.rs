@@ -48,6 +48,10 @@ impl HomebaseTransaction {
     }
 
     /// Plan assertions for one isolation level and authority snapshot.
+    #[allow(
+        dead_code,
+        reason = "kept as the direct transaction-to-authority planning boundary"
+    )]
     pub fn plan(
         self,
         isolation: IsolationLevel,

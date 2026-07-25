@@ -14,6 +14,7 @@ use homebase_core::tag::{DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq};
 
 use super::pending;
 use crate::Error;
+use crate::commit::history;
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
 
@@ -134,8 +135,8 @@ impl MetaStore for DatabaseMetaStore {
                     );
                     let active =
                         pollster::block_on(self.inner.oplog(space, expected.neck, through))?;
-                    if pending::reject_active(connection, &active)? {
-                        crate::commit::proposal::advance_commit_seq(connection)?;
+                    if let Some(writes) = pending::reject_active(connection, &active)? {
+                        history::record(connection, writes)?;
                     }
                 }
                 pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?;

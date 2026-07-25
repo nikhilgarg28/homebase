@@ -10,6 +10,7 @@ use super::operation::MultiliteOp;
 use super::store::DatabaseMetaStore;
 use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
+use crate::commit::history;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Result};
 
@@ -79,9 +80,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
         let apply_to = admit_range.end;
         let local_device = self.client.device();
-        let applied_foreign = transactions
+        let mut foreign_writes = std::collections::BTreeSet::new();
+        for (_, transaction) in transactions
             .iter()
-            .any(|(device, _)| *device != local_device);
+            .filter(|(device, _)| *device != local_device)
+        {
+            let lowered = transaction.to_homebase()?;
+            foreign_writes.extend(history::writes_from_mutations(&lowered.mutations)?);
+        }
         runtime.run(ExecutionMode::RemoteApply, |connection| {
             runtime.with_internal_metadata(|| {
                 let current_submit = block_on(store.oplog_cursors(space_id))?;
@@ -97,14 +103,15 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             }
 
             runtime.with_internal_metadata(|| {
-                if applied_foreign {
-                    crate::commit::proposal::advance_commit_seq(connection)?;
+                if !foreign_writes.is_empty() {
+                    history::record(connection, foreign_writes)?;
                 }
                 block_on(store.mark_admits_applied(space_id, apply_to))?;
                 Ok(())
             })?;
             Ok(())
         })?;
+        self.prune_commit_history()?;
         Ok(())
     }
 }

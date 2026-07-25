@@ -1,8 +1,10 @@
 //! Local accept/reject effects for speculative Multilite transactions.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use homebase_client::meta::DeviceOp;
+use homebase_core::key::Key;
 use homebase_core::reader::Reader;
 use homebase_core::tag::DeviceSeq;
 use homebase_core::writer::Writer;
@@ -12,6 +14,7 @@ use super::catalog;
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
 use super::transaction::MultiliteTransaction;
+use crate::commit::history;
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__pending";
@@ -279,7 +282,10 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
 
 /// Undo and retire the pending transactions represented by one exact active
 /// Homebase window. Transactions are unwound in reverse device order.
-pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) -> Result<bool> {
+pub fn reject_active(
+    connection: &Connection,
+    active: &[(DeviceSeq, DeviceOp)],
+) -> Result<Option<BTreeSet<Key>>> {
     let expected = active
         .iter()
         .filter_map(|(seq, operation)| matches!(operation, DeviceOp::Commit { .. }).then_some(*seq))
@@ -295,13 +301,18 @@ pub fn reject_active(connection: &Connection, active: &[(DeviceSeq, DeviceOp)]) 
         ));
     }
 
+    let mut writes = BTreeSet::new();
+    for pending in &pending {
+        let lowered = pending.transaction.to_homebase()?;
+        writes.extend(history::writes_from_mutations(&lowered.mutations)?);
+    }
     for pending in pending.iter().rev() {
         apply_effects(connection, &pending.on_reject)?;
     }
     if !pending.is_empty() {
         connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
     }
-    Ok(!pending.is_empty())
+    Ok((!pending.is_empty()).then_some(writes))
 }
 
 /// Verify that every pending transaction still belongs to the active submit log.

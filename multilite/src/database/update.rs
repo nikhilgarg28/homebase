@@ -1,6 +1,9 @@
 //! Managed local update execution.
 
+use std::collections::BTreeSet;
+
 use homebase_client::{ClientError, ServerHandle};
+use homebase_core::key::Key;
 use homebase_core::tag::AdmissionSeq;
 use pollster::block_on;
 use rusqlite::{Connection, Row};
@@ -17,6 +20,7 @@ use super::{
 use crate::branch::changeset::ChangesetCapture;
 use crate::branch::{OverlayOptions, WritableBranch};
 use crate::commit::footprint::ReadTrace;
+use crate::commit::history;
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
@@ -198,7 +202,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         Ok(changed)
     }
 
-    fn finalize_serialized(self) -> Result<bool> {
+    fn finalize_serialized(self) -> Result<Option<BTreeSet<Key>>> {
         let UpdateBackend::Serialized {
             database,
             runtime,
@@ -208,15 +212,17 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             operations,
         } = self.backend
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if operations.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let transaction = MultiliteTransaction::new(operations)?;
         let mut homebase = transaction.to_homebase()?;
         homebase.include_read_trace(&read_trace);
-        let (mutations, assertions) = homebase.plan(self.isolation, authority_frontier);
+        let (mutations, footprint) = homebase.into_parts();
+        let writes = history::writes_from_mutations(&mutations)?;
+        let assertions = footprint.plan(self.isolation, authority_frontier);
         runtime.with_internal_metadata(|| {
             let sequence = block_on(async {
                 let space = database
@@ -231,7 +237,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             })?;
             pending::insert(connection, sequence, &transaction)
         })?;
-        Ok(true)
+        Ok(Some(writes))
     }
 }
 
@@ -328,11 +334,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     options.isolation_level(),
                 );
                 let value = operation(&mut update)?;
-                if update.finalize_serialized()? {
-                    crate::commit::proposal::advance_commit_seq(connection)?;
+                if let Some(writes) = update.finalize_serialized()? {
+                    history::record(connection, writes)?;
                 }
                 Ok(value)
             })?;
+        self.prune_commit_history()?;
 
         match self.policy.policy() {
             SyncPolicy::LocalOnly => {}
