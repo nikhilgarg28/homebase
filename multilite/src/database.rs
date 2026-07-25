@@ -52,7 +52,7 @@ use crate::{Error, Params, Result};
 
 use self::authority::Authority;
 use self::policy::{PolicyState, PushScheduler};
-use self::row::{CapturedRow, StoredValue};
+use self::row::{CapturedChange, CapturedRow, StoredValue};
 use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
 
 pub use self::connection::Connection;
@@ -282,7 +282,7 @@ impl Deref for DatabaseRuntime {
 pub(crate) struct DatabaseHooks;
 
 impl HookPolicy for DatabaseHooks {
-    type Event = CapturedRow;
+    type Event = CapturedChange;
 
     fn authorize(&mut self, mode: ExecutionMode, context: AuthContext<'_>) -> Authorization {
         authorize_database(mode, &context)
@@ -295,16 +295,16 @@ impl HookPolicy for DatabaseHooks {
         table: &str,
         update: &PreUpdateCase,
     ) -> Result<Option<Self::Event>> {
-        capture_insert(mode, database, table, update)
+        capture_change(mode, database, table, update)
     }
 }
 
-fn capture_insert(
+fn capture_change(
     mode: ExecutionMode,
     database: &str,
     table: &str,
     update: &PreUpdateCase,
-) -> Result<Option<CapturedRow>> {
+) -> Result<Option<CapturedChange>> {
     if mode != ExecutionMode::Public
         || database != "main"
         || is_schema_table(table)
@@ -312,29 +312,48 @@ fn capture_insert(
     {
         return Ok(None);
     }
-    let PreUpdateCase::Insert(values) = update else {
-        return Err(Error::CaptureInvariant(
-            "public table mutation was not an insert",
-        ));
+    let (depth, rowid, column_count) = match update {
+        PreUpdateCase::Insert(values) => (
+            values.get_query_depth(),
+            values.get_new_row_id(),
+            values.get_column_count(),
+        ),
+        PreUpdateCase::Delete(values) => (
+            values.get_query_depth(),
+            values.get_old_row_id(),
+            values.get_column_count(),
+        ),
+        PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => {
+            return Err(Error::CaptureInvariant(
+                "public table mutation was not an insert or delete",
+            ));
+        }
     };
-    if values.get_query_depth() != 0 {
+    if depth != 0 {
         return Err(Error::CaptureInvariant(
             "writes caused by triggers are not supported",
         ));
     }
-    let rowid = values.get_new_row_id();
-    let values = (0..values.get_column_count())
+    let values = (0..column_count)
         .map(|index| {
-            values
-                .get_new_column_value(index)
-                .map(StoredValue::capture)
-                .map_err(Error::from)
+            match update {
+                PreUpdateCase::Insert(values) => values.get_new_column_value(index),
+                PreUpdateCase::Delete(values) => values.get_old_column_value(index),
+                PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => unreachable!(),
+            }
+            .map(StoredValue::capture)
+            .map_err(Error::from)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Some(CapturedRow {
+    let row = CapturedRow {
         table: table.to_owned(),
         rowid,
         values,
+    };
+    Ok(Some(match update {
+        PreUpdateCase::Insert(_) => CapturedChange::Insert(row),
+        PreUpdateCase::Delete(_) => CapturedChange::Delete(row),
+        PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => unreachable!(),
     }))
 }
 
@@ -796,6 +815,9 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         AuthAction::Insert { table_name } => {
             authorize_user_table(context.database_name, table_name)
         }
+        AuthAction::Delete { table_name } => {
+            authorize_user_table(context.database_name, table_name)
+        }
         _ => Authorization::Deny,
     }
 }
@@ -809,7 +831,7 @@ fn authorize_read(database: Option<&str>, table: &str) -> Authorization {
 }
 
 fn authorize_user_table(database: Option<&str>, table: &str) -> Authorization {
-    if is_main(database) && !has_multilite_prefix(table) {
+    if is_main(database) && !has_multilite_prefix(table) && !is_sqlite_internal_table(table) {
         Authorization::Allow
     } else {
         Authorization::Deny
@@ -830,6 +852,12 @@ fn is_main(database: Option<&str>) -> bool {
 
 fn is_schema_table(table: &str) -> bool {
     table.eq_ignore_ascii_case("sqlite_master") || table.eq_ignore_ascii_case("sqlite_schema")
+}
+
+fn is_sqlite_internal_table(table: &str) -> bool {
+    table
+        .get(.."sqlite_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
 }
 
 fn has_multilite_prefix(table: &str) -> bool {

@@ -10,7 +10,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
 use super::operation::MultiliteOp;
-use super::row::InsertRows;
+use super::row::{CapturedChange, DeleteRows, InsertRows};
 use super::schema::table_prefix;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
@@ -112,22 +112,62 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 Ok(changed)
             }
             ValidatedExecute::Insert => {
-                let (changed, events) = self.hooks.run(
+                let mut inserted = None;
+                let (changed, _) = self.hooks.run(
                     || Ok(self.connection.execute(sql, params)?),
-                    |events| super::row::normalize_hidden_rowids(self.connection, events),
+                    |events| {
+                        super::row::normalize_insert_rowids(self.connection, events)?;
+                        let had_events = !events.is_empty();
+                        let captured = std::mem::take(events)
+                            .into_iter()
+                            .map(|event| match event {
+                                CapturedChange::Insert(row) => Ok(row),
+                                CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
+                                    "INSERT captured a deleted application row",
+                                )),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        inserted = InsertRows::from_captured(self.connection, &captured)?;
+                        if inserted.is_none() && had_events {
+                            return Err(Error::UnsupportedSql(
+                                "INSERT target has no synchronized schema identity",
+                            ));
+                        }
+                        Ok(())
+                    },
                 )?;
-                let inserted = self
-                    .hooks
-                    .with_internal(|| InsertRows::from_captured(self.connection, &events))?;
-                let Some(inserted) = inserted else {
-                    if events.is_empty() {
-                        return Ok(changed);
-                    }
-                    return Err(Error::UnsupportedSql(
-                        "INSERT target has no synchronized schema identity",
-                    ));
-                };
-                self.operations.push(MultiliteOp::InsertRows(inserted));
+                if let Some(inserted) = inserted {
+                    self.operations.push(MultiliteOp::InsertRows(inserted));
+                }
+                Ok(changed)
+            }
+            ValidatedExecute::Delete => {
+                let mut deleted = None;
+                let (changed, _) = self.hooks.run(
+                    || Ok(self.connection.execute(sql, params)?),
+                    |events| {
+                        let had_events = !events.is_empty();
+                        let captured = std::mem::take(events)
+                            .into_iter()
+                            .map(|event| match event {
+                                CapturedChange::Delete(row) => Ok(row),
+                                CapturedChange::Insert(_) => Err(Error::CaptureInvariant(
+                                    "DELETE captured an inserted application row",
+                                )),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        deleted = DeleteRows::from_captured(self.connection, &captured)?;
+                        if deleted.is_none() && had_events {
+                            return Err(Error::UnsupportedSql(
+                                "DELETE target has no synchronized schema identity",
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(deleted) = deleted {
+                    self.operations.push(MultiliteOp::DeleteRows(deleted));
+                }
                 Ok(changed)
             }
         }
@@ -141,7 +181,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
 #[derive(Default)]
 struct BranchHookState {
-    events: Vec<super::row::CapturedRow>,
+    events: Vec<CapturedChange>,
     error: Option<Error>,
     internal_depth: usize,
     trace_reads: bool,
@@ -191,7 +231,7 @@ impl<'connection> BranchHooks<'connection> {
                 if state.internal_depth != 0 || state.error.is_some() {
                     return;
                 }
-                match super::capture_insert(ExecutionMode::Public, database, table, update) {
+                match super::capture_change(ExecutionMode::Public, database, table, update) {
                     Ok(Some(event)) => state.events.push(event),
                     Ok(None) => {}
                     Err(error) => state.error = Some(error),
@@ -204,8 +244,8 @@ impl<'connection> BranchHooks<'connection> {
     fn run<T>(
         &self,
         operation: impl FnOnce() -> Result<T>,
-        finalize: impl FnOnce(&mut Vec<super::row::CapturedRow>) -> Result<()>,
-    ) -> Result<(T, Vec<super::row::CapturedRow>)> {
+        finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
+    ) -> Result<(T, Vec<CapturedChange>)> {
         let checkpoint = lock(&self.state).events.len();
         self.with_internal(|| {
             self.connection

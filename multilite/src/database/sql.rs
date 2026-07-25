@@ -14,6 +14,7 @@ use crate::{Error, Result};
 pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
     Insert,
+    Delete,
 }
 
 /// Validate the initial transaction-read grammar and rewrite its sources.
@@ -172,8 +173,48 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
             }
             Ok(ValidatedExecute::Insert)
         }
+        Stmt::Delete {
+            with,
+            tbl_name,
+            indexed,
+            returning,
+            order_by,
+            limit,
+            ..
+        } => {
+            if with.is_some() {
+                return Err(Error::UnsupportedSql("DELETE WITH is not supported"));
+            }
+            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified and aliased DELETE targets are not supported",
+                ));
+            }
+            let table = identifier(&tbl_name.name)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            if indexed.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "DELETE index selection is not supported",
+                ));
+            }
+            if returning.is_some() {
+                return Err(Error::UnsupportedSql("DELETE RETURNING is not supported"));
+            }
+            if order_by.is_some() || limit.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "DELETE ORDER BY and LIMIT are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::Delete)
+        }
         _ => Err(Error::UnsupportedSql(
-            "execute accepts only CREATE TABLE and INSERT",
+            "execute accepts only CREATE TABLE, INSERT, and DELETE",
         )),
     }
 }
@@ -395,13 +436,16 @@ mod tests {
     }
 
     #[test]
-    fn accepts_restricted_create_table_and_insert_forms() {
+    fn accepts_restricted_create_insert_and_delete_forms() {
         for sql in [
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
             "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
             "INSERT INTO notes VALUES (1, 'ON CONFLICT')",
             "INSERT INTO \"replace\" VALUES (1)",
             "WITH value(id) AS (SELECT 1) INSERT INTO notes SELECT id, 'x' FROM value",
+            "DELETE FROM notes",
+            "DELETE FROM notes WHERE id = ?1",
+            "DELETE FROM notes WHERE id IN (SELECT id FROM archived)",
         ] {
             validate_execute(sql).unwrap();
         }
@@ -448,6 +492,22 @@ mod tests {
             "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id) ON CONFLICT ABORT)",
             "CREATE TABLE notes (id INTEGER, UNIQUE (id) ON CONFLICT ROLLBACK)",
             "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn rejects_delete_extensions_outside_the_initial_slice() {
+        for sql in [
+            "WITH old AS (SELECT 1) DELETE FROM notes WHERE id IN old",
+            "DELETE FROM main.notes",
+            "DELETE FROM notes AS old",
+            "DELETE FROM notes INDEXED BY notes_id",
+            "DELETE FROM notes NOT INDEXED",
+            "DELETE FROM notes RETURNING id",
+            "DELETE FROM notes ORDER BY id LIMIT 1",
+            "DELETE FROM __multilite__pending",
         ] {
             assert_unsupported(sql);
         }

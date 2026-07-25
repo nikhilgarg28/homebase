@@ -78,6 +78,13 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
             )
             .await
             .unwrap();
+        assert_eq!(
+            database
+                .execute_async("DELETE FROM notes WHERE id = ?1", [Value::Integer(2)])
+                .await
+                .unwrap(),
+            1
+        );
         let statement = database
             .prepare_async("SELECT body FROM notes WHERE id >= ?1 ORDER BY id")
             .await
@@ -87,7 +94,7 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
                 .query_map_async([Value::Integer(2)], |row| row.get::<_, String>(0))
                 .await
                 .unwrap(),
-            ["two", "three"]
+            ["three"]
         );
     });
 }

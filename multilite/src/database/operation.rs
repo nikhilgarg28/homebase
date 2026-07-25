@@ -8,7 +8,7 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
 use super::catalog;
-use super::row::{InsertRows, RowHomebaseOp};
+use super::row::{DeleteRows, InsertRows, RowHomebaseOp};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
@@ -16,12 +16,14 @@ use crate::{Error, Result};
 const OPERATION_FRAME_VERSION: u8 = 1;
 const CREATE_TABLE_OPERATION: u8 = 1;
 const INSERT_ROWS_OPERATION: u8 = 2;
+const DELETE_ROWS_OPERATION: u8 = 3;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MultiliteOp {
     CreateTable(CreateTable),
     InsertRows(InsertRows),
+    DeleteRows(DeleteRows),
 }
 
 /// Homebase mutations and conflict footprint for one [`MultiliteOp`].
@@ -57,6 +59,10 @@ impl MultiliteOp {
                 writer.u8(INSERT_ROWS_OPERATION);
                 writer.bytes(&inserted.encode());
             }
+            Self::DeleteRows(deleted) => {
+                writer.u8(DELETE_ROWS_OPERATION);
+                writer.bytes(&deleted.encode());
+            }
         }
         writer.finish()
     }
@@ -74,6 +80,9 @@ impl MultiliteOp {
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())
                 .map(Self::InsertRows)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            DELETE_ROWS_OPERATION => DeleteRows::decode(reader.rest())
+                .map(Self::DeleteRows)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             kind => Err(OperationCodecError::UnknownKind(kind)),
         }
@@ -95,6 +104,15 @@ impl MultiliteOp {
                     .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
                 (mutations, footprint)
             }
+            Self::DeleteRows(deleted) => {
+                let RowHomebaseOp {
+                    mutations,
+                    footprint,
+                } = deleted
+                    .to_homebase()
+                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                (mutations, footprint)
+            }
         };
         Ok(HomebaseOp {
             mutations,
@@ -110,6 +128,7 @@ impl MultiliteOp {
                 catalog::insert(connection, created)
             }
             Self::InsertRows(inserted) => inserted.apply(connection),
+            Self::DeleteRows(deleted) => deleted.apply(connection),
         }
     }
 }
@@ -142,7 +161,7 @@ mod tests {
 
     use super::*;
     use crate::database::catalog;
-    use crate::database::row::{CapturedRow, StoredValue};
+    use crate::database::row::{CapturedRow, DeleteRows, StoredValue};
     use crate::database::schema::{CreateColumn, DeclaredType, SqlName};
 
     fn table() -> CreateTableSpec {
@@ -199,5 +218,22 @@ mod tests {
             MultiliteOp::decode(&[2, CREATE_TABLE_OPERATION]),
             Err(OperationCodecError::UnknownVersion(2))
         );
+
+        let deleted = MultiliteOp::DeleteRows(
+            DeleteRows::from_captured(
+                &connection,
+                &[CapturedRow {
+                    table: "notes".into(),
+                    rowid: 7,
+                    values: vec![StoredValue::Integer(7)],
+                }],
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(MultiliteOp::decode(&deleted.encode()).unwrap(), deleted);
+        let (mutations, footprint) = deleted.to_homebase().unwrap().into_parts();
+        assert!(matches!(mutations.as_slice(), [Mutation::Delete { .. }]));
+        assert_eq!(footprint.writes().len(), 1);
     }
 }

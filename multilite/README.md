@@ -6,13 +6,14 @@ the Homebase coordination kernel.
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits a restricted persistent
-`CREATE TABLE`, read-only prepared `SELECT`, and `INSERT` against non-reserved
-tables. A table must use the initial four declared types and exactly one inline
-primary key; richer constraints and schema forms remain rejected. Other verbs,
+`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, and `DELETE` against
+non-reserved tables. A table must use the initial four declared types and
+exactly one inline primary key; richer constraints and schema forms remain
+rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
-row insertion into lean logical operations. `Connection::update(|tx| ...)`
+row insertion/deletion into lean logical operations. `Connection::update(|tx| ...)`
 accumulates multiple statements into one UUID-keyed `MultiliteTransaction`,
 while `Connection::view(|tx| ...)` owns one read-only SQLite snapshot. Their
 transaction values provide SQLite-shaped `query`, `query_map`, and `prepare`
@@ -53,12 +54,21 @@ write-revision cells. Accepted foreign rows replay by stable IDs through the
 local schema catalog; rejected local rows are deleted by the pending journal in
 the same transaction that rolls back the Homebase submit window.
 
+`DELETE` currently accepts one unqualified, unaliased user table with an
+optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and
+`LIMIT` remain rejected. SQLite evaluates the predicate and the preupdate hook
+captures every complete old row image. `DeleteRows` lowers those rows to exact
+Homebase point deletes with the same row-keyspace and write-revision guards as
+inserts. Remote apply verifies the complete current row before deleting it, and
+rejection restores values plus the hidden SQLite rowid when one exists.
+Zero-row deletes create no logical transaction.
+
 `Connection::open` is the single file-lifecycle verb;
 `MultiliteConnection` remains an alias for compatibility. Open initializes or
 validates database identity, Homebase metadata, the pending-effects journal,
 and the schema catalog in one general implementation path. Existing SQLite
-user tables are preserved and remain readable. Inserts into an adopted table
-are rejected until that table has a synchronized schema identity.
+user tables are preserved and remain readable. Inserts and deletes against an
+adopted table are rejected until that table has a synchronized schema identity.
 
 A new database without options mints a public `DatabaseId` and local device
 identity. Another replica is initialized by passing the first file's opaque,
@@ -132,9 +142,9 @@ speculative SQLite state. A remote write does undo its own local SQLite effects
 before returning a definitive rejection. Transport failure is not rejection:
 durable local submissions remain available for retry because admission may be
 ambiguous. Freshness is session-local and starts stale after every open. Inserts
-into tables created through Multilite participate in every synchronization
-policy; adopted tables without durable schema identities are rejected by the
-row pipeline.
+and deletes against tables created through Multilite participate in every
+synchronization policy; adopted tables without durable schema identities are
+rejected by the row pipeline.
 
 Current invitations and space envelopes are plaintext scaffolding. The API
 is designed for a later encrypted default: a fresh open will mint the final
@@ -160,7 +170,7 @@ journal, not a second operation log. Its versioned record codec stores repeated
 effect lists derived from all ordered operations: acceptance runs forward,
 while rejection unwinds operations in reverse. CREATE TABLE rejection drops
 the speculative table and catalog entry, while INSERT rejection removes the
-exact speculative rows.
+exact speculative rows and DELETE rejection restores each complete old row.
 `__multilite__schema` is the local lookup index from SQLite names and stable
 table UUIDs to authenticated schema definitions.
 The ordered-store adapter executes synchronously under a serialized,

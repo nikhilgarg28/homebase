@@ -37,6 +37,56 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
 }
 
 #[test]
+fn delete_uses_sqlite_predicates_and_zero_rows_are_a_noop() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("delete.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO notes VALUES
+            (1, 'keep'),
+            (2, 'delete'),
+            (3, 'also delete')",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "DELETE FROM notes
+             WHERE id IN (
+                SELECT id FROM notes
+                WHERE body LIKE '%delete%'
+             )",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.execute("DELETE FROM notes WHERE id = ?1", [99_i64])
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query("SELECT id, body FROM notes", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "keep".into())]
+    );
+    assert_eq!(db.execute("DELETE FROM notes", ()).unwrap(), 1);
+    assert!(
+        db.query("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rejected.sqlite");
@@ -48,7 +98,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
 
     for sql in [
         "UPDATE notes SET body = 'updated' WHERE id = 1",
-        "DELETE FROM notes WHERE id = 1",
         "ALTER TABLE notes ADD COLUMN extra TEXT",
         "DROP TABLE notes",
         "CREATE INDEX notes_body ON notes(body)",
@@ -91,6 +140,158 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn delete_extensions_and_reserved_targets_are_rejected_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("delete-shape.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'original')", ())
+        .unwrap();
+
+    for sql in [
+        "WITH old AS (SELECT 1) DELETE FROM notes WHERE id IN old",
+        "DELETE FROM main.notes",
+        "DELETE FROM notes AS old",
+        "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
+        "DELETE FROM notes NOT INDEXED",
+        "DELETE FROM notes RETURNING id",
+        "DELETE FROM notes ORDER BY id LIMIT 1",
+        "DELETE FROM __multilite__pending",
+        "DELETE FROM sqlite_sequence",
+    ] {
+        assert!(
+            matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))),
+            "statement was accepted: {sql}"
+        );
+        assert_eq!(read_note(&db), "original");
+    }
+}
+
+#[test]
+fn delete_from_an_adopted_table_rolls_back_without_a_schema_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adopted-delete.sqlite");
+    let stock = Connection::open(&path).unwrap();
+    stock
+        .execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes VALUES (1, 'original')",
+        )
+        .unwrap();
+    drop(stock);
+
+    let db = MultiliteConnection::open(&path).unwrap();
+    assert!(matches!(
+        db.execute("DELETE FROM notes WHERE id = 1", ()),
+        Err(Error::UnsupportedSql(
+            "DELETE target has no synchronized schema identity"
+        ))
+    ));
+    assert_eq!(read_note(&db), "original");
+}
+
+#[test]
+fn caught_adopted_table_write_errors_rollback_their_statement_savepoints() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("caught-adopted-write.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE adopted (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO adopted VALUES (1, 'original')",
+        )
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE owned (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
+
+    db.update(|transaction| {
+        assert!(matches!(
+            transaction.execute("DELETE FROM adopted WHERE id = 1", ()),
+            Err(Error::UnsupportedSql(
+                "DELETE target has no synchronized schema identity"
+            ))
+        ));
+        assert!(matches!(
+            transaction.execute("INSERT INTO adopted VALUES (2, 'untracked')", ()),
+            Err(Error::UnsupportedSql(
+                "INSERT target has no synchronized schema identity"
+            ))
+        ));
+        transaction.execute("INSERT INTO owned VALUES (1, 'tracked')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT id, body FROM adopted", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "original".into())]
+    );
+    assert_eq!(
+        db.query("SELECT id, body FROM owned", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "tracked".into())]
+    );
+}
+
+#[test]
+fn trigger_generated_delete_effects_abort_the_whole_statement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("trigger-delete.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'note')", ())?;
+        transaction.execute("INSERT INTO audit VALUES (1, 'audit')", ())?;
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER delete_audit
+             AFTER DELETE ON notes
+             BEGIN
+                 DELETE FROM audit WHERE id = old.id;
+             END",
+        )
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    assert!(matches!(
+        db.execute("DELETE FROM notes WHERE id = 1", ()),
+        Err(Error::CaptureInvariant(
+            "writes caused by triggers are not supported"
+        ))
+    ));
+    for table in ["notes", "audit"] {
+        assert_eq!(
+            db.query(&format!("SELECT count(*) FROM {table}"), (), |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            [1]
+        );
+    }
 }
 
 #[test]

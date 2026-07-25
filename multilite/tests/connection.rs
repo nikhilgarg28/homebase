@@ -178,6 +178,44 @@ fn managed_update_and_view_share_sqlite_shaped_query_methods() {
 }
 
 #[test]
+fn managed_update_preserves_insert_delete_manifest_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("delete-order.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'old')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.update(|transaction| {
+        transaction.execute("DELETE FROM notes WHERE id = 1", ())?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'replacement')", ())?;
+        transaction.execute("INSERT INTO notes VALUES (2, 'temporary')", ())?;
+        transaction.execute("DELETE FROM notes WHERE id = 2", ())?;
+        assert_eq!(
+            transaction.query("SELECT id, body FROM notes", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?,
+            [(1, "replacement".into())]
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT id, body FROM notes", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "replacement".into())]
+    );
+}
+
+#[test]
 fn managed_view_keeps_its_branch_while_same_database_update_commits() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("concurrent-view.sqlite")).unwrap();

@@ -1,5 +1,6 @@
 //! Captured SQLite rows and their durable Homebase representation.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use homebase_core::key::{Key, KeyError};
@@ -8,7 +9,7 @@ use homebase_core::messages::AdmittedBatch;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
-use rusqlite::{Connection, ToSql, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
@@ -21,7 +22,7 @@ pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
 const ROW_FRAME_VERSION: u8 = 2;
-const INSERT_FRAME_VERSION: u8 = 1;
+const ROW_SET_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
 const TAG_ROW_KEYSPACE: u8 = 2;
 const TAG_KEY_PART: u8 = 3;
@@ -33,12 +34,19 @@ const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_TYPE: u8 = 2;
 const TAG_VALUE: u8 = 2;
 
-/// One final SQLite row observed after affinity and generated values ran.
+/// One complete SQLite row image observed after affinity and generated values ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedRow {
     pub table: String,
     pub rowid: i64,
     pub values: Vec<StoredValue>,
+}
+
+/// One direct application-row change observed by SQLite's preupdate hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapturedChange {
+    Insert(CapturedRow),
+    Delete(CapturedRow),
 }
 
 impl StoredValue {
@@ -121,7 +129,13 @@ pub struct InsertRows {
     rows: Vec<Row>,
 }
 
-/// Homebase mutations and conflict footprint for one row insertion.
+/// One logical multi-row DELETE carrying the complete removed row images.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRows {
+    deleted: InsertRows,
+}
+
+/// Homebase mutations and conflict footprint for one row operation.
 pub struct RowHomebaseOp {
     pub mutations: Vec<Mutation>,
     pub footprint: ConflictFootprint,
@@ -137,7 +151,7 @@ impl InsertRows {
         };
         if captured.iter().any(|row| row.table != first.table) {
             return Err(Error::CaptureInvariant(
-                "one INSERT statement changed more than one table",
+                "one row operation changed more than one table",
             ));
         }
         let Some(created) = catalog::by_name(connection, &first.table)? else {
@@ -179,6 +193,8 @@ impl InsertRows {
     }
 
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        self.validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let mut mutations = Vec::with_capacity(self.rows.len());
         let mut footprint = ConflictFootprint::new();
         for row in &self.rows {
@@ -250,12 +266,14 @@ impl InsertRows {
             }
             candidate.rows.push(row);
         }
-        operation.ok_or(RowCodecError::InvalidBatch)
+        let operation = operation.ok_or(RowCodecError::InvalidBatch)?;
+        operation.validate_structure()?;
+        Ok(operation)
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.u8(INSERT_FRAME_VERSION);
+        writer.u8(ROW_SET_FRAME_VERSION);
         put_field(&mut writer, TAG_TABLE, &self.table.as_bytes());
         for row in &self.rows {
             put_field(&mut writer, TAG_ROW, &self.encode_row(row));
@@ -265,7 +283,7 @@ impl InsertRows {
 
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
         let mut reader = Reader::new(frame);
-        if reader.u8() != Some(INSERT_FRAME_VERSION) {
+        if reader.u8() != Some(ROW_SET_FRAME_VERSION) {
             return Err(RowCodecError::UnknownVersion);
         }
         let mut table = None;
@@ -299,6 +317,7 @@ impl InsertRows {
         if Some(operation.table) != table {
             return Err(RowCodecError::InvalidBatch);
         }
+        operation.validate_structure()?;
         Ok(operation)
     }
 
@@ -364,7 +383,19 @@ impl InsertRows {
     }
 
     pub fn delete_materialized(&self, connection: &Connection) -> Result<()> {
+        self.delete_materialized_with(
+            connection,
+            "pending INSERT row no longer matches SQLite state",
+        )
+    }
+
+    fn delete_materialized_with(
+        &self,
+        connection: &Connection,
+        mismatch: &'static str,
+    ) -> Result<()> {
         let created = self.catalog_definition(connection)?;
+        let columns = created.columns();
         let primary = created.primary_key_columns().collect::<Vec<_>>();
         let mut predicates = primary
             .iter()
@@ -379,7 +410,19 @@ impl InsertRows {
             "DELETE FROM {} WHERE {predicate}",
             quote_identifier(created.table_name())
         );
-        let mut statement = connection.prepare(&sql)?;
+        let mut selected = columns
+            .iter()
+            .map(|column| quote_identifier(column.name().value()))
+            .collect::<Vec<_>>();
+        if let Some(alias) = hidden_rowid {
+            selected.push(quote_identifier(alias));
+        }
+        let select_sql = format!(
+            "SELECT {} FROM {} WHERE {predicate}",
+            selected.join(", "),
+            quote_identifier(created.table_name())
+        );
+        let mut select = connection.prepare(&select_sql)?;
         for row in self.rows.iter().rev() {
             let primary = self.primary_values(row)?;
             let mut parameters = Vec::<&dyn ToSql>::with_capacity(
@@ -389,10 +432,45 @@ impl InsertRows {
             if hidden_rowid.is_some() {
                 parameters.push(&row.rowid);
             }
-            if statement.execute(params_from_iter(parameters))? != 1 {
-                return Err(Error::InvalidDatabase(
-                    "pending INSERT row no longer matches SQLite state",
-                ));
+            let actual = select
+                .query_row(params_from_iter(parameters.iter().copied()), |result| {
+                    let values = (0..columns.len())
+                        .map(|index| result.get_ref(index).map(StoredValue::capture))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let rowid = hidden_rowid
+                        .map(|_| result.get::<_, i64>(columns.len()))
+                        .transpose()?;
+                    Ok((values, rowid))
+                })
+                .optional()?;
+            let expected = columns
+                .iter()
+                .map(|column| {
+                    row.values
+                        .iter()
+                        .find(|(id, _)| *id == column.id())
+                        .map(|(_, value)| value.clone())
+                        .ok_or(Error::InvalidMultiliteOp(
+                            "row is missing a schema column".into(),
+                        ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if actual != Some((expected, hidden_rowid.map(|_| row.rowid))) {
+                return Err(Error::InvalidDatabase(mismatch));
+            }
+        }
+        let mut delete = connection.prepare(&sql)?;
+        for row in self.rows.iter().rev() {
+            let primary = self.primary_values(row)?;
+            let mut parameters = Vec::<&dyn ToSql>::with_capacity(
+                primary.len() + usize::from(hidden_rowid.is_some()),
+            );
+            parameters.extend(primary.into_iter().map(|value| value as &dyn ToSql));
+            if hidden_rowid.is_some() {
+                parameters.push(&row.rowid);
+            }
+            if delete.execute(params_from_iter(parameters))? != 1 {
+                return Err(Error::InvalidDatabase(mismatch));
             }
         }
         Ok(())
@@ -407,6 +485,8 @@ impl InsertRows {
     }
 
     fn validate_against(&self, created: &CreateTable) -> Result<()> {
+        self.validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let expected_key_parts = created
             .primary_key_columns()
             .map(|column| KeyPartRules {
@@ -437,6 +517,26 @@ impl InsertRows {
             self.key_images(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
             })?;
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
+        if self.key_parts.is_empty() || self.rows.is_empty() {
+            return Err(RowCodecError::InvalidRow);
+        }
+        if self.key_parts.iter().enumerate().any(|(index, part)| {
+            self.key_parts[..index]
+                .iter()
+                .any(|seen| seen.column == part.column)
+        }) {
+            return Err(RowCodecError::DuplicateField);
+        }
+        let mut keys = BTreeSet::new();
+        for row in &self.rows {
+            if !keys.insert(self.row_key(row)?) {
+                return Err(RowCodecError::DuplicateRow);
+            }
         }
         Ok(())
     }
@@ -482,6 +582,54 @@ impl InsertRows {
             );
         }
         writer.finish()
+    }
+}
+
+impl DeleteRows {
+    pub fn from_captured(
+        connection: &Connection,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        Ok(InsertRows::from_captured(connection, captured)?.map(|deleted| Self { deleted }))
+    }
+
+    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        self.deleted
+            .validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let mut mutations = Vec::with_capacity(self.deleted.rows.len());
+        let mut footprint = ConflictFootprint::new();
+        for row in &self.deleted.rows {
+            let key = self
+                .deleted
+                .row_key(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+            footprint.add_write(key.clone());
+            mutations.push(Mutation::Delete { key });
+        }
+        footprint.add_constraint(active_row_keyspace_key(self.deleted.table));
+        footprint.add_constraint(write_revision_key(self.deleted.table));
+        Ok(RowHomebaseOp {
+            mutations,
+            footprint,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.deleted.encode()
+    }
+
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        InsertRows::decode(frame).map(|deleted| Self { deleted })
+    }
+
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        self.deleted
+            .delete_materialized_with(connection, "DELETE row no longer matches SQLite state")
+    }
+
+    pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
+        self.deleted.apply(connection)
     }
 }
 
@@ -709,16 +857,25 @@ fn decode_row(
 /// Replace branch-local sequential hidden rowids with collision-resistant ids.
 ///
 /// INTEGER PRIMARY KEY already supplies stable row identity and is left alone.
-pub(super) fn normalize_hidden_rowids(
+pub(super) fn normalize_insert_rowids(
     connection: &Connection,
-    captured: &mut [CapturedRow],
+    captured: &mut [CapturedChange],
 ) -> Result<()> {
-    let Some(first) = captured.first() else {
+    let Some(first) = captured.first().map(|change| match change {
+        CapturedChange::Insert(row) => Ok(row),
+        CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
+            "INSERT captured a deleted application row",
+        )),
+    }) else {
         return Ok(());
     };
-    if captured.iter().any(|row| row.table != first.table) {
+    let first = first?;
+    if captured.iter().any(|change| match change {
+        CapturedChange::Insert(row) => row.table != first.table,
+        CapturedChange::Delete(_) => true,
+    }) {
         return Err(Error::CaptureInvariant(
-            "one INSERT statement changed more than one table",
+            "INSERT captured an unexpected row change",
         ));
     }
     let Some(created) = catalog::by_name(connection, &first.table)? else {
@@ -731,7 +888,10 @@ pub(super) fn normalize_hidden_rowids(
     let alias = quote_identifier(alias);
     let exists_sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {alias} = ?1)");
     let update_sql = format!("UPDATE {table} SET {alias} = ?1 WHERE {alias} = ?2");
-    for row in captured {
+    for change in captured {
+        let CapturedChange::Insert(row) = change else {
+            unreachable!("all captured changes were checked above")
+        };
         let rowid = loop {
             let bytes = Uuid::new_v4().into_bytes();
             let candidate =
@@ -826,6 +986,7 @@ pub enum RowCodecError {
     InvalidUuid,
     InvalidValue,
     InvalidRow,
+    DuplicateRow,
     NullPrimaryKey,
     InvalidKey(KeyError),
     InvalidBatch,
@@ -842,6 +1003,7 @@ impl fmt::Display for RowCodecError {
             Self::InvalidUuid => f.write_str("row identity is not a UUID v4"),
             Self::InvalidValue => f.write_str("invalid stored SQLite value"),
             Self::InvalidRow => f.write_str("invalid row frame"),
+            Self::DuplicateRow => f.write_str("row operation contains a duplicate logical row"),
             Self::NullPrimaryKey => f.write_str("primary key value is NULL"),
             Self::InvalidKey(error) => write!(f, "invalid Homebase row key: {error}"),
             Self::InvalidBatch => f.write_str("admitted row operation has an invalid envelope"),
@@ -984,6 +1146,103 @@ mod tests {
     }
 
     #[test]
+    fn delete_codec_lowers_exact_keys_and_restores_complete_rows() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        let deleted = DeleteRows {
+            deleted: inserted.clone(),
+        };
+
+        assert_eq!(DeleteRows::decode(&deleted.encode()).unwrap(), deleted);
+        let lowered = deleted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 2);
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .all(|mutation| matches!(mutation, Mutation::Delete { .. }))
+        );
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(
+            lowered.mutations[0].key(),
+            &primary_key_prefix(&created, &[StoredValue::Integer(7)]).unwrap()
+        );
+
+        inserted.apply(&connection).unwrap();
+        deleted.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        deleted.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .prepare("SELECT id, body, payload FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [(7, Some("hello".into()), vec![0, 1]), (9, None, Vec::new()),]
+        );
+    }
+
+    #[test]
+    fn row_set_codec_rejects_duplicate_primary_key_images() {
+        let created = definition();
+        let connection = connection(&created);
+        let mut inserted = inserted(&connection);
+        inserted.rows.push(inserted.rows[0].clone());
+
+        assert_eq!(
+            InsertRows::decode(&inserted.encode()),
+            Err(RowCodecError::DuplicateRow)
+        );
+        assert!(matches!(
+            inserted.to_homebase(),
+            Err(Error::InvalidMultiliteOp(message))
+                if message == "row operation contains a duplicate logical row"
+        ));
+    }
+
+    #[test]
+    fn delete_refuses_a_row_whose_non_key_values_diverged() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        let deleted = DeleteRows {
+            deleted: inserted.clone(),
+        };
+        inserted.apply(&connection).unwrap();
+        connection
+            .execute("UPDATE notes SET body = 'changed' WHERE id = 7", ())
+            .unwrap();
+
+        assert!(matches!(
+            deleted.apply(&connection),
+            Err(Error::InvalidDatabase(
+                "DELETE row no longer matches SQLite state"
+            ))
+        ));
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn apply_and_reject_effects_replay_exact_rows() {
         let created = definition();
         let connection = connection(&created);
@@ -1047,15 +1306,19 @@ mod tests {
         source
             .execute("INSERT INTO documents VALUES ('a', 'one')", ())
             .unwrap();
-        let mut captured = vec![CapturedRow {
+        let mut changes = vec![CapturedChange::Insert(CapturedRow {
             table: "documents".into(),
             rowid: 1,
             values: vec![
                 StoredValue::Text(b"a".to_vec()),
                 StoredValue::Text(b"one".to_vec()),
             ],
-        }];
-        normalize_hidden_rowids(&source, &mut captured).unwrap();
+        })];
+        normalize_insert_rowids(&source, &mut changes).unwrap();
+        let [CapturedChange::Insert(captured)] = changes.as_slice() else {
+            unreachable!()
+        };
+        let captured = vec![captured.clone()];
         assert_ne!(captured[0].rowid, 1);
 
         let inserted = InsertRows::from_captured(&source, &captured)

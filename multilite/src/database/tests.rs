@@ -442,6 +442,57 @@ fn local_first_zero_schedules_push_without_waiting_in_execute() {
 }
 
 #[test]
+fn local_first_delete_pushes_in_the_background_and_rebases_on_a_replica() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let database = Database::open_with(
+        directory.path().join("local-first-delete.sqlite"),
+        OpenOptions::new()
+            .sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::ZERO,
+                read_staleness: Duration::from_secs(60),
+            })
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(database.database_id().space_id()));
+    let runtime = database.runtime().unwrap();
+    database.start_background_push().unwrap();
+    database
+        .update(&runtime, |update| {
+            update.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            update.execute("INSERT INTO notes VALUES (1, 'temporary')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    wait_until(|| pending_ops(&database).is_empty());
+
+    assert_eq!(
+        database
+            .execute(&runtime, "DELETE FROM notes WHERE id = 1", ())
+            .unwrap(),
+        1
+    );
+    assert!(row_ids(&database).is_empty());
+    wait_until(|| pending_ops(&database).is_empty());
+
+    let replica = Database::open_with(
+        directory.path().join("local-first-delete-replica.sqlite"),
+        OpenOptions::new()
+            .invitation(database.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let replica_runtime = replica.runtime().unwrap();
+    replica.pull().unwrap();
+    replica.rebase(&replica_runtime).unwrap();
+    assert!(row_ids(&replica).is_empty());
+}
+
+#[test]
 fn remote_write_returns_only_after_admission_and_pending_cleanup() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -515,6 +566,84 @@ fn remote_rejection_undoes_sqlite_before_returning_the_error() {
     let state = client_state(&second);
     let cursors = state.spaces[&second.database_id().space_id()].cursors;
     assert_eq!(cursors.neck, cursors.tail);
+}
+
+#[test]
+fn remote_delete_rejection_restores_the_complete_row_before_returning() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = Database::open_with(
+        directory.path().join("delete-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(first.database_id().space_id()));
+    let first_runtime = first.runtime().unwrap();
+    first
+        .update(&first_runtime, |update| {
+            update.execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT NOT NULL,
+                    payload BLOB
+                )",
+                (),
+            )?;
+            update.execute("INSERT INTO notes VALUES (1, 'original', x'0102')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+    let second = Database::open_with(
+        directory.path().join("delete-loser.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .sync_policy(SyncPolicy::Remote)
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let second_runtime = second.runtime().unwrap();
+    let error = second
+        .update(&second_runtime, |update| {
+            assert_eq!(update.execute("DELETE FROM notes WHERE id = 1", ())?, 1);
+            assert_eq!(
+                update.execute("INSERT INTO notes VALUES (1, 'replacement', x'99')", ())?,
+                1
+            );
+            assert_eq!(
+                update.execute("INSERT INTO notes VALUES (2, 'temporary', NULL)", ())?,
+                1
+            );
+            assert_eq!(update.execute("DELETE FROM notes WHERE id = 2", ())?, 1);
+            assert_eq!(
+                first.execute(&first_runtime, "DELETE FROM notes WHERE id = 1", ())?,
+                1
+            );
+            assert_eq!(first.push()?, PushOutcome::Drained);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::AuthorityRejected(KernelError::RangeAssertFailed { .. })
+    ));
+    assert!(pending_ops(&second).is_empty());
+    second.with_connection(|connection| {
+        assert_eq!(
+            connection
+                .query_row("SELECT id, body, payload FROM notes", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },)
+                .unwrap(),
+            (1, "original".into(), vec![1, 2])
+        );
+    });
 }
 
 #[test]
@@ -2398,8 +2527,17 @@ fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
             .prepare(&runtime, "SELECT value FROM __multilite__meta")
             .is_err()
     );
+    database
+        .execute(&runtime, "INSERT INTO accepted VALUES (1, 'one')", ())
+        .unwrap();
+    assert_eq!(
+        database
+            .execute(&runtime, "DELETE FROM accepted WHERE id = 1", ())
+            .unwrap(),
+        1
+    );
     assert!(matches!(
-        database.execute(&runtime, "DELETE FROM accepted", ()),
+        database.execute(&runtime, "UPDATE accepted SET value = 'two'", ()),
         Err(Error::UnsupportedSql(_))
     ));
 }
@@ -2581,6 +2719,41 @@ fn multi_row_insert_is_one_durable_pending_operation() {
     drop(database);
     let reopened = Database::open(&path).unwrap();
     assert_eq!(pending_ops(&reopened).len(), 2);
+}
+
+#[test]
+fn zero_row_delete_does_not_advance_local_or_homebase_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("empty-delete.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .update(&runtime, |update| {
+            update.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            update.execute("INSERT INTO notes VALUES (1, 'kept')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    let state_before = client_state(&database);
+    let pending_before = pending_ops(&database);
+    let commit_before = database.with_connection(history::current).unwrap();
+
+    assert_eq!(
+        database
+            .execute(&runtime, "DELETE FROM notes WHERE id = 99", ())
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(client_state(&database), state_before);
+    assert_eq!(pending_ops(&database), pending_before);
+    assert_eq!(
+        database.with_connection(history::current).unwrap(),
+        commit_before
+    );
+    assert_eq!(row_ids(&database), [1]);
 }
 
 #[test]
