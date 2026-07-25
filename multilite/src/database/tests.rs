@@ -2364,9 +2364,7 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
         }]
     );
     assert_eq!(
-        database
-            .with_connection(|connection| proposal::apply(connection, &first))
-            .unwrap(),
+        database.commit_proposal(first.clone()).unwrap(),
         CommitReceipt {
             commit_seq: crate::commit::snapshot::CommitSeq(1),
             disposition: CommitDisposition::AlreadyCommitted,
