@@ -13,8 +13,9 @@ use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
 use crate::branch::changeset::CapturedChangeset;
+use crate::commit::footprint::ConflictFootprint;
 use crate::commit::snapshot::SnapshotDescriptor;
-use crate::database::isolation::{ConflictFootprint, IsolationLevel};
+use crate::database::isolation::IsolationLevel;
 use crate::database::operation::MultiliteOp;
 use crate::database::row::{CapturedRow, InsertRows};
 use crate::database::transaction::MultiliteTransaction;

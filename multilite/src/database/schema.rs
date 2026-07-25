@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
-use super::isolation::ConflictFootprint;
+use crate::commit::footprint::ConflictFootprint;
 
 const SCHEMA_FRAME_VERSION: u8 = 1;
 const TAG_MUTATION_ID: u8 = 1;

@@ -6,9 +6,9 @@ use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
 
-use super::isolation::ConflictFootprint;
 use super::row::{InsertRows, RowHomebaseOp};
 use super::schema::{CreateTable, CreateTableSpec};
+use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
 const OPERATION_FRAME_VERSION: u8 = 1;

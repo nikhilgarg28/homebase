@@ -5,7 +5,6 @@ use homebase_core::tag::AdmissionSeq;
 use pollster::block_on;
 use rusqlite::{Connection, Row};
 
-use super::isolation::ReadTrace;
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
 use super::sql::ValidatedExecute;
@@ -17,6 +16,7 @@ use super::{
 };
 use crate::branch::changeset::ChangesetCapture;
 use crate::branch::{OverlayOptions, WritableBranch};
+use crate::commit::footprint::ReadTrace;
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};

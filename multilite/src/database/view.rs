@@ -3,9 +3,9 @@
 use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
-use super::isolation::ReadTrace;
 use super::vtab::Plan;
 use super::{Database, DatabaseRuntime, sql};
+use crate::commit::footprint::ReadTrace;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 

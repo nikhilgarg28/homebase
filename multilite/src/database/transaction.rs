@@ -10,8 +10,9 @@ use homebase_core::writer::Writer;
 use uuid::{Uuid, Variant, Version};
 
 use super::codes;
-use super::isolation::{ConflictFootprint, IsolationLevel, ReadTrace};
+use super::isolation::IsolationLevel;
 use super::operation::MultiliteOp;
+use crate::commit::footprint::{ConflictFootprint, ReadTrace};
 use crate::{Error, Result};
 
 const TRANSACTION_FRAME_VERSION: u8 = 1;

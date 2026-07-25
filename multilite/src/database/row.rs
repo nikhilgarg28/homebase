@@ -11,12 +11,12 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
-use super::isolation::ConflictFootprint;
 use super::schema::{
     ColumnId, CreateTable, DeclaredType, RowKeyspaceId, SchemaRevisionId, TableId,
     active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
+use crate::commit::footprint::ConflictFootprint;
 pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 

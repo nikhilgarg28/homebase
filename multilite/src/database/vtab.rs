@@ -13,9 +13,9 @@ use rusqlite::vtab::{
 };
 
 use super::catalog;
-use super::isolation::ReadTrace;
 use super::row::{StoredValue, primary_key_prefix, row_keyspace_prefix};
 use super::schema::{CreateTable, DeclaredType, SchemaRevisionId, TableId};
+use crate::commit::footprint::ReadTrace;
 use crate::{Error, Result};
 
 const MODULE_PREFIX: &str = "__multilite__vtab_";
