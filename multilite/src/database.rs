@@ -407,9 +407,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         let validated = sql::validate_execute(sql)?;
         match validated {
             sql::ValidatedExecute::CreateTable(table) => {
-                self.execute_serialized(runtime, |update| {
-                    update.execute_validated(sql, params, sql::ValidatedExecute::CreateTable(table))
-                })
+                self.execute_owned_create_table(runtime, sql, params, table)
             }
             sql::ValidatedExecute::Insert => self.update(runtime, |update| {
                 update.execute_validated(sql, params, sql::ValidatedExecute::Insert)

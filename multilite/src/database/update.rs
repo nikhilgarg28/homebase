@@ -10,6 +10,7 @@ use rusqlite::{Connection, Row};
 
 use super::operation::MultiliteOp;
 use super::row::InsertRows;
+use super::schema::CreateTableSpec;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
@@ -42,8 +43,8 @@ enum UpdateBackend<'a, H: ServerHandle> {
 /// One managed update accumulating a single durable transaction.
 ///
 /// Snapshot-isolated DML executes on a private SQLite branch. Serializable
-/// work and the temporary DDL path retain the canonical serialized runtime
-/// until native branch read tracing and stop-the-world DDL are complete.
+/// managed updates retain the canonical serialized runtime until native branch
+/// read tracing is complete.
 pub struct UpdateTransaction<'a, H: ServerHandle> {
     isolation: IsolationLevel,
     backend: UpdateBackend<'a, H>,
@@ -264,12 +265,36 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         }
     }
 
-    pub(super) fn execute_serialized<T>(
+    pub(super) fn execute_owned_create_table<Q: Params>(
         self: &std::sync::Arc<Self>,
         runtime: &DatabaseRuntime,
-        operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
-    ) -> Result<T> {
-        self.update_serialized(runtime, UpdateOptions::new(self.isolation_level), operation)
+        sql: &str,
+        params: Q,
+        table: CreateTableSpec,
+    ) -> Result<usize> {
+        {
+            let _operation = self.enter_operation()?;
+            self.refresh_read_serial(runtime)?;
+        }
+        let BranchSnapshot {
+            physical,
+            logical,
+            tables: _,
+            history_pin: _history_pin,
+        } = self.issue_branch_snapshot(true)?;
+        let branch = WritableBranch::open(physical, OverlayOptions::default())
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        let operation = MultiliteOp::create_table(sql, table);
+        let MultiliteOp::CreateTable(created) = &operation else {
+            unreachable!("create-table constructor returned another operation")
+        };
+        let changed = branch.connection().execute(sql, params)?;
+        catalog::insert(branch.connection(), created)?;
+        let proposal =
+            CommitProposal::create_table(logical, self.isolation_level, created.clone())?;
+        self.commit_proposal(proposal)?;
+        self.finish_branch_write()?;
+        Ok(changed)
     }
 
     fn update_on_branch<T>(

@@ -1862,6 +1862,21 @@ fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
         ),
         Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"))
     ));
+    assert!(
+        database
+            .execute(
+                &runtime,
+                "CREATE TABLE extra_params (id INTEGER PRIMARY KEY)",
+                [1],
+            )
+            .is_err()
+    );
+    assert!(!table_exists(&database, "extra_params"));
+    assert!(pending_ops(&database).is_empty());
+    assert_eq!(
+        database.with_connection(history::current).unwrap(),
+        crate::commit::snapshot::CommitSeq(0)
+    );
     database
         .execute(
             &runtime,
@@ -2297,7 +2312,7 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
 }
 
 #[test]
-fn snapshot_insert_commits_across_unrelated_serialized_ddl() {
+fn snapshot_insert_commits_across_unrelated_owned_ddl() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("concurrent-ddl.sqlite")).unwrap();
     let runtime = database.runtime().unwrap();
