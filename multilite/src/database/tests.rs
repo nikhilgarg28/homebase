@@ -1,5 +1,6 @@
 //! Database orchestration tests.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -801,7 +802,7 @@ fn failed_pending_insert_rolls_back_the_table_and_homebase_submission() {
 }
 
 #[test]
-fn serialized_update_is_one_sqlite_unit_submission_pending_record_and_admission() {
+fn serializable_branch_update_is_one_submission_pending_record_and_admission() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let database = Database::open_with(
@@ -836,7 +837,7 @@ fn serialized_update_is_one_sqlite_unit_submission_pending_record_and_admission(
             },
         )
         .unwrap();
-    assert_eq!(changed, [1, 1, 1]);
+    assert_eq!(changed, [0, 1, 1]);
 
     let state = client_state(&database);
     let space = &state.spaces[&database.database_id.space_id()];
@@ -947,7 +948,7 @@ fn managed_update_reads_are_asserted_only_for_serializable_isolation() {
 
         let traced = database.with_connection(|connection| {
             let created = catalog::by_name(connection, table).unwrap().unwrap();
-            row::row_keyspace_prefix(&created)
+            schema::table_prefix(created.table_id())
         });
         let state = client_state(&database);
         let space = &state.spaces[&database.database_id.space_id()];
@@ -977,7 +978,83 @@ fn managed_update_reads_are_asserted_only_for_serializable_isolation() {
 }
 
 #[test]
-fn statement_failure_rolls_back_the_complete_serialized_update() {
+fn serializable_branch_traces_joins_and_insert_select_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("coarse-reads.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .update(&runtime, |update| {
+            update.execute(
+                "CREATE TABLE source (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            update.execute(
+                "CREATE TABLE lookup (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL)",
+                (),
+            )?;
+            update.execute(
+                "CREATE TABLE archive (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    database
+        .update(&runtime, |update| {
+            update.execute("INSERT INTO source VALUES (1, 'one')", ())?;
+            update.execute("INSERT INTO lookup VALUES (1, 1)", ())?;
+            Ok(())
+        })
+        .unwrap();
+
+    database
+        .update_with(
+            &runtime,
+            UpdateOptions::new(IsolationLevel::Serializable),
+            |update| {
+                assert_eq!(
+                    update.query(
+                        "SELECT count(*)
+                         FROM source JOIN lookup ON lookup.id = source.id
+                         WHERE lookup.enabled = 1",
+                        (),
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    [1]
+                );
+                update.execute(
+                    "INSERT INTO archive SELECT id, body FROM source WHERE id = 1",
+                    (),
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let expected = database.with_connection(|connection| {
+        ["source", "lookup"]
+            .into_iter()
+            .map(|table| {
+                let created = catalog::by_name(connection, table).unwrap().unwrap();
+                schema::table_prefix(created.table_id())
+            })
+            .collect::<BTreeSet<_>>()
+    });
+    let state = client_state(&database);
+    let space = &state.spaces[&database.database_id.space_id()];
+    let last = DeviceSeq(space.cursors.tail.0 - 1);
+    let DeviceOp::Commit { range_asserts, .. } = &space.oplog[&last] else {
+        panic!("serializable branch did not submit one commit")
+    };
+    let asserted = range_asserts
+        .iter()
+        .map(|assertion| assertion.prefix.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(expected.is_subset(&asserted));
+}
+
+#[test]
+fn statement_failure_rolls_back_the_complete_serializable_update() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("statement-failure.sqlite")).unwrap();
     let runtime = database.runtime().unwrap();

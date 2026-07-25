@@ -3,10 +3,7 @@
 use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
-use super::vtab::Plan;
 use super::{Database, DatabaseRuntime, sql};
-use crate::commit::footprint::ReadTrace;
-use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
 /// One managed, read-only SQLite snapshot.
@@ -40,65 +37,25 @@ impl<'a> ViewTransaction<'a> {
 
     /// Prepare one read-only statement bound to this managed snapshot.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        TransactionStatement::new_direct(self.connection, sql)
+        TransactionStatement::new(self.connection, sql)
     }
 }
 
 /// A read-only prepared statement that cannot outlive its managed transaction.
 pub struct TransactionStatement<'a> {
-    runtime: Option<&'a DatabaseRuntime>,
     connection: &'a Connection,
-    read_trace: Option<ReadTrace>,
-    vtab_read_plan: Option<Plan>,
     sql: String,
 }
 
 impl<'a> TransactionStatement<'a> {
-    pub(crate) fn new(
-        runtime: &'a DatabaseRuntime,
-        connection: &'a Connection,
-        sql: &str,
-        read_trace: Option<ReadTrace>,
-    ) -> Result<Self> {
-        sql::validate_managed_statement(sql)?;
-        let vtab_read_plan = read_trace
-            .as_ref()
-            .map(|_| runtime.vtabs.plan(connection, sql))
-            .transpose()?
-            .flatten();
-        let ((), events) = runtime.run(ExecutionMode::Public, |connection| {
-            let statement = connection.prepare(sql)?;
-            if statement.readonly() {
-                Ok(())
-            } else {
-                Err(Error::PreparedWrite)
-            }
-        })?;
-        if !events.is_empty() {
-            return Err(Error::CaptureInvariant(
-                "preparing a read-only statement captured row changes",
-            ));
-        }
-        Ok(Self {
-            runtime: Some(runtime),
-            connection,
-            read_trace,
-            vtab_read_plan,
-            sql: sql.to_owned(),
-        })
-    }
-
-    pub(crate) fn new_direct(connection: &'a Connection, sql: &str) -> Result<Self> {
+    pub(crate) fn new(connection: &'a Connection, sql: &str) -> Result<Self> {
         sql::validate_managed_statement(sql)?;
         let statement = connection.prepare(sql)?;
         if !statement.readonly() {
             return Err(Error::PreparedWrite);
         }
         Ok(Self {
-            runtime: None,
             connection,
-            read_trace: None,
-            vtab_read_plan: None,
             sql: sql.to_owned(),
         })
     }
@@ -109,56 +66,14 @@ impl<'a> TransactionStatement<'a> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let Some(runtime) = self.runtime else {
-            let mut statement = self.connection.prepare(&self.sql)?;
-            if !statement.readonly() {
-                return Err(Error::PreparedWrite);
-            }
-            return statement
-                .query_map(params, map)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into);
-        };
-        let (sql, mode, _bindings) = match &self.vtab_read_plan {
-            Some(plan) => {
-                let trace = self
-                    .read_trace
-                    .as_ref()
-                    .expect("read plans carry an update trace")
-                    .clone();
-                let (bindings, events) = runtime
-                    .run(ExecutionMode::InternalMetadata, |connection| {
-                        plan.bind(connection, trace)
-                    })?;
-                ensure_read_only_events(events)?;
-                (plan.sql(), ExecutionMode::InternalMetadata, Some(bindings))
-            }
-            None => (self.sql.as_str(), ExecutionMode::Public, None),
-        };
-        let expected_connection = self.connection;
-        let (rows, events) = runtime.run(mode, |connection| {
-            debug_assert!(std::ptr::eq(connection, expected_connection));
-            let mut statement = connection.prepare(sql)?;
-            if !statement.readonly() {
-                return Err(Error::PreparedWrite);
-            }
-            statement
-                .query_map(params, map)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
-        })?;
-        ensure_read_only_events(events)?;
-        Ok(rows)
-    }
-}
-
-fn ensure_read_only_events(events: Vec<super::row::CapturedRow>) -> Result<()> {
-    if events.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::CaptureInvariant(
-            "executing a read-only statement captured row changes",
-        ))
+        let mut statement = self.connection.prepare(&self.sql)?;
+        if !statement.readonly() {
+            return Err(Error::PreparedWrite);
+        }
+        statement
+            .query_map(params, map)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 

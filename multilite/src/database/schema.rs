@@ -364,6 +364,12 @@ fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
     .expect("table schema key is bounded")
 }
 
+/// Prefix covering every durable schema and row cell owned by one table.
+pub fn table_prefix(table: TableId) -> Key {
+    Key::from_bytes([codes::ROOT, codes::TABLES, table.0.as_slice()])
+        .expect("table prefix is bounded")
+}
+
 pub fn active_row_keyspace_key(table: TableId) -> Key {
     Key::from_bytes([
         codes::ROOT,

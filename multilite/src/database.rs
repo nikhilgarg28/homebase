@@ -15,6 +15,7 @@ mod store;
 pub(crate) mod transaction;
 mod update;
 mod view;
+#[cfg(test)]
 mod vtab;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -257,14 +258,12 @@ pub(crate) type DatabaseClient<H> =
 
 pub(crate) struct DatabaseRuntime {
     inner: RuntimeConnection<DatabaseHooks>,
-    vtabs: vtab::Registry,
 }
 
 impl DatabaseRuntime {
     fn new(owner: ConnectionOwner) -> Result<Self> {
         Ok(Self {
             inner: RuntimeConnection::new(owner, DatabaseHooks)?,
-            vtabs: vtab::Registry::default(),
         })
     }
 }
@@ -502,23 +501,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         })?;
         self.policy.mark_pulled();
         Ok(PullOutcome { through })
-    }
-
-    fn finish_remote_write(&self) -> Result<()> {
-        match self.push_serial()? {
-            PushOutcome::Drained => Ok(()),
-            PushOutcome::Rejected(rejection) => self.repair_remote_rejection(rejection),
-        }
-    }
-
-    fn repair_remote_rejection(&self, rejection: PushRejection) -> Result<()> {
-        let error = rejection.error.clone();
-        self.rollback_serial(&rejection)?;
-        // Retire the rollback marker when authority remains reachable. If this
-        // best-effort push becomes unavailable, the marker remains durable and
-        // the next remote operation drains it before doing new work.
-        let _ = self.push_serial();
-        Err(Error::AuthorityRejected(error))
     }
 
     pub(crate) fn prepare(
@@ -884,13 +866,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         self.database
             .view(&self.runtime, |view| view.query(&self.sql, params, map))
     }
-}
-
-fn pin_snapshot(connection: &SqliteConnection) -> Result<()> {
-    let _: i64 = connection.query_row("SELECT count(*) FROM main.sqlite_schema", (), |row| {
-        row.get(0)
-    })?;
-    Ok(())
 }
 
 fn open_on<H: ServerHandle + Send + Sync + 'static>(

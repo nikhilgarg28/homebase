@@ -486,12 +486,14 @@ impl InsertRows {
 }
 
 /// Prefix covering every row encoded under a table's active row keyspace.
+#[cfg(test)]
 pub fn row_keyspace_prefix(created: &CreateTable) -> Key {
     row_prefix(created.table_id(), created.row_keyspace_id(), Vec::new())
         .expect("table row prefix is bounded and non-empty")
 }
 
 /// Exact row prefix produced by one complete primary-key value tuple.
+#[cfg(test)]
 pub fn primary_key_prefix(
     created: &CreateTable,
     values: &[StoredValue],

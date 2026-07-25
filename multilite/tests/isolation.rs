@@ -141,7 +141,7 @@ fn primary_key_collisions_are_mandatory_at_both_isolation_levels() {
 }
 
 #[test]
-fn serializable_primary_key_reads_allow_disjoint_conditional_inserts() {
+fn coarse_serializable_table_reads_conflict_across_disjoint_point_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let authority = server();
     let first = MultiliteConnection::open_with(
@@ -173,10 +173,13 @@ fn serializable_primary_key_reads_allow_disjoint_conditional_inserts() {
     ));
 
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let rejection = rejected(second.push().unwrap());
+    assert_range_assertion_failed(&rejection);
+    second.rollback(&rejection).unwrap();
     assert_eq!(second.push().unwrap(), PushOutcome::Drained);
     converge(&first, &second);
 
-    let expected = vec![(1, String::from("mon")), (2, String::from("tue"))];
+    let expected = vec![(1, String::from("mon"))];
     assert_eq!(bookings(&first), expected);
     assert_eq!(bookings(&second), expected);
 }

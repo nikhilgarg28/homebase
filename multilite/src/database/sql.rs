@@ -2,9 +2,10 @@
 
 use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
-    As, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Name, OneSelect, Operator,
-    ResultColumn, SelectTable, Stmt, TabFlags,
+    Cmd, ColumnConstraint, CreateTableBody, InsertBody, Name, Stmt, TabFlags,
 };
+#[cfg(test)]
+use sqlite3_parser::ast::{As, Expr, OneSelect, Operator, ResultColumn, SelectTable};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
@@ -16,6 +17,7 @@ pub enum ValidatedExecute {
 }
 
 /// Validate the initial transaction-read grammar and rewrite its sources.
+#[cfg(test)]
 pub fn rewrite_managed_read(
     sql: &str,
     mut resolve_source: impl FnMut(&str) -> Result<String>,
@@ -92,6 +94,7 @@ pub fn rewrite_managed_read(
     Ok(Some(Cmd::Stmt(Stmt::Select(select)).to_string()))
 }
 
+#[cfg(test)]
 fn validate_result_columns(columns: &[ResultColumn]) -> Result<()> {
     for column in columns {
         match column {
@@ -102,6 +105,7 @@ fn validate_result_columns(columns: &[ResultColumn]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_read_expression(expression: &Expr) -> Result<()> {
     match expression {
         Expr::Id(_) | Expr::Name(_) | Expr::Qualified(_, _) | Expr::Variable(_) => Ok(()),
@@ -121,6 +125,7 @@ fn validate_read_expression(expression: &Expr) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn unsupported_managed_read() -> Error {
     Error::UnsupportedSql(
         "managed update SELECT supports one table with simple equality predicates",

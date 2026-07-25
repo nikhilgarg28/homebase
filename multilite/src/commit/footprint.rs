@@ -1,6 +1,7 @@
 //! Typed logical conflict footprints shared by local and authority validation.
 
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use homebase_core::key::Key;
@@ -27,10 +28,12 @@ pub struct ConflictFootprint {
 /// logical ranges as SQLite executes them. Keeping this read-only by type
 /// prevents statement execution from contributing mandatory write guards.
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 pub struct ReadTrace {
     footprint: Arc<Mutex<ConflictFootprint>>,
 }
 
+#[cfg(test)]
 impl ReadTrace {
     pub fn new() -> Self {
         Self::default()
@@ -152,6 +155,7 @@ impl ConflictFootprint {
     }
 }
 
+#[cfg(test)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

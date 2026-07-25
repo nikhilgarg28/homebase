@@ -13,7 +13,7 @@ use uuid::{Uuid, Variant, Version};
 use super::codes;
 use super::isolation::IsolationLevel;
 use super::operation::MultiliteOp;
-use crate::commit::footprint::{ConflictFootprint, ReadTrace};
+use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
 const TRANSACTION_FRAME_VERSION: u8 = 1;
@@ -38,11 +38,6 @@ pub struct HomebaseTransaction {
 }
 
 impl HomebaseTransaction {
-    /// Merge reads observed while the transaction's SQLite statements ran.
-    pub fn include_read_trace(&mut self, trace: &ReadTrace) {
-        self.footprint.extend(trace.footprint());
-    }
-
     /// Split deterministic mutations from their typed conflict footprint.
     pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
         (self.mutations, self.footprint)
