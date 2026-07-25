@@ -45,9 +45,10 @@ multilite
   Reusing a branch SQLite handle itself requires a proven reset/rebind protocol
   for schema caches, hooks, temp state, overlays, and snapshot identity.
 
-- Extend the landed per-database authority actor beyond FIFO push/pull. Add
-  request coalescing, retry/backoff, cancellation-independent completion, and
-  exact per-submission replies. Preserve the acyclic ownership rule: authority
+- Extend the landed per-database authority actor beyond FIFO push/pull. Exact
+  per-submission targeting and typed replies have landed; add transport request
+  coalescing, retry/backoff, and cancellation-independent completion. Preserve
+  the acyclic ownership rule: authority
   workflows may submit checked completion proposals and wait for the committer,
   while the committer may apply owned local Homebase transitions but must never
   wait for the authority actor or acquire its workflow permit. Completion
@@ -82,16 +83,19 @@ format so the cleanup cannot accidentally change durable or wire encodings.
 
 Handle multi-schema / attach etc
 
-Async-first Multilite committer completion (the bounded channel, oneshot
-replies, and borrowed-scope permits landed in `b763fee`):
-- After Branch VFS updates produce owned `CommitProposal`s, move canonical
-  SQLite materialization, Homebase metadata, pending effects, sync-policy state,
-  and submit/push/pull/rebase/rollback workflows fully behind committer commands.
-  Local rows and Homebase metadata must remain in the same SQLite transaction.
+Async-first Multilite public API (typed committer and authority channels,
+owned proposals, exact submission receipts, and synchronous wrappers exist):
 - Make the primary internal API async and keep SQLite-compatible synchronous
-  methods as blocking wrappers over the same command/reply path.
-- Return owned query rows and column metadata across the committer boundary; perform
-  public mapping and `FromSql` conversion on the caller side.
+  methods as `pollster` wrappers over the same futures.
+- Run branch creation, native SQLite closures, and owned-row extraction on a
+  bounded blocking executor so an async caller never occupies a runtime worker
+  with SQLite or filesystem work.
+- Return owned query rows and column metadata across that worker boundary;
+  perform public mapping and `FromSql` conversion without lending a
+  `rusqlite::Row` across an await.
+- Expose async push, pull, rebase, rollback, execute, view/query, and update
+  surfaces while preserving the exact `DeviceSeq` policy semantics landed in
+  authority batch 18.
 - Preserve cancellation, backpressure, shutdown, and durable-side-effect rules:
   dropping a caller never cancels work after it may have committed, and network
   I/O is never awaited while a canonical SQLite transaction is open.

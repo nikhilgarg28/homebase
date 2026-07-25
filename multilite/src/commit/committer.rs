@@ -350,6 +350,7 @@ mod tests {
                     Ok(CommitReceipt {
                         commit_seq,
                         disposition: crate::commit::proposal::CommitDisposition::Applied,
+                        submitted: None,
                     })
                 })
                 .collect())

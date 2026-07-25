@@ -6,7 +6,7 @@ use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use homebase_client::{ClientError, PushOutcome, ServerHandle};
 use homebase_core::space::SpaceId;
-use homebase_core::tag::AdmissionSeq;
+use homebase_core::tag::{AdmissionSeq, DeviceSeq};
 
 use super::DatabaseClient;
 use crate::{Error, Result};
@@ -15,6 +15,10 @@ const INBOX_CAPACITY: usize = 64;
 
 enum Request {
     Push {
+        reply: oneshot::Sender<Result<PushOutcome>>,
+    },
+    PushUntil {
+        through: DeviceSeq,
         reply: oneshot::Sender<Result<PushOutcome>>,
     },
     Pull {
@@ -59,6 +63,19 @@ impl Authority {
         pollster::block_on(self.push())
     }
 
+    pub async fn push_until(&self, through: DeviceSeq) -> Result<PushOutcome> {
+        let (reply, response) = oneshot::channel();
+        self.outbox
+            .send(Request::PushUntil { through, reply })
+            .await
+            .map_err(|_| unavailable())?;
+        response.await.map_err(|_| unavailable())?
+    }
+
+    pub fn push_until_blocking(&self, through: DeviceSeq) -> Result<PushOutcome> {
+        pollster::block_on(self.push_until(through))
+    }
+
     pub async fn pull(&self) -> Result<AdmissionSeq> {
         let (reply, response) = oneshot::channel();
         self.outbox
@@ -85,6 +102,19 @@ where
                         .space(space)
                         .await?
                         .push()
+                        .await
+                        .map_err(ClientError::from)
+                }
+                .await
+                .map_err(Error::from);
+                let _ = reply.send(result);
+            }
+            Request::PushUntil { through, reply } => {
+                let result = async {
+                    client
+                        .space(space)
+                        .await?
+                        .push_until(through)
                         .await
                         .map_err(ClientError::from)
                 }

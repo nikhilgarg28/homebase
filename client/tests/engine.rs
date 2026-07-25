@@ -2137,6 +2137,45 @@ fn push_until_rejects_a_sequence_outside_the_active_oplog() {
 }
 
 #[test]
+fn submission_push_recognizes_a_target_acked_by_another_push() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = spawn_server(Arc::new(ManualClock::new(Timestamp(0))), &[SPACE]);
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+        let target = space
+            .submit_unchecked(vec![set(key(&[b"db", b"target"]), b"target")], vec![])
+            .await
+            .unwrap();
+        space
+            .submit_unchecked(vec![set(key(&[b"db", b"later"]), b"later")], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            space.push().await.unwrap(),
+            PushOutcome::Drained {
+                acked_through: Some(DeviceSeq(2))
+            }
+        );
+        assert_eq!(
+            target.push().await.unwrap(),
+            PushReceipt::Applied {
+                seq: DeviceSeq(1),
+                admission_seq: None,
+            }
+        );
+    });
+}
+
+#[test]
 fn push_until_leaves_later_submission_pending() {
     block_on(async {
         let mem = MemoryStore::new();

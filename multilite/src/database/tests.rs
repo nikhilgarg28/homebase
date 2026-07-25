@@ -191,6 +191,19 @@ fn table_sql<H: ServerHandle + Send + Sync + 'static>(
     })
 }
 
+fn row_ids<H: ServerHandle + Send + Sync + 'static>(database: &Database<H>) -> Vec<i64> {
+    database.with_connection(|connection| {
+        let mut statement = connection
+            .prepare("SELECT id FROM notes ORDER BY id")
+            .unwrap();
+        statement
+            .query_map((), |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    })
+}
+
 fn stock_user_schema(path: &Path) -> Vec<(String, String)> {
     let connection = SqliteConnection::open(path).unwrap();
     let mut statement = connection
@@ -505,6 +518,102 @@ fn remote_rejection_undoes_sqlite_before_returning_the_error() {
 }
 
 #[test]
+fn remote_writes_wait_for_their_own_submission_disposition() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let winner = Database::open_with(
+        directory.path().join("exact-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(winner.database_id().space_id()));
+    let winner_runtime = winner.runtime().unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let remote = Database::open_with(
+        directory.path().join("exact-remote.sqlite"),
+        OpenOptions::new()
+            .invitation(winner.replica_invitation())
+            .sync_policy(SyncPolicy::Remote)
+            .server(gated_router(
+                Arc::clone(&server),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            )),
+    )
+    .unwrap();
+    let runtime = Arc::new(remote.runtime().unwrap());
+
+    let (first_ready, first_started) = std::sync::mpsc::sync_channel(1);
+    let (first_release, first_continue) = std::sync::mpsc::sync_channel(1);
+    let (first_reply, first_result) = std::sync::mpsc::sync_channel(1);
+    let first = Arc::clone(&remote);
+    let first_runtime = Arc::clone(&runtime);
+    std::thread::spawn(move || {
+        let result = first.update(&first_runtime, |update| {
+            first_ready.send(()).unwrap();
+            first_continue.recv().unwrap();
+            update.execute("CREATE TABLE admitted (id INTEGER PRIMARY KEY)", ())?;
+            Ok(())
+        });
+        let _ = first_reply.send(result);
+    });
+
+    let (second_ready, second_started) = std::sync::mpsc::sync_channel(1);
+    let (second_release, second_continue) = std::sync::mpsc::sync_channel(1);
+    let (second_reply, second_result) = std::sync::mpsc::sync_channel(1);
+    let second = Arc::clone(&remote);
+    let second_runtime = Arc::clone(&runtime);
+    std::thread::spawn(move || {
+        let result = second.update(&second_runtime, |update| {
+            second_ready.send(()).unwrap();
+            second_continue.recv().unwrap();
+            update.execute(
+                "CREATE TABLE CONFLICT (id INTEGER PRIMARY KEY, payload BLOB)",
+                (),
+            )?;
+            Ok(())
+        });
+        let _ = second_reply.send(result);
+    });
+
+    first_started.recv().unwrap();
+    second_started.recv().unwrap();
+    winner
+        .execute(
+            &winner_runtime,
+            "CREATE TABLE conflict (id INTEGER PRIMARY KEY)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+
+    first_release.send(()).unwrap();
+    entered.wait();
+    second_release.send(()).unwrap();
+    wait_until(|| pending_ops(&remote).len() == 2);
+    release.wait();
+
+    assert_eq!(
+        first_result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(),
+        ()
+    );
+    assert!(matches!(
+        second_result.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Err(Error::AuthorityRejected(
+            KernelError::RangeAssertFailed { .. }
+        ))
+    ));
+    assert!(table_exists(&remote, "admitted"));
+    assert!(!table_exists(&remote, "conflict"));
+    assert!(pending_ops(&remote).is_empty());
+}
+
+#[test]
 fn remote_write_first_drains_history_buffered_under_local_only() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("policy-change.sqlite");
@@ -748,6 +857,112 @@ fn local_first_read_honors_its_staleness_window() {
         tables.query_map((), |row| row.get::<_, String>(0)).unwrap(),
         ["first_table", "second_table"]
     );
+}
+
+#[test]
+fn policies_and_isolation_levels_converge_across_two_devices_and_restart() {
+    for (policy_name, policy) in [
+        ("local", SyncPolicy::LocalOnly),
+        (
+            "local-first",
+            SyncPolicy::LocalFirst {
+                write_delay: Duration::from_secs(3600),
+                read_staleness: Duration::from_secs(3600),
+            },
+        ),
+        ("remote", SyncPolicy::Remote),
+    ] {
+        for (isolation_name, isolation) in [
+            ("snapshot", IsolationLevel::Snapshot),
+            ("serializable", IsolationLevel::Serializable),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let first_path = directory
+                .path()
+                .join(format!("{policy_name}-{isolation_name}-first.sqlite"));
+            let second_path = directory
+                .path()
+                .join(format!("{policy_name}-{isolation_name}-second.sqlite"));
+            let server = server();
+            let first = Database::open_with(
+                &first_path,
+                OpenOptions::new()
+                    .sync_policy(policy)
+                    .isolation_level(isolation)
+                    .server(router(Arc::clone(&server))),
+            )
+            .unwrap();
+            assert!(server.create_space(first.database_id().space_id()));
+            let first_runtime = first.runtime().unwrap();
+            first
+                .execute(
+                    &first_runtime,
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+                    (),
+                )
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+            let second = Database::open_with(
+                &second_path,
+                OpenOptions::new()
+                    .invitation(first.replica_invitation())
+                    .sync_policy(policy)
+                    .isolation_level(isolation)
+                    .server(router(Arc::clone(&server))),
+            )
+            .unwrap();
+            let second_runtime = second.runtime().unwrap();
+            second.pull().unwrap();
+            second.rebase(&second_runtime).unwrap();
+
+            first
+                .update_with(&first_runtime, UpdateOptions::new(isolation), |update| {
+                    update.execute("INSERT INTO notes VALUES (1, 'first')", ())?;
+                    Ok(())
+                })
+                .unwrap();
+            second
+                .update_with(&second_runtime, UpdateOptions::new(isolation), |update| {
+                    update.execute("INSERT INTO notes VALUES (2, 'second')", ())?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+            first.pull().unwrap();
+            first.rebase(&first_runtime).unwrap();
+            second.pull().unwrap();
+            second.rebase(&second_runtime).unwrap();
+            assert_eq!(row_ids(&first), [1, 2]);
+            assert_eq!(row_ids(&second), [1, 2]);
+
+            drop(first_runtime);
+            drop(second_runtime);
+            drop(first);
+            drop(second);
+
+            let reopened_first = Database::open_with(
+                &first_path,
+                OpenOptions::new()
+                    .sync_policy(policy)
+                    .isolation_level(isolation)
+                    .server(router(Arc::clone(&server))),
+            )
+            .unwrap();
+            let reopened_second = Database::open_with(
+                &second_path,
+                OpenOptions::new()
+                    .sync_policy(policy)
+                    .isolation_level(isolation)
+                    .server(router(Arc::clone(&server))),
+            )
+            .unwrap();
+            assert_eq!(row_ids(&reopened_first), [1, 2]);
+            assert_eq!(row_ids(&reopened_second), [1, 2]);
+        }
+    }
 }
 
 #[test]
@@ -2613,16 +2828,19 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
     assert_eq!(results.len(), 4);
     let first_receipt = results[0].as_ref().unwrap();
     assert_eq!(first_receipt.disposition, CommitDisposition::Applied);
+    assert_eq!(first_receipt.submitted, Some(DeviceSeq(1)));
     assert_eq!(
         results[1].as_ref().unwrap(),
         &CommitReceipt {
             commit_seq: first_receipt.commit_seq,
             disposition: CommitDisposition::AlreadyCommitted,
+            submitted: first_receipt.submitted,
         }
     );
     assert!(matches!(results[2], Err(Error::CommitConflict(_))));
     let last_receipt = results[3].as_ref().unwrap();
     assert_eq!(last_receipt.disposition, CommitDisposition::Applied);
+    assert_eq!(last_receipt.submitted, Some(DeviceSeq(2)));
     assert_eq!(first_receipt.commit_seq, last_receipt.commit_seq);
     assert_eq!(
         first_receipt.commit_seq,
@@ -2648,6 +2866,7 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
         CommitReceipt {
             commit_seq: crate::commit::snapshot::CommitSeq(1),
             disposition: CommitDisposition::AlreadyCommitted,
+            submitted: first_receipt.submitted,
         }
     );
 }

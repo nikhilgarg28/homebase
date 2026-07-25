@@ -169,6 +169,10 @@ pub enum CommitDisposition {
 pub struct CommitReceipt {
     pub commit_seq: crate::commit::snapshot::CommitSeq,
     pub disposition: CommitDisposition,
+    /// Homebase identity allocated for a locally submitted transaction.
+    ///
+    /// Authority-only metadata transitions do not create a submission.
+    pub submitted: Option<DeviceSeq>,
 }
 
 /// One successfully replayed proposal awaiting its group's durable receipt.
@@ -176,11 +180,21 @@ pub struct PreparedCommit {
     id: ProposalId,
     hash: [u8; 32],
     writes: Vec<WriteRegion>,
+    submitted: Option<DeviceSeq>,
 }
 
 impl PreparedCommit {
     pub fn writes(&self) -> &[WriteRegion] {
         &self.writes
+    }
+
+    pub fn submitted(&self) -> Option<DeviceSeq> {
+        self.submitted
+    }
+
+    pub fn with_submission(mut self, submitted: DeviceSeq) -> Self {
+        self.submitted = Some(submitted);
+        self
     }
 }
 
@@ -688,6 +702,7 @@ impl CommitProposal {
             id: self.id,
             hash: proposal_hash(&self.encode()?),
             writes,
+            submitted: None,
         })
     }
 
@@ -792,7 +807,8 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         "CREATE TABLE {RECEIPT_TABLE} (
             proposal_id BLOB PRIMARY KEY NOT NULL CHECK(length(proposal_id) = 16),
             commit_seq BLOB NOT NULL CHECK(length(commit_seq) = 8),
-            proposal_hash BLOB NOT NULL CHECK(length(proposal_hash) = 32)
+            proposal_hash BLOB NOT NULL CHECK(length(proposal_hash) = 32),
+            device_seq BLOB CHECK(device_seq IS NULL OR length(device_seq) = 8)
         ) WITHOUT ROWID"
     ))?;
     Ok(())
@@ -842,6 +858,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
         (String::from("proposal_id"), String::from("BLOB"), true, 1),
         (String::from("commit_seq"), String::from("BLOB"), true, 0),
         (String::from("proposal_hash"), String::from("BLOB"), true, 0),
+        (String::from("device_seq"), String::from("BLOB"), false, 0),
     ];
     if columns != expected {
         return Err(Error::InvalidDatabase(
@@ -855,7 +872,8 @@ pub fn validate(connection: &Connection) -> Result<()> {
     )?;
     let current = history::current(connection)?;
     let mut statement = connection.prepare(&format!(
-        "SELECT proposal_id, commit_seq, proposal_hash FROM {RECEIPT_TABLE} ORDER BY commit_seq"
+        "SELECT proposal_id, commit_seq, proposal_hash, device_seq
+         FROM {RECEIPT_TABLE} ORDER BY commit_seq"
     ))?;
     let receipts = statement
         .query_map((), |row| {
@@ -863,17 +881,23 @@ pub fn validate(connection: &Connection) -> Result<()> {
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, commit_seq, hash) in receipts {
+    for (id, commit_seq, hash, device_seq) in receipts {
         if uuid_bytes(&id).is_err() {
             return Err(Error::InvalidDatabase(
                 "commit receipt proposal id is malformed",
             ));
         }
         let commit_seq = history::decode_commit_seq(&commit_seq, false)?;
-        if commit_seq > current || hash.len() != 32 {
+        if commit_seq > current
+            || hash.len() != 32
+            || device_seq
+                .as_deref()
+                .is_some_and(|bytes| decode_device_seq(bytes).is_err())
+        {
             return Err(Error::InvalidDatabase("commit receipt is malformed"));
         }
     }
@@ -930,6 +954,7 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
             Ok(CommitReceipt {
                 commit_seq,
                 disposition: CommitDisposition::Applied,
+                submitted: prepared.submitted,
             })
         }
     }
@@ -1017,13 +1042,17 @@ pub fn finalize_group(
     for commit in prepared {
         connection.execute(
             &format!(
-                "INSERT INTO {RECEIPT_TABLE} (proposal_id, commit_seq, proposal_hash)
-                 VALUES (?1, ?2, ?3)"
+                "INSERT INTO {RECEIPT_TABLE} (
+                    proposal_id, commit_seq, proposal_hash, device_seq
+                 ) VALUES (?1, ?2, ?3, ?4)"
             ),
             params![
                 commit.id.to_bytes().as_slice(),
                 commit_seq.0.to_be_bytes().as_slice(),
                 commit.hash.as_slice(),
+                commit
+                    .submitted
+                    .map(|sequence| sequence.0.to_be_bytes().to_vec()),
             ],
         )?;
     }
@@ -1037,13 +1066,20 @@ fn committed_receipt(
     let row = connection
         .query_row(
             &format!(
-                "SELECT commit_seq, proposal_hash FROM {RECEIPT_TABLE} WHERE proposal_id = ?1"
+                "SELECT commit_seq, proposal_hash, device_seq
+                 FROM {RECEIPT_TABLE} WHERE proposal_id = ?1"
             ),
             [proposal.id().to_bytes().as_slice()],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    row.map(|(commit_seq, expected_hash)| {
+    row.map(|(commit_seq, expected_hash, submitted)| {
         let encoded = proposal.encode()?;
         if expected_hash != proposal_hash(&encoded) {
             return Err(Error::InvalidCommitProposal(
@@ -1053,6 +1089,7 @@ fn committed_receipt(
         Ok(CommitReceipt {
             commit_seq: history::decode_commit_seq(&commit_seq, false)?,
             disposition: CommitDisposition::AlreadyCommitted,
+            submitted: submitted.as_deref().map(decode_device_seq).transpose()?,
         })
     })
     .transpose()
@@ -1060,6 +1097,19 @@ fn committed_receipt(
 
 fn proposal_hash(encoded: &[u8]) -> [u8; 32] {
     Sha256::digest(encoded).into()
+}
+
+fn decode_device_seq(encoded: &[u8]) -> Result<DeviceSeq> {
+    let bytes: [u8; 8] = encoded
+        .try_into()
+        .map_err(|_| Error::InvalidDatabase("commit receipt device sequence is malformed"))?;
+    let sequence = DeviceSeq(u64::from_be_bytes(bytes));
+    if sequence.0 == 0 {
+        return Err(Error::InvalidDatabase(
+            "commit receipt device sequence is malformed",
+        ));
+    }
+    Ok(sequence)
 }
 
 fn lower_insert_operations(
@@ -1825,6 +1875,7 @@ mod tests {
             CommitReceipt {
                 commit_seq: CommitSeq(1),
                 disposition: CommitDisposition::Applied,
+                submitted: None,
             }
         );
         assert_eq!(
@@ -1832,6 +1883,7 @@ mod tests {
             CommitReceipt {
                 commit_seq: CommitSeq(1),
                 disposition: CommitDisposition::AlreadyCommitted,
+                submitted: None,
             }
         );
         assert!(
@@ -1974,6 +2026,7 @@ mod tests {
             CommitReceipt {
                 commit_seq: CommitSeq(1),
                 disposition: CommitDisposition::Applied,
+                submitted: None,
             }
         );
         assert_eq!(
@@ -1981,6 +2034,7 @@ mod tests {
             CommitReceipt {
                 commit_seq: CommitSeq(1),
                 disposition: CommitDisposition::AlreadyCommitted,
+                submitted: None,
             }
         );
         assert_eq!(history::current(&fixture.writer).unwrap(), CommitSeq(1));
@@ -2027,6 +2081,7 @@ mod tests {
             CommitReceipt {
                 commit_seq: CommitSeq(1),
                 disposition: CommitDisposition::AlreadyCommitted,
+                submitted: None,
             }
         );
         assert_eq!(
@@ -2050,7 +2105,8 @@ mod tests {
                  CREATE TABLE {RECEIPT_TABLE} (
                     proposal_id BLOB PRIMARY KEY NOT NULL,
                     commit_seq BLOB NOT NULL,
-                    proposal_hash BLOB NOT NULL
+                    proposal_hash BLOB NOT NULL,
+                    device_seq BLOB
                  )"
             ))
             .unwrap();

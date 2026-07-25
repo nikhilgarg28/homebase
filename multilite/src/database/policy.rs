@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use homebase_client::ServerHandle;
 
 use super::Database;
+use crate::commit::snapshot::CommitSeq;
 use crate::{Error, Result};
 
 /// How locally materialized SQLite state interacts with authority.
@@ -78,6 +79,7 @@ impl PolicyState {
 pub struct PushScheduler {
     sender: Sender<SchedulerCommand>,
     receiver: Mutex<Option<Receiver<SchedulerCommand>>>,
+    last_group: Mutex<Option<CommitSeq>>,
 }
 
 enum SchedulerCommand {
@@ -91,6 +93,7 @@ impl PushScheduler {
         Self {
             sender,
             receiver: Mutex::new(Some(receiver)),
+            last_group: Mutex::new(None),
         }
     }
 
@@ -112,6 +115,23 @@ impl PushScheduler {
         let now = Instant::now();
         let deadline = now.checked_add(delay).unwrap_or(now);
         let _ = self.sender.send(SchedulerCommand::Schedule(deadline));
+    }
+
+    /// Schedule at most once for every canonical local commit group.
+    pub fn schedule_group(&self, group: CommitSeq, delay: Duration) {
+        let mut last = lock(&self.last_group);
+        if last.is_some_and(|scheduled| scheduled >= group) {
+            return;
+        }
+        let now = Instant::now();
+        let deadline = now.checked_add(delay).unwrap_or(now);
+        if self
+            .sender
+            .send(SchedulerCommand::Schedule(deadline))
+            .is_ok()
+        {
+            *last = Some(group);
+        }
     }
 }
 
@@ -155,4 +175,33 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::TryRecvError;
+
+    use super::*;
+
+    #[test]
+    fn one_local_first_schedule_is_emitted_per_commit_group() {
+        let scheduler = PushScheduler::new();
+        let receiver = lock(&scheduler.receiver).take().unwrap();
+
+        scheduler.schedule_group(CommitSeq(7), Duration::from_secs(1));
+        scheduler.schedule_group(CommitSeq(7), Duration::from_secs(1));
+        scheduler.schedule_group(CommitSeq(6), Duration::from_secs(1));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SchedulerCommand::Schedule(_))
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        scheduler.schedule_group(CommitSeq(8), Duration::from_secs(1));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SchedulerCommand::Schedule(_))
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
 }

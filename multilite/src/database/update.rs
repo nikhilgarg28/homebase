@@ -352,20 +352,27 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 transaction,
                 reads,
             )?;
-            self.commit_proposal(proposal)?;
-            self.finish_branch_write()?;
+            let receipt = self.commit_proposal(proposal)?;
+            self.finish_branch_write(receipt)?;
         }
         Ok(value)
     }
 
-    fn finish_branch_write(self: &std::sync::Arc<Self>) -> Result<()> {
+    fn finish_branch_write(
+        self: &std::sync::Arc<Self>,
+        receipt: crate::commit::proposal::CommitReceipt,
+    ) -> Result<()> {
+        let sequence = receipt.submitted.ok_or(Error::CaptureInvariant(
+            "transaction commit receipt has no Homebase sequence",
+        ))?;
         match self.policy.policy() {
             SyncPolicy::LocalOnly => Ok(()),
             SyncPolicy::LocalFirst { write_delay, .. } => {
-                self.scheduler.schedule(write_delay);
+                self.scheduler
+                    .schedule_group(receipt.commit_seq, write_delay);
                 Ok(())
             }
-            SyncPolicy::Remote => match self.push()? {
+            SyncPolicy::Remote => match self.push_submission(sequence)? {
                 super::PushOutcome::Drained => Ok(()),
                 super::PushOutcome::Rejected(rejection) => {
                     let error = rejection.error.clone();

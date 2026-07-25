@@ -350,14 +350,15 @@ pub(crate) struct Database<H: ServerHandle> {
 }
 
 enum GroupSlot {
-    Prepared,
-    DuplicatePrepared,
+    Prepared { submitted: Option<DeviceSeq> },
+    DuplicatePrepared { submitted: Option<DeviceSeq> },
     Complete(Result<CommitReceipt>),
 }
 
 struct SeenGroupProposal {
     encoded: Vec<u8>,
     receipt: Option<CommitReceipt>,
+    submitted: Option<DeviceSeq>,
 }
 
 impl Database<OfflineServer> {
@@ -428,11 +429,18 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
-        self.push_via_authority()
+        self.push_via_authority(None)
     }
 
-    fn push_via_authority(&self) -> Result<PushOutcome> {
-        let pushed = self.authority.push_blocking()?;
+    fn push_submission(&self, sequence: DeviceSeq) -> Result<PushOutcome> {
+        self.push_via_authority(Some(sequence))
+    }
+
+    fn push_via_authority(&self, through: Option<DeviceSeq>) -> Result<PushOutcome> {
+        let pushed = match through {
+            Some(sequence) => self.authority.push_until_blocking(sequence)?,
+            None => self.authority.push_blocking()?,
+        };
         match pushed {
             HomebasePushOutcome::Drained { .. } => Ok(PushOutcome::Drained),
             HomebasePushOutcome::Stalled { at, error, .. } => {
@@ -593,7 +601,9 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                         } else {
                             slots.push(match previous.receipt {
                                 Some(receipt) => GroupSlot::Complete(Ok(receipt)),
-                                None => GroupSlot::DuplicatePrepared,
+                                None => GroupSlot::DuplicatePrepared {
+                                    submitted: previous.submitted,
+                                },
                             });
                         }
                         continue;
@@ -608,14 +618,16 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     match outcome {
                         Ok(PrepareOutcome::Prepared(commit)) => {
                             accepted_writes.extend(commit.writes().iter().cloned());
+                            let submitted = commit.submitted();
                             seen.insert(
                                 proposal.id(),
                                 SeenGroupProposal {
                                     encoded,
                                     receipt: None,
+                                    submitted,
                                 },
                             );
-                            slots.push(GroupSlot::Prepared);
+                            slots.push(GroupSlot::Prepared { submitted });
                             prepared.push(commit);
                         }
                         Ok(PrepareOutcome::AlreadyCommitted(receipt)) => {
@@ -624,6 +636,7 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                                 SeenGroupProposal {
                                     encoded,
                                     receipt: Some(receipt),
+                                    submitted: receipt.submitted,
                                 },
                             );
                             slots.push(GroupSlot::Complete(Ok(receipt)));
@@ -644,13 +657,15 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                 let results = slots
                     .into_iter()
                     .map(|slot| match slot {
-                        GroupSlot::Prepared => Ok(CommitReceipt {
+                        GroupSlot::Prepared { submitted } => Ok(CommitReceipt {
                             commit_seq: commit_seq.expect("prepared group has a commit sequence"),
                             disposition: CommitDisposition::Applied,
+                            submitted,
                         }),
-                        GroupSlot::DuplicatePrepared => Ok(CommitReceipt {
+                        GroupSlot::DuplicatePrepared { submitted } => Ok(CommitReceipt {
                             commit_seq: commit_seq.expect("prepared group has a commit sequence"),
                             disposition: CommitDisposition::AlreadyCommitted,
+                            submitted,
                         }),
                         GroupSlot::Complete(result) => result,
                     })
@@ -670,23 +685,24 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
         match proposal.body() {
             ProposalBody::Transaction(transaction) => {
                 let outcome = proposal::prepare(connection, proposal, accepted_writes)?;
-                if matches!(outcome, PrepareOutcome::Prepared(_)) {
-                    let (mutations, assertions) = proposal.to_homebase()?;
-                    let sequence = block_on(async {
-                        let space = self.client.space(self.database_id.space_id()).await?;
-                        let prepared = space
-                            .prepare_unchecked(mutations, assertions)
-                            .await
-                            .map_err(ClientError::from)?;
-                        space
-                            .commit_prepared(prepared)
-                            .await
-                            .map_err(ClientError::from)
-                            .map_err(Error::from)
-                    })?;
-                    pending::insert(connection, sequence, transaction.transaction())?;
-                }
-                Ok(outcome)
+                let PrepareOutcome::Prepared(commit) = outcome else {
+                    return Ok(outcome);
+                };
+                let (mutations, assertions) = proposal.to_homebase()?;
+                let sequence = block_on(async {
+                    let space = self.client.space(self.database_id.space_id()).await?;
+                    let prepared = space
+                        .prepare_unchecked(mutations, assertions)
+                        .await
+                        .map_err(ClientError::from)?;
+                    space
+                        .commit_prepared(prepared)
+                        .await
+                        .map_err(ClientError::from)
+                        .map_err(Error::from)
+                })?;
+                pending::insert(connection, sequence, transaction.transaction())?;
+                Ok(PrepareOutcome::Prepared(commit.with_submission(sequence)))
             }
             ProposalBody::ApplyAdmissions(apply) => {
                 if let Some(receipt) = proposal.committed_receipt(connection)? {

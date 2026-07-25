@@ -256,10 +256,13 @@ impl<M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 'sta
             };
             let cursors = space_state.cursors;
             let confirmed_checksum = space_state.checksum;
-            if let Some(target) = through
-                && (target < cursors.neck || target >= cursors.tail)
-            {
-                return target_missing(Some(target));
+            if let Some(target) = through {
+                if target < cursors.head {
+                    return Ok(PushRun::drained(None, None));
+                }
+                if target < cursors.neck || target >= cursors.tail {
+                    return target_missing(Some(target));
+                }
             }
             if cursors.neck >= cursors.tail {
                 return Ok(PushRun::drained(acked, target_admission));
