@@ -636,9 +636,9 @@ mod tests {
                     },
                     CapturedRow {
                         table: "notes".into(),
-                        rowid: 7,
+                        rowid: 8,
                         values: vec![
-                            StoredValue::Integer(7),
+                            StoredValue::Integer(8),
                             StoredValue::Text(b"after".to_vec()),
                         ],
                     },

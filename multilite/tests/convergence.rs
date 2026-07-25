@@ -317,6 +317,107 @@ fn disjoint_updates_admit_and_same_row_updates_repair_then_converge() {
 }
 
 #[test]
+fn disjoint_key_moves_admit_and_destination_collisions_repair_then_converge() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("move-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("move-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute(
+                "INSERT INTO notes VALUES
+                    (1, 'one'),
+                    (2, 'two'),
+                    (3, 'three'),
+                    (4, 'four')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("UPDATE notes SET id = 11 WHERE id = 1", ())
+        .unwrap();
+    second
+        .execute("UPDATE notes SET id = 12 WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(rows(&first), rows(&second));
+    assert_eq!(
+        rows(&first),
+        [
+            (3, "three".into()),
+            (4, "four".into()),
+            (11, "one".into()),
+            (12, "two".into()),
+        ]
+    );
+
+    first
+        .execute("UPDATE notes SET id = 30 WHERE id = 3", ())
+        .unwrap();
+    second
+        .execute("UPDATE notes SET id = 30 WHERE id = 4", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("colliding UPDATE destination was not rejected")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query(
+                "SELECT id, body FROM notes WHERE id IN (4, 30)",
+                (),
+                |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)) }
+            )
+            .unwrap(),
+        [(4, "four".into())]
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(rows(&first), rows(&second));
+    assert_eq!(
+        rows(&first),
+        [
+            (4, "four".into()),
+            (11, "one".into()),
+            (12, "two".into()),
+            (30, "three".into()),
+        ]
+    );
+}
+
+#[test]
 fn disjoint_deletes_admit_and_same_row_deletes_repair_then_converge() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -437,7 +538,7 @@ fn queued_insert_then_delete_admit_in_same_device_order() {
 }
 
 #[test]
-fn queued_insert_then_update_admit_in_same_device_order() {
+fn queued_insert_then_key_move_admit_in_same_device_order() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let database = MultiliteConnection::open_with(
@@ -458,14 +559,14 @@ fn queued_insert_then_update_admit_in_same_device_order() {
         .execute("INSERT INTO notes VALUES (1, 'before')", ())
         .unwrap();
     database
-        .execute("UPDATE notes SET body = 'after' WHERE id = 1", ())
+        .execute("UPDATE notes SET id = 2, body = 'after' WHERE id = 1", ())
         .unwrap();
-    assert_eq!(rows(&database), [(1, "after".into())]);
+    assert_eq!(rows(&database), [(2, "after".into())]);
 
     assert_eq!(database.push().unwrap(), PushOutcome::Drained);
     database.pull().unwrap();
     database.rebase().unwrap();
-    assert_eq!(rows(&database), [(1, "after".into())]);
+    assert_eq!(rows(&database), [(2, "after".into())]);
 }
 
 #[test]
@@ -535,7 +636,7 @@ fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
 }
 
 #[test]
-fn rejected_text_primary_key_update_restores_values_and_hidden_rowid() {
+fn rejected_text_primary_key_move_restores_rowid_then_applies_the_winner() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let first = MultiliteConnection::open_with(
@@ -571,10 +672,16 @@ fn rejected_text_primary_key_update_restores_values_and_hidden_rowid() {
     let original = document(&second);
 
     first
-        .execute("UPDATE documents SET body = 'winner' WHERE id = 'a'", ())
+        .execute(
+            "UPDATE documents SET id = 'winner', body = 'first' WHERE id = 'a'",
+            (),
+        )
         .unwrap();
     second
-        .execute("UPDATE documents SET body = 'loser' WHERE id = 'a'", ())
+        .execute(
+            "UPDATE documents SET id = 'loser', body = 'second' WHERE id = 'a'",
+            (),
+        )
         .unwrap();
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
     let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
@@ -591,7 +698,10 @@ fn rejected_text_primary_key_update_restores_values_and_hidden_rowid() {
     for database in [&first, &second] {
         let updated = document(database);
         assert_eq!(updated.0, original.0);
-        assert_eq!((updated.1.as_str(), updated.2.as_str()), ("a", "winner"));
+        assert_eq!(
+            (updated.1.as_str(), updated.2.as_str()),
+            ("winner", "first")
+        );
     }
 }
 

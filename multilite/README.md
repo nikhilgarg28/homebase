@@ -6,14 +6,14 @@ the Homebase coordination kernel.
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits a restricted persistent
-`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, and `DELETE` against
+`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE` against
 non-reserved tables. A table must use the initial four declared types and
 exactly one inline primary key; richer constraints and schema forms remain
 rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
-row insertion/deletion into lean logical operations. `Connection::update(|tx| ...)`
+row insertion/deletion/replacement into lean logical operations. `Connection::update(|tx| ...)`
 accumulates multiple statements into one UUID-keyed `MultiliteTransaction`,
 while `Connection::view(|tx| ...)` owns one read-only SQLite snapshot. Their
 transaction values provide SQLite-shaped `query`, `query_map`, and `prepare`
@@ -63,12 +63,22 @@ inserts. Remote apply verifies the complete current row before deleting it, and
 rejection restores values plus the hidden SQLite rowid when one exists.
 Zero-row deletes create no logical transaction.
 
+`UPDATE` uses the same single-table grammar boundary as `DELETE`, while
+allowing ordinary SQLite expressions and subqueries in `SET` and `WHERE`.
+SQLite supplies complete before/after row images. Stable-key updates lower to a
+point Set; primary-key moves lower to a Delete of the old key followed by a Set
+of the new key, with both keys in the conflict footprint. Rejection restores
+the old image. Integer primary-key moves follow SQLite's rowid alias, while
+non-integer primary-key moves preserve their hidden rowid; direct hidden-rowid
+changes remain unsupported.
+
 `Connection::open` is the single file-lifecycle verb;
 `MultiliteConnection` remains an alias for compatibility. Open initializes or
 validates database identity, Homebase metadata, the pending-effects journal,
 and the schema catalog in one general implementation path. Existing SQLite
-user tables are preserved and remain readable. Inserts and deletes against an
-adopted table are rejected until that table has a synchronized schema identity.
+user tables are preserved and remain readable. Inserts, deletes, and updates
+against an adopted table are rejected until that table has a synchronized
+schema identity.
 
 A new database without options mints a public `DatabaseId` and local device
 identity. Another replica is initialized by passing the first file's opaque,
@@ -170,7 +180,8 @@ journal, not a second operation log. Its versioned record codec stores repeated
 effect lists derived from all ordered operations: acceptance runs forward,
 while rejection unwinds operations in reverse. CREATE TABLE rejection drops
 the speculative table and catalog entry, while INSERT rejection removes the
-exact speculative rows and DELETE rejection restores each complete old row.
+exact speculative rows, DELETE rejection restores each complete old row, and
+UPDATE rejection restores its complete before images.
 `__multilite__schema` is the local lookup index from SQLite names and stable
 table UUIDs to authenticated schema definitions.
 The ordered-store adapter executes synchronously under a serialized,

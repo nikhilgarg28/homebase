@@ -159,7 +159,7 @@ fn update_uses_sqlite_expressions_subqueries_and_complete_row_capture() {
 }
 
 #[test]
-fn stable_update_rejects_key_and_hidden_rowid_changes_atomically() {
+fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("update-identity.sqlite")).unwrap();
     db.update(|transaction| {
@@ -180,25 +180,69 @@ fn stable_update_rejects_key_and_hidden_rowid_changes_atomically() {
     })
     .unwrap();
 
+    let original_document_rowid = db
+        .query("SELECT _rowid_ FROM documents", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()[0];
+    assert_eq!(
+        db.execute("UPDATE notes SET id = 2, body = 'changed' WHERE id = 1", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute("UPDATE notes SET rowid = 4 WHERE id = 2", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE documents SET id = 'b', body = 'moved' WHERE id = 'a'",
+            (),
+        )
+        .unwrap(),
+        1
+    );
     assert!(matches!(
-        db.execute("UPDATE notes SET id = 2, body = 'changed' WHERE id = 1", ()),
-        Err(Error::UnsupportedSql(
-            "UPDATE of PRIMARY KEY columns is not supported"
-        ))
-    ));
-    assert!(matches!(
-        db.execute("UPDATE documents SET rowid = rowid + 1 WHERE id = 'a'", ()),
+        db.execute("UPDATE documents SET rowid = rowid + 1 WHERE id = 'b'", ()),
         Err(Error::UnsupportedSql(
             "UPDATE of SQLite rowid is not supported"
         ))
     ));
-    assert_eq!(read_note(&db), "original");
     assert_eq!(
-        db.query("SELECT id, body FROM documents", (), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        db.query("SELECT id, body FROM notes", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .unwrap(),
-        [("a".into(), "document".into())]
+        [(4, "changed".into())]
+    );
+    assert_eq!(
+        db.query("SELECT _rowid_, id, body FROM documents", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(original_document_rowid, "b".into(), "moved".into())]
+    );
+
+    db.execute("INSERT INTO notes VALUES (5, 'occupied')", ())
+        .unwrap();
+    assert!(
+        db.execute(
+            "UPDATE notes SET id = 5, body = 'collision' WHERE id = 4",
+            ()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        db.query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(4, "changed".into()), (5, "occupied".into())]
     );
 }
 
