@@ -33,12 +33,12 @@ use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
-use crate::committer::{ActiveBranch, ActiveBranches, CommitPermit, Committer};
+use crate::commit::committer::{CommitPermit, Committer, HistoryPin, HistoryPins};
+use crate::commit::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
+use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
-use crate::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
-use crate::snapshot::SnapshotDescriptor;
 use crate::{Error, Params, Result};
 
 use self::policy::{PolicyState, PushScheduler};
@@ -338,7 +338,7 @@ pub(crate) struct Database<H: ServerHandle> {
     policy: PolicyState,
     isolation_level: IsolationLevel,
     committer: Committer,
-    active_branches: ActiveBranches,
+    history_pins: HistoryPins,
     scheduler: PushScheduler,
 }
 
@@ -543,9 +543,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     fn capture_branch_snapshot(&self, track_for_commit: bool) -> Result<BranchSnapshot> {
         let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
             .map_err(|error| Error::Branch(error.to_string()))?;
-        let (apply_seq, tables) = self.owner.with_connection(|connection| {
+        let (commit_seq, tables) = self.owner.with_connection(|connection| {
             Ok::<_, Error>((
-                proposal::current_apply_seq(connection)?,
+                proposal::current_commit_seq(connection)?,
                 catalog::table_names(connection)?,
             ))
         })?;
@@ -566,12 +566,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Ok(BranchSnapshot {
             physical,
             logical: SnapshotDescriptor {
-                apply_seq,
+                commit_seq,
                 authority_applied_through,
                 submit_cursors,
             },
             tables,
-            active: track_for_commit.then(|| self.active_branches.register(apply_seq)),
+            history_pin: track_for_commit.then(|| self.history_pins.register(commit_seq)),
         })
     }
 
@@ -605,9 +605,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     })?;
                     pending::insert(connection, sequence, proposal.transaction())?;
                 }
-                let through = match self.active_branches.oldest() {
+                let through = match self.history_pins.oldest() {
                     Some(oldest) => oldest,
-                    None => proposal::current_apply_seq(connection)?,
+                    None => proposal::current_commit_seq(connection)?,
                 };
                 proposal::prune_history(connection, through)?;
                 Ok(receipt)
@@ -766,7 +766,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         policy: PolicyState::new(sync_policy),
         isolation_level,
         committer: Committer::new().map_err(committer_error)?,
-        active_branches: ActiveBranches::default(),
+        history_pins: HistoryPins::default(),
         scheduler: PushScheduler::new(),
     })
 }
@@ -775,7 +775,7 @@ struct BranchSnapshot {
     physical: crate::branch::snapshot::PinnedSnapshot,
     logical: SnapshotDescriptor,
     tables: Vec<String>,
-    active: Option<ActiveBranch>,
+    history_pin: Option<HistoryPin>,
 }
 
 fn wal_path_for(path: &Path) -> PathBuf {
@@ -903,7 +903,7 @@ fn offline_server(_: &SpaceId) -> Option<UnreachableSpace> {
     None
 }
 
-fn committer_error(error: crate::committer::CommitterError) -> Error {
+fn committer_error(error: crate::commit::committer::CommitterError) -> Error {
     Error::Committer(error.to_string())
 }
 

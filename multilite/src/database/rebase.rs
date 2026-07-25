@@ -98,7 +98,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
             runtime.with_internal_metadata(|| {
                 if applied_foreign {
-                    crate::proposal::advance_apply_seq(connection)?;
+                    crate::commit::proposal::advance_commit_seq(connection)?;
                 }
                 block_on(store.mark_admits_applied(space_id, apply_to))?;
                 Ok(())

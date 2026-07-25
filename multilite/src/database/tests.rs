@@ -1578,11 +1578,15 @@ fn rollback_preserves_an_accepted_prefix_and_retires_only_the_rejected_suffix() 
     assert!(table_exists(&second, "tasks"));
     assert!(table_exists(&second, "NOTES"));
 
-    let before_rollback = second.with_connection(proposal::current_apply_seq).unwrap();
+    let before_rollback = second
+        .with_connection(proposal::current_commit_seq)
+        .unwrap();
     second.rollback(&rejection).unwrap();
     assert_eq!(
-        second.with_connection(proposal::current_apply_seq).unwrap(),
-        crate::snapshot::ApplySeq(before_rollback.0 + 1)
+        second
+            .with_connection(proposal::current_commit_seq)
+            .unwrap(),
+        crate::commit::snapshot::CommitSeq(before_rollback.0 + 1)
     );
     assert!(pending_ops(&second).is_empty());
     assert!(table_exists(&second, "tasks"));
@@ -2145,8 +2149,10 @@ fn two_replicas_converge_rows_and_reject_only_a_conflicting_insert() {
     second.pull().unwrap();
     second.rebase(&second_runtime).unwrap();
     assert_eq!(
-        second.with_connection(proposal::current_apply_seq).unwrap(),
-        crate::snapshot::ApplySeq(1)
+        second
+            .with_connection(proposal::current_commit_seq)
+            .unwrap(),
+        crate::commit::snapshot::CommitSeq(1)
     );
 
     first
@@ -2259,21 +2265,24 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
     assert_eq!(rows, [(1, "one".into()), (2, "two".into())]);
     assert_eq!(
         database
-            .with_connection(proposal::current_apply_seq)
+            .with_connection(proposal::current_commit_seq)
             .unwrap(),
-        crate::snapshot::ApplySeq(3)
+        crate::commit::snapshot::CommitSeq(3)
     );
     assert_eq!(pending_ops(&database).len(), 3);
     assert_eq!(
         database
             .with_connection(|connection| {
-                proposal::history_after(connection, crate::snapshot::ApplySeq(0))
+                proposal::history_after(connection, crate::commit::snapshot::CommitSeq(0))
             })
             .unwrap()
             .into_iter()
-            .map(|committed| committed.apply_seq)
+            .map(|committed| committed.commit_seq)
             .collect::<Vec<_>>(),
-        [crate::snapshot::ApplySeq(2), crate::snapshot::ApplySeq(3)]
+        [
+            crate::commit::snapshot::CommitSeq(2),
+            crate::commit::snapshot::CommitSeq(3)
+        ]
     );
 
     database
@@ -2284,13 +2293,13 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
     assert_eq!(
         database
             .with_connection(|connection| {
-                proposal::history_after(connection, crate::snapshot::ApplySeq(0))
+                proposal::history_after(connection, crate::commit::snapshot::CommitSeq(0))
             })
             .unwrap()
             .into_iter()
-            .map(|committed| committed.apply_seq)
+            .map(|committed| committed.commit_seq)
             .collect::<Vec<_>>(),
-        [crate::snapshot::ApplySeq(4)]
+        [crate::commit::snapshot::CommitSeq(4)]
     );
 }
 
@@ -2346,9 +2355,9 @@ fn concurrent_snapshot_updates_reject_one_primary_key_collision() {
     );
     assert_eq!(
         database
-            .with_connection(proposal::current_apply_seq)
+            .with_connection(proposal::current_commit_seq)
             .unwrap(),
-        crate::snapshot::ApplySeq(2)
+        crate::commit::snapshot::CommitSeq(2)
     );
     assert_eq!(pending_ops(&database).len(), 2);
 }

@@ -135,7 +135,7 @@ impl MetaStore for DatabaseMetaStore {
                     let active =
                         pollster::block_on(self.inner.oplog(space, expected.neck, through))?;
                     if pending::reject_active(connection, &active)? {
-                        crate::proposal::advance_apply_seq(connection)?;
+                        crate::commit::proposal::advance_commit_seq(connection)?;
                     }
                 }
                 pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?;

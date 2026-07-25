@@ -3,14 +3,12 @@
 //! Not published for use yet.
 
 mod branch;
-mod committer;
+mod commit;
 mod connection;
 mod database;
 mod error;
 mod metastore;
-mod proposal;
 mod runtime;
-mod snapshot;
 mod value;
 
 pub use database::{Connection as MultiliteConnection, Statement as MultiliteStatement};

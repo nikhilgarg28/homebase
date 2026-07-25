@@ -10,45 +10,45 @@ use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use parking_lot::Mutex;
 
-use crate::snapshot::ApplySeq;
+use crate::commit::snapshot::CommitSeq;
 
 const COMMAND_CAPACITY: usize = 64;
 
 /// In-process writable branches that still need OCC history after their cut.
 #[derive(Clone, Default)]
-pub struct ActiveBranches {
-    inner: Arc<Mutex<BTreeMap<ApplySeq, usize>>>,
+pub struct HistoryPins {
+    inner: Arc<Mutex<BTreeMap<CommitSeq, usize>>>,
 }
 
-impl ActiveBranches {
-    pub fn register(&self, apply_seq: ApplySeq) -> ActiveBranch {
-        *self.inner.lock().entry(apply_seq).or_default() += 1;
-        ActiveBranch {
-            apply_seq,
-            branches: self.clone(),
+impl HistoryPins {
+    pub fn register(&self, commit_seq: CommitSeq) -> HistoryPin {
+        *self.inner.lock().entry(commit_seq).or_default() += 1;
+        HistoryPin {
+            commit_seq,
+            pins: self.clone(),
         }
     }
 
-    pub fn oldest(&self) -> Option<ApplySeq> {
+    pub fn oldest(&self) -> Option<CommitSeq> {
         self.inner.lock().first_key_value().map(|(seq, _)| *seq)
     }
 }
 
 /// Registration held until one writable branch has received its disposition.
-pub struct ActiveBranch {
-    apply_seq: ApplySeq,
-    branches: ActiveBranches,
+pub struct HistoryPin {
+    commit_seq: CommitSeq,
+    pins: HistoryPins,
 }
 
-impl Drop for ActiveBranch {
+impl Drop for HistoryPin {
     fn drop(&mut self) {
-        let mut active = self.branches.inner.lock();
-        let count = active
-            .get_mut(&self.apply_seq)
-            .expect("active branch registration remains present");
+        let mut pins = self.pins.inner.lock();
+        let count = pins
+            .get_mut(&self.commit_seq)
+            .expect("history pin remains registered");
         *count -= 1;
         if *count == 0 {
-            active.remove(&self.apply_seq);
+            pins.remove(&self.commit_seq);
         }
     }
 }
@@ -205,18 +205,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_branch_frontier_tracks_the_oldest_live_apply_sequence() {
-        let branches = ActiveBranches::default();
-        let later = branches.register(ApplySeq(9));
-        let first = branches.register(ApplySeq(3));
-        let second = branches.register(ApplySeq(3));
-        assert_eq!(branches.oldest(), Some(ApplySeq(3)));
+    fn history_frontier_tracks_the_oldest_live_commit_sequence() {
+        let pins = HistoryPins::default();
+        let later = pins.register(CommitSeq(9));
+        let first = pins.register(CommitSeq(3));
+        let second = pins.register(CommitSeq(3));
+        assert_eq!(pins.oldest(), Some(CommitSeq(3)));
         drop(first);
-        assert_eq!(branches.oldest(), Some(ApplySeq(3)));
+        assert_eq!(pins.oldest(), Some(CommitSeq(3)));
         drop(second);
-        assert_eq!(branches.oldest(), Some(ApplySeq(9)));
+        assert_eq!(pins.oldest(), Some(CommitSeq(9)));
         drop(later);
-        assert_eq!(branches.oldest(), None);
+        assert_eq!(pins.oldest(), None);
     }
 
     #[test]

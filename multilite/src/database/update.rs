@@ -17,7 +17,7 @@ use super::{
 };
 use crate::branch::changeset::ChangesetCapture;
 use crate::branch::{OverlayOptions, WritableBranch};
-use crate::proposal::CommitProposal;
+use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
 
@@ -280,7 +280,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             physical,
             logical,
             tables,
-            active: _active,
+            history_pin: _history_pin,
         } = self.issue_branch_snapshot(true)?;
         let branch = WritableBranch::open(physical, OverlayOptions::default())
             .map_err(|error| Error::Branch(error.to_string()))?;
@@ -329,7 +329,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 );
                 let value = operation(&mut update)?;
                 if update.finalize_serialized()? {
-                    crate::proposal::advance_apply_seq(connection)?;
+                    crate::commit::proposal::advance_commit_seq(connection)?;
                 }
                 Ok(value)
             })?;
