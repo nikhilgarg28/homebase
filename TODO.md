@@ -23,7 +23,16 @@ multilite
   dedicated `PRAGMA data_version` observer, WAL epoch/tip comparison, schema
   cookie, and Multilite commit marker; enter an explicit externally-modified or
   quarantine state until a logical import/diff exists, since repairing the page
-  map alone cannot create the missing Homebase operation.
+  map alone cannot create the missing Homebase operation. Include divergent
+  physical-schema tests where an out-of-band writer installs a trigger or
+  foreign-key action on a synchronized table: remote materialization and
+  rejection repair must not silently produce unrepresented side-effect writes.
+  Today this is principally a foreign/legacy-schema hazard because Multilite
+  rejects trigger-generated public writes and cannot create those schema
+  features. If Multilite later supports triggers or mutating FK actions, captured
+  logical effects must still be materialized exactly once, either by suppressing
+  trigger/FK execution during replay or by proving an equivalent centralized
+  materialization invariant.
 
 - Centralize local physical-schema validation under that foreign-writer and
   corruption boundary. Logical `MultiliteOp`s now completely describe canonical
@@ -33,6 +42,15 @@ multilite
   should detect an out-of-band SQLite schema change and enter the same
   externally-modified/quarantine path; schema revision and keyspace IDs plus
   range assertions remain the distributed DDL/DML conflict mechanism.
+
+- Bound speculative DELETE capture deterministically. A DELETE currently buffers
+  every complete old row image in memory and retains restoration data for
+  rejection repair, so enforce explicit per-statement row and encoded-byte limits
+  with atomic rollback and stable errors before claiming support for unbounded
+  bulk deletes. Later evaluate spilling restoration images to disk, transaction-
+  preserving chunking, and lowering eligible predicates to Homebase
+  `DeleteRange`; range lowering must preserve precise local rollback data and
+  correct snapshot/serializable conflict footprints.
 
 - Measure and reduce private-transaction startup overhead before pooling branch
   connections blindly. The normal writable path still opens an unused baseline
