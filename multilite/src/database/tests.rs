@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,12 @@ use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, OrderedMetaStor
 use homebase_client::server::offline_router;
 use homebase_core::clock::{ManualClock, Timestamp};
 use homebase_core::key::{Key, MAX_COMPONENT_LEN};
+use homebase_core::messages::{
+    AcquireRequest, AcquireResponse, AdmissionRequest, AdmissionResponse, GetRequest, GetResponse,
+    ListLeasesRequest, ListLeasesResponse, ListRequest, ListResponse, PullRequest, PullResponse,
+    ReadAtRequest, ReadAtResponse, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+};
+use homebase_core::space::{Space, SpaceError};
 use homebase_core::tag::{DeviceChecksum, DeviceSeq, Mutation};
 use rusqlite::OptionalExtension;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -45,6 +51,86 @@ fn router(server: Arc<TestServer>) -> impl Fn(&SpaceId) -> Option<SpaceHandle> +
     move |space| server.space(space)
 }
 
+struct GatedAdmitSpace {
+    inner: SpaceHandle,
+    gate_once: Arc<AtomicBool>,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl Space for GatedAdmitSpace {
+    async fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> std::result::Result<AcquireResponse, SpaceError> {
+        self.inner.acquire(request).await
+    }
+
+    async fn renew(&self, request: RenewRequest) -> std::result::Result<RenewResponse, SpaceError> {
+        self.inner.renew(request).await
+    }
+
+    async fn release(
+        &self,
+        request: ReleaseRequest,
+    ) -> std::result::Result<ReleaseResponse, SpaceError> {
+        self.inner.release(request).await
+    }
+
+    async fn list_leases(
+        &self,
+        request: ListLeasesRequest,
+    ) -> std::result::Result<ListLeasesResponse, SpaceError> {
+        self.inner.list_leases(request).await
+    }
+
+    async fn admit(
+        &self,
+        request: AdmissionRequest,
+    ) -> std::result::Result<AdmissionResponse, SpaceError> {
+        if self.gate_once.swap(false, Ordering::SeqCst) {
+            self.entered.wait();
+            self.release.wait();
+        }
+        self.inner.admit(request).await
+    }
+
+    async fn pull(&self, request: PullRequest) -> std::result::Result<PullResponse, SpaceError> {
+        self.inner.pull(request).await
+    }
+
+    async fn get(&self, request: GetRequest) -> std::result::Result<GetResponse, SpaceError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> std::result::Result<ListResponse, SpaceError> {
+        self.inner.list(request).await
+    }
+
+    async fn read_at(
+        &self,
+        request: ReadAtRequest,
+    ) -> std::result::Result<ReadAtResponse, SpaceError> {
+        self.inner.read_at(request).await
+    }
+}
+
+fn gated_router(
+    server: Arc<TestServer>,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+) -> impl Fn(&SpaceId) -> Option<GatedAdmitSpace> + Sync {
+    let gate_once = Arc::new(AtomicBool::new(true));
+    move |space| {
+        server.space(space).map(|inner| GatedAdmitSpace {
+            inner,
+            gate_once: Arc::clone(&gate_once),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })
+    }
+}
+
 fn client_state<H: ServerHandle + Send + Sync + 'static>(database: &Database<H>) -> ClientState {
     let store = DatabaseMetaStore::new(database.owner.clone());
     block_on(store.load()).unwrap()
@@ -72,6 +158,20 @@ fn pending_ops<H: ServerHandle + Send + Sync + 'static>(
     database: &Database<H>,
 ) -> Vec<pending::PendingTransaction> {
     database.with_connection(pending::load).unwrap()
+}
+
+fn backend_for<H: ServerHandle + Send + Sync + 'static>(
+    database: &Database<H>,
+    path: &Path,
+) -> DatabaseCommitBackend<H> {
+    DatabaseCommitBackend {
+        owner: database.owner.clone(),
+        path: path.to_owned(),
+        wal_path: wal_path_for(path),
+        database_id: database.database_id,
+        client: Arc::clone(&database.client),
+        commit_history: CommitHistory::default(),
+    }
 }
 
 fn table_sql<H: ServerHandle + Send + Sync + 'static>(
@@ -140,6 +240,44 @@ fn create_proposal(snapshot: SnapshotDescriptor, name: &str) -> CommitProposal {
     .unwrap()
 }
 
+fn pending_apply_proposal<H: ServerHandle + Send + Sync + 'static>(
+    database: &Database<H>,
+) -> CommitProposal {
+    let space_id = database.database_id.space_id();
+    let store = DatabaseMetaStore::new(database.owner.clone());
+    let (submit, admits, batches) = block_on(async {
+        let submit = store.oplog_cursors(space_id).await?;
+        let admits = store.admit_cursors(space_id).await?;
+        let space = database.client.space(space_id).await?;
+        let batches = space
+            .admits()
+            .iter(admits.neck..admits.tail)
+            .await
+            .map_err(ClientError::from)?;
+        Ok::<_, Error>((submit, admits, batches))
+    })
+    .unwrap();
+    let transactions = batches
+        .into_iter()
+        .filter(|batch| !batch.entries.is_empty())
+        .map(|batch| {
+            Ok(crate::commit::proposal::AdmittedTransaction {
+                device: batch.device,
+                transaction: MultiliteTransaction::from_homebase(&batch)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    CommitProposal::apply_admissions(
+        submit,
+        admits,
+        admits.tail,
+        database.client.device(),
+        transactions,
+    )
+    .unwrap()
+}
+
 fn submit_direct<H: ServerHandle + Send + Sync + 'static>(
     database: &Database<H>,
     operation: &MultiliteOp,
@@ -198,6 +336,67 @@ fn policy_defaults_are_local_and_authority_requirements_fail_before_open() {
         Err(Error::AuthorityRequired("local-first policy"))
     ));
     assert!(!local_first_path.exists());
+}
+
+#[test]
+fn database_workers_release_the_client_after_the_last_handle_drops() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("worker-lifetime.sqlite")).unwrap();
+    let client = Arc::downgrade(&database.client);
+
+    drop(database);
+
+    wait_until(|| client.upgrade().is_none());
+}
+
+#[test]
+fn local_proposal_does_not_wait_for_an_inflight_authority_permit() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let database = Database::open_with(
+        directory.path().join("authority-permit.sqlite"),
+        OpenOptions::new().server(gated_router(
+            Arc::clone(&server),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        )),
+    )
+    .unwrap();
+    assert!(server.create_space(database.database_id().space_id()));
+    let runtime = Arc::new(database.runtime().unwrap());
+    database
+        .execute(&runtime, "CREATE TABLE first (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+
+    let (push_reply, push_result) = std::sync::mpsc::sync_channel(1);
+    let pushing = Arc::clone(&database);
+    std::thread::spawn(move || {
+        let _ = push_reply.send(pushing.push());
+    });
+    entered.wait();
+
+    let (write_reply, write_result) = std::sync::mpsc::sync_channel(1);
+    let writing = Arc::clone(&database);
+    let write_runtime = Arc::clone(&runtime);
+    std::thread::spawn(move || {
+        let result = writing.execute(
+            &write_runtime,
+            "CREATE TABLE second (id INTEGER PRIMARY KEY)",
+            (),
+        );
+        let _ = write_reply.send(result);
+    });
+
+    let write_result = write_result.recv_timeout(Duration::from_secs(2));
+    release.wait();
+    let push_result = push_result.recv_timeout(Duration::from_secs(2));
+
+    assert_eq!(write_result.unwrap().unwrap(), 0);
+    assert_eq!(push_result.unwrap().unwrap(), PushOutcome::Drained);
+    assert!(table_exists(&database, "first"));
+    assert!(table_exists(&database, "second"));
 }
 
 #[test]
@@ -1292,7 +1491,7 @@ fn rebase_rejects_cursor_changes_between_snapshot_and_apply() {
                 (),
             )?;
             assert_eq!(source.push()?, PushOutcome::Drained);
-            replica.pull_serial()?;
+            replica.pull_via_authority()?;
             Ok(())
         })
         .unwrap_err();
@@ -2248,7 +2447,7 @@ fn two_replicas_converge_rows_and_reject_only_a_conflicting_insert() {
     second.rebase(&second_runtime).unwrap();
     assert_eq!(
         second.with_connection(history::current).unwrap(),
-        crate::commit::snapshot::CommitSeq(1)
+        crate::commit::snapshot::CommitSeq(2)
     );
 
     first
@@ -2395,8 +2594,10 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
 #[test]
 fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
     let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("commit-group.sqlite")).unwrap();
-    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let path = directory.path().join("commit-group.sqlite");
+    let database = Database::open(&path).unwrap();
+    let backend = backend_for(&database, &path);
+    let snapshot = backend.capture_snapshot(true).unwrap();
     let first = create_proposal(snapshot.logical, "notes");
     let conflict = create_proposal(snapshot.logical, "NOTES");
     let last = create_proposal(snapshot.logical, "tasks");
@@ -2406,8 +2607,8 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
         .collect::<Vec<_>>();
     let expected_writes = history::writes_from_mutations(&expected_mutations);
 
-    let results = database
-        .commit_proposal_group_serial(&[&first, &first, &conflict, &last])
+    let results = backend
+        .commit_group(&[&first, &first, &conflict, &last])
         .unwrap();
     assert_eq!(results.len(), 4);
     let first_receipt = results[0].as_ref().unwrap();
@@ -2452,18 +2653,156 @@ fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
 }
 
 #[test]
+fn remote_apply_and_disjoint_local_transaction_share_one_commit_sequence() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let source = Database::open_with(
+        directory.path().join("source.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(source.database_id.space_id()));
+    let replica_path = directory.path().join("replica.sqlite");
+    let replica = Database::open_with(
+        &replica_path,
+        OpenOptions::new()
+            .invitation(source.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let source_runtime = source.runtime().unwrap();
+    source
+        .execute(
+            &source_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+    replica.pull().unwrap();
+    assert_eq!(
+        replica.with_connection(history::current).unwrap(),
+        crate::commit::snapshot::CommitSeq(1)
+    );
+    assert!(
+        replica
+            .with_connection(|connection| {
+                history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
+            })
+            .unwrap()
+            .is_empty()
+    );
+
+    let apply = pending_apply_proposal(&replica);
+    let backend = backend_for(&replica, &replica_path);
+    let snapshot = backend.capture_snapshot(true).unwrap();
+    let local = create_proposal(snapshot.logical, "tasks");
+    let results = backend.commit_group(&[&apply, &local]).unwrap();
+
+    let apply_receipt = results[0].as_ref().unwrap();
+    let local_receipt = results[1].as_ref().unwrap();
+    assert_eq!(apply_receipt.commit_seq, local_receipt.commit_seq);
+    assert_eq!(
+        apply_receipt.commit_seq,
+        crate::commit::snapshot::CommitSeq(2)
+    );
+    assert!(table_exists(&replica, "notes"));
+    assert!(table_exists(&replica, "tasks"));
+    assert_eq!(pending_ops(&replica).len(), 1);
+}
+
+#[test]
+fn remote_apply_rejects_only_an_overlapping_local_group_member() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let source = Database::open_with(
+        directory.path().join("source.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(source.database_id.space_id()));
+    let replica_path = directory.path().join("replica.sqlite");
+    let replica = Database::open_with(
+        &replica_path,
+        OpenOptions::new()
+            .invitation(source.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let source_runtime = source.runtime().unwrap();
+    source
+        .execute(
+            &source_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(source.push().unwrap(), PushOutcome::Drained);
+    replica.pull().unwrap();
+
+    let apply = pending_apply_proposal(&replica);
+    let backend = backend_for(&replica, &replica_path);
+    let snapshot = backend.capture_snapshot(true).unwrap();
+    let collision = create_proposal(snapshot.logical, "NOTES");
+    let disjoint = create_proposal(snapshot.logical, "tasks");
+    let results = backend
+        .commit_group(&[&apply, &collision, &disjoint])
+        .unwrap();
+
+    let shared = results[0].as_ref().unwrap().commit_seq;
+    assert!(matches!(results[1], Err(Error::CommitConflict(_))));
+    assert_eq!(results[2].as_ref().unwrap().commit_seq, shared);
+    assert!(table_exists(&replica, "notes"));
+    assert!(table_exists(&replica, "tasks"));
+    assert_eq!(pending_ops(&replica).len(), 1);
+}
+
+#[test]
+fn stale_metadata_proposal_does_not_poison_a_later_group_member() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stale-metadata.sqlite");
+    let database = Database::open(&path).unwrap();
+    let backend = backend_for(&database, &path);
+    let stale = CommitProposal::append_admissions(
+        AdmitCursors {
+            head: AdmissionSeq(1),
+            neck: AdmissionSeq(1),
+            tail: AdmissionSeq(2),
+        },
+        homebase_core::messages::PullResponse {
+            after: AdmissionSeq(1),
+            through: AdmissionSeq(1),
+            batches: Vec::new(),
+        },
+    )
+    .unwrap();
+    let snapshot = backend.capture_snapshot(true).unwrap();
+    let local = create_proposal(snapshot.logical, "notes");
+
+    let results = backend.commit_group(&[&stale, &local]).unwrap();
+    assert!(matches!(results[0], Err(Error::CommitConflict(_))));
+    assert_eq!(
+        results[1].as_ref().unwrap().commit_seq,
+        crate::commit::snapshot::CommitSeq(1)
+    );
+    assert!(table_exists(&database, "notes"));
+}
+
+#[test]
 fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
     let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("atomic-snapshot.sqlite")).unwrap();
+    let path = directory.path().join("atomic-snapshot.sqlite");
+    let database = Database::open(&path).unwrap();
+    let backend = backend_for(&database, &path);
     let space = database.database_id.space_id();
     let device = database.client.device();
 
-    let snapshot = database
-        .capture_branch_snapshot_after_physical(true, || {
+    let snapshot = backend
+        .capture_snapshot_inner(true, || {
             database
                 .owner
                 .with_savepoint("__multilite__snapshot_race", |connection| {
-                    database.commit_history.record(
+                    backend.commit_history.record(
                         connection,
                         vec![history::WriteRegion::Point(
                             Key::from_bytes([b"test".as_slice(), b"write".as_slice()]).unwrap(),
@@ -2506,7 +2845,7 @@ fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
     assert_eq!(snapshot.logical.submit_cursors, OplogCursors::default());
     assert_eq!(snapshot.logical.authority_applied_through, AdmissionSeq(0));
 
-    let current = database.capture_branch_snapshot(false).unwrap();
+    let current = backend.capture_snapshot(false).unwrap();
     assert_eq!(
         current.logical.commit_seq,
         crate::commit::snapshot::CommitSeq(1)
@@ -2516,15 +2855,16 @@ fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
 }
 
 #[test]
-fn queued_owned_proposals_coalesce_behind_one_committer_turn() {
+fn typed_committer_accepts_concurrent_owned_proposals() {
     let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("queued-group.sqlite")).unwrap();
-    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let path = directory.path().join("queued-group.sqlite");
+    let database = Database::open(&path).unwrap();
+    let backend = backend_for(&database, &path);
+    let snapshot = backend.capture_snapshot(true).unwrap();
     let proposals = [
         create_proposal(snapshot.logical, "notes"),
         create_proposal(snapshot.logical, "tasks"),
     ];
-    let permit = database.enter_operation().unwrap();
     let handles = proposals
         .into_iter()
         .map(|proposal| {
@@ -2532,18 +2872,13 @@ fn queued_owned_proposals_coalesce_behind_one_committer_turn() {
             std::thread::spawn(move || database.commit_proposal(proposal))
         })
         .collect::<Vec<_>>();
-    wait_until(|| database.commit_queue.pending_len() == 2);
-    drop(permit);
 
     let receipts = handles
         .into_iter()
         .map(|handle| handle.join().unwrap().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(receipts[0].commit_seq, receipts[1].commit_seq);
-    assert_eq!(
-        receipts[0].commit_seq,
-        crate::commit::snapshot::CommitSeq(1)
-    );
+    assert!(receipts.iter().all(|receipt| receipt.commit_seq.0 >= 1));
+    assert!(receipts.iter().all(|receipt| receipt.commit_seq.0 <= 2));
     assert!(table_exists(&database, "notes"));
     assert!(table_exists(&database, "tasks"));
     assert_eq!(pending_ops(&database).len(), 2);
@@ -2552,8 +2887,10 @@ fn queued_owned_proposals_coalesce_behind_one_committer_turn() {
 #[test]
 fn commit_group_finalization_failure_rolls_back_every_successful_member() {
     let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("commit-group-failure.sqlite")).unwrap();
-    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let path = directory.path().join("commit-group-failure.sqlite");
+    let database = Database::open(&path).unwrap();
+    let backend = backend_for(&database, &path);
+    let snapshot = backend.capture_snapshot(true).unwrap();
     let first = create_proposal(snapshot.logical, "notes");
     let second = create_proposal(snapshot.logical, "tasks");
     let state_before = client_state(&database);
@@ -2568,7 +2905,7 @@ fn commit_group_finalization_failure_rolls_back_every_successful_member() {
     });
 
     assert!(matches!(
-        database.commit_proposal_group_serial(&[&first, &second]),
+        backend.commit_group(&[&first, &second]),
         Err(Error::Sqlite(_))
     ));
     assert!(!table_exists(&database, "notes"));

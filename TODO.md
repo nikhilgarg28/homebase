@@ -45,14 +45,14 @@ multilite
   Reusing a branch SQLite handle itself requires a proven reset/rebind protocol
   for schema caches, hooks, temp state, overlays, and snapshot identity.
 
-- Add one async authority actor per database/space alongside the SQLite
-  committer. It owns transport state, push/pull coalescing, retry/backoff, and
-  authority request ordering; public push/pull sends commands with oneshot
-  replies. Split each workflow into committer-owned prepare, actor-owned network
-  I/O, and committer-owned checked completion/apply phases. The committer must
-  never await the authority actor while the actor is waiting for a committer
-  reply; completion messages carry operation ids and expected cursor snapshots
-  so stale responses are rejected or retried idempotently.
+- Extend the landed per-database authority actor beyond FIFO push/pull. Add
+  request coalescing, retry/backoff, cancellation-independent completion, and
+  exact per-submission replies. Preserve the acyclic ownership rule: authority
+  workflows may submit checked completion proposals and wait for the committer,
+  while the committer may apply owned local Homebase transitions but must never
+  wait for the authority actor or acquire its workflow permit. Completion
+  proposals carry deterministic ids and expected cursors so stale responses are
+  rejected or retried idempotently.
 
 - client should run slatedb in single threaded tokio
 - add more kinds of leases - forever lease, oneshot lease?

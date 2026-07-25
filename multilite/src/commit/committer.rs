@@ -1,21 +1,23 @@
-//! FIFO serialization for canonical SQLite commits and authority workflows.
+//! Typed FIFO serialization for canonical proposals and snapshot capture.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::mpsc;
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TryRecvError, WeakSender};
 use futures_channel::oneshot;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::Result;
+use crate::branch::snapshot::PinnedSnapshot;
 use crate::commit::history::{self, WriteRegion};
-use crate::commit::snapshot::CommitSeq;
+use crate::commit::proposal::{CommitProposal, CommitReceipt};
+use crate::commit::snapshot::{CommitSeq, SnapshotDescriptor};
+use crate::{Error, Result};
 
-const COMMAND_CAPACITY: usize = 64;
+const INBOX_CAPACITY: usize = 256;
+const GROUP_CAPACITY: usize = 32;
 
 /// In-process writable branches that still need OCC history after their cut.
 #[derive(Clone, Default)]
@@ -88,160 +90,196 @@ impl Drop for HistoryPin {
     }
 }
 
-trait ActorJob: Send {
-    fn run(self: Box<Self>);
+/// One physical and logical database snapshot captured at a queue boundary.
+pub struct CommitSnapshot {
+    pub(crate) physical: PinnedSnapshot,
+    pub(crate) logical: SnapshotDescriptor,
+    pub(crate) history_pin: Option<HistoryPin>,
 }
 
-struct Work<F, R> {
-    operation: Option<F>,
-    reply: oneshot::Sender<std::result::Result<R, CommitterError>>,
+/// Canonical database work owned by the committer thread.
+pub trait CommitBackend: Send + Sync + 'static {
+    /// Prepare and atomically finalize one bounded FIFO proposal group.
+    fn commit_group(&self, proposals: &[&CommitProposal]) -> Result<Vec<Result<CommitReceipt>>>;
+
+    /// Capture one physical and logical snapshot at this exact queue position.
+    fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot>;
 }
 
-struct DetachedWork<F> {
-    operation: Option<F>,
+enum Request {
+    Propose {
+        proposal: CommitProposal,
+        reply: oneshot::Sender<Result<CommitReceipt>>,
+    },
+    CaptureSnapshot {
+        writable: bool,
+        reply: oneshot::Sender<Result<CommitSnapshot>>,
+    },
 }
 
-impl<F, R> ActorJob for Work<F, R>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    fn run(mut self: Box<Self>) {
-        let operation = self.operation.take().expect("actor work runs once");
-        let result = catch_unwind(AssertUnwindSafe(operation))
-            .map_err(|_| CommitterError::OperationPanicked);
-        let _ = self.reply.send(result);
-    }
-}
-
-impl<F> ActorJob for DetachedWork<F>
-where
-    F: FnOnce() + Send + 'static,
-{
-    fn run(mut self: Box<Self>) {
-        let operation = self.operation.take().expect("detached work runs once");
-        let _ = catch_unwind(AssertUnwindSafe(operation));
-    }
-}
-
-enum Command {
-    Run(Box<dyn ActorJob>),
-    Enter(oneshot::Sender<mpsc::SyncSender<()>>),
-}
-
-/// Sending side of one bounded serial database executor.
-#[derive(Clone)]
+/// Sending side of one typed serial database executor.
 pub struct Committer {
-    outbox: Sender<Command>,
+    outbox: Sender<Request>,
+}
+
+impl Clone for Committer {
+    fn clone(&self) -> Self {
+        Self {
+            outbox: self.outbox.clone(),
+        }
+    }
+}
+
+/// Non-owning route used by components retained by the committer backend.
+pub struct WeakCommitter {
+    outbox: WeakSender<Request>,
+}
+
+impl Clone for WeakCommitter {
+    fn clone(&self) -> Self {
+        Self {
+            outbox: self.outbox.clone(),
+        }
+    }
 }
 
 impl Committer {
-    pub fn new() -> std::result::Result<Self, CommitterError> {
-        Self::with_capacity(COMMAND_CAPACITY)
+    pub fn new<B>(backend: Arc<B>) -> std::result::Result<Self, CommitterError>
+    where
+        B: CommitBackend,
+    {
+        Self::with_capacity(backend, INBOX_CAPACITY)
     }
 
-    fn with_capacity(capacity: usize) -> std::result::Result<Self, CommitterError> {
+    fn with_capacity<B>(
+        backend: Arc<B>,
+        capacity: usize,
+    ) -> std::result::Result<Self, CommitterError>
+    where
+        B: CommitBackend,
+    {
         let (outbox, inbox) = async_channel::bounded(capacity);
         std::thread::Builder::new()
-            .name("multilite-database".into())
-            .spawn(move || run(inbox))
+            .name("multilite-committer".into())
+            .spawn(move || run(inbox, backend))
             .map_err(|error| CommitterError::Startup(error.to_string()))?;
         Ok(Self { outbox })
     }
 
-    /// Run owned work in FIFO order on the database executor.
-    ///
-    /// Once accepted by the channel, work runs even if the response future is
-    /// dropped. This prevents caller cancellation from retracting a commit.
-    pub async fn call<F, R>(&self, operation: F) -> std::result::Result<R, CommitterError>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
+    /// Enqueue one owned canonical transition.
+    pub async fn propose(&self, proposal: CommitProposal) -> Result<CommitReceipt> {
         let (reply, response) = oneshot::channel();
         self.outbox
-            .send(Command::Run(Box::new(Work {
-                operation: Some(operation),
-                reply,
-            })))
+            .send(Request::Propose { proposal, reply })
             .await
-            .map_err(|_| CommitterError::Unavailable)?;
-        response.await.map_err(|_| CommitterError::Unavailable)?
-    }
-
-    pub fn call_blocking<F, R>(&self, operation: F) -> std::result::Result<R, CommitterError>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        pollster::block_on(self.call(operation))
-    }
-
-    /// Schedule owned work without coupling execution to a response future.
-    pub async fn dispatch<F>(&self, operation: F) -> std::result::Result<(), CommitterError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.outbox
-            .send(Command::Run(Box::new(DetachedWork {
-                operation: Some(operation),
-            })))
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        response
             .await
-            .map_err(|_| CommitterError::Unavailable)
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
     }
 
-    pub fn dispatch_blocking<F>(&self, operation: F) -> std::result::Result<(), CommitterError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        pollster::block_on(self.dispatch(operation))
+    pub fn propose_blocking(&self, proposal: CommitProposal) -> Result<CommitReceipt> {
+        pollster::block_on(self.propose(proposal))
     }
 
-    /// Acquire the FIFO execution turn for work that borrows caller state.
-    ///
-    /// The work remains on the caller thread, but every actor job and every
-    /// other borrowed scope waits until this permit is dropped.
-    pub async fn enter(&self) -> std::result::Result<CommitPermit, CommitterError> {
-        let (reply, granted) = oneshot::channel();
-        self.outbox
-            .send(Command::Enter(reply))
-            .await
-            .map_err(|_| CommitterError::Unavailable)?;
-        let release = granted.await.map_err(|_| CommitterError::Unavailable)?;
-        Ok(CommitPermit {
-            release: Some(release),
-        })
-    }
-
-    pub fn enter_blocking(&self) -> std::result::Result<CommitPermit, CommitterError> {
-        pollster::block_on(self.enter())
-    }
-}
-
-/// Exclusive execution turn for one borrowed database workflow.
-pub struct CommitPermit {
-    release: Option<mpsc::SyncSender<()>>,
-}
-
-impl Drop for CommitPermit {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
+    /// Return a route that does not keep the committer worker alive.
+    pub fn downgrade(&self) -> WeakCommitter {
+        WeakCommitter {
+            outbox: self.outbox.downgrade(),
         }
     }
+
+    /// Capture one snapshot after every preceding proposal and before every
+    /// following proposal.
+    pub async fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.outbox
+            .send(Request::CaptureSnapshot { writable, reply })
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        response
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
+    }
+
+    pub fn capture_snapshot_blocking(&self, writable: bool) -> Result<CommitSnapshot> {
+        pollster::block_on(self.capture_snapshot(writable))
+    }
 }
 
-fn run(inbox: Receiver<Command>) {
-    while let Ok(command) = inbox.recv_blocking() {
-        match command {
-            Command::Run(job) => job.run(),
-            Command::Enter(reply) => {
-                let (release, released) = mpsc::sync_channel(1);
-                if reply.send(release).is_ok() {
-                    let _ = released.recv();
+impl WeakCommitter {
+    pub fn propose_blocking(&self, proposal: CommitProposal) -> Result<CommitReceipt> {
+        let outbox = self
+            .outbox
+            .upgrade()
+            .ok_or_else(|| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        let (reply, response) = oneshot::channel();
+        outbox
+            .send_blocking(Request::Propose { proposal, reply })
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        pollster::block_on(response)
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
+    }
+}
+
+fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
+    let mut deferred = None;
+    loop {
+        let request = match deferred.take() {
+            Some(request) => request,
+            None => match inbox.recv_blocking() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
+        match request {
+            Request::Propose { proposal, reply } => {
+                let mut group = vec![(proposal, reply)];
+                while group.len() < GROUP_CAPACITY {
+                    match inbox.try_recv() {
+                        Ok(Request::Propose { proposal, reply }) => {
+                            group.push((proposal, reply));
+                        }
+                        Ok(snapshot @ Request::CaptureSnapshot { .. }) => {
+                            deferred = Some(snapshot);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => break,
+                    }
+                }
+                let proposals = group
+                    .iter()
+                    .map(|(proposal, _)| proposal)
+                    .collect::<Vec<_>>();
+                let results = catch_unwind(AssertUnwindSafe(|| backend.commit_group(&proposals)));
+                match results {
+                    Ok(Ok(results)) if results.len() == group.len() => {
+                        for ((_, reply), result) in group.into_iter().zip(results) {
+                            let _ = reply.send(result);
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        fail_group(group, "committer returned the wrong result count");
+                    }
+                    Ok(Err(error)) => {
+                        fail_group(group, &format!("commit group aborted: {error}"));
+                    }
+                    Err(_) => fail_group(group, "commit group panicked"),
                 }
             }
+            Request::CaptureSnapshot { writable, reply } => {
+                let result = catch_unwind(AssertUnwindSafe(|| backend.capture_snapshot(writable)))
+                    .unwrap_or_else(|_| Err(Error::Committer("snapshot capture panicked".into())));
+                let _ = reply.send(result);
+            }
         }
+    }
+}
+
+fn fail_group(group: Vec<(CommitProposal, oneshot::Sender<Result<CommitReceipt>>)>, message: &str) {
+    for (_, reply) in group {
+        let _ = reply.send(Err(Error::Committer(message.to_owned())));
     }
 }
 
@@ -249,7 +287,6 @@ fn run(inbox: Receiver<Command>) {
 pub enum CommitterError {
     Startup(String),
     Unavailable,
-    OperationPanicked,
 }
 
 impl fmt::Display for CommitterError {
@@ -257,7 +294,6 @@ impl fmt::Display for CommitterError {
         match self {
             Self::Startup(message) => write!(f, "could not start committer: {message}"),
             Self::Unavailable => f.write_str("committer is unavailable"),
-            Self::OperationPanicked => f.write_str("committer operation panicked"),
         }
     }
 }
@@ -266,157 +302,159 @@ impl std::error::Error for CommitterError {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use homebase_client::meta::OplogCursors;
+    use homebase_core::tag::AdmissionSeq;
 
     use super::*;
+    use crate::commit::snapshot::SnapshotDescriptor;
+    use crate::database::isolation::IsolationLevel;
+    use crate::database::operation::MultiliteOp;
+    use crate::database::schema::{
+        CreateColumn, CreateTable, CreateTableSpec, DeclaredType, SqlName,
+    };
+    use crate::database::transaction::MultiliteTransaction;
+
+    struct TestBackend {
+        groups: Mutex<Vec<Vec<String>>>,
+        snapshot: AtomicU64,
+        _directory: tempfile::TempDir,
+        database_path: PathBuf,
+        wal_path: PathBuf,
+    }
+
+    impl CommitBackend for TestBackend {
+        fn commit_group(
+            &self,
+            proposals: &[&CommitProposal],
+        ) -> Result<Vec<Result<CommitReceipt>>> {
+            self.groups.lock().push(
+                proposals
+                    .iter()
+                    .map(|proposal| {
+                        let MultiliteOp::CreateTable(created) =
+                            &proposal.transaction().operations()[0]
+                        else {
+                            unreachable!()
+                        };
+                        created.table_name().to_owned()
+                    })
+                    .collect(),
+            );
+            let commit_seq = CommitSeq(self.snapshot.fetch_add(1, Ordering::SeqCst) + 1);
+            Ok(proposals
+                .iter()
+                .map(|_| {
+                    Ok(CommitReceipt {
+                        commit_seq,
+                        disposition: crate::commit::proposal::CommitDisposition::Applied,
+                    })
+                })
+                .collect())
+        }
+
+        fn capture_snapshot(&self, _writable: bool) -> Result<CommitSnapshot> {
+            let commit_seq = CommitSeq(self.snapshot.load(Ordering::SeqCst));
+            Ok(CommitSnapshot {
+                physical: PinnedSnapshot::capture(&self.database_path, &self.wal_path)
+                    .map_err(|error| Error::Branch(error.to_string()))?,
+                logical: SnapshotDescriptor {
+                    commit_seq,
+                    authority_applied_through: AdmissionSeq(0),
+                    submit_cursors: OplogCursors::default(),
+                },
+                history_pin: None,
+            })
+        }
+    }
+
+    fn backend() -> Arc<TestBackend> {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("committer.sqlite");
+        let wal_path = directory.path().join("committer.sqlite-wal");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE snapshot_fixture(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(connection);
+        Arc::new(TestBackend {
+            groups: Mutex::new(Vec::new()),
+            snapshot: AtomicU64::new(0),
+            _directory: directory,
+            database_path,
+            wal_path,
+        })
+    }
+
+    fn proposal(name: &str) -> CommitProposal {
+        CommitProposal::from_transaction(
+            SnapshotDescriptor {
+                commit_seq: CommitSeq(0),
+                authority_applied_through: AdmissionSeq(0),
+                submit_cursors: OplogCursors::default(),
+            },
+            IsolationLevel::Snapshot,
+            MultiliteTransaction::new(vec![MultiliteOp::CreateTable(CreateTable::new(
+                &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
+                CreateTableSpec {
+                    name: SqlName::new(name.into()),
+                    columns: vec![CreateColumn {
+                        name: SqlName::new("id".into()),
+                        declared_type: DeclaredType::Integer,
+                        not_null: false,
+                        primary_key: true,
+                    }],
+                },
+            ))])
+            .unwrap(),
+            std::iter::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn proposals_batch_and_snapshot_capture_is_an_ordered_boundary() {
+        let backend = backend();
+        let committer = Committer::new(Arc::clone(&backend)).unwrap();
+
+        let first = {
+            let committer = committer.clone();
+            std::thread::spawn(move || committer.propose_blocking(proposal("one")).unwrap())
+        };
+        let second = {
+            let committer = committer.clone();
+            std::thread::spawn(move || committer.propose_blocking(proposal("two")).unwrap())
+        };
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let captured = committer.capture_snapshot_blocking(false).unwrap();
+        assert!(captured.logical.commit_seq >= CommitSeq(1));
+        let mut committed = backend
+            .groups
+            .lock()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        committed.sort();
+        assert_eq!(committed, ["one", "two"]);
+    }
 
     #[test]
     fn history_frontier_tracks_the_oldest_live_commit_sequence() {
-        let pins = HistoryPins::default();
-        let later = pins.register(CommitSeq(9));
-        let first = pins.register(CommitSeq(3));
-        let second = pins.register(CommitSeq(3));
-        assert_eq!(pins.oldest(), Some(CommitSeq(3)));
-        drop(first);
-        assert_eq!(pins.oldest(), Some(CommitSeq(3)));
-        drop(second);
-        assert_eq!(pins.oldest(), Some(CommitSeq(9)));
+        let history = CommitHistory::default();
+        let later = history.pin(CommitSeq(5));
+        let earliest = history.pin(CommitSeq(2));
+        let same = history.pin(CommitSeq(2));
+        assert_eq!(history.pins.oldest(), Some(CommitSeq(2)));
+        drop(earliest);
+        assert_eq!(history.pins.oldest(), Some(CommitSeq(2)));
+        drop(same);
+        assert_eq!(history.pins.oldest(), Some(CommitSeq(5)));
         drop(later);
-        assert_eq!(pins.oldest(), None);
-    }
-
-    #[test]
-    fn borrowed_permit_blocks_owned_work_until_drop() {
-        let actor = Committer::new().unwrap();
-        let permit = actor.enter_blocking().unwrap();
-        let (finished, completion) = mpsc::channel();
-        let worker = actor.clone();
-        let join = std::thread::spawn(move || {
-            worker
-                .call_blocking(move || finished.send(7).unwrap())
-                .unwrap();
-        });
-
-        assert!(completion.recv_timeout(Duration::from_millis(20)).is_err());
-        drop(permit);
-        assert_eq!(completion.recv_timeout(Duration::from_secs(1)).unwrap(), 7);
-        join.join().unwrap();
-    }
-
-    #[test]
-    fn cancelled_waiter_does_not_strand_following_work() {
-        let actor = Committer::new().unwrap();
-        let permit = actor.enter_blocking().unwrap();
-        let (cancelled_reply, cancelled) = oneshot::channel();
-        actor
-            .outbox
-            .send_blocking(Command::Enter(cancelled_reply))
-            .unwrap();
-        drop(cancelled);
-
-        let next = actor.clone();
-        let join = std::thread::spawn(move || {
-            let permit = next.enter_blocking().unwrap();
-            drop(permit);
-        });
-        drop(permit);
-        join.join().unwrap();
-    }
-
-    #[test]
-    fn active_borrowed_scope_preserves_bounded_backpressure() {
-        let actor = Committer::with_capacity(1).unwrap();
-        let permit = actor.enter_blocking().unwrap();
-        let (reply, _response) = oneshot::channel();
-        actor
-            .outbox
-            .try_send(Command::Run(Box::new(Work {
-                operation: Some(|| ()),
-                reply,
-            })))
-            .unwrap();
-        let (reply, _response) = oneshot::channel();
-        assert!(matches!(
-            actor.outbox.try_send(Command::Run(Box::new(Work {
-                operation: Some(|| ()),
-                reply,
-            }))),
-            Err(async_channel::TrySendError::Full(_))
-        ));
-        drop(permit);
-    }
-
-    #[test]
-    fn owned_jobs_keep_fifo_channel_order() {
-        let actor = Committer::new().unwrap();
-        let permit = actor.enter_blocking().unwrap();
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut responses = Vec::new();
-        for value in [1, 2] {
-            let order = Arc::clone(&order);
-            let (reply, response) = oneshot::channel();
-            actor
-                .outbox
-                .send_blocking(Command::Run(Box::new(Work {
-                    operation: Some(move || order.lock().unwrap().push(value)),
-                    reply,
-                })))
-                .unwrap();
-            responses.push(response);
-        }
-
-        drop(permit);
-        for response in responses {
-            pollster::block_on(response).unwrap().unwrap();
-        }
-        assert_eq!(*order.lock().unwrap(), [1, 2]);
-    }
-
-    #[test]
-    fn dropped_reply_does_not_cancel_accepted_work() {
-        let actor = Committer::new().unwrap();
-        let completed = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&completed);
-        let (reply, response) = oneshot::channel();
-        actor
-            .outbox
-            .send_blocking(Command::Run(Box::new(Work {
-                operation: Some(move || counted.store(1, Ordering::Release)),
-                reply,
-            })))
-            .unwrap();
-        drop(response);
-
-        actor.call_blocking(|| ()).unwrap();
-        assert_eq!(completed.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn panicking_job_does_not_kill_the_actor() {
-        let actor = Committer::new().unwrap();
-        assert_eq!(
-            actor.call_blocking(|| panic!("injected")),
-            Err(CommitterError::OperationPanicked)
-        );
-        assert_eq!(actor.call_blocking(|| 9).unwrap(), 9);
-    }
-
-    #[test]
-    fn detached_jobs_run_in_order_and_panics_do_not_kill_the_actor() {
-        let actor = Committer::new().unwrap();
-        let completed = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&completed);
-        actor
-            .dispatch_blocking(move || counted.store(1, Ordering::Release))
-            .unwrap();
-        actor
-            .dispatch_blocking(|| panic!("injected detached panic"))
-            .unwrap();
-
-        assert_eq!(actor.call_blocking(|| 9).unwrap(), 9);
-        assert_eq!(completed.load(Ordering::Acquire), 1);
+        assert_eq!(history.pins.oldest(), None);
     }
 }

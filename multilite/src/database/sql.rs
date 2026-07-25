@@ -1,11 +1,11 @@
 //! SQLite-AST checks for the database's current public SQL surface.
 
 use fallible_iterator::FallibleIterator as _;
+#[cfg(test)]
+use sqlite3_parser::ast::{As, Expr, OneSelect, Operator, ResultColumn, SelectTable};
 use sqlite3_parser::ast::{
     Cmd, ColumnConstraint, CreateTableBody, InsertBody, Name, Stmt, TabFlags,
 };
-#[cfg(test)]
-use sqlite3_parser::ast::{As, Expr, OneSelect, Operator, ResultColumn, SelectTable};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};

@@ -27,7 +27,7 @@
 //! behind that applied prefix; the server remains authoritative about whether
 //! a relevant foreign admission raced the submission.
 
-use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource};
+use crate::cipher::{CipherError, NonceSource, SpaceCipher, SystemNonceSource, ValueNonce};
 use crate::client::Client;
 use crate::meta::{AdmitCursors, Committed, HeldLease, MetaStore, SubmitMode};
 use crate::server::ServerHandle;
@@ -81,6 +81,10 @@ pub enum SpaceDriverError {
     },
     SubmissionNotPending {
         seq: DeviceSeq,
+    },
+    PreparedForAnotherSpace {
+        expected: SpaceId,
+        actual: SpaceId,
     },
     AdmitRangeUnavailable {
         from: AdmissionSeq,
@@ -146,6 +150,10 @@ impl fmt::Display for SpaceDriverError {
             Self::SubmissionNotPending { seq } => {
                 write!(f, "submission {seq:?} is no longer pending")
             }
+            Self::PreparedForAnotherSpace { expected, actual } => write!(
+                f,
+                "prepared submission belongs to {actual:?}, not requested space {expected:?}"
+            ),
             Self::AdmitRangeUnavailable {
                 from,
                 to,
@@ -237,6 +245,21 @@ pub struct Submission<'a, M, H, C, N = SystemNonceSource> {
     pub seq: DeviceSeq,
     client: &'a Client<M, H, C, N>,
     space: SpaceId,
+}
+
+/// Encoded local submission intent that has not consumed durable counters.
+///
+/// Final `DeviceSeq`, versions, and seals are assigned only when this intent
+/// is committed against a [`MetaStore`]. Keeping preparation owned lets an
+/// adapter enqueue the transition without retaining a `Space` borrow.
+pub struct PreparedSubmission {
+    space: SpaceId,
+    encoded: Vec<Mutation>,
+    range_asserts: Vec<RangeAssert>,
+    submit_mode: SubmitMode,
+    cipher: SpaceCipher,
+    device: DeviceId,
+    nonces: Vec<ValueNonce>,
 }
 
 impl<M, H, C, N> fmt::Debug for Submission<'_, M, H, C, N> {
@@ -352,11 +375,11 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
     {
         let _permit = self.enter().await?;
         let mutations = mutations.into_iter().map(Into::into).collect();
-        let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
-        self.check_range_asserts(&range_asserts).await?;
-        let committed = self
-            .persist_submission(encoded, range_asserts, SubmitMode::Checked)
+        let prepared = self
+            .prepare_submission(mutations, range_asserts, SubmitMode::Checked)
             .await?;
+        self.check_range_asserts(&prepared.range_asserts).await?;
+        let committed = self.persist_submission(prepared).await?;
         Ok(Submission {
             seq: committed.seq,
             client: self.client,
@@ -377,15 +400,57 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
     {
         let _permit = self.enter().await?;
         let mutations = mutations.into_iter().map(Into::into).collect();
-        let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
-        let committed = self
-            .persist_submission(encoded, range_asserts, SubmitMode::Unchecked)
+        let prepared = self
+            .prepare_submission(mutations, range_asserts, SubmitMode::Unchecked)
             .await?;
+        let committed = self.persist_submission(prepared).await?;
         Ok(Submission {
             seq: committed.seq,
             client: self.client,
             space: self.id,
         })
+    }
+
+    /// Prepare an unchecked submission without reading or mutating durable
+    /// client state.
+    ///
+    /// This adapter entry point performs name encoding and owns fresh nonces.
+    /// [`Space::commit_prepared`] performs the checked durable transition.
+    #[doc(hidden)]
+    pub async fn prepare_unchecked<I, T>(
+        &self,
+        mutations: I,
+        range_asserts: Vec<RangeAssert>,
+    ) -> Result<PreparedSubmission, SpaceDriverError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Mutation>,
+    {
+        self.prepare_submission(
+            mutations.into_iter().map(Into::into).collect(),
+            range_asserts,
+            SubmitMode::Unchecked,
+        )
+        .await
+    }
+
+    /// Commit one owned prepared submission without entering a multi-step
+    /// Homebase workflow.
+    ///
+    /// Adapters must call this from their canonical local transaction owner.
+    /// The metadata reservation is validated again immediately before commit.
+    #[doc(hidden)]
+    pub async fn commit_prepared(
+        &self,
+        prepared: PreparedSubmission,
+    ) -> Result<DeviceSeq, SpaceDriverError> {
+        if prepared.space != self.id {
+            return Err(SpaceDriverError::PreparedForAnotherSpace {
+                expected: self.id,
+                actual: prepared.space,
+            });
+        }
+        Ok(self.persist_submission(prepared).await?.seq)
     }
 
     /// Push this space's active oplog as far as possible.
@@ -440,19 +505,13 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             .map_err(Into::into)
     }
 
-    async fn persist_submission(
+    async fn prepare_submission(
         &self,
-        encoded: Vec<Mutation>,
+        mutations: Vec<Mutation>,
         range_asserts: Vec<RangeAssert>,
         submit_mode: SubmitMode,
-    ) -> Result<Committed, SpaceDriverError> {
-        let cipher = self.cipher();
-        let device = self.device();
-        let reserved = self
-            .client
-            .store()
-            .reserve_commit(self.id, encoded.len(), range_asserts, submit_mode)
-            .await?;
+    ) -> Result<PreparedSubmission, SpaceDriverError> {
+        let (encoded, range_asserts) = self.encode_submission(mutations, range_asserts).await?;
         let nonces = (0..encoded.len())
             .map(|_| {
                 self.client
@@ -460,6 +519,35 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
                     .map_err(|reason| SpaceDriverError::Nonce { reason })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(PreparedSubmission {
+            space: self.id,
+            encoded,
+            range_asserts,
+            submit_mode,
+            cipher: self.cipher(),
+            device: self.device(),
+            nonces,
+        })
+    }
+
+    async fn persist_submission(
+        &self,
+        prepared: PreparedSubmission,
+    ) -> Result<Committed, SpaceDriverError> {
+        let PreparedSubmission {
+            space,
+            encoded,
+            range_asserts,
+            submit_mode,
+            cipher,
+            device,
+            nonces,
+        } = prepared;
+        let reserved = self
+            .client
+            .store()
+            .reserve_commit(space, encoded.len(), range_asserts, submit_mode)
+            .await?;
         let seq = reserved.seq;
         let versions = reserved.versions.clone();
         let entries = self
@@ -485,11 +573,7 @@ impl<'a, M: MetaStore, H: ServerHandle, C: HybridClock, N: NonceSource + Send + 
             })
             .await
             .map_err(coordination_unavailable)??;
-        let committed = self
-            .client
-            .store()
-            .commit(self.id, reserved, entries)
-            .await?;
+        let committed = self.client.store().commit(space, reserved, entries).await?;
         Ok(committed)
     }
 

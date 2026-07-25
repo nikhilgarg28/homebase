@@ -623,6 +623,75 @@ fn unchecked_submit_bypasses_local_assert_gate() {
 }
 
 #[test]
+fn prepared_submissions_own_intent_but_allocate_counters_at_commit() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        let space = client.space(SPACE).await.unwrap();
+
+        let first = space
+            .prepare_unchecked(vec![set(key(&[b"db", b"one"]), b"1")], vec![])
+            .await
+            .unwrap();
+        let second = space
+            .prepare_unchecked(vec![set(key(&[b"db", b"two"]), b"2")], vec![])
+            .await
+            .unwrap();
+        assert_eq!(queued(&mem).await, 0);
+
+        assert_eq!(space.commit_prepared(first).await.unwrap(), DeviceSeq(1));
+        assert_eq!(space.commit_prepared(second).await.unwrap(), DeviceSeq(2));
+
+        let state = audit(&OrderedMetaStore::new(&mem)).await;
+        assert_eq!(state.spaces[&SPACE].cursors.tail, DeviceSeq(3));
+        assert_eq!(state.spaces[&SPACE].ver_high, Some(Ver(2)));
+    });
+}
+
+#[test]
+fn prepared_submission_cannot_be_committed_to_another_space() {
+    block_on(async {
+        let mem = MemoryStore::new();
+        let clock = ManualClock::new(Timestamp(0));
+        let handle = |_: &SpaceId| Option::<SpaceHandle>::None;
+        let client = open_client(OrderedMetaStore::new(&mem), &handle, &clock, dev(1))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(SPACE))
+            .await
+            .unwrap();
+        client
+            .attach(&SpaceEnvelope::plaintext(OTHER_SPACE))
+            .await
+            .unwrap();
+        let first = client.space(SPACE).await.unwrap();
+        let second = client.space(OTHER_SPACE).await.unwrap();
+        let prepared = first
+            .prepare_unchecked(vec![set(key(&[b"db", b"row"]), b"value")], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.commit_prepared(prepared).await,
+            Err(SpaceDriverError::PreparedForAnotherSpace {
+                expected: OTHER_SPACE,
+                actual: SPACE,
+            })
+        );
+        assert_eq!(queued(&mem).await, 0);
+    });
+}
+
+#[test]
 fn exact_admit_ranges_are_dense_bounded_and_read_only() {
     block_on(async {
         let mem = MemoryStore::new();

@@ -15,10 +15,9 @@ use super::schema::table_prefix;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
-use super::{
-    BranchSnapshot, Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog,
-};
+use super::{Database, DatabaseRuntime, IsolationLevel, SyncPolicy, UpdateOptions, catalog};
 use crate::branch::{OverlayOptions, WritableBranch};
+use crate::commit::committer::CommitSnapshot;
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
@@ -334,11 +333,8 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         options: UpdateOptions,
         operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
     ) -> Result<T> {
-        {
-            let _operation = self.enter_operation()?;
-            self.refresh_read_serial(runtime)?;
-        }
-        let BranchSnapshot {
+        self.refresh_read(runtime)?;
+        let CommitSnapshot {
             physical,
             logical,
             history_pin: _history_pin,

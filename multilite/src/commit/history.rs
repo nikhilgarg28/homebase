@@ -180,11 +180,6 @@ pub fn record(connection: &Connection, writes: Vec<WriteRegion>) -> Result<Commi
 }
 
 fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<CommitSeq> {
-    if writes.is_empty() {
-        return Err(Error::CaptureInvariant(
-            "canonical commit has no logical writes",
-        ));
-    }
     if !canonical_writes(&writes) {
         return Err(Error::CaptureInvariant(
             "canonical commit writes are not sorted and unique",
@@ -197,15 +192,17 @@ fn record_inner(connection: &Connection, writes: Vec<WriteRegion>) -> Result<Com
             .checked_add(1)
             .ok_or_else(|| Error::CommitConflict("local commit sequence is exhausted".into()))?,
     );
-    let encoded = encode_writes(&writes)?;
     connection.execute(
         &format!("UPDATE {COMMIT_STATE_TABLE} SET commit_seq = ?1 WHERE singleton = 1"),
         [next.0.to_be_bytes().as_slice()],
     )?;
-    connection.execute(
-        &format!("INSERT INTO {HISTORY_TABLE} (commit_seq, writes) VALUES (?1, ?2)"),
-        rusqlite::params![next.0.to_be_bytes().as_slice(), encoded],
-    )?;
+    if !writes.is_empty() {
+        let encoded = encode_writes(&writes)?;
+        connection.execute(
+            &format!("INSERT INTO {HISTORY_TABLE} (commit_seq, writes) VALUES (?1, ?2)"),
+            rusqlite::params![next.0.to_be_bytes().as_slice(), encoded],
+        )?;
+    }
     Ok(next)
 }
 
@@ -447,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_empty_write_records_are_rejected() {
+    fn malformed_records_are_rejected_and_metadata_only_commits_advance() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
         connection
@@ -468,7 +465,11 @@ mod tests {
                 "canonical write record is malformed"
             ))
         ));
-        assert!(record(&connection, Vec::new()).is_err());
+        let metadata = Connection::open_in_memory().unwrap();
+        initialize(&metadata).unwrap();
+        assert_eq!(record(&metadata, Vec::new()).unwrap(), CommitSeq(1));
+        assert_eq!(current(&metadata).unwrap(), CommitSeq(1));
+        assert!(history_after(&metadata, CommitSeq(0)).unwrap().is_empty());
     }
 
     #[test]

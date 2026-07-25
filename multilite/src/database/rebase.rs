@@ -1,47 +1,42 @@
 //! Atomic application of fetched Multilite operations after local push drains.
 
+use std::sync::Arc;
+
 use homebase_client::meta::MetaStore;
 use homebase_client::{ClientError, ServerHandle};
 use pollster::block_on;
+#[cfg(test)]
 use rusqlite::Connection;
 
 use super::store::DatabaseMetaStore;
 use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
-use crate::commit::history;
-use crate::runtime::ExecutionMode;
+use crate::commit::proposal::{AdmittedTransaction, CommitProposal};
 use crate::{Error, Result};
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
-    pub(crate) fn rebase(&self, runtime: &DatabaseRuntime) -> Result<()> {
-        let _operation = self.enter_operation()?;
-        self.rebase_serial(runtime)?;
+    pub(crate) fn rebase(self: &Arc<Self>, runtime: &DatabaseRuntime) -> Result<()> {
+        self.rebase_inner(runtime, || Ok(()))?;
         self.policy.mark_rebased();
         Ok(())
     }
 
-    pub fn rebase_serial(&self, runtime: &DatabaseRuntime) -> Result<()> {
-        self.rebase_inner(runtime, || Ok(()))
-    }
-
     #[cfg(test)]
     pub(super) fn rebase_after_snapshot(
-        &self,
+        self: &Arc<Self>,
         runtime: &DatabaseRuntime,
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let _operation = self.enter_operation()?;
         self.rebase_inner(runtime, after_snapshot)
     }
 
     fn rebase_inner(
-        &self,
-        runtime: &DatabaseRuntime,
+        self: &Arc<Self>,
+        _runtime: &DatabaseRuntime,
         after_snapshot: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let space_id = self.database_id.space_id();
-        let store =
-            DatabaseMetaStore::with_history(self.owner.clone(), self.commit_history.clone());
+        let store = DatabaseMetaStore::read_only(self.owner.clone());
         let (initial_submit, initial_admits) = block_on(async {
             let submit = store.oplog_cursors(space_id).await?;
             let admits = store.admit_cursors(space_id).await?;
@@ -52,6 +47,9 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         }
 
         let admit_range = initial_admits.neck..initial_admits.tail;
+        if admit_range.is_empty() {
+            return Ok(());
+        }
         let batches = block_on(async {
             let space = self.client.space(self.database_id.space_id()).await?;
             space
@@ -68,7 +66,10 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     return Ok(None);
                 }
                 let transaction = MultiliteTransaction::from_homebase(&batch)?;
-                Ok(Some((batch.device, transaction)))
+                Ok(Some(AdmittedTransaction {
+                    device: batch.device,
+                    transaction,
+                }))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -77,45 +78,19 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
         after_snapshot()?;
 
-        let apply_to = admit_range.end;
-        let local_device = self.client.device();
-        let mut foreign_writes = std::collections::BTreeSet::new();
-        for (_, transaction) in transactions
-            .iter()
-            .filter(|(device, _)| *device != local_device)
-        {
-            let lowered = transaction.to_homebase()?;
-            foreign_writes.extend(history::writes_from_mutations(&lowered.mutations));
-        }
-        runtime.run(ExecutionMode::RemoteApply, |connection| {
-            runtime.with_internal_metadata(|| {
-                let current_submit = block_on(store.oplog_cursors(space_id))?;
-                let current_admits = block_on(store.admit_cursors(space_id))?;
-                if current_submit != initial_submit || current_admits != initial_admits {
-                    return Err(Error::RebaseStateChanged);
-                }
-                Ok(())
-            })?;
-
-            for (device, transaction) in &transactions {
-                apply_transaction(connection, transaction, *device == local_device)?;
-            }
-
-            runtime.with_internal_metadata(|| {
-                if !foreign_writes.is_empty() {
-                    self.commit_history
-                        .record(connection, foreign_writes.iter().cloned().collect())?;
-                }
-                block_on(store.mark_admits_applied(space_id, apply_to))?;
-                Ok(())
-            })?;
-            Ok(())
-        })?;
-        self.prune_commit_history()?;
+        let proposal = CommitProposal::apply_admissions(
+            initial_submit,
+            initial_admits,
+            admit_range.end,
+            self.client.device(),
+            transactions,
+        )?;
+        self.commit_proposal(proposal)?;
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn apply_transaction(
     connection: &Connection,
     transaction: &MultiliteTransaction,

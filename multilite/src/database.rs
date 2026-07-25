@@ -1,5 +1,6 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod authority;
 pub(crate) mod catalog;
 mod codes;
 mod connection;
@@ -20,7 +21,6 @@ mod vtab;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,11 +36,12 @@ use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
-use crate::commit::batch::{CommitQueue, QueuedCommit};
-use crate::commit::committer::{CommitHistory, CommitPermit, Committer, HistoryPin};
+use crate::commit::committer::{
+    CommitBackend, CommitHistory, CommitSnapshot, Committer, WeakCommitter,
+};
 use crate::commit::history;
 use crate::commit::proposal::{
-    self, CommitDisposition, CommitProposal, CommitReceipt, PrepareOutcome,
+    self, CommitDisposition, CommitProposal, CommitReceipt, PrepareOutcome, ProposalBody,
 };
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
@@ -48,9 +49,10 @@ use crate::metastore::{SqliteOrderedStore, SqliteSnapshotStore};
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
+use self::authority::Authority;
 use self::policy::{PolicyState, PushScheduler};
 use self::row::{CapturedRow, StoredValue};
-use self::store::DatabaseMetaStore;
+use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
 
 pub use self::connection::Connection;
 pub use self::isolation::{IsolationLevel, UpdateOptions};
@@ -338,15 +340,12 @@ fn capture_insert(
 /// An opened general Multilite database.
 pub(crate) struct Database<H: ServerHandle> {
     owner: ConnectionOwner,
-    path: PathBuf,
-    wal_path: PathBuf,
     database_id: DatabaseId,
-    client: DatabaseClient<H>,
+    client: Arc<DatabaseClient<H>>,
     policy: PolicyState,
     isolation_level: IsolationLevel,
     committer: Committer,
-    commit_queue: CommitQueue,
-    commit_history: CommitHistory,
+    authority: Authority,
     scheduler: PushScheduler,
 }
 
@@ -429,20 +428,11 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
-        let database = Arc::clone(self);
-        self.committer
-            .call_blocking(move || database.push_serial())
-            .map_err(committer_error)?
+        self.push_via_authority()
     }
 
-    fn push_serial(&self) -> Result<PushOutcome> {
-        let pushed = block_on(async {
-            self.client
-                .space(self.database_id.space_id())
-                .await?
-                .push()
-                .await
-        })?;
+    fn push_via_authority(&self) -> Result<PushOutcome> {
+        let pushed = self.authority.push_blocking()?;
         match pushed {
             HomebasePushOutcome::Drained { .. } => Ok(PushOutcome::Drained),
             HomebasePushOutcome::Stalled { at, error, .. } => {
@@ -461,44 +451,24 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     /// Undo the speculative SQLite effects covered by one definitive push
     /// rejection and retire that exact active submit window.
     pub(crate) fn rollback(self: &Arc<Self>, rejection: &PushRejection) -> Result<()> {
-        let database = Arc::clone(self);
-        let rejection = rejection.clone();
-        self.committer
-            .call_blocking(move || database.rollback_serial(&rejection))
-            .map_err(committer_error)?
-    }
-
-    fn rollback_serial(&self, rejection: &PushRejection) -> Result<()> {
         if rejection.database_id != self.database_id
             || rejection.device_id != self.client.device()
             || rejection.failed_at != rejection.submit_cursors.neck
         {
             return Err(Error::StalePushRejection);
         }
-
-        match block_on(self.client.rollback_if_unchanged(
-            self.database_id.space_id(),
-            rejection.failed_at,
-            rejection.submit_cursors,
-        )) {
-            Ok(()) => self.prune_commit_history(),
-            Err(ClientError::RollbackWindowChanged) => Err(Error::StalePushRejection),
-            Err(error) => Err(error.into()),
-        }
+        let proposal =
+            CommitProposal::reject_submissions(rejection.failed_at, rejection.submit_cursors)?;
+        self.commit_proposal(proposal)?;
+        Ok(())
     }
 
     pub(crate) fn pull(self: &Arc<Self>) -> Result<PullOutcome> {
-        let database = Arc::clone(self);
-        self.committer
-            .call_blocking(move || database.pull_serial())
-            .map_err(committer_error)?
+        self.pull_via_authority()
     }
 
-    fn pull_serial(&self) -> Result<PullOutcome> {
-        let through = block_on(async {
-            let space = self.client.space(self.database_id.space_id()).await?;
-            space.pull().await.map_err(ClientError::from)
-        })?;
+    fn pull_via_authority(&self) -> Result<PullOutcome> {
+        let through = self.authority.pull_blocking()?;
         self.policy.mark_pulled();
         Ok(PullOutcome { through })
     }
@@ -509,7 +479,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         sql: &str,
     ) -> Result<Statement<H>> {
         sql::validate_managed_statement(sql)?;
-        let _operation = self.enter_operation()?;
         runtime.run(ExecutionMode::Public, |connection| {
             let statement = connection.prepare(sql)?;
             if statement.readonly() {
@@ -531,20 +500,44 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     fn submit_cursors(&self) -> Result<OplogCursors> {
-        let store =
-            DatabaseMetaStore::with_history(self.owner.clone(), self.commit_history.clone());
+        let store = DatabaseMetaStore::read_only(self.owner.clone());
         Ok(block_on(store.oplog_cursors(self.database_id.space_id()))?)
     }
 
-    fn capture_branch_snapshot(&self, track_for_commit: bool) -> Result<BranchSnapshot> {
-        self.capture_branch_snapshot_inner(track_for_commit, || Ok(()))
+    fn issue_branch_snapshot(self: &Arc<Self>, track_for_commit: bool) -> Result<CommitSnapshot> {
+        self.committer.capture_snapshot_blocking(track_for_commit)
     }
 
-    fn capture_branch_snapshot_inner(
+    fn commit_proposal(self: &Arc<Self>, proposal: CommitProposal) -> Result<CommitReceipt> {
+        self.committer.propose_blocking(proposal)
+    }
+
+    fn refresh_read(self: &Arc<Self>, runtime: &DatabaseRuntime) -> Result<()> {
+        if !self.policy.read_requires_refresh() {
+            return Ok(());
+        }
+        let submit = self.submit_cursors()?;
+        if submit.neck < submit.tail {
+            match self.push()? {
+                PushOutcome::Drained => {}
+                PushOutcome::Rejected(rejection) => {
+                    return Err(Error::RefreshPushRejected(rejection));
+                }
+            }
+        }
+        self.pull()?;
+        self.rebase(runtime)?;
+        self.policy.mark_rebased();
+        Ok(())
+    }
+}
+
+impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
+    fn capture_snapshot_inner(
         &self,
         track_for_commit: bool,
         after_physical: impl FnOnce() -> Result<()>,
-    ) -> Result<BranchSnapshot> {
+    ) -> Result<CommitSnapshot> {
         let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
             .map_err(|error| Error::Branch(error.to_string()))?;
         after_physical()?;
@@ -562,7 +555,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 .checked_sub(1)
                 .ok_or(Error::InvalidDatabase("admit neck cannot be zero"))?,
         );
-        Ok(BranchSnapshot {
+        Ok(CommitSnapshot {
             physical,
             logical: SnapshotDescriptor {
                 commit_seq,
@@ -573,68 +566,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         })
     }
 
-    #[cfg(test)]
-    fn capture_branch_snapshot_after_physical(
-        &self,
-        track_for_commit: bool,
-        after_physical: impl FnOnce() -> Result<()>,
-    ) -> Result<BranchSnapshot> {
-        self.capture_branch_snapshot_inner(track_for_commit, after_physical)
-    }
-
-    fn issue_branch_snapshot(self: &Arc<Self>, track_for_commit: bool) -> Result<BranchSnapshot> {
-        let database = Arc::clone(self);
-        self.committer
-            .call_blocking(move || database.capture_branch_snapshot(track_for_commit))
-            .map_err(committer_error)?
-    }
-
-    fn commit_proposal(self: &Arc<Self>, proposal: CommitProposal) -> Result<CommitReceipt> {
-        let ticket = self.commit_queue.enqueue(proposal)?;
-        if ticket.should_schedule() {
-            let database = Arc::clone(self);
-            if let Err(error) = self
-                .committer
-                .dispatch_blocking(move || database.drain_commit_queue())
-            {
-                self.commit_queue.fail_all(error.to_string());
-            }
-        }
-        ticket.wait()
-    }
-
-    fn drain_commit_queue(&self) {
-        while let Some(group) = self.commit_queue.take_group() {
-            let proposals = group.iter().map(QueuedCommit::proposal).collect::<Vec<_>>();
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                self.commit_proposal_group_serial(&proposals)
-            }));
-            match outcome {
-                Ok(Ok(results)) => {
-                    debug_assert_eq!(group.len(), results.len());
-                    for (queued, result) in group.into_iter().zip(results) {
-                        queued.reply(result);
-                    }
-                }
-                Ok(Err(error)) => {
-                    let message = format!("commit group aborted: {error}");
-                    for queued in group {
-                        queued.reply(Err(Error::Committer(message.clone())));
-                    }
-                }
-                Err(_) => {
-                    let message = "commit group panicked".to_owned();
-                    for queued in group {
-                        queued.reply(Err(Error::Committer(message.clone())));
-                    }
-                    self.commit_queue.fail_all(message);
-                    return;
-                }
-            }
-        }
-    }
-
-    fn commit_proposal_group_serial(
+    fn commit_proposal_group(
         &self,
         proposals: &[&CommitProposal],
     ) -> Result<Vec<Result<CommitReceipt>>> {
@@ -670,22 +602,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                     let outcome =
                         self.owner
                             .with_savepoint("__multilite__commit_member", |connection| {
-                                let outcome =
-                                    proposal::prepare(connection, proposal, &accepted_writes)?;
-                                if matches!(outcome, PrepareOutcome::Prepared(_)) {
-                                    let (mutations, assertions) = proposal.to_homebase()?;
-                                    let sequence = block_on(async {
-                                        let space =
-                                            self.client.space(self.database_id.space_id()).await?;
-                                        let submission = space
-                                            .submit_unchecked(mutations, assertions)
-                                            .await
-                                            .map_err(ClientError::from)?;
-                                        Ok::<_, Error>(submission.seq)
-                                    })?;
-                                    pending::insert(connection, sequence, proposal.transaction())?;
-                                }
-                                Ok(outcome)
+                                self.prepare_commit_proposal(connection, proposal, &accepted_writes)
                             });
 
                     match outcome {
@@ -744,35 +661,146 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             })
     }
 
-    pub(super) fn prune_commit_history(&self) -> Result<()> {
-        self.owner
-            .with_savepoint("__multilite__commit_history_gc", |connection| {
-                self.commit_history.prune(connection)?;
-                Ok(())
-            })
-    }
-
-    fn refresh_read_serial(&self, runtime: &DatabaseRuntime) -> Result<()> {
-        if !self.policy.read_requires_refresh() {
-            return Ok(());
-        }
-        let submit = self.submit_cursors()?;
-        if submit.neck < submit.tail {
-            match self.push_serial()? {
-                PushOutcome::Drained => {}
-                PushOutcome::Rejected(rejection) => {
-                    return Err(Error::RefreshPushRejected(rejection));
+    fn prepare_commit_proposal(
+        &self,
+        connection: &SqliteConnection,
+        proposal: &CommitProposal,
+        accepted_writes: &BTreeSet<history::WriteRegion>,
+    ) -> Result<PrepareOutcome> {
+        match proposal.body() {
+            ProposalBody::Transaction(transaction) => {
+                let outcome = proposal::prepare(connection, proposal, accepted_writes)?;
+                if matches!(outcome, PrepareOutcome::Prepared(_)) {
+                    let (mutations, assertions) = proposal.to_homebase()?;
+                    let sequence = block_on(async {
+                        let space = self.client.space(self.database_id.space_id()).await?;
+                        let prepared = space
+                            .prepare_unchecked(mutations, assertions)
+                            .await
+                            .map_err(ClientError::from)?;
+                        space
+                            .commit_prepared(prepared)
+                            .await
+                            .map_err(ClientError::from)
+                            .map_err(Error::from)
+                    })?;
+                    pending::insert(connection, sequence, transaction.transaction())?;
                 }
+                Ok(outcome)
+            }
+            ProposalBody::ApplyAdmissions(apply) => {
+                if let Some(receipt) = proposal.committed_receipt(connection)? {
+                    return Ok(PrepareOutcome::AlreadyCommitted(receipt));
+                }
+                proposal.validate()?;
+                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let space = self.database_id.space_id();
+                let current_submit = block_on(store.oplog_cursors(space))?;
+                let current_admits = block_on(store.admit_cursors(space))?;
+                if current_submit != apply.expected_submit()
+                    || current_admits != apply.expected_admits()
+                {
+                    return Err(Error::RebaseStateChanged);
+                }
+                if current_submit.neck != current_submit.tail {
+                    return Err(Error::RebasePendingSubmissions);
+                }
+
+                let mut writes = BTreeSet::new();
+                for admitted in apply.transactions() {
+                    if admitted.device == apply.local_device() {
+                        continue;
+                    }
+                    admitted.transaction.apply(connection)?;
+                    let lowered = admitted.transaction.to_homebase()?;
+                    writes.extend(history::writes_from_mutations(&lowered.mutations));
+                }
+                block_on(store.mark_admits_applied(space, apply.through()))?;
+                Ok(PrepareOutcome::Prepared(
+                    proposal.prepare_receipt(writes.into_iter().collect())?,
+                ))
+            }
+            ProposalBody::RejectSubmissions(reject) => {
+                if let Some(receipt) = proposal.committed_receipt(connection)? {
+                    return Ok(PrepareOutcome::AlreadyCommitted(receipt));
+                }
+                proposal.validate()?;
+                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let space = self.database_id.space_id();
+                let current = block_on(store.oplog_cursors(space))?;
+                if current != reject.expected_submit() {
+                    return Err(Error::StalePushRejection);
+                }
+                let through = DeviceSeq(
+                    current
+                        .tail
+                        .0
+                        .checked_sub(1)
+                        .ok_or(Error::InvalidDatabase("submit tail cannot be zero"))?,
+                );
+                let active = block_on(store.oplog(space, current.neck, through))?;
+                let repair = pending::prepare_rejection(connection, &active)?
+                    .ok_or(Error::StalePushRejection)?;
+                let writes = repair.writes().to_vec();
+                repair.apply(connection)?;
+                block_on(store.rollback_if_unchanged(
+                    space,
+                    reject.failed_at(),
+                    reject.expected_submit(),
+                ))?;
+                Ok(PrepareOutcome::Prepared(proposal.prepare_receipt(writes)?))
+            }
+            ProposalBody::AcceptSubmissions(accept) => {
+                if let Some(receipt) = proposal.committed_receipt(connection)? {
+                    return Ok(PrepareOutcome::AlreadyCommitted(receipt));
+                }
+                proposal.validate()?;
+                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let space = self.database_id.space_id();
+                let current = block_on(store.oplog_cursors(space))?;
+                let expected = accept.expected_submit();
+                if current.head != expected.head
+                    || current.neck != expected.neck
+                    || current.tail < expected.tail
+                {
+                    return Err(Error::CommitConflict(
+                        "submit window changed before acknowledgement".into(),
+                    ));
+                }
+                block_on(store.trim_oplog(space, accept.through(), accept.checksum()))?;
+                pending::accept_through(connection, accept.through())?;
+                Ok(PrepareOutcome::Prepared(
+                    proposal.prepare_receipt(Vec::new())?,
+                ))
+            }
+            ProposalBody::AppendAdmissions(append) => {
+                if let Some(receipt) = proposal.committed_receipt(connection)? {
+                    return Ok(PrepareOutcome::AlreadyCommitted(receipt));
+                }
+                proposal.validate()?;
+                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let space = self.database_id.space_id();
+                if block_on(store.admit_cursors(space))? != append.expected_admits() {
+                    return Err(Error::CommitConflict(
+                        "admit window changed before pull capture".into(),
+                    ));
+                }
+                block_on(store.append_admits(space, append.response()))?;
+                Ok(PrepareOutcome::Prepared(
+                    proposal.prepare_receipt(Vec::new())?,
+                ))
             }
         }
-        self.pull_serial()?;
-        self.rebase_serial(runtime)?;
-        self.policy.mark_rebased();
-        Ok(())
+    }
+}
+
+impl<H: ServerHandle + Send + Sync + 'static> CommitBackend for DatabaseCommitBackend<H> {
+    fn commit_group(&self, proposals: &[&CommitProposal]) -> Result<Vec<Result<CommitReceipt>>> {
+        self.commit_proposal_group(proposals)
     }
 
-    fn enter_operation(&self) -> Result<CommitPermit> {
-        self.committer.enter_blocking().map_err(committer_error)
+    fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot> {
+        self.capture_snapshot_inner(writable, || Ok(()))
     }
 }
 
@@ -882,49 +910,69 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
     } = options;
     let lineage = Lineage(mint_id()?);
     let commit_history = CommitHistory::default();
+    let canonical = CanonicalRouter::default();
     let wal_path = wal_path_for(&path);
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
             match classify(connection)? {
-                DatabaseState::Fresh => initialize(
-                    &owner,
-                    invitation,
-                    server,
-                    lineage,
-                    commit_history.clone(),
-                    path.clone(),
-                    wal_path.clone(),
-                ),
+                DatabaseState::Fresh => {
+                    initialize(&owner, invitation, server, lineage, canonical.clone())
+                }
                 DatabaseState::Initialized => reopen(
                     &owner,
                     invitation.as_ref(),
                     server,
                     lineage,
                     commit_history.clone(),
-                    path.clone(),
-                    wal_path.clone(),
+                    canonical.clone(),
                 ),
             }
         })?;
+    let client = Arc::new(client);
+    let commit_backend = Arc::new(DatabaseCommitBackend {
+        owner: owner.clone(),
+        path,
+        wal_path,
+        database_id,
+        client: Arc::clone(&client),
+        commit_history: commit_history.clone(),
+    });
+    let committer = Committer::new(Arc::clone(&commit_backend)).map_err(committer_error)?;
+    canonical.install(Arc::new(CommitterMetaSink {
+        committer: committer.downgrade(),
+    }))?;
+    let authority = Authority::new(Arc::clone(&client), database_id.space_id())
+        .map_err(|error| Error::BackgroundWorker(error.to_string()))?;
     Ok(Database {
         owner,
-        wal_path,
-        path,
         database_id,
         client,
         policy: PolicyState::new(sync_policy),
         isolation_level,
-        committer: Committer::new().map_err(committer_error)?,
-        commit_queue: CommitQueue::new(),
-        commit_history,
+        committer,
+        authority,
         scheduler: PushScheduler::new(),
     })
 }
 
-struct BranchSnapshot {
-    physical: crate::branch::snapshot::PinnedSnapshot,
-    logical: SnapshotDescriptor,
-    history_pin: Option<HistoryPin>,
+struct DatabaseCommitBackend<H: ServerHandle> {
+    owner: ConnectionOwner,
+    path: PathBuf,
+    wal_path: PathBuf,
+    database_id: DatabaseId,
+    client: Arc<DatabaseClient<H>>,
+    commit_history: CommitHistory,
+}
+
+struct CommitterMetaSink {
+    committer: WeakCommitter,
+}
+
+impl CanonicalMetaSink for CommitterMetaSink {
+    fn propose(&self, proposal: CommitProposal) -> Result<()> {
+        self.committer.propose_blocking(proposal)?;
+        Ok(())
+    }
 }
 
 fn wal_path_for(path: &Path) -> PathBuf {
@@ -938,9 +986,7 @@ fn initialize<H: ServerHandle>(
     invitation: Option<ReplicaInvitation>,
     server: H,
     lineage: Lineage,
-    commit_history: CommitHistory,
-    database_path: PathBuf,
-    wal_path: PathBuf,
+    canonical: CanonicalRouter,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
     let database_id = match invitation {
         Some(invitation) => invitation.database_id,
@@ -951,8 +997,7 @@ fn initialize<H: ServerHandle>(
     owner.with_connection(catalog::initialize)?;
     owner.with_connection(proposal::initialize)?;
     owner.with_connection(history::initialize)?;
-    let store =
-        DatabaseMetaStore::with_database(owner.clone(), commit_history, database_path, wal_path);
+    let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
     let client = block_on(Client::open(
         store,
         server,
@@ -970,15 +1015,9 @@ fn reopen<H: ServerHandle>(
     server: H,
     lineage: Lineage,
     commit_history: CommitHistory,
-    database_path: PathBuf,
-    wal_path: PathBuf,
+    canonical: CanonicalRouter,
 ) -> Result<(DatabaseId, DatabaseClient<H>)> {
-    let store = DatabaseMetaStore::with_database(
-        owner.clone(),
-        commit_history.clone(),
-        database_path,
-        wal_path,
-    );
+    let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
     let state = block_on(store.load())?;
     if state.device.is_none() {
         return Err(Error::InvalidDatabase("device identity is missing"));

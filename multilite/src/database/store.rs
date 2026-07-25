@@ -1,6 +1,6 @@
 //! Homebase metadata transitions joined to Multilite's local disposition log.
 
-use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use homebase_client::meta::{
     AdmitCursors, ClientState, CodecRecord, Committed, DeviceOp, HeldLease, MetaStore,
@@ -15,47 +15,58 @@ use homebase_core::storage::StorageError;
 use homebase_core::tag::{DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq};
 
 use super::pending;
-use crate::Error;
-use crate::branch::snapshot::PinnedSnapshot;
-use crate::branch::{OverlayOptions, WritableBranch};
-use crate::commit::committer::CommitHistory;
+use crate::commit::proposal::CommitProposal;
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
+use crate::{Error, Result as MultiliteResult};
 
 /// Homebase metadata whose acknowledged submit trim also finalizes Multilite.
 pub struct DatabaseMetaStore {
     owner: ConnectionOwner,
     inner: OrderedMetaStore<SqliteOrderedStore>,
-    commit_history: CommitHistory,
-    branch_files: Option<(PathBuf, PathBuf)>,
+    canonical: CanonicalRouter,
+}
+
+pub trait CanonicalMetaSink: Send + Sync + 'static {
+    fn propose(&self, proposal: CommitProposal) -> MultiliteResult<()>;
+}
+
+#[derive(Clone, Default)]
+pub struct CanonicalRouter {
+    sink: Arc<OnceLock<Arc<dyn CanonicalMetaSink>>>,
+}
+
+impl CanonicalRouter {
+    pub fn install(&self, sink: Arc<dyn CanonicalMetaSink>) -> MultiliteResult<()> {
+        self.sink
+            .set(sink)
+            .map_err(|_| Error::Committer("canonical metadata sink is already installed".into()))
+    }
+
+    fn sink(&self) -> Option<&Arc<dyn CanonicalMetaSink>> {
+        self.sink.get()
+    }
 }
 
 impl DatabaseMetaStore {
     #[cfg(test)]
     pub fn new(owner: ConnectionOwner) -> Self {
-        Self::with_history(owner, CommitHistory::default())
+        Self::read_only(owner)
     }
 
-    pub fn with_history(owner: ConnectionOwner, commit_history: CommitHistory) -> Self {
+    pub fn read_only(owner: ConnectionOwner) -> Self {
         Self {
             inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
             owner,
-            commit_history,
-            branch_files: None,
+            canonical: CanonicalRouter::default(),
         }
     }
 
-    pub fn with_database(
-        owner: ConnectionOwner,
-        commit_history: CommitHistory,
-        database_path: PathBuf,
-        wal_path: PathBuf,
-    ) -> Self {
+    pub fn with_database(owner: ConnectionOwner, canonical: CanonicalRouter) -> Self {
         Self {
             inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
             owner,
-            commit_history,
-            branch_files: Some((database_path, wal_path)),
+            canonical,
         }
     }
 }
@@ -130,6 +141,12 @@ impl MetaStore for DatabaseMetaStore {
         through: DeviceSeq,
         checksum: DeviceChecksum,
     ) -> Result<(), StorageError> {
+        if let Some(sink) = self.canonical.sink() {
+            let expected = self.inner.oplog_cursors(space).await?;
+            let proposal = CommitProposal::accept_submissions(expected, through, checksum)
+                .map_err(storage_error)?;
+            return sink.propose(proposal).map_err(storage_error);
+        }
         self.owner
             .with_savepoint("__multilite__ack", |connection| {
                 pollster::block_on(self.inner.trim_oplog(space, through, checksum))?;
@@ -149,47 +166,12 @@ impl MetaStore for DatabaseMetaStore {
         to: DeviceSeq,
         expected: OplogCursors,
     ) -> Result<(), StorageError> {
-        let current = self.inner.oplog_cursors(space).await?;
-        let repair = if current == expected {
-            let through = DeviceSeq(
-                expected
-                    .tail
-                    .0
-                    .checked_sub(1)
-                    .ok_or_else(|| StorageError("submit tail cannot be zero".into()))?,
-            );
-            let active = self.inner.oplog(space, expected.neck, through).await?;
-            self.owner
-                .with_connection(|connection| pending::prepare_rejection(connection, &active))
-                .map_err(storage_error)?
-        } else {
-            None
-        };
-
-        if let (Some(repair), Some((database_path, wal_path))) =
-            (&repair, self.branch_files.as_ref())
-        {
-            let snapshot = PinnedSnapshot::capture(database_path, wal_path)
-                .map_err(|error| StorageError(error.to_string()))?;
-            let branch = WritableBranch::open(snapshot, OverlayOptions::default())
-                .map_err(|error| StorageError(error.to_string()))?;
-            repair.apply(branch.connection()).map_err(storage_error)?;
+        if let Some(sink) = self.canonical.sink() {
+            let proposal =
+                CommitProposal::reject_submissions(to, expected).map_err(storage_error)?;
+            return sink.propose(proposal).map_err(storage_error);
         }
-
-        self.owner
-            .with_savepoint("__multilite__rollback", |connection| {
-                let current = pollster::block_on(self.inner.oplog_cursors(space))?;
-                if current == expected
-                    && let Some(repair) = &repair
-                {
-                    repair.apply(connection)?;
-                    self.commit_history
-                        .record(connection, repair.writes().to_vec())?;
-                }
-                pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?;
-                Ok(())
-            })
-            .map_err(storage_error)
+        self.inner.rollback_if_unchanged(space, to, expected).await
     }
 
     async fn append_admits(
@@ -197,6 +179,12 @@ impl MetaStore for DatabaseMetaStore {
         space: SpaceId,
         response: &PullResponse,
     ) -> Result<(), StorageError> {
+        if let Some(sink) = self.canonical.sink() {
+            let expected = self.inner.admit_cursors(space).await?;
+            let proposal = CommitProposal::append_admissions(expected, response.clone())
+                .map_err(storage_error)?;
+            return sink.propose(proposal).map_err(storage_error);
+        }
         self.inner.append_admits(space, response).await
     }
 
