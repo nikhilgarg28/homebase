@@ -2297,6 +2297,63 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
 }
 
 #[test]
+fn snapshot_insert_commits_across_unrelated_serialized_ddl() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("concurrent-ddl.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .execute(
+            &runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+
+    let branch_ready = Arc::new(Barrier::new(2));
+    let ddl_finished = Arc::new(Barrier::new(2));
+    let worker = {
+        let database = Arc::clone(&database);
+        let branch_ready = Arc::clone(&branch_ready);
+        let ddl_finished = Arc::clone(&ddl_finished);
+        std::thread::spawn(move || {
+            let runtime = database.runtime().unwrap();
+            database.update(&runtime, |update| {
+                branch_ready.wait();
+                ddl_finished.wait();
+                update.execute("INSERT INTO notes VALUES (1, 'branch')", ())
+            })
+        })
+    };
+
+    branch_ready.wait();
+    database
+        .execute(
+            &runtime,
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, done INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+    ddl_finished.wait();
+    assert_eq!(worker.join().unwrap().unwrap(), 1);
+
+    assert!(table_exists(&database, "tasks"));
+    assert_eq!(
+        database.with_connection(|connection| {
+            connection
+                .query_row("SELECT body FROM notes WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+        }),
+        "branch"
+    );
+    assert_eq!(
+        database.with_connection(history::current).unwrap(),
+        crate::commit::snapshot::CommitSeq(3)
+    );
+}
+
+#[test]
 fn concurrent_snapshot_updates_reject_one_primary_key_collision() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("concurrent-collision.sqlite")).unwrap();

@@ -1,6 +1,6 @@
 //! Net SQLite changes captured from a private branch and replayed canonically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
 
@@ -19,19 +19,25 @@ use sqlite3_parser::lexer::sql::Parser;
 use super::WritableBranch;
 use crate::value::StoredValue;
 
-const CHANGESET_FRAME_VERSION: u8 = 1;
-const TAG_SCHEMA: u8 = 1;
+const CHANGESET_FRAME_VERSION: u8 = 2;
+const TAG_TABLE_BINDING: u8 = 1;
 const TAG_SQLITE_CHANGESET: u8 = 2;
 const TAG_ROWID_TRANSITION: u8 = 3;
+const TABLE_BINDING_FRAME_VERSION: u8 = 1;
+const TAG_TABLE_NAME: u8 = 1;
+const TAG_TABLE_FINGERPRINT: u8 = 2;
 
-/// Hash of the complete application schema against which a changeset ran.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SchemaFingerprint([u8; 32]);
+/// Physical SQLite definition of one table touched by a changeset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableBinding {
+    name: String,
+    fingerprint: [u8; 32],
+}
 
 /// A transaction's net changes over explicitly attached synchronized tables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedChangeset {
-    schema: SchemaFingerprint,
+    tables: Vec<TableBinding>,
     sqlite: Vec<u8>,
     rowids: Vec<RowidTransition>,
 }
@@ -54,20 +60,13 @@ impl CapturedChangeset {
         self.sqlite.is_empty()
     }
 
-    pub fn schema(&self) -> SchemaFingerprint {
-        self.schema
-    }
-
     pub fn sqlite_bytes(&self) -> &[u8] {
         &self.sqlite
     }
 
-    /// Verify that this capture still describes the supplied SQLite schema.
-    pub fn validate_schema(&self, connection: &Connection) -> Result<(), ChangesetError> {
-        if schema_fingerprint(connection)? != self.schema {
-            return Err(ChangesetError::SchemaChanged);
-        }
-        Ok(())
+    /// Verify every touched table still has its captured physical definition.
+    pub fn validate_tables(&self, connection: &Connection) -> Result<(), ChangesetError> {
+        validate_table_bindings(connection, &self.tables)
     }
 
     /// Project the currently supported insert-only logical transaction.
@@ -102,7 +101,13 @@ impl CapturedChangeset {
     pub fn encode(&self) -> Result<Vec<u8>, ChangesetError> {
         let mut writer = Writer::new();
         writer.u8(CHANGESET_FRAME_VERSION);
-        put_field(&mut writer, TAG_SCHEMA, &self.schema.0)?;
+        for table in &self.tables {
+            put_field(
+                &mut writer,
+                TAG_TABLE_BINDING,
+                &encode_table_binding(table)?,
+            )?;
+        }
         put_field(&mut writer, TAG_SQLITE_CHANGESET, &self.sqlite)?;
         for rowids in &self.rowids {
             let mut value = Writer::with_capacity(18);
@@ -121,32 +126,28 @@ impl CapturedChangeset {
                 "unknown captured changeset frame version",
             ));
         }
-        let mut schema = None;
+        let mut tables = Vec::new();
         let mut sqlite = None;
         let mut rowids = Vec::new();
         while let Some((tag, value)) = next_field(&mut reader)? {
             match tag {
-                TAG_SCHEMA => {
-                    let bytes = value.try_into().map_err(|_| {
-                        ChangesetError::Malformed("schema fingerprint has the wrong length")
-                    })?;
-                    set_once(&mut schema, SchemaFingerprint(bytes))?;
-                }
+                TAG_TABLE_BINDING => tables.push(decode_table_binding(value)?),
                 TAG_SQLITE_CHANGESET => set_once(&mut sqlite, value.to_vec())?,
                 TAG_ROWID_TRANSITION => rowids.push(decode_rowids(value)?),
                 _ => {}
             }
         }
+        let sqlite = sqlite.ok_or(ChangesetError::Malformed(
+            "captured changeset is missing its SQLite payload",
+        ))?;
+        let changes = decode_changeset(&sqlite)?;
         let captured = Self {
-            schema: schema.ok_or(ChangesetError::Malformed(
-                "captured changeset is missing its schema fingerprint",
-            ))?,
-            sqlite: sqlite.ok_or(ChangesetError::Malformed(
-                "captured changeset is missing its SQLite payload",
-            ))?,
+            tables,
+            sqlite,
             rowids,
         };
-        if decode_changeset(&captured.sqlite)?.len() != captured.rowids.len() {
+        validate_binding_set(&captured.tables, &changes)?;
+        if changes.len() != captured.rowids.len() {
             return Err(ChangesetError::Malformed(
                 "captured rowid metadata has the wrong length",
             ));
@@ -162,7 +163,8 @@ impl CapturedChangeset {
                 "captured rowid metadata has the wrong length",
             ));
         }
-        apply_changes(connection, self.schema, &changes, &self.rowids)
+        validate_binding_set(&self.tables, &changes)?;
+        apply_changes(connection, &self.tables, &changes, &self.rowids)
     }
 
     #[cfg(test)]
@@ -185,7 +187,7 @@ pub struct ChangesetCapture<'connection> {
     connection: &'connection Connection,
     baseline: &'connection Connection,
     session: Session<'connection>,
-    schema: SchemaFingerprint,
+    tables: BTreeMap<Vec<u8>, TableBinding>,
 }
 
 impl<'connection> ChangesetCapture<'connection> {
@@ -201,12 +203,22 @@ impl<'connection> ChangesetCapture<'connection> {
         baseline: &'connection Connection,
         tables: &[&str],
     ) -> Result<Self, ChangesetError> {
-        let schema = schema_fingerprint(connection)?;
+        let mut bindings = BTreeMap::new();
         let mut session = Session::new(connection)?;
         for table in tables {
             let layout = table_layout(connection, table)?;
             if !layout.columns.iter().any(|column| column.primary_key > 0) {
                 return Err(ChangesetError::TableWithoutPrimaryKey((*table).to_owned()));
+            }
+            let binding = table_binding(connection, table)?
+                .ok_or_else(|| ChangesetError::UnknownTable((*table).to_owned()))?;
+            if bindings
+                .insert(canonical_name(&binding.name), binding)
+                .is_some()
+            {
+                return Err(ChangesetError::Malformed(
+                    "duplicate attached changeset table",
+                ));
             }
             session.attach(Some(*table))?;
         }
@@ -214,7 +226,7 @@ impl<'connection> ChangesetCapture<'connection> {
             connection,
             baseline,
             session,
-            schema,
+            tables: bindings,
         })
     }
 
@@ -223,8 +235,20 @@ impl<'connection> ChangesetCapture<'connection> {
         self.session.changeset_strm(&mut bytes)?;
         let changes = decode_changeset(&bytes)?;
         let rowids = capture_rowid_transitions(self.baseline, self.connection, &changes)?;
+        let touched = changes
+            .iter()
+            .map(|change| canonical_name(&change.table))
+            .collect::<BTreeSet<_>>();
+        let tables = touched
+            .into_iter()
+            .map(|name| {
+                self.tables.remove(&name).ok_or(ChangesetError::Malformed(
+                    "changeset contains an unattached table",
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(CapturedChangeset {
-            schema: self.schema,
+            tables,
             sqlite: bytes,
             rowids,
         })
@@ -299,6 +323,52 @@ fn decode_optional_rowid(reader: &mut Reader<'_>) -> Result<Option<i64>, Changes
     }
 }
 
+fn encode_table_binding(binding: &TableBinding) -> Result<Vec<u8>, ChangesetError> {
+    let mut writer = Writer::new();
+    writer.u8(TABLE_BINDING_FRAME_VERSION);
+    put_field(&mut writer, TAG_TABLE_NAME, binding.name.as_bytes())?;
+    put_field(&mut writer, TAG_TABLE_FINGERPRINT, &binding.fingerprint)?;
+    Ok(writer.finish())
+}
+
+fn decode_table_binding(frame: &[u8]) -> Result<TableBinding, ChangesetError> {
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(TABLE_BINDING_FRAME_VERSION) {
+        return Err(ChangesetError::Malformed(
+            "unknown changeset table-binding version",
+        ));
+    }
+    let mut name = None;
+    let mut fingerprint = None;
+    while let Some((tag, value)) = next_field(&mut reader)? {
+        match tag {
+            TAG_TABLE_NAME => {
+                let value = String::from_utf8(value.to_vec())
+                    .map_err(|_| ChangesetError::Malformed("changeset table name is not UTF-8"))?;
+                if value.is_empty() {
+                    return Err(ChangesetError::Malformed("changeset table name is empty"));
+                }
+                set_once(&mut name, value)?;
+            }
+            TAG_TABLE_FINGERPRINT => {
+                let value = value.try_into().map_err(|_| {
+                    ChangesetError::Malformed("table fingerprint has the wrong length")
+                })?;
+                set_once(&mut fingerprint, value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(TableBinding {
+        name: name.ok_or(ChangesetError::Malformed(
+            "changeset table binding is missing its name",
+        ))?,
+        fingerprint: fingerprint.ok_or(ChangesetError::Malformed(
+            "changeset table binding is missing its fingerprint",
+        ))?,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangeKind {
     Insert,
@@ -348,14 +418,18 @@ struct ReplayChange {
     final_rowid: Option<i64>,
 }
 
-fn schema_fingerprint(connection: &Connection) -> Result<SchemaFingerprint, ChangesetError> {
+fn table_binding(
+    connection: &Connection,
+    table: &str,
+) -> Result<Option<TableBinding>, ChangesetError> {
     let mut statement = connection.prepare(
         "SELECT type, name, tbl_name, coalesce(sql, '')
          FROM main.sqlite_schema
-         WHERE name NOT LIKE 'sqlite_%'
+         WHERE tbl_name = ?1 COLLATE NOCASE
+           AND name NOT LIKE 'sqlite_%'
          ORDER BY type, name",
     )?;
-    let rows = statement.query_map((), |row| {
+    let rows = statement.query_map([table], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -363,9 +437,16 @@ fn schema_fingerprint(connection: &Connection) -> Result<SchemaFingerprint, Chan
             row.get::<_, String>(3)?,
         ))
     })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some(table_name) = rows
+        .iter()
+        .find(|(kind, name, owner, _)| kind == "table" && name == owner)
+        .map(|(_, name, _, _)| name.clone())
+    else {
+        return Ok(None);
+    };
     let mut hash = Sha256::new();
-    for row in rows {
-        let (kind, name, table, sql) = row?;
+    for (kind, name, table, sql) in rows {
         for field in [&kind, &name, &table, &sql] {
             let length = u64::try_from(field.len())
                 .map_err(|_| ChangesetError::Malformed("schema field is too large"))?;
@@ -373,7 +454,50 @@ fn schema_fingerprint(connection: &Connection) -> Result<SchemaFingerprint, Chan
             hash.update(field.as_bytes());
         }
     }
-    Ok(SchemaFingerprint(hash.finalize().into()))
+    Ok(Some(TableBinding {
+        name: table_name,
+        fingerprint: hash.finalize().into(),
+    }))
+}
+
+fn validate_table_bindings(
+    connection: &Connection,
+    expected: &[TableBinding],
+) -> Result<(), ChangesetError> {
+    for expected in expected {
+        if table_binding(connection, &expected.name)?.as_ref() != Some(expected) {
+            return Err(ChangesetError::SchemaChanged);
+        }
+    }
+    Ok(())
+}
+
+fn validate_binding_set(
+    bindings: &[TableBinding],
+    changes: &[NetChange],
+) -> Result<(), ChangesetError> {
+    let expected = changes
+        .iter()
+        .map(|change| canonical_name(&change.table))
+        .collect::<BTreeSet<_>>();
+    let actual = bindings
+        .iter()
+        .map(|binding| canonical_name(&binding.name))
+        .collect::<Vec<_>>();
+    if actual.windows(2).any(|pair| pair[0] >= pair[1])
+        || actual.into_iter().collect::<BTreeSet<_>>() != expected
+    {
+        return Err(ChangesetError::Malformed(
+            "changeset table bindings do not match its changes",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_name(name: &str) -> Vec<u8> {
+    let mut canonical = name.as_bytes().to_vec();
+    canonical.make_ascii_lowercase();
+    canonical
 }
 
 fn decode_changeset(bytes: &[u8]) -> Result<Vec<NetChange>, ChangesetError> {
@@ -439,15 +563,13 @@ fn optional_value(
 
 fn apply_changes(
     connection: &Connection,
-    expected_schema: SchemaFingerprint,
+    expected_tables: &[TableBinding],
     changes: &[NetChange],
     rowids: &[RowidTransition],
 ) -> Result<(), ChangesetError> {
     connection.execute_batch("SAVEPOINT __multilite_changeset_apply")?;
     let result = (|| {
-        if schema_fingerprint(connection)? != expected_schema {
-            return Err(ChangesetError::SchemaChanged);
-        }
+        validate_table_bindings(connection, expected_tables)?;
         if changes.is_empty() {
             return Ok(());
         }
@@ -994,7 +1116,7 @@ impl fmt::Display for ChangesetError {
         match self {
             Self::Sqlite(error) => write!(formatter, "SQLite changeset error: {error}"),
             Self::SchemaChanged => {
-                formatter.write_str("canonical schema differs from the branch schema")
+                formatter.write_str("a touched table differs from the branch schema")
             }
             Self::UnknownTable(table) => write!(formatter, "unknown changeset table {table:?}"),
             Self::TableWithoutPrimaryKey(table) => {
@@ -1118,8 +1240,8 @@ mod tests {
             changeset
         );
         assert_eq!(
-            changeset.schema(),
-            schema_fingerprint(&fixture.writer).unwrap()
+            changeset.tables,
+            vec![table_binding(&fixture.writer, "items").unwrap().unwrap()]
         );
         assert_eq!(
             changeset.summary().unwrap(),
@@ -1532,6 +1654,62 @@ mod tests {
     }
 
     #[test]
+    fn replay_ignores_physical_schema_changes_to_untouched_tables() {
+        let fixture = Fixture::new(
+            "CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE unrelated (id INTEGER PRIMARY KEY)",
+            "INSERT INTO records VALUES (1, 'base')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(&branch, &["records", "unrelated"]).unwrap();
+        branch
+            .connection()
+            .execute("UPDATE records SET value = 'branch' WHERE id = 1", ())
+            .unwrap();
+        let changeset = capture.finish().unwrap();
+        assert_eq!(
+            changeset
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            ["records"]
+        );
+
+        fixture
+            .writer
+            .execute("ALTER TABLE unrelated ADD COLUMN note TEXT", ())
+            .unwrap();
+        changeset.apply(&fixture.writer).unwrap();
+        assert_eq!(record_value(&fixture.writer), "branch");
+    }
+
+    #[test]
+    fn replay_rejects_index_changes_on_a_touched_table() {
+        let fixture = Fixture::new(
+            "CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            "INSERT INTO records VALUES (1, 'base')",
+        );
+        let branch = fixture.branch();
+        let capture = ChangesetCapture::start(&branch, &["records"]).unwrap();
+        branch
+            .connection()
+            .execute("UPDATE records SET value = 'branch' WHERE id = 1", ())
+            .unwrap();
+        let changeset = capture.finish().unwrap();
+        fixture
+            .writer
+            .execute("CREATE INDEX records_value ON records(value)", ())
+            .unwrap();
+
+        assert!(matches!(
+            changeset.apply(&fixture.writer),
+            Err(ChangesetError::SchemaChanged)
+        ));
+        assert_eq!(record_value(&fixture.writer), "base");
+    }
+
+    #[test]
     fn final_foreign_key_validation_rolls_back_an_orphan() {
         let fixture = Fixture::new(
             "CREATE TABLE parents (id INTEGER PRIMARY KEY);
@@ -1591,19 +1769,24 @@ mod tests {
         with_unknown.extend_from_slice(&[99, 0, 0, 0, 2, 7, 8]);
         assert_eq!(CapturedChangeset::decode(&with_unknown).unwrap(), changeset);
 
-        let mut duplicate_schema = encoded.clone();
+        let mut duplicate_binding = encoded.clone();
         let mut writer = Writer::new();
-        put_field(&mut writer, TAG_SCHEMA, &changeset.schema.0).unwrap();
-        duplicate_schema.extend_from_slice(&writer.finish());
+        put_field(
+            &mut writer,
+            TAG_TABLE_BINDING,
+            &encode_table_binding(&changeset.tables[0]).unwrap(),
+        )
+        .unwrap();
+        duplicate_binding.extend_from_slice(&writer.finish());
         assert!(matches!(
-            CapturedChangeset::decode(&duplicate_schema),
+            CapturedChangeset::decode(&duplicate_binding),
             Err(ChangesetError::Malformed(
-                "duplicate captured changeset field"
+                "changeset table bindings do not match its changes"
             ))
         ));
 
         let missing_rowid = CapturedChangeset {
-            schema: changeset.schema,
+            tables: changeset.tables.clone(),
             sqlite: changeset.sqlite.clone(),
             rowids: Vec::new(),
         };
@@ -1611,6 +1794,18 @@ mod tests {
             CapturedChangeset::decode(&missing_rowid.encode().unwrap()),
             Err(ChangesetError::Malformed(
                 "captured rowid metadata has the wrong length"
+            ))
+        ));
+
+        let missing_binding = CapturedChangeset {
+            tables: Vec::new(),
+            sqlite: changeset.sqlite,
+            rowids: changeset.rowids,
+        };
+        assert!(matches!(
+            CapturedChangeset::decode(&missing_binding.encode().unwrap()),
+            Err(ChangesetError::Malformed(
+                "changeset table bindings do not match its changes"
             ))
         ));
     }

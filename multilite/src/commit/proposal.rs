@@ -94,7 +94,7 @@ impl CommitProposal {
             return Ok(None);
         }
         changeset
-            .validate_schema(connection)
+            .validate_tables(connection)
             .map_err(invalid_changeset)?;
         let operations = lower_insert_operations(&changeset, connection)?;
         let transaction = MultiliteTransaction::new(operations)?;
@@ -150,7 +150,7 @@ impl CommitProposal {
     /// Cross-check captured SQLite rows against the logical operation envelope.
     pub fn validate_against(&self, connection: &Connection) -> Result<()> {
         self.changeset
-            .validate_schema(connection)
+            .validate_tables(connection)
             .map_err(commit_changeset)?;
         let operations = lower_insert_operations(&self.changeset, connection)?;
         if operations != self.transaction.operations() {
