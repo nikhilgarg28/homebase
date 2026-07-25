@@ -128,6 +128,13 @@ fn create_operation(name: &str) -> MultiliteOp {
     )
 }
 
+fn create_proposal(snapshot: SnapshotDescriptor, name: &str) -> CommitProposal {
+    let MultiliteOp::CreateTable(created) = create_operation(name) else {
+        unreachable!("create operation returned another operation kind")
+    };
+    CommitProposal::create_table(snapshot, IsolationLevel::Snapshot, created).unwrap()
+}
+
 fn submit_direct<H: ServerHandle + Send + Sync + 'static>(
     database: &Database<H>,
     operation: &MultiliteOp,
@@ -2273,31 +2280,26 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
             .unwrap()
     });
     assert_eq!(rows, [(1, "one".into()), (2, "two".into())]);
-    assert_eq!(
-        database.with_connection(history::current).unwrap(),
-        crate::commit::snapshot::CommitSeq(3)
+    let concurrent_commit_seq = database.with_connection(history::current).unwrap();
+    assert!(
+        (2..=3).contains(&concurrent_commit_seq.0),
+        "the concurrent proposals may share one group or occupy adjacent groups"
     );
     assert_eq!(pending_ops(&database).len(), 3);
-    assert_eq!(
-        database
-            .with_connection(|connection| {
-                history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
-            })
-            .unwrap()
-            .into_iter()
-            .map(|committed| committed.commit_seq)
-            .collect::<Vec<_>>(),
-        [
-            crate::commit::snapshot::CommitSeq(2),
-            crate::commit::snapshot::CommitSeq(3)
-        ]
-    );
+    let retained = database
+        .with_connection(|connection| {
+            history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
+        })
+        .unwrap();
+    assert_eq!(retained.first().unwrap().commit_seq.0, 2);
+    assert_eq!(retained.last().unwrap().commit_seq, concurrent_commit_seq);
 
     database
         .update(&runtime, |update| {
             update.execute("INSERT INTO notes VALUES (3, 'three')", ())
         })
         .unwrap();
+    let final_commit_seq = crate::commit::snapshot::CommitSeq(concurrent_commit_seq.0 + 1);
     assert_eq!(
         database
             .with_connection(|connection| {
@@ -2307,8 +2309,135 @@ fn snapshot_update_bodies_overlap_and_disjoint_proposals_both_commit() {
             .into_iter()
             .map(|committed| committed.commit_seq)
             .collect::<Vec<_>>(),
-        [crate::commit::snapshot::CommitSeq(4)]
+        [final_commit_seq]
     );
+}
+
+#[test]
+fn commit_group_shares_one_sequence_and_skips_only_its_conflicting_member() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("commit-group.sqlite")).unwrap();
+    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let first = create_proposal(snapshot.logical, "notes");
+    let conflict = create_proposal(snapshot.logical, "NOTES");
+    let last = create_proposal(snapshot.logical, "tasks");
+    let expected_keys = [&first, &last]
+        .into_iter()
+        .flat_map(|proposal| proposal.to_homebase().unwrap().0)
+        .map(|mutation| mutation.key().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let results = database
+        .commit_proposal_group_serial(&[&first, &first, &conflict, &last])
+        .unwrap();
+    assert_eq!(results.len(), 4);
+    let first_receipt = results[0].as_ref().unwrap();
+    assert_eq!(first_receipt.disposition, CommitDisposition::Applied);
+    assert_eq!(
+        results[1].as_ref().unwrap(),
+        &CommitReceipt {
+            commit_seq: first_receipt.commit_seq,
+            disposition: CommitDisposition::AlreadyCommitted,
+        }
+    );
+    assert!(matches!(results[2], Err(Error::CommitConflict(_))));
+    let last_receipt = results[3].as_ref().unwrap();
+    assert_eq!(last_receipt.disposition, CommitDisposition::Applied);
+    assert_eq!(first_receipt.commit_seq, last_receipt.commit_seq);
+    assert_eq!(
+        first_receipt.commit_seq,
+        crate::commit::snapshot::CommitSeq(1)
+    );
+
+    assert!(table_exists(&database, "notes"));
+    assert!(table_exists(&database, "tasks"));
+    assert_eq!(pending_ops(&database).len(), 2);
+    assert_eq!(
+        database
+            .with_connection(|connection| {
+                history::history_after(connection, crate::commit::snapshot::CommitSeq(0))
+            })
+            .unwrap(),
+        [history::CommitRecord {
+            commit_seq: crate::commit::snapshot::CommitSeq(1),
+            keys: expected_keys,
+        }]
+    );
+    assert_eq!(
+        database
+            .with_connection(|connection| proposal::apply(connection, &first))
+            .unwrap(),
+        CommitReceipt {
+            commit_seq: crate::commit::snapshot::CommitSeq(1),
+            disposition: CommitDisposition::AlreadyCommitted,
+        }
+    );
+}
+
+#[test]
+fn queued_owned_proposals_coalesce_behind_one_committer_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("queued-group.sqlite")).unwrap();
+    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let proposals = [
+        create_proposal(snapshot.logical, "notes"),
+        create_proposal(snapshot.logical, "tasks"),
+    ];
+    let permit = database.enter_operation().unwrap();
+    let handles = proposals
+        .into_iter()
+        .map(|proposal| {
+            let database = Arc::clone(&database);
+            std::thread::spawn(move || database.commit_proposal(proposal))
+        })
+        .collect::<Vec<_>>();
+    wait_until(|| database.commit_queue.pending_len() == 2);
+    drop(permit);
+
+    let receipts = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts[0].commit_seq, receipts[1].commit_seq);
+    assert_eq!(
+        receipts[0].commit_seq,
+        crate::commit::snapshot::CommitSeq(1)
+    );
+    assert!(table_exists(&database, "notes"));
+    assert!(table_exists(&database, "tasks"));
+    assert_eq!(pending_ops(&database).len(), 2);
+}
+
+#[test]
+fn commit_group_finalization_failure_rolls_back_every_successful_member() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("commit-group-failure.sqlite")).unwrap();
+    let snapshot = database.capture_branch_snapshot(true).unwrap();
+    let first = create_proposal(snapshot.logical, "notes");
+    let second = create_proposal(snapshot.logical, "tasks");
+    let state_before = client_state(&database);
+    database.with_connection(|connection| {
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_group_receipt
+                 BEFORE INSERT ON __multilite__commits
+                 BEGIN SELECT RAISE(ABORT, 'injected group receipt failure'); END",
+            )
+            .unwrap();
+    });
+
+    assert!(matches!(
+        database.commit_proposal_group_serial(&[&first, &second]),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(!table_exists(&database, "notes"));
+    assert!(!table_exists(&database, "tasks"));
+    assert!(pending_ops(&database).is_empty());
+    assert_eq!(
+        database.with_connection(history::current).unwrap(),
+        crate::commit::snapshot::CommitSeq(0)
+    );
+    assert_eq!(client_state(&database), state_before);
 }
 
 #[test]

@@ -17,7 +17,9 @@ mod update;
 mod view;
 mod vtab;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,9 +35,12 @@ use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
+use crate::commit::batch::{CommitQueue, QueuedCommit};
 use crate::commit::committer::{CommitPermit, Committer, HistoryPin, HistoryPins};
 use crate::commit::history;
-use crate::commit::proposal::{self, CommitDisposition, CommitProposal, CommitReceipt};
+use crate::commit::proposal::{
+    self, CommitDisposition, CommitProposal, CommitReceipt, PrepareOutcome,
+};
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
 use crate::metastore::SqliteOrderedStore;
@@ -339,8 +344,20 @@ pub(crate) struct Database<H: ServerHandle> {
     policy: PolicyState,
     isolation_level: IsolationLevel,
     committer: Committer,
+    commit_queue: CommitQueue,
     history_pins: HistoryPins,
     scheduler: PushScheduler,
+}
+
+enum GroupSlot {
+    Prepared,
+    DuplicatePrepared,
+    Complete(Result<CommitReceipt>),
+}
+
+struct SeenGroupProposal {
+    encoded: Vec<u8>,
+    receipt: Option<CommitReceipt>,
 }
 
 impl Database<OfflineServer> {
@@ -582,34 +599,157 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     fn commit_proposal(self: &Arc<Self>, proposal: CommitProposal) -> Result<CommitReceipt> {
-        let database = Arc::clone(self);
-        self.committer
-            .call_blocking(move || database.commit_proposal_serial(&proposal))
-            .map_err(committer_error)?
+        let ticket = self.commit_queue.enqueue(proposal)?;
+        if ticket.should_schedule() {
+            let database = Arc::clone(self);
+            if let Err(error) = self
+                .committer
+                .dispatch_blocking(move || database.drain_commit_queue())
+            {
+                self.commit_queue.fail_all(error.to_string());
+            }
+        }
+        ticket.wait()
     }
 
-    fn commit_proposal_serial(&self, proposal: &CommitProposal) -> Result<CommitReceipt> {
-        self.owner
-            .with_savepoint("__multilite__branch_commit", |connection| {
-                let receipt = proposal::apply(connection, proposal)?;
-                if receipt.disposition == CommitDisposition::Applied {
-                    let (mutations, assertions) = proposal.to_homebase()?;
-                    let sequence = block_on(async {
-                        let space = self.client.space(self.database_id.space_id()).await?;
-                        let submission = space
-                            .submit_unchecked(mutations, assertions)
-                            .await
-                            .map_err(ClientError::from)?;
-                        Ok::<_, Error>(submission.seq)
-                    })?;
-                    pending::insert(connection, sequence, proposal.transaction())?;
+    fn drain_commit_queue(&self) {
+        while let Some(group) = self.commit_queue.take_group() {
+            let proposals = group.iter().map(QueuedCommit::proposal).collect::<Vec<_>>();
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                self.commit_proposal_group_serial(&proposals)
+            }));
+            match outcome {
+                Ok(Ok(results)) => {
+                    debug_assert_eq!(group.len(), results.len());
+                    for (queued, result) in group.into_iter().zip(results) {
+                        queued.reply(result);
+                    }
                 }
+                Ok(Err(error)) => {
+                    let message = format!("commit group aborted: {error}");
+                    for queued in group {
+                        queued.reply(Err(Error::Committer(message.clone())));
+                    }
+                }
+                Err(_) => {
+                    let message = "commit group panicked".to_owned();
+                    for queued in group {
+                        queued.reply(Err(Error::Committer(message.clone())));
+                    }
+                    self.commit_queue.fail_all(message);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn commit_proposal_group_serial(
+        &self,
+        proposals: &[&CommitProposal],
+    ) -> Result<Vec<Result<CommitReceipt>>> {
+        self.owner
+            .with_savepoint("__multilite__commit_group", |connection| {
+                let mut accepted_writes = BTreeSet::new();
+                let mut prepared = Vec::new();
+                let mut slots = Vec::with_capacity(proposals.len());
+                let mut seen: BTreeMap<_, SeenGroupProposal> = BTreeMap::new();
+
+                for proposal in proposals {
+                    let encoded = match proposal.encode() {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            slots.push(GroupSlot::Complete(Err(error)));
+                            continue;
+                        }
+                    };
+                    if let Some(previous) = seen.get(&proposal.id()) {
+                        if previous.encoded != encoded {
+                            slots.push(GroupSlot::Complete(Err(Error::InvalidCommitProposal(
+                                "one proposal id names different commit payloads".into(),
+                            ))));
+                        } else {
+                            slots.push(match previous.receipt {
+                                Some(receipt) => GroupSlot::Complete(Ok(receipt)),
+                                None => GroupSlot::DuplicatePrepared,
+                            });
+                        }
+                        continue;
+                    }
+
+                    let outcome =
+                        self.owner
+                            .with_savepoint("__multilite__commit_member", |connection| {
+                                let outcome =
+                                    proposal::prepare(connection, proposal, &accepted_writes)?;
+                                if matches!(outcome, PrepareOutcome::Prepared(_)) {
+                                    let (mutations, assertions) = proposal.to_homebase()?;
+                                    let sequence = block_on(async {
+                                        let space =
+                                            self.client.space(self.database_id.space_id()).await?;
+                                        let submission = space
+                                            .submit_unchecked(mutations, assertions)
+                                            .await
+                                            .map_err(ClientError::from)?;
+                                        Ok::<_, Error>(submission.seq)
+                                    })?;
+                                    pending::insert(connection, sequence, proposal.transaction())?;
+                                }
+                                Ok(outcome)
+                            });
+
+                    match outcome {
+                        Ok(PrepareOutcome::Prepared(commit)) => {
+                            accepted_writes.extend(commit.writes().iter().cloned());
+                            seen.insert(
+                                proposal.id(),
+                                SeenGroupProposal {
+                                    encoded,
+                                    receipt: None,
+                                },
+                            );
+                            slots.push(GroupSlot::Prepared);
+                            prepared.push(commit);
+                        }
+                        Ok(PrepareOutcome::AlreadyCommitted(receipt)) => {
+                            seen.insert(
+                                proposal.id(),
+                                SeenGroupProposal {
+                                    encoded,
+                                    receipt: Some(receipt),
+                                },
+                            );
+                            slots.push(GroupSlot::Complete(Ok(receipt)));
+                        }
+                        Err(error) => slots.push(GroupSlot::Complete(Err(error))),
+                    }
+                }
+
+                let commit_seq = if prepared.is_empty() {
+                    None
+                } else {
+                    Some(proposal::finalize_group(connection, &prepared)?)
+                };
+                let results = slots
+                    .into_iter()
+                    .map(|slot| match slot {
+                        GroupSlot::Prepared => Ok(CommitReceipt {
+                            commit_seq: commit_seq.expect("prepared group has a commit sequence"),
+                            disposition: CommitDisposition::Applied,
+                        }),
+                        GroupSlot::DuplicatePrepared => Ok(CommitReceipt {
+                            commit_seq: commit_seq.expect("prepared group has a commit sequence"),
+                            disposition: CommitDisposition::AlreadyCommitted,
+                        }),
+                        GroupSlot::Complete(result) => result,
+                    })
+                    .collect();
+
                 let through = match self.history_pins.oldest() {
                     Some(oldest) => oldest,
                     None => history::current(connection)?,
                 };
                 history::prune(connection, through)?;
-                Ok(receipt)
+                Ok(results)
             })
     }
 
@@ -777,6 +917,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         policy: PolicyState::new(sync_policy),
         isolation_level,
         committer: Committer::new().map_err(committer_error)?,
+        commit_queue: CommitQueue::new(),
         history_pins: HistoryPins::default(),
         scheduler: PushScheduler::new(),
     })

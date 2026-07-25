@@ -62,6 +62,10 @@ struct Work<F, R> {
     reply: oneshot::Sender<std::result::Result<R, CommitterError>>,
 }
 
+struct DetachedWork<F> {
+    operation: Option<F>,
+}
+
 impl<F, R> ActorJob for Work<F, R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -72,6 +76,16 @@ where
         let result = catch_unwind(AssertUnwindSafe(operation))
             .map_err(|_| CommitterError::OperationPanicked);
         let _ = self.reply.send(result);
+    }
+}
+
+impl<F> ActorJob for DetachedWork<F>
+where
+    F: FnOnce() + Send + 'static,
+{
+    fn run(mut self: Box<Self>) {
+        let operation = self.operation.take().expect("detached work runs once");
+        let _ = catch_unwind(AssertUnwindSafe(operation));
     }
 }
 
@@ -126,6 +140,26 @@ impl Committer {
         R: Send + 'static,
     {
         pollster::block_on(self.call(operation))
+    }
+
+    /// Schedule owned work without coupling execution to a response future.
+    pub async fn dispatch<F>(&self, operation: F) -> std::result::Result<(), CommitterError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.outbox
+            .send(Command::Run(Box::new(DetachedWork {
+                operation: Some(operation),
+            })))
+            .await
+            .map_err(|_| CommitterError::Unavailable)
+    }
+
+    pub fn dispatch_blocking<F>(&self, operation: F) -> std::result::Result<(), CommitterError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        pollster::block_on(self.dispatch(operation))
     }
 
     /// Acquire the FIFO execution turn for work that borrows caller state.
@@ -333,5 +367,21 @@ mod tests {
             Err(CommitterError::OperationPanicked)
         );
         assert_eq!(actor.call_blocking(|| 9).unwrap(), 9);
+    }
+
+    #[test]
+    fn detached_jobs_run_in_order_and_panics_do_not_kill_the_actor() {
+        let actor = Committer::new().unwrap();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&completed);
+        actor
+            .dispatch_blocking(move || counted.store(1, Ordering::Release))
+            .unwrap();
+        actor
+            .dispatch_blocking(|| panic!("injected detached panic"))
+            .unwrap();
+
+        assert_eq!(actor.call_blocking(|| 9).unwrap(), 9);
+        assert_eq!(completed.load(Ordering::Acquire), 1);
     }
 }

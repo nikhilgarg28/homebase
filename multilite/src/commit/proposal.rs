@@ -8,7 +8,7 @@
     )
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use homebase_core::key::Key;
@@ -81,6 +81,25 @@ pub enum CommitDisposition {
 pub struct CommitReceipt {
     pub commit_seq: crate::commit::snapshot::CommitSeq,
     pub disposition: CommitDisposition,
+}
+
+/// One successfully replayed proposal awaiting its group's durable receipt.
+pub struct PreparedCommit {
+    id: ProposalId,
+    hash: [u8; 32],
+    writes: BTreeSet<Key>,
+}
+
+impl PreparedCommit {
+    pub fn writes(&self) -> &BTreeSet<Key> {
+        &self.writes
+    }
+}
+
+/// Result of checking one proposal inside a canonical commit group.
+pub enum PrepareOutcome {
+    Prepared(PreparedCommit),
+    AlreadyCommitted(CommitReceipt),
 }
 
 impl CommitProposal {
@@ -453,8 +472,30 @@ pub fn apply(connection: &Connection, proposal: &CommitProposal) -> Result<Commi
 }
 
 fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {
+    match prepare(connection, proposal, &BTreeSet::new())? {
+        PrepareOutcome::AlreadyCommitted(receipt) => Ok(receipt),
+        PrepareOutcome::Prepared(prepared) => {
+            let commit_seq = finalize_group(connection, std::slice::from_ref(&prepared))?;
+            Ok(CommitReceipt {
+                commit_seq,
+                disposition: CommitDisposition::Applied,
+            })
+        }
+    }
+}
+
+/// Validate and replay one proposal without advancing the group's commit sequence.
+///
+/// The caller must surround this operation with a proposal-local savepoint and
+/// call [`finalize_group`] in the same outer transaction for every prepared
+/// proposal it retains.
+pub fn prepare(
+    connection: &Connection,
+    proposal: &CommitProposal,
+    accepted_writes: &BTreeSet<Key>,
+) -> Result<PrepareOutcome> {
     if let Some(receipt) = committed_receipt(connection, proposal)? {
-        return Ok(receipt);
+        return Ok(PrepareOutcome::AlreadyCommitted(receipt));
     }
 
     let current = history::current(connection)?;
@@ -475,30 +516,61 @@ fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<Com
             )));
         }
     }
-
-    apply_canonical(connection, proposal)?;
+    if proposal
+        .footprint()
+        .conflicts_with_writes(proposal.isolation(), accepted_writes)
+    {
+        return Err(Error::CommitConflict(
+            "proposal conflicts with an earlier proposal in its commit group".into(),
+        ));
+    }
     let lowered = proposal.transaction().to_homebase()?;
-    let commit_seq = history::record(
-        connection,
-        history::writes_from_mutations(&lowered.mutations)?,
-    )?;
+    let writes = history::writes_from_mutations(&lowered.mutations)?;
     let encoded = proposal.encode()?;
     let hash = proposal_hash(&encoded);
-    connection.execute(
-        &format!(
-            "INSERT INTO {RECEIPT_TABLE} (proposal_id, commit_seq, proposal_hash)
-             VALUES (?1, ?2, ?3)"
-        ),
-        params![
-            proposal.id().to_bytes().as_slice(),
-            commit_seq.0.to_be_bytes().as_slice(),
-            hash.as_slice(),
-        ],
-    )?;
-    Ok(CommitReceipt {
-        commit_seq,
-        disposition: CommitDisposition::Applied,
-    })
+    apply_canonical(connection, proposal)?;
+    Ok(PrepareOutcome::Prepared(PreparedCommit {
+        id: proposal.id(),
+        hash,
+        writes,
+    }))
+}
+
+/// Publish one canonical visibility transition and all proposal receipts.
+pub fn finalize_group(
+    connection: &Connection,
+    prepared: &[PreparedCommit],
+) -> Result<crate::commit::snapshot::CommitSeq> {
+    if prepared.is_empty() {
+        return Err(Error::CaptureInvariant(
+            "cannot finalize an empty commit group",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut writes = BTreeSet::new();
+    for commit in prepared {
+        if !ids.insert(commit.id) {
+            return Err(Error::InvalidCommitProposal(
+                "commit group contains a duplicate proposal id".into(),
+            ));
+        }
+        writes.extend(commit.writes.iter().cloned());
+    }
+    let commit_seq = history::record(connection, writes)?;
+    for commit in prepared {
+        connection.execute(
+            &format!(
+                "INSERT INTO {RECEIPT_TABLE} (proposal_id, commit_seq, proposal_hash)
+                 VALUES (?1, ?2, ?3)"
+            ),
+            params![
+                commit.id.to_bytes().as_slice(),
+                commit_seq.0.to_be_bytes().as_slice(),
+                commit.hash.as_slice(),
+            ],
+        )?;
+    }
+    Ok(commit_seq)
 }
 
 fn apply_canonical(connection: &Connection, proposal: &CommitProposal) -> Result<()> {

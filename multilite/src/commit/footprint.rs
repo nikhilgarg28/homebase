@@ -15,9 +15,9 @@ use crate::database::isolation::IsolationLevel;
 /// reads become assertions only under serializable isolation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConflictFootprint {
-    writes: PrefixSet,
-    constraints: PrefixSet,
-    reads: PrefixSet,
+    writes: PrefixAntichain,
+    constraints: PrefixAntichain,
+    reads: PrefixAntichain,
 }
 
 /// Shared read-prefix sink for every statement in one managed update.
@@ -156,13 +156,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Sorted component-prefix antichain maintained as keys arrive.
+/// Minimal component-prefix antichain used to emit conflict assertions.
+///
+/// This deliberately differs from canonical commit history, which retains
+/// every exact point key written by a commit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PrefixSet {
+struct PrefixAntichain {
     keys: BTreeSet<Key>,
 }
 
-impl PrefixSet {
+impl PrefixAntichain {
     fn insert(&mut self, key: Key) {
         if self
             .keys
@@ -285,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn each_typed_prefix_set_is_pruned_as_contributions_arrive() {
+    fn each_typed_prefix_antichain_is_pruned_as_contributions_arrive() {
         let table = key(&[b"tables", b"one"]);
         let first = key(&[b"tables", b"one", b"rows", b"7"]);
         let second = key(&[b"tables", b"one", b"rows", b"9"]);
