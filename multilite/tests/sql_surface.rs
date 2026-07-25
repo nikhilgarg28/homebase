@@ -87,6 +87,122 @@ fn delete_uses_sqlite_predicates_and_zero_rows_are_a_noop() {
 }
 
 #[test]
+fn update_uses_sqlite_expressions_subqueries_and_complete_row_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("update.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT,
+                score REAL NOT NULL,
+                payload BLOB
+            )",
+            (),
+        )?;
+        transaction.execute("CREATE TABLE selected (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "INSERT INTO notes VALUES
+                (1, 'one', 1.5, x'01'),
+                (2, NULL, 2.5, NULL),
+                (3, 'three', 3.5, x'03')",
+            (),
+        )?;
+        transaction.execute("INSERT INTO selected VALUES (1), (2)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "UPDATE notes
+             SET body = coalesce(upper(body), ?1),
+                 score = score + ?2,
+                 payload = CASE id WHEN 1 THEN x'0a0b' ELSE x'' END
+             WHERE id IN (SELECT id FROM selected)",
+            ("EMPTY", 0.25_f64),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, body, score, payload FROM notes ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            (1, Some("ONE".into()), 1.75, Some(vec![10, 11])),
+            (2, Some("EMPTY".into()), 2.75, Some(Vec::new())),
+            (3, Some("three".into()), 3.5, Some(vec![3])),
+        ]
+    );
+
+    assert_eq!(
+        db.execute("UPDATE notes SET body = body WHERE id = 3", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute("UPDATE notes SET body = 'missing' WHERE id = 99", ())
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn stable_update_rejects_key_and_hidden_rowid_changes_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("update-identity.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE documents (
+                id TEXT NOT NULL PRIMARY KEY,
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'original')", ())?;
+        transaction.execute("INSERT INTO documents VALUES ('a', 'document')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(matches!(
+        db.execute("UPDATE notes SET id = 2, body = 'changed' WHERE id = 1", ()),
+        Err(Error::UnsupportedSql(
+            "UPDATE of PRIMARY KEY columns is not supported"
+        ))
+    ));
+    assert!(matches!(
+        db.execute("UPDATE documents SET rowid = rowid + 1 WHERE id = 'a'", ()),
+        Err(Error::UnsupportedSql(
+            "UPDATE of SQLite rowid is not supported"
+        ))
+    ));
+    assert_eq!(read_note(&db), "original");
+    assert_eq!(
+        db.query("SELECT id, body FROM documents", (), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [("a".into(), "document".into())]
+    );
+}
+
+#[test]
 fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rejected.sqlite");
@@ -97,7 +213,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
         .unwrap();
 
     for sql in [
-        "UPDATE notes SET body = 'updated' WHERE id = 1",
         "ALTER TABLE notes ADD COLUMN extra TEXT",
         "DROP TABLE notes",
         "CREATE INDEX notes_body ON notes(body)",
@@ -140,6 +255,37 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("update-shape.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'original')", ())
+        .unwrap();
+
+    for sql in [
+        "WITH old AS (SELECT 1) UPDATE notes SET body = 'x'",
+        "UPDATE OR REPLACE notes SET body = 'x'",
+        "UPDATE main.notes SET body = 'x'",
+        "UPDATE notes AS old SET body = 'x'",
+        "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
+        "UPDATE notes NOT INDEXED SET body = 'x'",
+        "UPDATE notes SET (id, body) = (2, 'x')",
+        "UPDATE notes SET body = source.body FROM notes AS source",
+        "UPDATE notes SET body = 'x' RETURNING id",
+        "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
+        "UPDATE __multilite__pending SET record = x''",
+        "UPDATE sqlite_schema SET sql = NULL",
+    ] {
+        assert!(
+            matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))),
+            "statement was accepted: {sql}"
+        );
+        assert_eq!(read_note(&db), "original");
+    }
 }
 
 #[test]
@@ -194,6 +340,28 @@ fn delete_from_an_adopted_table_rolls_back_without_a_schema_identity() {
 }
 
 #[test]
+fn update_of_an_adopted_table_rolls_back_without_a_schema_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adopted-update.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes VALUES (1, 'original')",
+        )
+        .unwrap();
+
+    let db = MultiliteConnection::open(&path).unwrap();
+    assert!(matches!(
+        db.execute("UPDATE notes SET body = 'changed' WHERE id = 1", ()),
+        Err(Error::UnsupportedSql(
+            "UPDATE target has no synchronized schema identity"
+        ))
+    ));
+    assert_eq!(read_note(&db), "original");
+}
+
+#[test]
 fn caught_adopted_table_write_errors_rollback_their_statement_savepoints() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("caught-adopted-write.sqlite");
@@ -222,6 +390,12 @@ fn caught_adopted_table_write_errors_rollback_their_statement_savepoints() {
             transaction.execute("INSERT INTO adopted VALUES (2, 'untracked')", ()),
             Err(Error::UnsupportedSql(
                 "INSERT target has no synchronized schema identity"
+            ))
+        ));
+        assert!(matches!(
+            transaction.execute("UPDATE adopted SET body = 'changed' WHERE id = 1", ()),
+            Err(Error::UnsupportedSql(
+                "UPDATE target has no synchronized schema identity"
             ))
         ));
         transaction.execute("INSERT INTO owned VALUES (1, 'tracked')", ())?;
@@ -292,6 +466,55 @@ fn trigger_generated_delete_effects_abort_the_whole_statement() {
             [1]
         );
     }
+}
+
+#[test]
+fn trigger_generated_update_effects_abort_the_whole_statement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("trigger-update.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'note')", ())?;
+        transaction.execute("INSERT INTO audit VALUES (1, 'audit')", ())?;
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER update_audit
+             AFTER UPDATE ON notes
+             BEGIN
+                 UPDATE audit SET body = new.body WHERE id = new.id;
+             END",
+        )
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    assert!(matches!(
+        db.execute("UPDATE notes SET body = 'changed' WHERE id = 1", ()),
+        Err(Error::CaptureInvariant(
+            "writes caused by triggers are not supported"
+        ))
+    ));
+    assert_eq!(read_note(&db), "note");
+    assert_eq!(
+        db.query("SELECT body FROM audit WHERE id = 1", (), |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        ["audit"]
+    );
 }
 
 #[test]

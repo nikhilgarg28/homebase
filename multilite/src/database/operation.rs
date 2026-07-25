@@ -8,7 +8,7 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
 use super::catalog;
-use super::row::{DeleteRows, InsertRows, RowHomebaseOp};
+use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
@@ -17,6 +17,7 @@ const OPERATION_FRAME_VERSION: u8 = 1;
 const CREATE_TABLE_OPERATION: u8 = 1;
 const INSERT_ROWS_OPERATION: u8 = 2;
 const DELETE_ROWS_OPERATION: u8 = 3;
+const UPDATE_ROWS_OPERATION: u8 = 4;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +25,7 @@ pub enum MultiliteOp {
     CreateTable(CreateTable),
     InsertRows(InsertRows),
     DeleteRows(DeleteRows),
+    UpdateRows(UpdateRows),
 }
 
 /// Homebase mutations and conflict footprint for one [`MultiliteOp`].
@@ -63,6 +65,10 @@ impl MultiliteOp {
                 writer.u8(DELETE_ROWS_OPERATION);
                 writer.bytes(&deleted.encode());
             }
+            Self::UpdateRows(updated) => {
+                writer.u8(UPDATE_ROWS_OPERATION);
+                writer.bytes(&updated.encode());
+            }
         }
         writer.finish()
     }
@@ -83,6 +89,9 @@ impl MultiliteOp {
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             DELETE_ROWS_OPERATION => DeleteRows::decode(reader.rest())
                 .map(Self::DeleteRows)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            UPDATE_ROWS_OPERATION => UpdateRows::decode(reader.rest())
+                .map(Self::UpdateRows)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             kind => Err(OperationCodecError::UnknownKind(kind)),
         }
@@ -113,6 +122,15 @@ impl MultiliteOp {
                     .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
                 (mutations, footprint)
             }
+            Self::UpdateRows(updated) => {
+                let RowHomebaseOp {
+                    mutations,
+                    footprint,
+                } = updated
+                    .to_homebase()
+                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                (mutations, footprint)
+            }
         };
         Ok(HomebaseOp {
             mutations,
@@ -129,6 +147,7 @@ impl MultiliteOp {
             }
             Self::InsertRows(inserted) => inserted.apply(connection),
             Self::DeleteRows(deleted) => deleted.apply(connection),
+            Self::UpdateRows(updated) => updated.apply(connection),
         }
     }
 }
@@ -161,7 +180,7 @@ mod tests {
 
     use super::*;
     use crate::database::catalog;
-    use crate::database::row::{CapturedRow, DeleteRows, StoredValue};
+    use crate::database::row::{CapturedRow, DeleteRows, StoredValue, UpdateRows};
     use crate::database::schema::{CreateColumn, DeclaredType, SqlName};
 
     fn table() -> CreateTableSpec {
@@ -234,6 +253,59 @@ mod tests {
         assert_eq!(MultiliteOp::decode(&deleted.encode()).unwrap(), deleted);
         let (mutations, footprint) = deleted.to_homebase().unwrap().into_parts();
         assert!(matches!(mutations.as_slice(), [Mutation::Delete { .. }]));
+        assert_eq!(footprint.writes().len(), 1);
+
+        let update_spec = CreateTableSpec {
+            name: SqlName::new("updates".into()),
+            columns: vec![
+                CreateColumn {
+                    name: SqlName::new("id".into()),
+                    declared_type: DeclaredType::Integer,
+                    not_null: false,
+                    primary_key: true,
+                },
+                CreateColumn {
+                    name: SqlName::new("body".into()),
+                    declared_type: DeclaredType::Text,
+                    not_null: false,
+                    primary_key: false,
+                },
+            ],
+        };
+        let update_table = CreateTable::new(
+            "CREATE TABLE updates (id INTEGER PRIMARY KEY, body TEXT)",
+            update_spec,
+        );
+        connection.execute(update_table.sql(), ()).unwrap();
+        catalog::insert(&connection, &update_table).unwrap();
+        let updated = MultiliteOp::UpdateRows(
+            UpdateRows::from_captured(
+                &connection,
+                &[(
+                    CapturedRow {
+                        table: "updates".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"before".to_vec()),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "updates".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"after".to_vec()),
+                        ],
+                    },
+                )],
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(MultiliteOp::decode(&updated.encode()).unwrap(), updated);
+        let (mutations, footprint) = updated.to_homebase().unwrap().into_parts();
+        assert!(matches!(mutations.as_slice(), [Mutation::Set { .. }]));
         assert_eq!(footprint.writes().len(), 1);
     }
 }

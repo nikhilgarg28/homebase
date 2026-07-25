@@ -233,6 +233,55 @@ fn serializable_delete_predicates_conflict_across_disjoint_rows() {
     assert_eq!(bookings(&second), expected);
 }
 
+#[test]
+fn serializable_update_predicates_conflict_across_disjoint_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("serializable-update-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+    assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("serializable-update-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+    synchronize_schema(&first, &second);
+    first
+        .execute("INSERT INTO bookings VALUES (1, 'mon'), (2, 'tue')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    for (database, id, day) in [(&first, 1_i64, "monday"), (&second, 2_i64, "tuesday")] {
+        database
+            .update_with(
+                UpdateOptions::new(IsolationLevel::Serializable),
+                |transaction| {
+                    transaction.execute("UPDATE bookings SET day = ?1 WHERE id = ?2", (day, id))?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let rejection = rejected(second.push().unwrap());
+    assert_range_assertion_failed(&rejection);
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    converge(&first, &second);
+
+    let expected = vec![(1, String::from("monday")), (2, String::from("tue"))];
+    assert_eq!(bookings(&first), expected);
+    assert_eq!(bookings(&second), expected);
+}
+
 fn synchronize_schema<H1, H2>(source: &MultiliteConnection<H1>, replica: &MultiliteConnection<H2>)
 where
     H1: ServerHandle + Send + Sync + 'static,

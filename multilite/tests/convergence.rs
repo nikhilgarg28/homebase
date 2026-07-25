@@ -200,6 +200,123 @@ fn disjoint_mixed_schema_and_row_transactions_converge_in_manifest_order() {
 }
 
 #[test]
+fn disjoint_updates_admit_and_same_row_updates_repair_then_converge() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let second_path = directory.path().join("update-second.sqlite");
+    let first = MultiliteConnection::open_with(
+        directory.path().join("update-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute(
+                "INSERT INTO notes VALUES
+                    (1, 'first'),
+                    (2, 'second'),
+                    (7, 'contended')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    assert_eq!(
+        first
+            .execute("UPDATE notes SET body = 'first-updated' WHERE id = 1", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second
+            .execute("UPDATE notes SET body = 'second-updated' WHERE id = 2", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(
+        rows(&first),
+        [
+            (1, "first-updated".into()),
+            (2, "second-updated".into()),
+            (7, "contended".into()),
+        ]
+    );
+    assert_eq!(rows(&first), rows(&second));
+
+    first
+        .execute("UPDATE notes SET body = 'winner' WHERE id = 7", ())
+        .unwrap();
+    second
+        .execute("UPDATE notes SET body = 'loser' WHERE id = 7", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("same-row UPDATE was not rejected")
+    };
+    drop(second);
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert_eq!(
+        second
+            .query("SELECT body FROM notes WHERE id = 7", (), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        ["loser"]
+    );
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query("SELECT body FROM notes WHERE id = 7", (), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        ["contended"]
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(rows(&first), rows(&second));
+    assert_eq!(
+        first
+            .query("SELECT body FROM notes WHERE id = 7", (), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        ["winner"]
+    );
+}
+
+#[test]
 fn disjoint_deletes_admit_and_same_row_deletes_repair_then_converge() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -320,6 +437,38 @@ fn queued_insert_then_delete_admit_in_same_device_order() {
 }
 
 #[test]
+fn queued_insert_then_update_admit_in_same_device_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let database = MultiliteConnection::open_with(
+        directory.path().join("local-insert-update.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(database.database_id().to_bytes())));
+    database
+        .execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+
+    database
+        .execute("INSERT INTO notes VALUES (1, 'before')", ())
+        .unwrap();
+    database
+        .execute("UPDATE notes SET body = 'after' WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(rows(&database), [(1, "after".into())]);
+
+    assert_eq!(database.push().unwrap(), PushOutcome::Drained);
+    database.pull().unwrap();
+    database.rebase().unwrap();
+    assert_eq!(rows(&database), [(1, "after".into())]);
+}
+
+#[test]
 fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -382,6 +531,67 @@ fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[test]
+fn rejected_text_primary_key_update_restores_values_and_hidden_rowid() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("text-update-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("text-update-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE documents (
+                    id TEXT NOT NULL PRIMARY KEY,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO documents VALUES ('a', 'original')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    let original = document(&second);
+
+    first
+        .execute("UPDATE documents SET body = 'winner' WHERE id = 'a'", ())
+        .unwrap();
+    second
+        .execute("UPDATE documents SET body = 'loser' WHERE id = 'a'", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("same text-key UPDATE was not rejected")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(document(&second), original);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        let updated = document(database);
+        assert_eq!(updated.0, original.0);
+        assert_eq!((updated.1.as_str(), updated.2.as_str()), ("a", "winner"));
     }
 }
 

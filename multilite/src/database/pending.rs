@@ -11,7 +11,7 @@ use rusqlite::{Connection, params};
 
 use super::catalog;
 use super::operation::MultiliteOp;
-use super::row::{DeleteRows, InsertRows};
+use super::row::{DeleteRows, InsertRows, UpdateRows};
 use super::schema::CreateTable;
 use super::transaction::MultiliteTransaction;
 use crate::commit::history::{self, WriteRegion};
@@ -29,6 +29,7 @@ const EFFECT_FRAME_VERSION: u8 = 2;
 const DROP_TABLE_EFFECT: u8 = 1;
 const DELETE_ROWS_EFFECT: u8 = 2;
 const RESTORE_ROWS_EFFECT: u8 = 3;
+const RESTORE_UPDATED_ROWS_EFFECT: u8 = 4;
 
 /// A local effect to run when a speculative transaction gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub enum Effect {
     DropTable { created: CreateTable },
     DeleteRows { inserted: InsertRows },
     RestoreRows { deleted: DeleteRows },
+    RestoreUpdatedRows { updated: UpdateRows },
 }
 
 /// One speculative Multilite transaction keyed by its Homebase sequence.
@@ -167,6 +169,10 @@ impl PendingCodec {
                 writer.u8(RESTORE_ROWS_EFFECT);
                 writer.bytes(&deleted.encode());
             }
+            Effect::RestoreUpdatedRows { updated } => {
+                writer.u8(RESTORE_UPDATED_ROWS_EFFECT);
+                writer.bytes(&updated.encode());
+            }
         }
         writer.finish()
     }
@@ -189,6 +195,9 @@ impl PendingCodec {
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             RESTORE_ROWS_EFFECT => DeleteRows::decode(reader.rest())
                 .map(|deleted| Effect::RestoreRows { deleted })
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
+            RESTORE_UPDATED_ROWS_EFFECT => UpdateRows::decode(reader.rest())
+                .map(|updated| Effect::RestoreUpdatedRows { updated })
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             kind => Err(PendingCodecError::UnknownEffect(kind)),
         }
@@ -412,6 +421,12 @@ fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) 
                 deleted: deleted.clone(),
             }],
         ),
+        MultiliteOp::UpdateRows(updated) => (
+            Vec::new(),
+            vec![Effect::RestoreUpdatedRows {
+                updated: updated.clone(),
+            }],
+        ),
     }
 }
 
@@ -432,6 +447,7 @@ fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
             }
             Effect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
             Effect::RestoreRows { deleted } => deleted.restore_materialized(connection)?,
+            Effect::RestoreUpdatedRows { updated } => updated.restore_materialized(connection)?,
         }
     }
     Ok(())
@@ -581,6 +597,58 @@ mod tests {
         MultiliteOp::DeleteRows(DeleteRows::decode(&inserted.encode()).unwrap())
     }
 
+    fn update_operation() -> MultiliteOp {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let created = CreateTable::new(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            CreateTableSpec {
+                name: SqlName::new("notes".into()),
+                columns: vec![
+                    CreateColumn {
+                        name: SqlName::new("id".into()),
+                        declared_type: DeclaredType::Integer,
+                        not_null: false,
+                        primary_key: true,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("body".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                ],
+            },
+        );
+        connection.execute(created.sql(), ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        MultiliteOp::UpdateRows(
+            UpdateRows::from_captured(
+                &connection,
+                &[(
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"before".to_vec()),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"after".to_vec()),
+                        ],
+                    },
+                )],
+            )
+            .unwrap()
+            .unwrap(),
+        )
+    }
+
     fn transaction(operation: MultiliteOp) -> MultiliteTransaction {
         MultiliteTransaction::new(vec![operation]).unwrap()
     }
@@ -670,6 +738,32 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection).unwrap();
         insert(&connection, DeviceSeq(12), &transaction).unwrap();
+        assert_eq!(load(&connection).unwrap(), [pending]);
+    }
+
+    #[test]
+    fn codec_and_journal_roundtrip_update_rows_and_its_restore_effect() {
+        let operation = update_operation();
+        let transaction = transaction(operation.clone());
+        let pending = PendingTransaction::new(DeviceSeq(13), transaction.clone());
+        let MultiliteOp::UpdateRows(updated) = &operation else {
+            unreachable!()
+        };
+        assert_eq!(pending.on_accept, Vec::new());
+        assert_eq!(
+            pending.on_reject,
+            vec![Effect::RestoreUpdatedRows {
+                updated: updated.clone(),
+            }]
+        );
+        assert_eq!(
+            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            pending
+        );
+
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        insert(&connection, DeviceSeq(13), &transaction).unwrap();
         assert_eq!(load(&connection).unwrap(), [pending]);
     }
 

@@ -47,6 +47,10 @@ pub struct CapturedRow {
 pub enum CapturedChange {
     Insert(CapturedRow),
     Delete(CapturedRow),
+    Update {
+        before: CapturedRow,
+        after: CapturedRow,
+    },
 }
 
 impl StoredValue {
@@ -133,6 +137,13 @@ pub struct InsertRows {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteRows {
     deleted: InsertRows,
+}
+
+/// One logical multi-row UPDATE carrying complete before and after row images.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateRows {
+    before: InsertRows,
+    after: InsertRows,
 }
 
 /// Homebase mutations and conflict footprint for one row operation.
@@ -633,6 +644,168 @@ impl DeleteRows {
     }
 }
 
+impl UpdateRows {
+    pub fn from_captured(
+        connection: &Connection,
+        captured: &[(CapturedRow, CapturedRow)],
+    ) -> Result<Option<Self>> {
+        let changed = captured
+            .iter()
+            .filter(|(before, after)| before != after)
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        if changed
+            .iter()
+            .any(|(before, after)| before.table != after.table)
+        {
+            return Err(Error::CaptureInvariant(
+                "one UPDATE changed rows from different tables",
+            ));
+        }
+
+        let before_rows = changed
+            .iter()
+            .map(|(before, _)| (*before).clone())
+            .collect::<Vec<_>>();
+        let after_rows = changed
+            .iter()
+            .map(|(_, after)| (*after).clone())
+            .collect::<Vec<_>>();
+        let Some(before) = InsertRows::from_captured(connection, &before_rows)? else {
+            return Ok(None);
+        };
+        let after = InsertRows::from_captured(connection, &after_rows)?.ok_or(
+            Error::CaptureInvariant("UPDATE before and after rows resolved differently"),
+        )?;
+        let updated = Self { before, after };
+        if let Err(error) = updated.validate_structure() {
+            return Err(match error {
+                RowCodecError::PrimaryKeyChanged => {
+                    Error::UnsupportedSql("UPDATE of PRIMARY KEY columns is not supported")
+                }
+                RowCodecError::RowidChanged => {
+                    Error::UnsupportedSql("UPDATE of SQLite rowid is not supported")
+                }
+                error => Error::InvalidMultiliteOp(error.to_string()),
+            });
+        }
+        Ok(Some(updated))
+    }
+
+    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        self.validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let mut mutations = Vec::with_capacity(self.after.rows.len());
+        let mut footprint = ConflictFootprint::new();
+        for row in &self.after.rows {
+            let key = self
+                .after
+                .row_key(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+            footprint.add_write(key.clone());
+            mutations.push(Mutation::Set {
+                key,
+                value: self.after.encode_row(row),
+            });
+        }
+        footprint.add_constraint(active_row_keyspace_key(self.after.table));
+        footprint.add_constraint(write_revision_key(self.after.table));
+        Ok(RowHomebaseOp {
+            mutations,
+            footprint,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        const VERSION: u8 = 1;
+        const TAG_BEFORE: u8 = 1;
+        const TAG_AFTER: u8 = 2;
+
+        let mut writer = Writer::new();
+        writer.u8(VERSION);
+        put_field(&mut writer, TAG_BEFORE, &self.before.encode());
+        put_field(&mut writer, TAG_AFTER, &self.after.encode());
+        writer.finish()
+    }
+
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        const VERSION: u8 = 1;
+        const TAG_BEFORE: u8 = 1;
+        const TAG_AFTER: u8 = 2;
+
+        let mut reader = Reader::new(frame);
+        if reader.u8() != Some(VERSION) {
+            return Err(RowCodecError::UnknownVersion);
+        }
+        let mut before = None;
+        let mut after = None;
+        while let Some((tag, value)) = next_field(&mut reader)? {
+            match tag {
+                TAG_BEFORE => set_once(&mut before, InsertRows::decode(value)?)?,
+                TAG_AFTER => set_once(&mut after, InsertRows::decode(value)?)?,
+                _ => {}
+            }
+        }
+        let updated = Self {
+            before: before.ok_or(RowCodecError::MissingField(TAG_BEFORE))?,
+            after: after.ok_or(RowCodecError::MissingField(TAG_AFTER))?,
+        };
+        updated.validate_structure()?;
+        Ok(updated)
+    }
+
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        self.validate_against_catalog(connection)?;
+        self.before
+            .delete_materialized_with(connection, "UPDATE row no longer matches SQLite state")?;
+        self.after.apply(connection)
+    }
+
+    pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
+        self.validate_against_catalog(connection)?;
+        self.after.delete_materialized_with(
+            connection,
+            "pending UPDATE row no longer matches SQLite state",
+        )?;
+        self.before.apply(connection)
+    }
+
+    fn validate_against_catalog(&self, connection: &Connection) -> Result<()> {
+        let before = self.before.catalog_definition(connection)?;
+        let after = self.after.catalog_definition(connection)?;
+        if before != after {
+            return Err(Error::InvalidMultiliteOp(
+                "UPDATE before and after rows use different schemas".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
+        self.before.validate_structure()?;
+        self.after.validate_structure()?;
+        if self.before.table != self.after.table
+            || self.before.schema_revision != self.after.schema_revision
+            || self.before.row_keyspace != self.after.row_keyspace
+            || self.before.key_parts != self.after.key_parts
+            || self.before.rows.len() != self.after.rows.len()
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
+        for (before, after) in self.before.rows.iter().zip(&self.after.rows) {
+            if self.before.row_key(before)? != self.after.row_key(after)? {
+                return Err(RowCodecError::PrimaryKeyChanged);
+            }
+            if before.rowid != after.rowid {
+                return Err(RowCodecError::RowidChanged);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Prefix covering every row encoded under a table's active row keyspace.
 #[cfg(test)]
 pub fn row_keyspace_prefix(created: &CreateTable) -> Key {
@@ -863,7 +1036,7 @@ pub(super) fn normalize_insert_rowids(
 ) -> Result<()> {
     let Some(first) = captured.first().map(|change| match change {
         CapturedChange::Insert(row) => Ok(row),
-        CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
+        CapturedChange::Delete(_) | CapturedChange::Update { .. } => Err(Error::CaptureInvariant(
             "INSERT captured a deleted application row",
         )),
     }) else {
@@ -872,7 +1045,7 @@ pub(super) fn normalize_insert_rowids(
     let first = first?;
     if captured.iter().any(|change| match change {
         CapturedChange::Insert(row) => row.table != first.table,
-        CapturedChange::Delete(_) => true,
+        CapturedChange::Delete(_) | CapturedChange::Update { .. } => true,
     }) {
         return Err(Error::CaptureInvariant(
             "INSERT captured an unexpected row change",
@@ -987,6 +1160,8 @@ pub enum RowCodecError {
     InvalidValue,
     InvalidRow,
     DuplicateRow,
+    PrimaryKeyChanged,
+    RowidChanged,
     NullPrimaryKey,
     InvalidKey(KeyError),
     InvalidBatch,
@@ -1004,6 +1179,10 @@ impl fmt::Display for RowCodecError {
             Self::InvalidValue => f.write_str("invalid stored SQLite value"),
             Self::InvalidRow => f.write_str("invalid row frame"),
             Self::DuplicateRow => f.write_str("row operation contains a duplicate logical row"),
+            Self::PrimaryKeyChanged => {
+                f.write_str("UPDATE of PRIMARY KEY columns is not supported")
+            }
+            Self::RowidChanged => f.write_str("UPDATE of SQLite rowid is not supported"),
             Self::NullPrimaryKey => f.write_str("primary key value is NULL"),
             Self::InvalidKey(error) => write!(f, "invalid Homebase row key: {error}"),
             Self::InvalidBatch => f.write_str("admitted row operation has an invalid envelope"),
@@ -1194,6 +1373,269 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
             [(7, Some("hello".into()), vec![0, 1]), (9, None, Vec::new()),]
+        );
+    }
+
+    #[test]
+    fn stable_update_codec_replaces_rows_and_restores_before_images() {
+        let created = definition();
+        let connection = connection(&created);
+        let updated = UpdateRows::from_captured(
+            &connection,
+            &[
+                (
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"before".to_vec()),
+                            StoredValue::Blob(vec![0]),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"after".to_vec()),
+                            StoredValue::Blob(vec![1, 2]),
+                        ],
+                    },
+                ),
+                (
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 9,
+                        values: vec![
+                            StoredValue::Integer(9),
+                            StoredValue::Null,
+                            StoredValue::Blob(Vec::new()),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 9,
+                        values: vec![
+                            StoredValue::Integer(9),
+                            StoredValue::Text(b"filled".to_vec()),
+                            StoredValue::Blob(vec![3]),
+                        ],
+                    },
+                ),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(UpdateRows::decode(&updated.encode()).unwrap(), updated);
+        let lowered = updated.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 2);
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .all(|mutation| matches!(mutation, Mutation::Set { .. }))
+        );
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 2);
+
+        updated.before.apply(&connection).unwrap();
+        updated.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .prepare("SELECT id, body, payload FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [
+                (7, Some("after".into()), vec![1, 2]),
+                (9, Some("filled".into()), vec![3]),
+            ]
+        );
+
+        updated.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .prepare("SELECT id, body, payload FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [(7, Some("before".into()), vec![0]), (9, None, Vec::new()),]
+        );
+    }
+
+    #[test]
+    fn stable_update_rejects_primary_key_and_hidden_rowid_changes() {
+        let created = definition();
+        let notes_connection = connection(&created);
+        assert!(matches!(
+            UpdateRows::from_captured(
+                &notes_connection,
+                &[(
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 1,
+                        values: vec![
+                            StoredValue::Integer(1),
+                            StoredValue::Null,
+                            StoredValue::Blob(Vec::new()),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 2,
+                        values: vec![
+                            StoredValue::Integer(2),
+                            StoredValue::Null,
+                            StoredValue::Blob(Vec::new()),
+                        ],
+                    },
+                )],
+            ),
+            Err(Error::UnsupportedSql(
+                "UPDATE of PRIMARY KEY columns is not supported"
+            ))
+        ));
+
+        let documents = CreateTable::new(
+            "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
+            CreateTableSpec {
+                name: SqlName::new("documents".into()),
+                columns: vec![
+                    CreateColumn {
+                        name: SqlName::new("id".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: true,
+                        primary_key: true,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("body".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                ],
+            },
+        );
+        let documents_connection = connection(&documents);
+        assert!(matches!(
+            UpdateRows::from_captured(
+                &documents_connection,
+                &[(
+                    CapturedRow {
+                        table: "documents".into(),
+                        rowid: 11,
+                        values: vec![
+                            StoredValue::Text(b"a".to_vec()),
+                            StoredValue::Text(b"before".to_vec()),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "documents".into(),
+                        rowid: 12,
+                        values: vec![
+                            StoredValue::Text(b"a".to_vec()),
+                            StoredValue::Text(b"after".to_vec()),
+                        ],
+                    },
+                )],
+            ),
+            Err(Error::UnsupportedSql(
+                "UPDATE of SQLite rowid is not supported"
+            ))
+        ));
+    }
+
+    #[test]
+    fn update_validates_every_before_image_before_changing_any_row() {
+        let created = definition();
+        let connection = connection(&created);
+        let updated = UpdateRows::from_captured(
+            &connection,
+            &[
+                (
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"before-7".to_vec()),
+                            StoredValue::Blob(vec![7]),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 7,
+                        values: vec![
+                            StoredValue::Integer(7),
+                            StoredValue::Text(b"after-7".to_vec()),
+                            StoredValue::Blob(vec![70]),
+                        ],
+                    },
+                ),
+                (
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 9,
+                        values: vec![
+                            StoredValue::Integer(9),
+                            StoredValue::Text(b"before-9".to_vec()),
+                            StoredValue::Blob(vec![9]),
+                        ],
+                    },
+                    CapturedRow {
+                        table: "notes".into(),
+                        rowid: 9,
+                        values: vec![
+                            StoredValue::Integer(9),
+                            StoredValue::Text(b"after-9".to_vec()),
+                            StoredValue::Blob(vec![90]),
+                        ],
+                    },
+                ),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        updated.before.apply(&connection).unwrap();
+        connection
+            .execute("UPDATE notes SET body = 'diverged' WHERE id = 9", ())
+            .unwrap();
+
+        assert!(matches!(
+            updated.apply(&connection),
+            Err(Error::InvalidDatabase(
+                "UPDATE row no longer matches SQLite state"
+            ))
+        ));
+        assert_eq!(
+            connection
+                .prepare("SELECT id, body FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [(7, "before-7".into()), (9, "diverged".into())]
         );
     }
 

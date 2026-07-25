@@ -15,6 +15,7 @@ pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
     Insert,
     Delete,
+    Update,
 }
 
 /// Validate the initial transaction-read grammar and rewrite its sources.
@@ -213,8 +214,64 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
             }
             Ok(ValidatedExecute::Delete)
         }
+        Stmt::Update {
+            with,
+            or_conflict,
+            tbl_name,
+            indexed,
+            sets,
+            from,
+            returning,
+            order_by,
+            limit,
+            ..
+        } => {
+            if with.is_some() {
+                return Err(Error::UnsupportedSql("UPDATE WITH is not supported"));
+            }
+            if or_conflict.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "UPDATE conflict clauses are not supported",
+                ));
+            }
+            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified and aliased UPDATE targets are not supported",
+                ));
+            }
+            let table = identifier(&tbl_name.name)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            if indexed.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "UPDATE index selection is not supported",
+                ));
+            }
+            if sets.iter().any(|set| set.col_names.len() != 1) {
+                return Err(Error::UnsupportedSql(
+                    "UPDATE tuple assignments are not supported",
+                ));
+            }
+            if from.is_some() {
+                return Err(Error::UnsupportedSql("UPDATE FROM is not supported"));
+            }
+            if returning.is_some() {
+                return Err(Error::UnsupportedSql("UPDATE RETURNING is not supported"));
+            }
+            if order_by.is_some() || limit.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "UPDATE ORDER BY and LIMIT are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::Update)
+        }
         _ => Err(Error::UnsupportedSql(
-            "execute accepts only CREATE TABLE, INSERT, and DELETE",
+            "execute accepts only CREATE TABLE, INSERT, DELETE, and UPDATE",
         )),
     }
 }
@@ -436,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_restricted_create_insert_and_delete_forms() {
+    fn accepts_restricted_create_insert_delete_and_update_forms() {
         for sql in [
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
             "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
@@ -446,6 +503,8 @@ mod tests {
             "DELETE FROM notes",
             "DELETE FROM notes WHERE id = ?1",
             "DELETE FROM notes WHERE id IN (SELECT id FROM archived)",
+            "UPDATE notes SET body = upper(body) WHERE id = ?1",
+            "UPDATE notes SET body = (SELECT body FROM archived WHERE archived.id = notes.id)",
         ] {
             validate_execute(sql).unwrap();
         }
@@ -514,11 +573,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_update_extensions_outside_the_initial_slice() {
+        for sql in [
+            "WITH old AS (SELECT 1) UPDATE notes SET body = 'x'",
+            "UPDATE OR REPLACE notes SET body = 'x'",
+            "UPDATE main.notes SET body = 'x'",
+            "UPDATE notes AS old SET body = 'x'",
+            "UPDATE notes INDEXED BY notes_id SET body = 'x'",
+            "UPDATE notes NOT INDEXED SET body = 'x'",
+            "UPDATE notes SET (body, payload) = ('x', x'00')",
+            "UPDATE notes SET body = archived.body FROM archived WHERE archived.id = notes.id",
+            "UPDATE notes SET body = 'x' RETURNING id",
+            "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
+            "UPDATE __multilite__pending SET record = x''",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
     fn rejects_every_other_statement_shape() {
         for sql in [
             "",
             "SELECT 1",
-            "UPDATE notes SET id = 2",
+            "ALTER TABLE notes ADD COLUMN body TEXT",
             "BEGIN",
             "EXPLAIN SELECT 1",
             "INSERT INTO notes VALUES (1) RETURNING id",

@@ -80,6 +80,16 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
             .unwrap();
         assert_eq!(
             database
+                .execute_async(
+                    "UPDATE notes SET body = upper(body) WHERE id = ?1",
+                    [Value::Integer(1)],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
                 .execute_async("DELETE FROM notes WHERE id = ?1", [Value::Integer(2)])
                 .await
                 .unwrap(),
@@ -95,6 +105,15 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
                 .await
                 .unwrap(),
             ["three"]
+        );
+        assert_eq!(
+            database
+                .query_async("SELECT body FROM notes WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .await
+                .unwrap(),
+            ["ONE"]
         );
     });
 }

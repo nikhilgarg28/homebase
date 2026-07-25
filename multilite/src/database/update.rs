@@ -10,7 +10,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
 use super::operation::MultiliteOp;
-use super::row::{CapturedChange, DeleteRows, InsertRows};
+use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
 use super::schema::table_prefix;
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
@@ -122,9 +122,11 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                             .into_iter()
                             .map(|event| match event {
                                 CapturedChange::Insert(row) => Ok(row),
-                                CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
-                                    "INSERT captured a deleted application row",
-                                )),
+                                CapturedChange::Delete(_) | CapturedChange::Update { .. } => {
+                                    Err(Error::CaptureInvariant(
+                                        "INSERT captured a non-insert application row",
+                                    ))
+                                }
                             })
                             .collect::<Result<Vec<_>>>()?;
                         inserted = InsertRows::from_captured(self.connection, &captured)?;
@@ -151,9 +153,11 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                             .into_iter()
                             .map(|event| match event {
                                 CapturedChange::Delete(row) => Ok(row),
-                                CapturedChange::Insert(_) => Err(Error::CaptureInvariant(
-                                    "DELETE captured an inserted application row",
-                                )),
+                                CapturedChange::Insert(_) | CapturedChange::Update { .. } => {
+                                    Err(Error::CaptureInvariant(
+                                        "DELETE captured a non-delete application row",
+                                    ))
+                                }
                             })
                             .collect::<Result<Vec<_>>>()?;
                         deleted = DeleteRows::from_captured(self.connection, &captured)?;
@@ -167,6 +171,41 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 )?;
                 if let Some(deleted) = deleted {
                     self.operations.push(MultiliteOp::DeleteRows(deleted));
+                }
+                Ok(changed)
+            }
+            ValidatedExecute::Update => {
+                let mut updated = None;
+                let (changed, _) = self.hooks.run(
+                    || Ok(self.connection.execute(sql, params)?),
+                    |events| {
+                        let had_events = !events.is_empty();
+                        let captured = std::mem::take(events)
+                            .into_iter()
+                            .map(|event| match event {
+                                CapturedChange::Update { before, after } => Ok((before, after)),
+                                CapturedChange::Insert(_) | CapturedChange::Delete(_) => {
+                                    Err(Error::CaptureInvariant(
+                                        "UPDATE captured a non-update application row",
+                                    ))
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        updated = UpdateRows::from_captured(self.connection, &captured)?;
+                        if updated.is_none()
+                            && had_events
+                            && let Some((before, _)) = captured.first()
+                            && catalog::by_name(self.connection, &before.table)?.is_none()
+                        {
+                            return Err(Error::UnsupportedSql(
+                                "UPDATE target has no synchronized schema identity",
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(updated) = updated {
+                    self.operations.push(MultiliteOp::UpdateRows(updated));
                 }
                 Ok(changed)
             }

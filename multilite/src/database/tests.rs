@@ -647,6 +647,85 @@ fn remote_delete_rejection_restores_the_complete_row_before_returning() {
 }
 
 #[test]
+fn remote_update_rejection_restores_the_before_image_before_returning() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = Database::open_with(
+        directory.path().join("update-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(first.database_id().space_id()));
+    let first_runtime = first.runtime().unwrap();
+    first
+        .update(&first_runtime, |update| {
+            update.execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT NOT NULL,
+                    payload BLOB
+                )",
+                (),
+            )?;
+            update.execute("INSERT INTO notes VALUES (1, 'original', x'0102')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+    let second = Database::open_with(
+        directory.path().join("update-loser.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .sync_policy(SyncPolicy::Remote)
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let second_runtime = second.runtime().unwrap();
+    let error = second
+        .update(&second_runtime, |update| {
+            assert_eq!(
+                update.execute(
+                    "UPDATE notes SET body = 'loser', payload = x'99' WHERE id = 1",
+                    (),
+                )?,
+                1
+            );
+            assert_eq!(
+                first.execute(
+                    &first_runtime,
+                    "UPDATE notes SET body = 'winner' WHERE id = 1",
+                    (),
+                )?,
+                1
+            );
+            assert_eq!(first.push()?, PushOutcome::Drained);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::AuthorityRejected(KernelError::RangeAssertFailed { .. })
+    ));
+    assert!(pending_ops(&second).is_empty());
+    second.with_connection(|connection| {
+        assert_eq!(
+            connection
+                .query_row("SELECT id, body, payload FROM notes", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap(),
+            (1, "original".into(), vec![1, 2])
+        );
+    });
+}
+
+#[test]
 fn remote_writes_wait_for_their_own_submission_disposition() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -2532,14 +2611,20 @@ fn database_owns_the_public_sql_surface_independent_of_format_hooks() {
         .unwrap();
     assert_eq!(
         database
+            .execute(
+                &runtime,
+                "UPDATE accepted SET value = 'two' WHERE id = 1",
+                (),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        database
             .execute(&runtime, "DELETE FROM accepted WHERE id = 1", ())
             .unwrap(),
         1
     );
-    assert!(matches!(
-        database.execute(&runtime, "UPDATE accepted SET value = 'two'", ()),
-        Err(Error::UnsupportedSql(_))
-    ));
 }
 
 #[test]

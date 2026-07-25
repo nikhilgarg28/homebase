@@ -312,49 +312,95 @@ fn capture_change(
     {
         return Ok(None);
     }
-    let (depth, rowid, column_count) = match update {
-        PreUpdateCase::Insert(values) => (
-            values.get_query_depth(),
-            values.get_new_row_id(),
-            values.get_column_count(),
-        ),
-        PreUpdateCase::Delete(values) => (
-            values.get_query_depth(),
-            values.get_old_row_id(),
-            values.get_column_count(),
-        ),
-        PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => {
+    let event = match update {
+        PreUpdateCase::Insert(values) => {
+            if values.get_query_depth() != 0 {
+                return Err(Error::CaptureInvariant(
+                    "writes caused by triggers are not supported",
+                ));
+            }
+            let captured = (0..values.get_column_count())
+                .map(|index| {
+                    values
+                        .get_new_column_value(index)
+                        .map(StoredValue::capture)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            CapturedChange::Insert(CapturedRow {
+                table: table.to_owned(),
+                rowid: values.get_new_row_id(),
+                values: captured,
+            })
+        }
+        PreUpdateCase::Delete(values) => {
+            if values.get_query_depth() != 0 {
+                return Err(Error::CaptureInvariant(
+                    "writes caused by triggers are not supported",
+                ));
+            }
+            let captured = (0..values.get_column_count())
+                .map(|index| {
+                    values
+                        .get_old_column_value(index)
+                        .map(StoredValue::capture)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            CapturedChange::Delete(CapturedRow {
+                table: table.to_owned(),
+                rowid: values.get_old_row_id(),
+                values: captured,
+            })
+        }
+        PreUpdateCase::Update {
+            old_value_accessor: old,
+            new_value_accessor: new,
+        } => {
+            if old.get_query_depth() != 0 || new.get_query_depth() != 0 {
+                return Err(Error::CaptureInvariant(
+                    "writes caused by triggers are not supported",
+                ));
+            }
+            if old.get_column_count() != new.get_column_count() {
+                return Err(Error::CaptureInvariant(
+                    "UPDATE before and after row widths differ",
+                ));
+            }
+            let before = (0..old.get_column_count())
+                .map(|index| {
+                    old.get_old_column_value(index)
+                        .map(StoredValue::capture)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let after = (0..new.get_column_count())
+                .map(|index| {
+                    new.get_new_column_value(index)
+                        .map(StoredValue::capture)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            CapturedChange::Update {
+                before: CapturedRow {
+                    table: table.to_owned(),
+                    rowid: old.get_old_row_id(),
+                    values: before,
+                },
+                after: CapturedRow {
+                    table: table.to_owned(),
+                    rowid: new.get_new_row_id(),
+                    values: after,
+                },
+            }
+        }
+        PreUpdateCase::Unknown => {
             return Err(Error::CaptureInvariant(
-                "public table mutation was not an insert or delete",
+                "public table mutation kind is unknown",
             ));
         }
     };
-    if depth != 0 {
-        return Err(Error::CaptureInvariant(
-            "writes caused by triggers are not supported",
-        ));
-    }
-    let values = (0..column_count)
-        .map(|index| {
-            match update {
-                PreUpdateCase::Insert(values) => values.get_new_column_value(index),
-                PreUpdateCase::Delete(values) => values.get_old_column_value(index),
-                PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => unreachable!(),
-            }
-            .map(StoredValue::capture)
-            .map_err(Error::from)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let row = CapturedRow {
-        table: table.to_owned(),
-        rowid,
-        values,
-    };
-    Ok(Some(match update {
-        PreUpdateCase::Insert(_) => CapturedChange::Insert(row),
-        PreUpdateCase::Delete(_) => CapturedChange::Delete(row),
-        PreUpdateCase::Update { .. } | PreUpdateCase::Unknown => unreachable!(),
-    }))
+    Ok(Some(event))
 }
 
 /// An opened general Multilite database.
@@ -816,6 +862,9 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
             authorize_user_table(context.database_name, table_name)
         }
         AuthAction::Delete { table_name } => {
+            authorize_user_table(context.database_name, table_name)
+        }
+        AuthAction::Update { table_name, .. } => {
             authorize_user_table(context.database_name, table_name)
         }
         _ => Authorization::Deny,
