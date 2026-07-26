@@ -13,14 +13,15 @@ use rusqlite::vtab::{
 };
 
 use super::catalog;
-use super::row::{StoredValue, primary_key_prefix, row_keyspace_prefix};
+use super::row::{
+    StoredValue, primary_key_equality_prefix, primary_key_prefix, row_keyspace_prefix,
+};
 use super::schema::{CreateTable, SchemaRevisionId, StrictType, TableId, TableMode};
 use crate::commit::footprint::ReadTrace;
 use crate::{Error, Result};
 
 const MODULE_PREFIX: &str = "__multilite__vtab_";
 const FULL_SCAN: c_int = 0;
-const PRIMARY_KEY_EQUALITY: c_int = 1;
 
 /// Lazy vtable registrations owned by one physical SQLite connection.
 #[derive(Default)]
@@ -149,26 +150,27 @@ fn module_name(table: TableId, revision: SchemaRevisionId) -> String {
 struct Module {
     name: String,
     definition: CreateTable,
-    primary_column: c_int,
+    primary_columns: Vec<c_int>,
     source: Arc<Mutex<Option<Arc<EagerSource>>>>,
 }
 
 impl Module {
     fn new(name: String, definition: CreateTable) -> Self {
-        let primary = definition
+        let primary_columns = definition
             .primary_key_columns()
-            .next()
-            .expect("validated tables have one primary key")
-            .id();
-        let primary_column = definition
-            .columns()
-            .iter()
-            .position(|column| column.id() == primary)
-            .expect("primary key belongs to its table") as c_int;
+            .map(|primary| {
+                let index = definition
+                    .columns()
+                    .iter()
+                    .position(|column| column.id() == primary.id())
+                    .expect("primary key belongs to its table");
+                c_int::try_from(index).expect("SQLite column index fits in c_int")
+            })
+            .collect();
         Self {
             name,
             definition,
-            primary_column,
+            primary_columns,
             source: Arc::new(Mutex::new(None)),
         }
     }
@@ -265,12 +267,19 @@ impl EagerSource {
         self.rows.len() as i64
     }
 
-    fn trace_filter(&self, value: Option<ValueRef<'_>>) {
+    fn trace_filter(&self, values: &[ValueRef<'_>]) {
         let full = row_keyspace_prefix(&self.definition);
-        let prefix = value
+        let values = values
+            .iter()
+            .copied()
             .map(StoredValue::capture)
-            .and_then(|value| primary_key_prefix(&self.definition, &[value]).ok())
-            .unwrap_or(full);
+            .collect::<Vec<_>>();
+        let prefix = if values.is_empty() {
+            None
+        } else {
+            primary_key_equality_prefix(&self.definition, &values).ok()
+        }
+        .unwrap_or(full);
         self.trace.record(prefix);
     }
 }
@@ -305,28 +314,44 @@ unsafe impl<'vtab> VTab<'vtab> for MultiliteVTab {
     fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
         // Later index SQL slices add catalog-backed keyspace candidates here;
         // SQLite's materialized index list is not durable replication meaning.
-        let mut point_read = false;
-        for (constraint, mut usage) in info.constraints_and_usages() {
-            if constraint.is_usable()
-                && constraint.column() == self.module.primary_column
-                && constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ
-            {
-                usage.set_argv_index(1);
-                point_read = true;
+        let constraints = info
+            .constraints()
+            .enumerate()
+            .map(|(index, constraint)| {
+                (
+                    index,
+                    constraint.column(),
+                    constraint.operator(),
+                    constraint.is_usable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut leading_equalities = Vec::new();
+        for primary in &self.module.primary_columns {
+            let Some((index, ..)) = constraints.iter().find(|(_, column, operator, usable)| {
+                *usable
+                    && column == primary
+                    && *operator == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ
+            }) else {
                 break;
-            }
+            };
+            leading_equalities.push(*index);
         }
-        info.set_idx_num(if point_read {
-            PRIMARY_KEY_EQUALITY
-        } else {
-            FULL_SCAN
-        });
+        for (argument, constraint) in leading_equalities.iter().enumerate() {
+            info.constraint_usage(*constraint)
+                .set_argv_index(c_int::try_from(argument + 1).expect("key part count fits c_int"));
+        }
+        let equality_count =
+            c_int::try_from(leading_equalities.len()).expect("key part count fits c_int");
+        info.set_idx_num(equality_count);
         let source = self.module.source()?;
-        info.set_estimated_rows(if point_read {
-            1
-        } else {
-            source.estimated_rows()
-        });
+        info.set_estimated_rows(
+            if leading_equalities.len() == self.module.primary_columns.len() {
+                1
+            } else {
+                source.estimated_rows()
+            },
+        );
         Ok(())
     }
 
@@ -353,11 +378,9 @@ unsafe impl VTabCursor for MultiliteCursor {
         _idx_str: Option<&str>,
         args: &Filters<'_>,
     ) -> rusqlite::Result<()> {
-        self.source.trace_filter(
-            (idx_num == PRIMARY_KEY_EQUALITY)
-                .then(|| args.iter().next())
-                .flatten(),
-        );
+        let equality_count = usize::try_from(idx_num).unwrap_or(FULL_SCAN as usize);
+        let values = args.iter().take(equality_count).collect::<Vec<_>>();
+        self.source.trace_filter(&values);
         self.row = Some(0);
         Ok(())
     }
@@ -484,6 +507,35 @@ mod tests {
         created
     }
 
+    fn composite_connection() -> (Connection, CreateTable) {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let sql = "CREATE TABLE memberships (
+            tenant TEXT,
+            member INTEGER,
+            body TEXT,
+            PRIMARY KEY (tenant, member)
+        ) WITHOUT ROWID";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        connection.execute(sql, ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        connection
+            .execute(
+                "INSERT INTO memberships VALUES
+                    ('acme', 1, 'one'),
+                    ('acme', 2, 'two'),
+                    ('beta', 1, 'three')",
+                (),
+            )
+            .unwrap();
+        (connection, created)
+    }
+
     #[test]
     fn full_scan_matches_sqlite_and_records_the_row_keyspace() {
         let (connection, created) = connection();
@@ -539,6 +591,99 @@ mod tests {
                 .plan(IsolationLevel::Serializable, AdmissionSeq(7))[0]
                 .prefix,
             exact
+        );
+    }
+
+    #[test]
+    fn composite_primary_key_equalities_record_one_exact_row() {
+        let (connection, created) = composite_connection();
+        let registry = Registry::default();
+        let plan = registry
+            .plan(
+                &connection,
+                "SELECT body FROM memberships
+                 WHERE member = ?2 AND tenant = ?1",
+            )
+            .unwrap()
+            .unwrap();
+        let trace = ReadTrace::new();
+        let _bindings = plan.bind(&connection, trace.clone()).unwrap();
+
+        let body = connection
+            .query_row(plan.sql(), rusqlite::params!["acme", 2], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(body, "two");
+        assert_eq!(
+            trace.footprint().reads(),
+            &BTreeSet::from([primary_key_prefix(
+                &created,
+                &[StoredValue::Text(b"acme".to_vec()), StoredValue::Integer(2),],
+            )
+            .unwrap()])
+        );
+    }
+
+    #[test]
+    fn composite_primary_key_reads_trace_only_leading_equality_parts() {
+        let (connection, created) = composite_connection();
+        let registry = Registry::default();
+        let leading_plan = registry
+            .plan(
+                &connection,
+                "SELECT body FROM memberships
+                 WHERE tenant = ?1 ORDER BY member",
+            )
+            .unwrap()
+            .unwrap();
+        let leading_trace = ReadTrace::new();
+        let rows = {
+            let _bindings = leading_plan
+                .bind(&connection, leading_trace.clone())
+                .unwrap();
+            connection
+                .prepare(leading_plan.sql())
+                .unwrap()
+                .query_map(["acme"], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows, ["one", "two"]);
+        assert_eq!(
+            leading_trace.footprint().reads(),
+            &BTreeSet::from([primary_key_equality_prefix(
+                &created,
+                &[StoredValue::Text(b"acme".to_vec())],
+            )
+            .unwrap()])
+        );
+
+        let nonleading_plan = registry
+            .plan(
+                &connection,
+                "SELECT body FROM memberships WHERE member = ?1 ORDER BY tenant",
+            )
+            .unwrap()
+            .unwrap();
+        let nonleading_trace = ReadTrace::new();
+        let rows = {
+            let _bindings = nonleading_plan
+                .bind(&connection, nonleading_trace.clone())
+                .unwrap();
+            connection
+                .prepare(nonleading_plan.sql())
+                .unwrap()
+                .query_map([1], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows, ["one", "three"]);
+        assert_eq!(
+            nonleading_trace.footprint().reads(),
+            &BTreeSet::from([row_keyspace_prefix(&created)])
         );
     }
 

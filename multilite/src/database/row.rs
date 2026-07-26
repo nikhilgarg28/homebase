@@ -1172,8 +1172,22 @@ pub fn primary_key_prefix(
     if primary.len() != values.len() {
         return Err(RowCodecError::InvalidRow);
     }
+    primary_key_equality_prefix(created, values)
+}
+
+/// Row prefix produced by equality values for consecutive leading PK parts.
+#[cfg(test)]
+pub fn primary_key_equality_prefix(
+    created: &CreateTable,
+    values: &[StoredValue],
+) -> std::result::Result<Key, RowCodecError> {
+    let primary = created.primary_key_columns().collect::<Vec<_>>();
+    if values.len() > primary.len() {
+        return Err(RowCodecError::InvalidRow);
+    }
     let images = primary
         .into_iter()
+        .take(values.len())
         .zip(values)
         .map(|(column, value)| {
             if matches!(
