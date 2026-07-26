@@ -133,6 +133,96 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn composite_without_rowid_rows_converge_and_repair_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("composite-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("composite-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE memberships (
+                tenant TEXT,
+                member INTEGER,
+                body TEXT NOT NULL,
+                PRIMARY KEY (member, tenant)
+            ) WITHOUT ROWID",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO memberships VALUES ('north', 1, 'first')", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO memberships VALUES ('south', 1, 'second')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO memberships VALUES ('shared', 7, 'winner')", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO memberships VALUES ('shared', 7, 'loser')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("same composite primary key was not rejected")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let memberships = |database: &MultiliteConnection<_>| {
+        database
+            .query(
+                "SELECT tenant, member, body
+                 FROM memberships ORDER BY member, tenant",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let expected = [
+        ("north".into(), 1, "first".into()),
+        ("south".into(), 1, "second".into()),
+        ("shared".into(), 7, "winner".into()),
+    ];
+    assert_eq!(memberships(&first), expected);
+    assert_eq!(memberships(&second), expected);
+    assert_eq!(tables(&first), tables(&second));
+}
+
+#[test]
 fn composite_unique_constraints_conflict_repair_and_converge() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

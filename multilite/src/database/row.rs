@@ -14,14 +14,14 @@ use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, RowKeyspaceId, SchemaRevisionId, StrictType, TableId,
-    TableMode, UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
+    TableMode, TableStorage, UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ROW_FRAME_VERSION: u8 = 2;
+const ROW_FRAME_VERSION: u8 = 3;
 const ROW_SET_FRAME_VERSION: u8 = 1;
 const UPDATE_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
@@ -30,6 +30,7 @@ const TAG_KEY_PART: u8 = 3;
 const TAG_COLUMN_VALUE: u8 = 4;
 const TAG_ROWID: u8 = 5;
 const TAG_UNIQUE_KEY: u8 = 6;
+const TAG_TABLE_STORAGE: u8 = 7;
 const TAG_TABLE: u8 = 1;
 const TAG_ROW: u8 = 2;
 const TAG_COLUMN_ID: u8 = 1;
@@ -135,7 +136,7 @@ pub struct UniqueKeyRules {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    rowid: i64,
+    rowid: Option<i64>,
     values: Vec<(ColumnId, StoredValue)>,
 }
 
@@ -145,6 +146,7 @@ pub struct InsertRows {
     table: TableId,
     schema_revision: SchemaRevisionId,
     row_keyspace: RowKeyspaceId,
+    storage: TableStorage,
     key_parts: Vec<KeyPartRules>,
     unique_keys: Vec<UniqueKeyRules>,
     rows: Vec<Row>,
@@ -196,7 +198,7 @@ impl InsertRows {
             .map(|column| KeyPartRules {
                 column: column.id(),
                 affinity: column.affinity(created.mode()),
-                rowid_alias: column.is_rowid_alias(),
+                rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
         let unique_keys = created
@@ -225,7 +227,7 @@ impl InsertRows {
         let rows = captured
             .iter()
             .map(|captured| Row {
-                rowid: captured.rowid,
+                rowid: (created.storage() == TableStorage::Rowid).then_some(captured.rowid),
                 values: columns
                     .iter()
                     .zip(&captured.values)
@@ -242,6 +244,7 @@ impl InsertRows {
             table: created.table_id(),
             schema_revision: created.schema_revision_id(),
             row_keyspace: created.row_keyspace_id(),
+            storage: created.storage(),
             key_parts,
             unique_keys,
             rows,
@@ -310,7 +313,7 @@ impl InsertRows {
             }
             let table = TableId::from_bytes(uuid_bytes(components[2].as_bytes())?);
             let row_keyspace = RowKeyspaceId::from_bytes(uuid_bytes(components[4].as_bytes())?);
-            let (schema_revision, encoded_keyspace, key_parts, unique_keys, row) =
+            let (schema_revision, encoded_keyspace, storage, key_parts, unique_keys, row) =
                 decode_row(value)?;
             if encoded_keyspace != row_keyspace {
                 return Err(RowCodecError::InvalidBatch);
@@ -319,6 +322,7 @@ impl InsertRows {
                 table,
                 schema_revision,
                 row_keyspace,
+                storage,
                 key_parts: key_parts.clone(),
                 unique_keys: unique_keys.clone(),
                 rows: Vec::new(),
@@ -326,6 +330,7 @@ impl InsertRows {
             if candidate.table != table
                 || candidate.schema_revision != schema_revision
                 || candidate.row_keyspace != row_keyspace
+                || candidate.storage != storage
                 || candidate.key_parts != key_parts
                 || candidate.unique_keys != unique_keys
             {
@@ -384,12 +389,13 @@ impl InsertRows {
                 TAG_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
                 TAG_ROW => {
                     let table = table.ok_or(RowCodecError::MissingField(TAG_TABLE))?;
-                    let (schema_revision, row_keyspace, key_parts, unique_keys, row) =
+                    let (schema_revision, row_keyspace, storage, key_parts, unique_keys, row) =
                         decode_row(value)?;
                     let candidate = operation.get_or_insert_with(|| Self {
                         table,
                         schema_revision,
                         row_keyspace,
+                        storage,
                         key_parts: key_parts.clone(),
                         unique_keys: unique_keys.clone(),
                         rows: Vec::new(),
@@ -397,6 +403,7 @@ impl InsertRows {
                     if candidate.table != table
                         || candidate.schema_revision != schema_revision
                         || candidate.row_keyspace != row_keyspace
+                        || candidate.storage != storage
                         || candidate.key_parts != key_parts
                         || candidate.unique_keys != unique_keys
                     {
@@ -468,7 +475,9 @@ impl InsertRows {
                 values.len() + usize::from(hidden_rowid.is_some()),
             );
             if hidden_rowid.is_some() {
-                parameters.push(&row.rowid);
+                parameters.push(row.rowid.as_ref().ok_or(Error::InvalidMultiliteOp(
+                    "rowid table row is missing its rowid".into(),
+                ))?);
             }
             parameters.extend(values.into_iter().map(|value| value as &dyn ToSql));
             statement.execute(params_from_iter(parameters))?;
@@ -524,7 +533,9 @@ impl InsertRows {
             );
             parameters.extend(primary.into_iter().map(|value| value as &dyn ToSql));
             if hidden_rowid.is_some() {
-                parameters.push(&row.rowid);
+                parameters.push(row.rowid.as_ref().ok_or(Error::InvalidMultiliteOp(
+                    "rowid table row is missing its rowid".into(),
+                ))?);
             }
             let actual = select
                 .query_row(params_from_iter(parameters.iter().copied()), |result| {
@@ -549,7 +560,7 @@ impl InsertRows {
                         ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if actual != Some((expected, hidden_rowid.map(|_| row.rowid))) {
+            if actual != Some((expected, hidden_rowid.and(row.rowid))) {
                 return Err(Error::InvalidDatabase(mismatch));
             }
         }
@@ -561,7 +572,9 @@ impl InsertRows {
             );
             parameters.extend(primary.into_iter().map(|value| value as &dyn ToSql));
             if hidden_rowid.is_some() {
-                parameters.push(&row.rowid);
+                parameters.push(row.rowid.as_ref().ok_or(Error::InvalidMultiliteOp(
+                    "rowid table row is missing its rowid".into(),
+                ))?);
             }
             if delete.execute(params_from_iter(parameters))? != 1 {
                 return Err(Error::InvalidDatabase(mismatch));
@@ -586,13 +599,14 @@ impl InsertRows {
             .map(|column| KeyPartRules {
                 column: column.id(),
                 affinity: column.affinity(created.mode()),
-                rowid_alias: column.is_rowid_alias(),
+                rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
         let expected_unique_keys = unique_key_rules(created);
         if self.table != created.table_id()
             || self.schema_revision != created.schema_revision_id()
             || self.row_keyspace != created.row_keyspace_id()
+            || self.storage != created.storage()
             || self.key_parts != expected_key_parts
             || self.unique_keys != expected_unique_keys
         {
@@ -640,6 +654,13 @@ impl InsertRows {
         if self.key_parts.is_empty() || self.rows.is_empty() {
             return Err(RowCodecError::InvalidRow);
         }
+        if self
+            .rows
+            .iter()
+            .any(|row| row.rowid.is_some() != (self.storage == TableStorage::Rowid))
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
         if self.key_parts.iter().enumerate().any(|(index, part)| {
             self.key_parts[..index]
                 .iter()
@@ -685,10 +706,12 @@ impl InsertRows {
                 },
             ] = self.key_parts.as_slice()
             {
-                let rowid_matches = row
-                    .values
-                    .iter()
-                    .any(|(id, value)| id == column && *value == StoredValue::Integer(row.rowid));
+                let rowid_matches = row.values.iter().any(|(id, value)| {
+                    id == column
+                        && row
+                            .rowid
+                            .is_some_and(|rowid| *value == StoredValue::Integer(rowid))
+                });
                 if !rowid_matches {
                     return Err(RowCodecError::InvalidRow);
                 }
@@ -781,8 +804,13 @@ impl InsertRows {
             .field(TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes())
             .expect("row field length fits in u32");
         writer
-            .field(TAG_ROWID, &row.rowid.to_be_bytes())
+            .field(TAG_TABLE_STORAGE, &[self.storage.to_u8()])
             .expect("row field length fits in u32");
+        if let Some(rowid) = row.rowid {
+            writer
+                .field(TAG_ROWID, &rowid.to_be_bytes())
+                .expect("row field length fits in u32");
+        }
         for part in &self.key_parts {
             writer
                 .field(TAG_KEY_PART, &encode_key_part(*part))
@@ -908,9 +936,24 @@ impl UpdateRows {
         connection: &Connection,
         captured: &[(CapturedRow, CapturedRow)],
     ) -> Result<Option<Self>> {
+        let Some((first_before, first_after)) = captured.first() else {
+            return Ok(None);
+        };
+        if first_before.table != first_after.table {
+            return Err(Error::CaptureInvariant(
+                "one UPDATE changed rows from different tables",
+            ));
+        }
+        let Some(created) = catalog::by_name(connection, &first_before.table)? else {
+            return Ok(None);
+        };
         let changed = captured
             .iter()
-            .filter(|(before, after)| before != after)
+            .filter(|(before, after)| {
+                before.table != after.table
+                    || before.values != after.values
+                    || (created.storage() == TableStorage::Rowid && before.rowid != after.rowid)
+            })
             .collect::<Vec<_>>();
         if changed.is_empty() {
             return Ok(None);
@@ -1088,19 +1131,21 @@ impl UpdateRows {
         if self.before.table != self.after.table
             || self.before.schema_revision != self.after.schema_revision
             || self.before.row_keyspace != self.after.row_keyspace
+            || self.before.storage != self.after.storage
             || self.before.key_parts != self.after.key_parts
             || self.before.unique_keys != self.after.unique_keys
             || self.before.rows.len() != self.after.rows.len()
         {
             return Err(RowCodecError::InvalidRow);
         }
-        let integer_primary_key = matches!(
-            self.before.key_parts.as_slice(),
-            [KeyPartRules {
-                rowid_alias: true,
-                ..
-            }]
-        );
+        let integer_primary_key = self.before.storage == TableStorage::Rowid
+            && matches!(
+                self.before.key_parts.as_slice(),
+                [KeyPartRules {
+                    rowid_alias: true,
+                    ..
+                }]
+            );
         for (before, after) in self.before.rows.iter().zip(&self.after.rows) {
             if before.rowid != after.rowid && !integer_primary_key {
                 return Err(RowCodecError::RowidChanged);
@@ -1145,7 +1190,7 @@ pub fn primary_key_prefix(
                 KeyPartRules {
                     column: column.id(),
                     affinity: column.affinity(created.mode()),
-                    rowid_alias: column.is_rowid_alias(),
+                    rowid_alias: created.is_rowid_alias(column.id()),
                 },
             )
         })
@@ -1385,6 +1430,7 @@ fn decode_row(
     (
         SchemaRevisionId,
         RowKeyspaceId,
+        TableStorage,
         Vec<KeyPartRules>,
         Vec<UniqueKeyRules>,
         Row,
@@ -1397,6 +1443,7 @@ fn decode_row(
     }
     let mut schema_revision = None;
     let mut row_keyspace = None;
+    let mut storage = None;
     let mut rowid = None;
     let mut key_parts = Vec::new();
     let mut unique_keys = Vec::new();
@@ -1411,6 +1458,15 @@ fn decode_row(
                 &mut row_keyspace,
                 RowKeyspaceId::from_bytes(uuid_bytes(value)?),
             )?,
+            TAG_TABLE_STORAGE => {
+                let [value] = value else {
+                    return Err(RowCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut storage,
+                    TableStorage::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
+                )?;
+            }
             TAG_ROWID => {
                 let bytes = value.try_into().map_err(|_| RowCodecError::InvalidLength)?;
                 set_once(&mut rowid, i64::from_be_bytes(bytes))?;
@@ -1431,15 +1487,17 @@ fn decode_row(
     {
         return Err(RowCodecError::DuplicateField);
     }
+    let storage = storage.ok_or(RowCodecError::MissingField(TAG_TABLE_STORAGE))?;
+    if rowid.is_some() != (storage == TableStorage::Rowid) {
+        return Err(RowCodecError::InvalidRow);
+    }
     Ok((
         schema_revision.ok_or(RowCodecError::MissingField(TAG_SCHEMA_REVISION))?,
         row_keyspace.ok_or(RowCodecError::MissingField(TAG_ROW_KEYSPACE))?,
+        storage,
         key_parts,
         unique_keys,
-        Row {
-            rowid: rowid.ok_or(RowCodecError::MissingField(TAG_ROWID))?,
-            values,
-        },
+        Row { rowid, values },
     ))
 }
 
@@ -1506,8 +1564,11 @@ pub(super) fn normalize_insert_rowids(
 }
 
 fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
+    if created.storage() == TableStorage::WithoutRowid {
+        return Ok(None);
+    }
     let primary = created.primary_key_columns().collect::<Vec<_>>();
-    if primary.len() == 1 && primary[0].is_rowid_alias() {
+    if primary.len() == 1 && created.is_rowid_alias(primary[0].id()) {
         return Ok(None);
     }
     ["_rowid_", "rowid", "oid"]
@@ -1605,24 +1666,25 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("payload".into()),
                         declared_type: TypeDeclaration::blob(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: Vec::new(),
@@ -1638,6 +1700,21 @@ mod tests {
         connection
     }
 
+    fn without_rowid_definition() -> CreateTable {
+        let sql = "CREATE TABLE memberships (
+            tenant TEXT,
+            member INTEGER,
+            body TEXT,
+            PRIMARY KEY (member, tenant)
+        ) WITHOUT ROWID";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        CreateTable::new(sql, spec)
+    }
+
     fn unique_definition() -> CreateTable {
         CreateTable::new(
             "CREATE TABLE accounts (
@@ -1649,24 +1726,25 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("accounts".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("organization".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: vec![CreateUnique {
@@ -1693,30 +1771,31 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("profiles".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("tenant".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("username".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: vec![
@@ -1840,6 +1919,46 @@ mod tests {
         assert_eq!(
             InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
             inserted
+        );
+    }
+
+    #[test]
+    fn without_rowid_rows_discard_undefined_hook_rowids_and_keep_composite_order() {
+        let created = without_rowid_definition();
+        let connection = connection(&created);
+        let captured = CapturedRow {
+            table: "memberships".into(),
+            rowid: 41,
+            values: vec![
+                StoredValue::Text(b"north".to_vec()),
+                StoredValue::Integer(7),
+                StoredValue::Text(b"body".to_vec()),
+            ],
+        };
+        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&captured))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inserted.storage, TableStorage::WithoutRowid);
+        assert_eq!(inserted.rows[0].rowid, None);
+        assert_eq!(
+            inserted
+                .key_parts
+                .iter()
+                .map(|part| part.column)
+                .collect::<Vec<_>>(),
+            [created.columns()[1].id(), created.columns()[0].id(),]
+        );
+        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations[0].key().components().len(), 7);
+
+        let mut same_row = captured.clone();
+        same_row.rowid = 999;
+        assert!(
+            UpdateRows::from_captured(&connection, &[(captured, same_row)])
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -2517,18 +2636,19 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("documents".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: true,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: Vec::new(),
@@ -2981,18 +3101,19 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("documents".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: true,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: Vec::new(),

@@ -10,7 +10,7 @@ use sqlite3_parser::ast::{
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
-    CreateColumn, CreateTableSpec, CreateUnique, SqlName, TableMode, TypeDeclaration,
+    CreateColumn, CreateTableSpec, CreateUnique, SqlName, TableMode, TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
 
@@ -461,19 +461,19 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             "CREATE TABLE AS SELECT is not supported",
         ));
     };
-    if flags.contains(TabFlags::WithoutRowid) {
-        return Err(Error::UnsupportedSql(
-            "WITHOUT ROWID tables are not supported",
-        ));
-    }
     let mode = if flags.contains(TabFlags::Strict) {
         TableMode::Strict
     } else {
         TableMode::Ordinary
     };
-    let mut primary_keys = 0;
+    let storage = if flags.contains(TabFlags::WithoutRowid) {
+        TableStorage::WithoutRowid
+    } else {
+        TableStorage::Rowid
+    };
+    let mut inline_primary_keys = 0;
     let mut unique_constraints = Vec::new();
-    let columns = columns
+    let mut columns = columns
         .into_values()
         .map(|column| {
             let name = identifier(&column.col_name)?;
@@ -487,7 +487,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 ));
             }
             let mut not_null = false;
-            let mut primary_key = false;
+            let mut primary_key = None;
             for constraint in column.constraints {
                 match constraint.constraint {
                     ColumnConstraint::PrimaryKey {
@@ -508,13 +508,13 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                                 "PRIMARY KEY ordering and conflict clauses are not supported",
                             ));
                         }
-                        if primary_key {
+                        if primary_key.is_some() {
                             return Err(Error::UnsupportedSql(
                                 "duplicate PRIMARY KEY constraints are not supported",
                             ));
                         }
-                        primary_key = true;
-                        primary_keys += 1;
+                        primary_key = Some(0);
+                        inline_primary_keys += 1;
                     }
                     ColumnConstraint::NotNull {
                         nullable: false,
@@ -555,13 +555,6 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     }
                 }
             }
-            if mode == TableMode::Strict && primary_key {
-                not_null = true;
-            } else if primary_key && !declared_type.is_exact_integer() && !not_null {
-                return Err(Error::UnsupportedSql(
-                    "a non-INTEGER PRIMARY KEY must also be NOT NULL",
-                ));
-            }
             Ok(CreateColumn {
                 name,
                 declared_type,
@@ -570,64 +563,138 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut table_primary_key = None;
     for constraint in constraints.into_iter().flatten() {
-        let TableConstraint::Unique {
-            columns: unique_columns,
-            conflict_clause,
-        } = constraint.constraint
-        else {
-            return Err(Error::UnsupportedSql(
-                "only UNIQUE table constraints are supported",
-            ));
-        };
-        if conflict_clause.is_some() {
-            return Err(Error::UnsupportedSql(
-                "UNIQUE conflict clauses are not supported",
-            ));
-        }
-        let unique_columns = unique_columns
-            .into_iter()
-            .map(|column| {
-                if column.order.is_some() || column.nulls.is_some() {
+        match constraint.constraint {
+            TableConstraint::Unique {
+                columns: unique_columns,
+                conflict_clause,
+            } => {
+                if conflict_clause.is_some() {
                     return Err(Error::UnsupportedSql(
-                        "UNIQUE ordering and NULLS placement are not supported",
+                        "UNIQUE conflict clauses are not supported",
                     ));
                 }
-                expression_identifier(column.expr)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if unique_columns.is_empty()
-            || unique_columns.iter().enumerate().any(|(index, column)| {
-                unique_columns[..index]
-                    .iter()
-                    .any(|seen| seen.canonical() == column.canonical())
-            })
-            || unique_columns.iter().any(|unique| {
-                !columns
-                    .iter()
-                    .any(|column| column.name.canonical() == unique.canonical())
-            })
-        {
+                let unique_columns = simple_key_columns(unique_columns, &columns, "UNIQUE")?;
+                unique_constraints.push(CreateUnique {
+                    name: constraint.name.map(|name| identifier(&name)).transpose()?,
+                    columns: unique_columns,
+                });
+            }
+            TableConstraint::PrimaryKey {
+                columns: primary_columns,
+                auto_increment,
+                conflict_clause,
+            } => {
+                if constraint.name.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "named PRIMARY KEY constraints are not supported",
+                    ));
+                }
+                if auto_increment {
+                    return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
+                }
+                if conflict_clause.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "PRIMARY KEY conflict clauses are not supported",
+                    ));
+                }
+                if table_primary_key.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "duplicate PRIMARY KEY constraints are not supported",
+                    ));
+                }
+                table_primary_key = Some(simple_key_columns(
+                    primary_columns,
+                    &columns,
+                    "PRIMARY KEY",
+                )?);
+            }
+            _ => {
+                return Err(Error::UnsupportedSql(
+                    "only PRIMARY KEY and UNIQUE table constraints are supported",
+                ));
+            }
+        }
+    }
+    if inline_primary_keys > 1 || (inline_primary_keys != 0 && table_primary_key.is_some()) {
+        return Err(Error::UnsupportedSql(
+            "CREATE TABLE requires exactly one PRIMARY KEY",
+        ));
+    }
+    if let Some(primary) = table_primary_key {
+        for column in &mut columns {
+            column.primary_key = primary
+                .iter()
+                .position(|name| name.canonical() == column.name.canonical());
+        }
+    }
+    let primary = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key.map(|position| (position, index)))
+        .collect::<Vec<_>>();
+    if primary.is_empty() {
+        return Err(Error::UnsupportedSql(
+            "CREATE TABLE requires exactly one PRIMARY KEY",
+        ));
+    }
+    let rowid_alias = storage == TableStorage::Rowid
+        && primary.len() == 1
+        && columns[primary[0].1].declared_type.is_exact_integer();
+    for (_, index) in primary {
+        if mode == TableMode::Strict || storage == TableStorage::WithoutRowid {
+            columns[index].not_null = true;
+        } else if !rowid_alias && !columns[index].not_null {
             return Err(Error::UnsupportedSql(
-                "UNIQUE constraints require distinct table columns",
+                "every non-rowid PRIMARY KEY column must also be NOT NULL",
             ));
         }
-        unique_constraints.push(CreateUnique {
-            name: constraint.name.map(|name| identifier(&name)).transpose()?,
-            columns: unique_columns,
-        });
-    }
-    if primary_keys != 1 {
-        return Err(Error::UnsupportedSql(
-            "CREATE TABLE requires exactly one inline PRIMARY KEY",
-        ));
     }
     Ok(ValidatedExecute::CreateTable(CreateTableSpec {
         name,
         mode,
+        storage,
         columns,
         unique_constraints,
     }))
+}
+
+fn simple_key_columns(
+    columns: Vec<sqlite3_parser::ast::SortedColumn>,
+    table_columns: &[CreateColumn],
+    kind: &'static str,
+) -> Result<Vec<SqlName>> {
+    let columns = columns
+        .into_iter()
+        .map(|column| {
+            if column.order.is_some() || column.nulls.is_some() {
+                return Err(Error::UnsupportedSql(match kind {
+                    "PRIMARY KEY" => "PRIMARY KEY ordering and NULLS placement are not supported",
+                    _ => "UNIQUE ordering and NULLS placement are not supported",
+                }));
+            }
+            expression_identifier(column.expr)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty()
+        || columns.iter().enumerate().any(|(index, column)| {
+            columns[..index]
+                .iter()
+                .any(|seen| seen.canonical() == column.canonical())
+        })
+        || columns.iter().any(|key| {
+            !table_columns
+                .iter()
+                .any(|column| column.name.canonical() == key.canonical())
+        })
+    {
+        return Err(Error::UnsupportedSql(match kind {
+            "PRIMARY KEY" => "PRIMARY KEY constraints require distinct table columns",
+            _ => "UNIQUE constraints require distinct table columns",
+        }));
+    }
+    Ok(columns)
 }
 
 fn type_declaration(declared: Type) -> Result<TypeDeclaration> {
@@ -778,8 +845,6 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES other(id))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT GENERATED ALWAYS AS (id))",
             "CREATE TABLE notes (id INTEGER CONSTRAINT pk PRIMARY KEY)",
-            "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id))",
-            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY ON CONFLICT REPLACE)",
             "CREATE TABLE notes (id INTEGER NOT NULL ON CONFLICT IGNORE)",
@@ -796,6 +861,69 @@ mod tests {
         ] {
             assert_unsupported(sql);
         }
+    }
+
+    #[test]
+    fn preserves_table_primary_key_order_and_without_rowid_storage() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE memberships (
+                tenant TEXT,
+                member INTEGER,
+                body TEXT,
+                PRIMARY KEY (member, tenant)
+            ) WITHOUT ROWID",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(spec.storage, TableStorage::WithoutRowid);
+        assert_eq!(
+            spec.columns
+                .iter()
+                .filter_map(|column| {
+                    column
+                        .primary_key
+                        .map(|position| (position, column.name.value()))
+                })
+                .collect::<Vec<_>>(),
+            [(1, "tenant"), (0, "member")]
+        );
+        assert!(spec.columns[0].not_null);
+        assert!(spec.columns[1].not_null);
+
+        let ValidatedExecute::CreateTable(rowid) =
+            validate_execute("CREATE TABLE aliases (id INTEGER, PRIMARY KEY (id))").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(rowid.storage, TableStorage::Rowid);
+        assert!(!rowid.columns[0].not_null);
+    }
+
+    #[test]
+    fn composite_primary_keys_require_stable_non_null_identity() {
+        for sql in [
+            "CREATE TABLE notes (tenant TEXT, id INTEGER, PRIMARY KEY (tenant, id))",
+            "CREATE TABLE notes (a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, a))",
+            "CREATE TABLE notes (a TEXT NOT NULL, PRIMARY KEY (missing))",
+            "CREATE TABLE notes (
+                a TEXT NOT NULL,
+                b TEXT NOT NULL,
+                PRIMARY KEY (a DESC, b)
+            )",
+        ] {
+            assert_unsupported(sql);
+        }
+
+        validate_execute(
+            "CREATE TABLE notes (
+                tenant TEXT NOT NULL,
+                id INTEGER NOT NULL,
+                PRIMARY KEY (tenant, id)
+            )",
+        )
+        .unwrap();
     }
 
     #[test]

@@ -235,11 +235,12 @@ fn create_operation(name: &str) -> MultiliteOp {
         schema::CreateTableSpec {
             name: schema::SqlName::new(name.into()),
             mode: Default::default(),
+            storage: crate::database::schema::TableStorage::Rowid,
             columns: vec![schema::CreateColumn {
                 name: schema::SqlName::new("id".into()),
                 declared_type: schema::TypeDeclaration::integer(),
                 not_null: false,
-                primary_key: true,
+                primary_key: Some(0),
             }],
             unique_constraints: Vec::new(),
         },

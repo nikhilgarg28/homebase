@@ -37,6 +37,135 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
 }
 
 #[test]
+fn composite_primary_keys_and_without_rowid_support_full_row_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("composite-primary.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE memberships (
+            tenant TEXT,
+            member INTEGER,
+            body TEXT NOT NULL,
+            PRIMARY KEY (member, tenant)
+        ) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO memberships VALUES
+            ('north', 2, 'two'),
+            ('north', 1, 'one'),
+            ('south', 1, 'other')",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT tenant, member, body FROM memberships ORDER BY member, tenant",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            ("north".into(), 1, "one".into()),
+            ("south".into(), 1, "other".into()),
+            ("north".into(), 2, "two".into()),
+        ]
+    );
+
+    db.execute(
+        "UPDATE memberships
+         SET member = 3, body = 'moved'
+         WHERE tenant = 'north' AND member = 2",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM memberships WHERE tenant = 'south' AND member = 1",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT tenant, member, body FROM memberships ORDER BY member, tenant",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            ("north".into(), 1, "one".into()),
+            ("north".into(), 3, "moved".into()),
+        ]
+    );
+    assert!(
+        db.execute(
+            "INSERT INTO memberships VALUES ('north', 1, 'duplicate')",
+            (),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn ordinary_composite_primary_keys_preserve_hidden_rowids() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("composite-rowid.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE documents (
+            tenant TEXT NOT NULL,
+            document INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            PRIMARY KEY (document, tenant)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO documents VALUES ('north', 1, 'original')", ())
+        .unwrap();
+    let rowid = db
+        .query("SELECT rowid FROM documents", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()[0];
+
+    db.execute(
+        "UPDATE documents
+         SET document = 2, body = 'moved'
+         WHERE tenant = 'north' AND document = 1",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT rowid, tenant, document, body FROM documents",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(rowid, "north".into(), 2, "moved".into())]
+    );
+}
+
+#[test]
 fn delete_uses_sqlite_predicates_and_zero_rows_are_a_noop() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("delete.sqlite")).unwrap();

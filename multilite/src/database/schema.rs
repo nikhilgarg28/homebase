@@ -17,7 +17,7 @@ use uuid::{Uuid, Variant, Version};
 use super::codes;
 use crate::commit::footprint::ConflictFootprint;
 
-const SCHEMA_FRAME_VERSION: u8 = 1;
+const SCHEMA_FRAME_VERSION: u8 = 2;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -28,6 +28,8 @@ const TAG_SCHEMA_REVISION_ID: u8 = 4;
 const TAG_ROW_KEYSPACE_ID: u8 = 5;
 const TAG_UNIQUE_CONSTRAINT: u8 = 6;
 const TAG_TABLE_MODE: u8 = 7;
+const TAG_PRIMARY_KEY: u8 = 8;
+const TAG_TABLE_STORAGE: u8 = 9;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_NAME: u8 = 2;
 const TAG_COLUMN_TYPE: u8 = 3;
@@ -38,10 +40,12 @@ const TAG_TYPE_ARGUMENT: u8 = 2;
 const TAG_UNIQUE_KEYSPACE_ID: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
 const TAG_UNIQUE_COLUMN_ID: u8 = 3;
+const TAG_PRIMARY_COLUMN_ID: u8 = 1;
 const COLUMN_NOT_NULL: u8 = 1;
-const COLUMN_PRIMARY_KEY: u8 = 2;
 const TABLE_MODE_ORDINARY: u8 = 0;
 const TABLE_MODE_STRICT: u8 = 1;
+const TABLE_STORAGE_ROWID: u8 = 0;
+const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
 
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
@@ -108,6 +112,31 @@ pub enum TableMode {
     #[default]
     Ordinary,
     Strict,
+}
+
+/// Physical SQLite table storage selected by the schema.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableStorage {
+    #[default]
+    Rowid,
+    WithoutRowid,
+}
+
+impl TableStorage {
+    pub(crate) fn to_u8(self) -> u8 {
+        match self {
+            Self::Rowid => TABLE_STORAGE_ROWID,
+            Self::WithoutRowid => TABLE_STORAGE_WITHOUT_ROWID,
+        }
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            TABLE_STORAGE_ROWID => Some(Self::Rowid),
+            TABLE_STORAGE_WITHOUT_ROWID => Some(Self::WithoutRowid),
+            _ => None,
+        }
+    }
 }
 
 impl TableMode {
@@ -269,7 +298,8 @@ pub struct CreateColumn {
     pub name: SqlName,
     pub declared_type: TypeDeclaration,
     pub not_null: bool,
-    pub primary_key: bool,
+    /// Position in the table's ordered primary key, if any.
+    pub primary_key: Option<usize>,
 }
 
 /// One validated inline or table-level UNIQUE declaration.
@@ -284,6 +314,7 @@ pub struct CreateUnique {
 pub struct CreateTableSpec {
     pub name: SqlName,
     pub mode: TableMode,
+    pub storage: TableStorage,
     pub columns: Vec<CreateColumn>,
     pub unique_constraints: Vec<CreateUnique>,
 }
@@ -312,7 +343,12 @@ pub struct Column {
     name: SqlName,
     declared_type: TypeDeclaration,
     not_null: bool,
-    primary_key: bool,
+}
+
+/// Ordered durable primary-key definition owned by a table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimaryKey {
+    columns: Vec<ColumnId>,
 }
 
 /// One durable UNIQUE key definition owned by a table schema revision.
@@ -321,6 +357,41 @@ pub struct UniqueConstraint {
     keyspace_id: UniqueKeyspaceId,
     name: Option<SqlName>,
     columns: Vec<ColumnId>,
+}
+
+/// An explicit index attached to a table schema.
+///
+/// CREATE INDEX is not admitted yet, but indexes live here rather than in a
+/// parallel database-level registry when that grammar is added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDefinition {
+    name: SqlName,
+    unique: bool,
+    columns: Vec<ColumnId>,
+}
+
+/// A foreign-key definition attached to a table schema.
+///
+/// Foreign-key SQL remains unsupported; this establishes table ownership for
+/// the definition before enforcement and codecs are added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyDefinition {
+    name: Option<SqlName>,
+    columns: Vec<ColumnId>,
+    referenced_table: SqlName,
+    referenced_columns: Vec<SqlName>,
+}
+
+/// Complete schema known for one table revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSchema {
+    mode: TableMode,
+    storage: TableStorage,
+    columns: Vec<Column>,
+    primary_key: PrimaryKey,
+    unique_constraints: Vec<UniqueConstraint>,
+    indexes: Vec<IndexDefinition>,
+    foreign_keys: Vec<ForeignKeyDefinition>,
 }
 
 /// Durable meaning of a restricted table creation.
@@ -332,9 +403,7 @@ pub struct CreateTable {
     schema_revision_id: SchemaRevisionId,
     row_keyspace_id: RowKeyspaceId,
     name: SqlName,
-    mode: TableMode,
-    columns: Vec<Column>,
-    unique_constraints: Vec<UniqueConstraint>,
+    schema: TableSchema,
 }
 
 /// Homebase mutations and conflict footprint for one schema change.
@@ -389,9 +458,43 @@ impl Column {
     pub fn is_not_null(&self) -> bool {
         self.not_null
     }
+}
 
-    pub fn is_rowid_alias(&self) -> bool {
-        self.primary_key && self.declared_type.is_exact_integer()
+impl PrimaryKey {
+    pub fn columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+}
+
+impl TableSchema {
+    pub fn mode(&self) -> TableMode {
+        self.mode
+    }
+
+    pub fn storage(&self) -> TableStorage {
+        self.storage
+    }
+
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    pub fn primary_key(&self) -> &PrimaryKey {
+        &self.primary_key
+    }
+
+    pub fn unique_constraints(&self) -> &[UniqueConstraint] {
+        &self.unique_constraints
+    }
+
+    #[allow(dead_code, reason = "populated when CREATE INDEX grammar is admitted")]
+    pub fn indexes(&self) -> &[IndexDefinition] {
+        &self.indexes
+    }
+
+    #[allow(dead_code, reason = "populated when FOREIGN KEY grammar is admitted")]
+    pub fn foreign_keys(&self) -> &[ForeignKeyDefinition] {
+        &self.foreign_keys
     }
 }
 
@@ -444,10 +547,15 @@ impl CreateTable {
                 value: encode_row_keyspace(self),
             },
         ];
-        mutations.extend(self.unique_constraints.iter().map(|unique| Mutation::Set {
-            key: unique_keyspace_key(self.table_id, unique.keyspace_id),
-            value: encode_unique_constraint(unique),
-        }));
+        mutations.extend(
+            self.schema
+                .unique_constraints
+                .iter()
+                .map(|unique| Mutation::Set {
+                    key: unique_keyspace_key(self.table_id, unique.keyspace_id),
+                    value: encode_unique_constraint(unique),
+                }),
+        );
         mutations.push(Mutation::Set {
             key: write_revision.clone(),
             value: self.mutation_id.0.to_vec(),
@@ -516,26 +624,54 @@ impl CreateTable {
     }
 
     pub fn mode(&self) -> TableMode {
-        self.mode
+        self.schema.mode()
+    }
+
+    pub fn storage(&self) -> TableStorage {
+        self.schema.storage()
+    }
+
+    #[allow(dead_code, reason = "used by future schema-changing operations")]
+    pub fn schema(&self) -> &TableSchema {
+        &self.schema
     }
 
     pub fn columns(&self) -> &[Column] {
-        &self.columns
+        self.schema.columns()
     }
 
     pub fn unique_constraints(&self) -> &[UniqueConstraint] {
-        &self.unique_constraints
+        self.schema.unique_constraints()
     }
 
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
-        self.columns.iter().filter(|column| column.primary_key)
+        self.schema.primary_key().columns().iter().map(|id| {
+            self.schema
+                .columns
+                .iter()
+                .find(|column| column.id == *id)
+                .expect("validated primary-key column exists")
+        })
+    }
+
+    pub fn is_rowid_alias(&self, column: ColumnId) -> bool {
+        self.schema.storage == TableStorage::Rowid
+            && self.schema.primary_key.columns.as_slice() == [column]
+            && self
+                .schema
+                .columns
+                .iter()
+                .find(|candidate| candidate.id == column)
+                .is_some_and(|candidate| candidate.declared_type.is_exact_integer())
     }
 
     fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
         self.name == spec.name
-            && self.mode == spec.mode
-            && self.columns.len() == spec.columns.len()
+            && self.schema.mode == spec.mode
+            && self.schema.storage == spec.storage
+            && self.schema.columns.len() == spec.columns.len()
             && self
+                .schema
                 .columns
                 .iter()
                 .zip(&spec.columns)
@@ -543,10 +679,12 @@ impl CreateTable {
                     encoded.name == parsed.name
                         && encoded.declared_type == parsed.declared_type
                         && encoded.not_null == parsed.not_null
-                        && encoded.primary_key == parsed.primary_key
                 })
-            && self.unique_constraints.len() == spec.unique_constraints.len()
+            && spec_primary_key_ids(spec, &self.schema.columns)
+                .is_some_and(|ids| ids == self.schema.primary_key.columns)
+            && self.schema.unique_constraints.len() == spec.unique_constraints.len()
             && self
+                .schema
                 .unique_constraints
                 .iter()
                 .zip(&spec.unique_constraints)
@@ -555,7 +693,7 @@ impl CreateTable {
                         && encoded.columns.len() == parsed.columns.len()
                         && encoded.columns.iter().zip(&parsed.columns).all(
                             |(encoded_column, parsed_column)| {
-                                self.columns.iter().any(|column| {
+                                self.schema.columns.iter().any(|column| {
                                     column.id == *encoded_column
                                         && column.name.canonical() == parsed_column.canonical()
                                 })
@@ -573,6 +711,7 @@ fn build_create_table(
     let CreateTableSpec {
         name,
         mode,
+        storage,
         columns: column_specs,
         unique_constraints: unique_specs,
     } = spec;
@@ -581,15 +720,18 @@ fn build_create_table(
     let schema_revision_id = SchemaRevisionId(mint());
     let row_keyspace_id = RowKeyspaceId(mint());
     let columns = column_specs
-        .into_iter()
+        .iter()
         .map(|column| Column {
             id: ColumnId(mint()),
-            name: column.name,
-            declared_type: column.declared_type,
+            name: column.name.clone(),
+            declared_type: column.declared_type.clone(),
             not_null: column.not_null,
-            primary_key: column.primary_key,
         })
         .collect::<Vec<_>>();
+    let primary_key = PrimaryKey {
+        columns: spec_primary_key_ids_from_columns(&column_specs, &columns)
+            .expect("validated PRIMARY KEY columns exist"),
+    };
     let unique_constraints = unique_specs
         .into_iter()
         .map(|unique| UniqueConstraint {
@@ -615,10 +757,45 @@ fn build_create_table(
         schema_revision_id,
         row_keyspace_id,
         name,
-        mode,
-        columns,
-        unique_constraints,
+        schema: TableSchema {
+            mode,
+            storage,
+            columns,
+            primary_key,
+            unique_constraints,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        },
     }
+}
+
+fn spec_primary_key_ids(spec: &CreateTableSpec, columns: &[Column]) -> Option<Vec<ColumnId>> {
+    spec_primary_key_ids_from_columns(&spec.columns, columns)
+}
+
+fn spec_primary_key_ids_from_columns(
+    specs: &[CreateColumn],
+    columns: &[Column],
+) -> Option<Vec<ColumnId>> {
+    let mut ordered = specs
+        .iter()
+        .enumerate()
+        .filter_map(|(column_index, column)| {
+            column
+                .primary_key
+                .map(|position| (position, columns[column_index].id))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(position, _)| *position);
+    if ordered.is_empty()
+        || ordered
+            .iter()
+            .enumerate()
+            .any(|(position, (actual, _))| *actual != position)
+    {
+        return None;
+    }
+    Some(ordered.into_iter().map(|(_, id)| id).collect())
 }
 
 fn log_key(id: MutationId) -> Key {
@@ -730,14 +907,23 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
         .field(TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0)
         .expect("schema field length must fit in u32");
     writer
-        .field(TAG_TABLE_MODE, &[table.mode.to_u8()])
+        .field(TAG_TABLE_MODE, &[table.schema.mode.to_u8()])
         .expect("schema field length must fit in u32");
-    for column in &table.columns {
+    writer
+        .field(TAG_TABLE_STORAGE, &[table.schema.storage.to_u8()])
+        .expect("schema field length must fit in u32");
+    writer
+        .field(
+            TAG_PRIMARY_KEY,
+            &encode_primary_key(&table.schema.primary_key),
+        )
+        .expect("schema field length must fit in u32");
+    for column in &table.schema.columns {
         writer
             .field(TAG_COLUMN, &encode_column(column))
             .expect("schema field length must fit in u32");
     }
-    for unique in &table.unique_constraints {
+    for unique in &table.schema.unique_constraints {
         writer
             .field(TAG_UNIQUE_CONSTRAINT, &encode_unique_constraint(unique))
             .expect("schema field length must fit in u32");
@@ -752,7 +938,7 @@ fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
     writer.u8(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
     for column in primary {
         writer.bytes16(&column.id.0);
-        writer.u8(column.affinity(table.mode).to_u8());
+        writer.u8(column.affinity(table.mode()).to_u8());
     }
     writer.finish()
 }
@@ -789,12 +975,19 @@ fn encode_column(column: &Column) -> Vec<u8> {
     if column.not_null {
         flags |= COLUMN_NOT_NULL;
     }
-    if column.primary_key {
-        flags |= COLUMN_PRIMARY_KEY;
-    }
     writer
         .field(TAG_COLUMN_FLAGS, &[flags])
         .expect("schema field length must fit in u32");
+    writer.finish()
+}
+
+fn encode_primary_key(primary_key: &PrimaryKey) -> Vec<u8> {
+    let mut writer = Writer::new();
+    for column in &primary_key.columns {
+        writer
+            .field(TAG_PRIMARY_COLUMN_ID, &column.0)
+            .expect("schema field length must fit in u32");
+    }
     writer.finish()
 }
 
@@ -827,6 +1020,7 @@ pub enum SchemaCodecError {
     InvalidColumnType,
     InvalidColumnFlags(u8),
     InvalidTableMode(u8),
+    InvalidTableStorage(u8),
     InvalidSchema,
     InvalidUuid,
     InvalidSql,
@@ -847,6 +1041,7 @@ impl fmt::Display for SchemaCodecError {
             Self::InvalidColumnType => f.write_str("invalid column type declaration"),
             Self::InvalidColumnFlags(value) => write!(f, "invalid column flags {value}"),
             Self::InvalidTableMode(value) => write!(f, "invalid table mode {value}"),
+            Self::InvalidTableStorage(value) => write!(f, "invalid table storage {value}"),
             Self::InvalidSchema => f.write_str("invalid structured schema"),
             Self::InvalidUuid => f.write_str("schema id is not a UUID v4"),
             Self::InvalidSql => f.write_str("literal SQL is outside the supported grammar"),
@@ -884,7 +1079,7 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     }
     let mutation_id = mutation_id.ok_or(SchemaCodecError::MissingField(TAG_MUTATION_ID))?;
     let sql = sql.ok_or(SchemaCodecError::MissingField(TAG_SQL))?;
-    let (table_id, schema_revision_id, row_keyspace_id, name, mode, columns, unique_constraints) =
+    let (table_id, schema_revision_id, row_keyspace_id, name, schema) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
     Ok(CreateTable {
         mutation_id,
@@ -893,9 +1088,7 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
         schema_revision_id,
         row_keyspace_id,
         name,
-        mode,
-        columns,
-        unique_constraints,
+        schema,
     })
 }
 
@@ -926,9 +1119,7 @@ fn decode_create_table(
         SchemaRevisionId,
         RowKeyspaceId,
         SqlName,
-        TableMode,
-        Vec<Column>,
-        Vec<UniqueConstraint>,
+        TableSchema,
     ),
     SchemaCodecError,
 > {
@@ -940,6 +1131,8 @@ fn decode_create_table(
     let mut row_keyspace_id = None;
     let mut name = None;
     let mut mode = None;
+    let mut storage = None;
+    let mut primary_key = None;
     let mut columns = Vec::new();
     let mut unique_constraints = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
@@ -962,18 +1155,61 @@ fn decode_create_table(
                     TableMode::from_u8(*value).ok_or(SchemaCodecError::InvalidTableMode(*value))?,
                 )?;
             }
+            TAG_TABLE_STORAGE => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut storage,
+                    TableStorage::from_u8(*value)
+                        .ok_or(SchemaCodecError::InvalidTableStorage(*value))?,
+                )?;
+            }
+            TAG_PRIMARY_KEY => set_once(&mut primary_key, decode_primary_key(value)?)?,
             TAG_COLUMN => columns.push(decode_column(value)?),
             TAG_UNIQUE_CONSTRAINT => unique_constraints.push(decode_unique_constraint(value)?),
             _ => {}
         }
     }
     let mode = mode.ok_or(SchemaCodecError::MissingField(TAG_TABLE_MODE))?;
-    let primary_keys = columns.iter().filter(|column| column.primary_key).count();
+    let storage = storage.ok_or(SchemaCodecError::MissingField(TAG_TABLE_STORAGE))?;
+    let primary_key = primary_key.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_KEY))?;
+    let rowid_alias = storage == TableStorage::Rowid
+        && primary_key.columns.len() == 1
+        && primary_key.columns.first().is_some_and(|id| {
+            columns
+                .iter()
+                .find(|column| column.id == *id)
+                .is_some_and(|column| column.declared_type.is_exact_integer())
+        });
     if columns.is_empty()
-        || primary_keys != 1
+        || primary_key.columns.is_empty()
+        || primary_key
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(index, column)| {
+                primary_key.columns[..index].contains(column)
+                    || !columns.iter().any(|candidate| candidate.id == *column)
+            })
         || (mode == TableMode::Strict
             && columns.iter().any(|column| {
-                column.strict_type().is_none() || (column.primary_key && !column.not_null)
+                column.strict_type().is_none()
+                    || (primary_key.columns.contains(&column.id) && !column.not_null)
+            }))
+        || (storage == TableStorage::WithoutRowid
+            && primary_key.columns.iter().any(|id| {
+                columns
+                    .iter()
+                    .find(|column| column.id == *id)
+                    .is_none_or(|column| !column.not_null)
+            }))
+        || (!rowid_alias
+            && primary_key.columns.iter().any(|id| {
+                columns
+                    .iter()
+                    .find(|column| column.id == *id)
+                    .is_none_or(|column| !column.not_null)
             }))
         || unique_constraints
             .iter()
@@ -1000,10 +1236,32 @@ fn decode_create_table(
         schema_revision_id.ok_or(SchemaCodecError::MissingField(TAG_SCHEMA_REVISION_ID))?,
         row_keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_ROW_KEYSPACE_ID))?,
         name.ok_or(SchemaCodecError::MissingField(TAG_TABLE_NAME))?,
-        mode,
-        columns,
-        unique_constraints,
+        TableSchema {
+            mode,
+            storage,
+            columns,
+            primary_key,
+            unique_constraints,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        },
     ))
+}
+
+fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    let mut columns = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        if tag == TAG_PRIMARY_COLUMN_ID {
+            columns.push(ColumnId(uuid_bytes(value)?));
+        }
+    }
+    if columns.is_empty() {
+        return Err(SchemaCodecError::InvalidSchema);
+    }
+    Ok(PrimaryKey { columns })
 }
 
 fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> {
@@ -1023,7 +1281,7 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
                 let [value] = value else {
                     return Err(SchemaCodecError::InvalidLength);
                 };
-                if value & !(COLUMN_NOT_NULL | COLUMN_PRIMARY_KEY) != 0 {
+                if value & !COLUMN_NOT_NULL != 0 {
                     return Err(SchemaCodecError::InvalidColumnFlags(*value));
                 }
                 set_once(&mut flags, *value)?;
@@ -1037,7 +1295,6 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         name: name.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_NAME))?,
         declared_type: declared_type.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_TYPE))?,
         not_null: flags & COLUMN_NOT_NULL != 0,
-        primary_key: flags & COLUMN_PRIMARY_KEY != 0,
     })
 }
 
@@ -1179,18 +1436,19 @@ mod tests {
         CreateTableSpec {
             name: SqlName::new(name.into()),
             mode: TableMode::Ordinary,
+            storage: TableStorage::Rowid,
             columns: vec![
                 CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),
                     not_null: false,
-                    primary_key: true,
+                    primary_key: Some(0),
                 },
                 CreateColumn {
                     name: SqlName::new("body".into()),
                     declared_type: TypeDeclaration::text(),
                     not_null: true,
-                    primary_key: false,
+                    primary_key: None,
                 },
             ],
             unique_constraints: Vec::new(),
@@ -1222,24 +1480,25 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("accounts".into()),
                 mode: TableMode::Ordinary,
+                storage: TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("organization".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: vec![CreateUnique {
@@ -1272,30 +1531,31 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("profiles".into()),
                 mode: TableMode::Ordinary,
+                storage: TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("tenant".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("username".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: vec![
@@ -1402,11 +1662,11 @@ mod tests {
     #[test]
     fn composite_unique_constraints_roundtrip_with_their_own_keyspace() {
         let created = deterministic_unique_create();
-        let unique = &created.unique_constraints[0];
+        let unique = &created.schema.unique_constraints[0];
         assert_eq!(unique.keyspace_id.0, test_uuid(8));
         assert_eq!(
             unique.columns,
-            vec![created.columns[1].id, created.columns[2].id]
+            vec![created.schema.columns[1].id, created.schema.columns[2].id]
         );
 
         let decoded = CreateTable::decode(&created.encode()).unwrap();
@@ -1426,9 +1686,10 @@ mod tests {
     #[test]
     fn overlapping_unique_constraints_keep_distinct_ordered_keyspaces() {
         let created = deterministic_overlapping_unique_create();
-        assert_eq!(created.unique_constraints.len(), 4);
+        assert_eq!(created.schema.unique_constraints.len(), 4);
         assert_eq!(
             created
+                .schema
                 .unique_constraints
                 .iter()
                 .map(|unique| unique.keyspace_id.0)
@@ -1437,15 +1698,16 @@ mod tests {
         );
         assert_eq!(
             created
+                .schema
                 .unique_constraints
                 .iter()
                 .map(|unique| unique.columns.clone())
                 .collect::<Vec<_>>(),
             [
-                vec![created.columns[2].id],
-                vec![created.columns[3].id],
-                vec![created.columns[1].id, created.columns[2].id],
-                vec![created.columns[1].id, created.columns[3].id],
+                vec![created.schema.columns[2].id],
+                vec![created.schema.columns[3].id],
+                vec![created.schema.columns[1].id, created.schema.columns[2].id],
+                vec![created.schema.columns[1].id, created.schema.columns[3].id],
             ]
         );
 
@@ -1454,7 +1716,7 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 10);
         for (mutation, unique) in lowered.mutations[5..9]
             .iter()
-            .zip(&created.unique_constraints)
+            .zip(&created.schema.unique_constraints)
         {
             assert_eq!(
                 mutation.key(),
@@ -1470,24 +1732,24 @@ mod tests {
     #[test]
     fn decoder_rejects_malformed_unique_definitions() {
         let mut duplicate_column = deterministic_unique_create();
-        duplicate_column.unique_constraints[0]
+        duplicate_column.schema.unique_constraints[0]
             .columns
-            .push(duplicate_column.columns[1].id);
+            .push(duplicate_column.schema.columns[1].id);
         assert_eq!(
             CreateTable::decode(&duplicate_column.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
 
         let mut unknown_column = deterministic_unique_create();
-        unknown_column.unique_constraints[0].columns[0] = ColumnId(test_uuid(99));
+        unknown_column.schema.unique_constraints[0].columns[0] = ColumnId(test_uuid(99));
         assert_eq!(
             CreateTable::decode(&unknown_column.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
 
         let mut duplicate_keyspace = deterministic_overlapping_unique_create();
-        duplicate_keyspace.unique_constraints[1].keyspace_id =
-            duplicate_keyspace.unique_constraints[0].keyspace_id;
+        duplicate_keyspace.schema.unique_constraints[1].keyspace_id =
+            duplicate_keyspace.schema.unique_constraints[0].keyspace_id;
         assert_eq!(
             CreateTable::decode(&duplicate_keyspace.encode()),
             Err(SchemaCodecError::InvalidSchema)
@@ -1617,7 +1879,7 @@ mod tests {
                 .map(|column| (
                     column.declared_type().to_sql(),
                     column.affinity(decoded.mode()),
-                    column.is_rowid_alias(),
+                    decoded.is_rowid_alias(column.id()),
                 ))
                 .collect::<Vec<_>>(),
             [
@@ -1651,25 +1913,71 @@ mod tests {
         assert_eq!(decoded.mode(), TableMode::Strict);
         assert!(decoded.primary_key_columns().next().unwrap().is_not_null());
         assert_eq!(
-            decoded.columns.last().unwrap().strict_type(),
+            decoded.schema.columns.last().unwrap().strict_type(),
             Some(StrictType::Any)
         );
         assert_eq!(
-            decoded.columns.last().unwrap().affinity(decoded.mode()),
+            decoded
+                .schema
+                .columns
+                .last()
+                .unwrap()
+                .affinity(decoded.mode()),
             Affinity::Blob
         );
 
         let mut mode_mismatch = created.clone();
-        mode_mismatch.mode = TableMode::Ordinary;
+        mode_mismatch.schema.mode = TableMode::Ordinary;
         assert_eq!(
             CreateTable::decode(&mode_mismatch.encode()),
             Err(SchemaCodecError::SqlMismatch)
         );
 
         let mut invalid_type = created;
-        invalid_type.columns[1].declared_type = TypeDeclaration::new("DECIMAL".into(), Vec::new());
+        invalid_type.schema.columns[1].declared_type =
+            TypeDeclaration::new("DECIMAL".into(), Vec::new());
         assert_eq!(
             CreateTable::decode(&invalid_type.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn table_schema_owns_ordered_composite_primary_and_associated_schema() {
+        let sql = "CREATE TABLE memberships (
+            tenant TEXT,
+            member INTEGER,
+            body TEXT,
+            UNIQUE (tenant, body),
+            PRIMARY KEY (member, tenant)
+        ) WITHOUT ROWID";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let schema = created.schema();
+
+        assert_eq!(schema.storage(), TableStorage::WithoutRowid);
+        assert_eq!(
+            created
+                .primary_key_columns()
+                .map(|column| column.name().value())
+                .collect::<Vec<_>>(),
+            ["member", "tenant"]
+        );
+        assert_eq!(schema.primary_key().columns().len(), 2);
+        assert_eq!(schema.unique_constraints().len(), 1);
+        assert!(schema.indexes().is_empty());
+        assert!(schema.foreign_keys().is_empty());
+        assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+
+        let mut duplicate_primary = created;
+        duplicate_primary.schema.primary_key.columns[1] =
+            duplicate_primary.schema.primary_key.columns[0];
+        assert_eq!(
+            CreateTable::decode(&duplicate_primary.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
     }
@@ -1684,7 +1992,7 @@ mod tests {
             .chain(std::iter::once(created.table_id.0))
             .chain(std::iter::once(created.schema_revision_id.0))
             .chain(std::iter::once(created.row_keyspace_id.0))
-            .chain(created.columns.iter().map(|column| column.id.0))
+            .chain(created.schema.columns.iter().map(|column| column.id.0))
         {
             let uuid = Uuid::from_bytes(bytes);
             assert_eq!(uuid.get_version(), Some(Version::Random));

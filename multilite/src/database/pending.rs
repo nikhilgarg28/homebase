@@ -548,11 +548,12 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new(name.into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),
                     not_null: false,
-                    primary_key: true,
+                    primary_key: Some(0),
                 }],
                 unique_constraints: Vec::new(),
             },
@@ -595,18 +596,19 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
+                storage: crate::database::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
-                        primary_key: true,
+                        primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
-                        primary_key: false,
+                        primary_key: None,
                     },
                 ],
                 unique_constraints: Vec::new(),
