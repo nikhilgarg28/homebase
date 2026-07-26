@@ -78,6 +78,18 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
             )
             .await
             .unwrap();
+        let insert = database
+            .prepare_async("INSERT INTO notes VALUES (?1, ?2)")
+            .await
+            .unwrap();
+        assert!(!insert.readonly());
+        assert_eq!(
+            insert
+                .execute_async((Value::Integer(4), Value::Text("four".into())))
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(
             database
                 .execute_async(
@@ -104,7 +116,7 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
                 .query_map_async([Value::Integer(2)], |row| row.get::<_, String>(0))
                 .await
                 .unwrap(),
-            ["three"]
+            ["three", "four"]
         );
         assert_eq!(
             database

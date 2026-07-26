@@ -4,7 +4,7 @@ use homebase_client::ServerHandle;
 use rusqlite::{Connection, Row};
 
 use super::{Database, DatabaseRuntime, sql};
-use crate::commit::committer::CommitSnapshot;
+use crate::branch::snapshot::PinnedReader;
 use crate::{Error, Params, Result};
 
 /// One managed, read-only SQLite snapshot.
@@ -27,6 +27,15 @@ impl<'a> ViewTransaction<'a> {
         statement.query_map(params, map)
     }
 
+    pub(super) fn query_prevalidated<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        let mut statement = TransactionStatement::new_prevalidated(self.connection, sql)?;
+        statement.query_map(params, map)
+    }
+
     /// Alias matching rusqlite's mapped-query vocabulary.
     pub fn query_map<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
     where
@@ -44,21 +53,21 @@ impl<'a> ViewTransaction<'a> {
 
 /// A read-only prepared statement that cannot outlive its managed transaction.
 pub struct TransactionStatement<'a> {
-    connection: &'a Connection,
-    sql: String,
+    statement: rusqlite::Statement<'a>,
 }
 
 impl<'a> TransactionStatement<'a> {
     pub(crate) fn new(connection: &'a Connection, sql: &str) -> Result<Self> {
-        sql::validate_managed_statement(sql)?;
+        sql::validate_read_statement(sql)?;
+        Self::new_prevalidated(connection, sql)
+    }
+
+    fn new_prevalidated(connection: &'a Connection, sql: &str) -> Result<Self> {
         let statement = connection.prepare(sql)?;
         if !statement.readonly() {
             return Err(Error::PreparedWrite);
         }
-        Ok(Self {
-            connection,
-            sql: sql.to_owned(),
-        })
+        Ok(Self { statement })
     }
 
     /// Execute the query and eagerly map every row in the managed snapshot.
@@ -67,11 +76,7 @@ impl<'a> TransactionStatement<'a> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let mut statement = self.connection.prepare(&self.sql)?;
-        if !statement.readonly() {
-            return Err(Error::PreparedWrite);
-        }
-        statement
+        self.statement
             .query_map(params, map)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -79,12 +84,10 @@ impl<'a> TransactionStatement<'a> {
 }
 
 pub(super) fn run_branch_view<T>(
-    snapshot: CommitSnapshot,
+    snapshot: PinnedReader,
     operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>,
 ) -> Result<T> {
-    let branch = crate::branch::ReadBranch::open(snapshot.physical)
-        .map_err(|error| Error::Branch(error.to_string()))?;
-    operation(&ViewTransaction::new(branch.connection()))
+    snapshot.with_reader(|reader| operation(&ViewTransaction::new(reader)))
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
@@ -95,7 +98,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         operation: impl FnOnce(&ViewTransaction<'_>) -> Result<T>,
     ) -> Result<T> {
         self.refresh_read(runtime)?;
-        let snapshot = self.issue_branch_snapshot(false)?;
+        let snapshot = self.issue_view_snapshot()?;
         run_branch_view(snapshot, operation)
     }
 }

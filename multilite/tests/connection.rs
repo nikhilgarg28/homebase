@@ -64,7 +64,7 @@ fn query_map_supports_normal_rusqlite_parameters_and_conversions() {
 }
 
 #[test]
-fn prepare_rejects_writes_without_mutating() {
+fn prepared_writes_execute_through_the_managed_update_path() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("readonly.sqlite")).unwrap();
     db.execute(
@@ -73,16 +73,17 @@ fn prepare_rejects_writes_without_mutating() {
     )
     .unwrap();
 
-    let error = match db.prepare("INSERT INTO values_v1 (value) VALUES (1)") {
-        Ok(_) => panic!("write statement unexpectedly prepared"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, Error::PreparedWrite));
+    let mut insert = db
+        .prepare("INSERT INTO values_v1 (value) VALUES (1)")
+        .unwrap();
+    assert!(!insert.readonly());
+    assert_eq!(insert.execute(()).unwrap(), 1);
 
     let mut statement = db.prepare("SELECT count(*) FROM values_v1").unwrap();
+    assert!(statement.readonly());
     assert_eq!(
         statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
-        [0]
+        [1]
     );
 }
 

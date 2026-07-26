@@ -1481,7 +1481,8 @@ mod tests {
         }
 
         fn branch(&self) -> WritableBranch {
-            WritableBranch::open(self.snapshot(), OverlayOptions::default()).unwrap()
+            WritableBranch::open_for_changeset_capture(self.snapshot(), OverlayOptions::default())
+                .unwrap()
         }
     }
 

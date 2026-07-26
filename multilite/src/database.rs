@@ -33,10 +33,12 @@ use homebase_core::clock::{Lineage, SystemHybridClock};
 use homebase_core::messages::KernelError;
 use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq};
+use parking_lot::Mutex;
 use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection as SqliteConnection, Row};
 
+use crate::commit::checkpoint::CheckpointPolicy;
 use crate::commit::committer::{
     CommitBackend, CommitHistory, CommitSnapshot, Committer, WeakCommitter,
 };
@@ -489,6 +491,16 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         params: Q,
     ) -> Result<usize> {
         let validated = sql::validate_execute(sql)?;
+        self.execute_validated(runtime, sql, params, validated)
+    }
+
+    fn execute_validated<Q: Params>(
+        self: &Arc<Self>,
+        runtime: &DatabaseRuntime,
+        sql: &str,
+        params: Q,
+        validated: sql::ValidatedExecute,
+    ) -> Result<usize> {
         self.update(runtime, |update| {
             update.execute_validated(sql, params, validated)
         })
@@ -513,19 +525,16 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         runtime: &Arc<DatabaseRuntime>,
         sql: &str,
     ) -> Result<Statement<H>> {
-        sql::validate_managed_statement(sql)?;
-        runtime.run(ExecutionMode::Public, |connection| {
-            let statement = connection.prepare(sql)?;
-            if statement.readonly() {
-                Ok(())
-            } else {
-                Err(Error::PreparedWrite)
-            }
-        })?;
+        let _ = runtime;
+        let kind = match sql::validate_statement(sql)? {
+            sql::ValidatedStatement::Read => StatementKind::Read,
+            sql::ValidatedStatement::Execute(validated) => StatementKind::Execute(validated),
+        };
         Ok(Statement {
             database: Arc::clone(self),
             runtime: Arc::clone(runtime),
             sql: sql.to_owned(),
+            kind,
         })
     }
 
@@ -541,6 +550,10 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     fn issue_branch_snapshot(self: &Arc<Self>, track_for_commit: bool) -> Result<CommitSnapshot> {
         self.committer.capture_snapshot_blocking(track_for_commit)
+    }
+
+    fn issue_view_snapshot(self: &Arc<Self>) -> Result<crate::branch::snapshot::PinnedReader> {
+        self.committer.capture_view_blocking()
     }
 
     fn commit_proposal(self: &Arc<Self>, proposal: CommitProposal) -> Result<CommitReceipt> {
@@ -559,7 +572,10 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
         track_for_commit: bool,
         after_physical: impl FnOnce() -> Result<()>,
     ) -> Result<CommitSnapshot> {
-        let physical = crate::branch::snapshot::PinnedSnapshot::capture(&self.path, &self.wal_path)
+        let physical = self
+            .snapshot_cache
+            .lock()
+            .capture(&self.path, &self.wal_path)
             .map_err(|error| Error::Branch(error.to_string()))?;
         after_physical()?;
         let (commit_seq, cursors) = physical.with_reader(|connection| {
@@ -825,11 +841,40 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
 
 impl<H: ServerHandle + Send + Sync + 'static> CommitBackend for DatabaseCommitBackend<H> {
     fn commit_group(&self, proposals: &[&CommitProposal]) -> Result<Vec<Result<CommitReceipt>>> {
-        self.commit_proposal_group(proposals)
+        let result = self.commit_proposal_group(proposals);
+        if result.is_ok() {
+            self.snapshot_cache.lock().invalidate_readers();
+            self.owner.with_connection(|connection| {
+                self.checkpoint
+                    .lock()
+                    .after_commit(connection, &self.wal_path)
+            });
+        }
+        result
     }
 
     fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot> {
+        self.owner.with_connection(|connection| {
+            self.checkpoint
+                .lock()
+                .before_snapshot(connection, &self.wal_path)
+        })?;
         self.capture_snapshot_inner(writable, || Ok(()))
+    }
+
+    fn capture_view(&self) -> Result<crate::branch::snapshot::PinnedReader> {
+        self.owner.with_connection(|connection| {
+            self.checkpoint
+                .lock()
+                .before_snapshot(connection, &self.wal_path)
+        })?;
+        let reader = self
+            .snapshot_cache
+            .lock()
+            .capture_reader(&self.path)
+            .map_err(|error| Error::Branch(error.to_string()))?;
+        reader.with_reader(|connection| connection.authorizer(Some(authorize_public)))?;
+        Ok(reader)
     }
 }
 
@@ -869,6 +914,10 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         }
         _ => Authorization::Deny,
     }
+}
+
+fn authorize_public(context: AuthContext<'_>) -> Authorization {
+    authorize_database(ExecutionMode::Public, &context)
 }
 
 fn authorize_read(database: Option<&str>, table: &str) -> Authorization {
@@ -915,7 +964,7 @@ fn has_multilite_prefix(table: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
 }
 
-/// A read-only prepared statement owned by a Multilite database.
+/// A validated prepared statement owned by a Multilite database.
 pub struct Statement<H = OfflineServer>
 where
     H: ServerHandle + Send + Sync + 'static,
@@ -923,17 +972,54 @@ where
     database: Arc<Database<H>>,
     runtime: Arc<DatabaseRuntime>,
     sql: String,
+    kind: StatementKind,
+}
+
+enum StatementKind {
+    Read,
+    Execute(sql::ValidatedExecute),
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
+    /// Whether this statement is read-only.
+    pub fn readonly(&self) -> bool {
+        matches!(self.kind, StatementKind::Read)
+    }
+
+    /// Execute a prepared mutating statement.
+    pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
+        let StatementKind::Execute(validated) = &self.kind else {
+            return Err(Error::PreparedWrite);
+        };
+        self.database
+            .execute_validated(&self.runtime, &self.sql, params, validated.clone())
+    }
+
+    /// Asynchronously execute a prepared mutating statement.
+    pub async fn execute_async<P>(&self, params: P) -> Result<usize>
+    where
+        P: Params + Send + 'static,
+    {
+        let StatementKind::Execute(validated) = &self.kind else {
+            return Err(Error::PreparedWrite);
+        };
+        self.database
+            .execute_validated_async(self.sql.clone(), params, validated.clone())
+            .await
+    }
+
     /// Execute the query and eagerly map every row.
     pub fn query_map<T, P, F>(&mut self, params: P, map: F) -> Result<Vec<T>>
     where
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        self.database
-            .view(&self.runtime, |view| view.query(&self.sql, params, map))
+        if !self.readonly() {
+            return Err(Error::PreparedWrite);
+        }
+        self.database.view(&self.runtime, |view| {
+            view.query_prevalidated(&self.sql, params, map)
+        })
     }
 
     /// Asynchronously execute this statement and return owned mapped values.
@@ -943,9 +1029,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         P: Params + Send + 'static,
         F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
     {
+        if !self.readonly() {
+            return Err(Error::PreparedWrite);
+        }
         let sql = self.sql.clone();
         self.database
-            .view_async(move |view| view.query(&sql, params, map))
+            .view_async(move |view| view.query_prevalidated(&sql, params, map))
             .await
     }
 
@@ -1000,6 +1089,8 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         database_id,
         client: Arc::clone(&client),
         commit_history: commit_history.clone(),
+        snapshot_cache: Mutex::new(crate::branch::snapshot::SnapshotCache::new()),
+        checkpoint: Mutex::new(CheckpointPolicy::default()),
     });
     let committer = Committer::new(Arc::clone(&commit_backend)).map_err(committer_error)?;
     canonical.install(Arc::new(CommitterMetaSink {
@@ -1026,6 +1117,8 @@ struct DatabaseCommitBackend<H: ServerHandle> {
     database_id: DatabaseId,
     client: Arc<DatabaseClient<H>>,
     commit_history: CommitHistory,
+    snapshot_cache: Mutex<crate::branch::snapshot::SnapshotCache>,
+    checkpoint: Mutex<CheckpointPolicy>,
 }
 
 struct CommitterMetaSink {

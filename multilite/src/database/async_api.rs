@@ -136,6 +136,18 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Q: Params + Send + 'static,
     {
         let validated = sql::validate_execute(&sql)?;
+        self.execute_validated_async(sql, params, validated).await
+    }
+
+    pub(super) async fn execute_validated_async<Q>(
+        self: &Arc<Self>,
+        sql: String,
+        params: Q,
+        validated: sql::ValidatedExecute,
+    ) -> Result<usize>
+    where
+        Q: Params + Send + 'static,
+    {
         self.update_async(move |update| update.execute_validated(&sql, params, validated))
             .await
     }
@@ -146,7 +158,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         F: Send + 'static + for<'a> FnOnce(&ViewTransaction<'a>) -> Result<T>,
     {
         self.refresh_read_async().await?;
-        let snapshot = self.committer.capture_snapshot(false).await?;
+        let snapshot = self.committer.capture_view().await?;
         blocking::run(move || run_branch_view(snapshot, operation)).await
     }
 

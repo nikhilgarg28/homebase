@@ -33,23 +33,21 @@ impl WalSource for File {
     }
 }
 
-/// Read exactly the prefix length observed before I/O began.
-pub fn read_observation(source: &impl WalSource) -> io::Result<Vec<u8>> {
-    let length = usize::try_from(source.len()?)
-        .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "WAL is too large"))?;
-    let mut bytes = vec![0; length];
-    let mut offset = 0_usize;
-    while offset < length {
-        let read = source.read_at(offset as u64, &mut bytes[offset..])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "WAL shrank during observation",
-            ));
-        }
-        offset += read;
+impl WalSource for &[u8] {
+    fn len(&self) -> io::Result<u64> {
+        Ok((**self).len() as u64)
     }
-    Ok(bytes)
+
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<usize> {
+        let offset = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WAL offset is too large"))?;
+        let Some(source) = (**self).get(offset..) else {
+            return Ok(0);
+        };
+        let amount = source.len().min(destination.len());
+        destination[..amount].copy_from_slice(&source[..amount]);
+        Ok(amount)
+    }
 }
 
 /// One WAL incarnation. A checkpoint reset rotates these salts.
@@ -88,7 +86,7 @@ pub struct WalSnapshot {
     max_frame: u32,
     page_count: u32,
     page_size: u32,
-    page_map: Arc<BTreeMap<u32, WalFrame>>,
+    page_map: PageMap,
 }
 
 impl WalSnapshot {
@@ -108,9 +106,89 @@ impl WalSnapshot {
         self.page_size
     }
 
-    pub fn page_map(&self) -> &BTreeMap<u32, WalFrame> {
+    pub fn page_map(&self) -> &PageMap {
         &self.page_map
     }
+}
+
+const PAGE_CHUNK_BITS: u32 = 8;
+const PAGE_CHUNK_LEN: usize = 1 << PAGE_CHUNK_BITS;
+
+/// Structurally shared latest-frame map grouped into 256-page chunks.
+///
+/// Publishing a committed snapshot clones only the root `Arc`. The first
+/// later write copies the much smaller chunk directory and each touched chunk
+/// at most once, while untouched chunks remain shared with older snapshots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageMap {
+    chunks: Arc<BTreeMap<u32, Arc<PageChunk>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PageChunk {
+    frames: Box<[Option<WalFrame>; PAGE_CHUNK_LEN]>,
+}
+
+impl Default for PageChunk {
+    fn default() -> Self {
+        Self {
+            frames: Box::new([None; PAGE_CHUNK_LEN]),
+        }
+    }
+}
+
+impl PageMap {
+    pub fn get(&self, page: &u32) -> Option<&WalFrame> {
+        let (chunk, offset) = page_location(*page);
+        self.chunks
+            .get(&chunk)
+            .and_then(|chunk| chunk.frames[offset].as_ref())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.iter().map(|(page, _)| page)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &WalFrame> + '_ {
+        self.iter().map(|(_, frame)| frame)
+    }
+
+    fn insert(&mut self, page: u32, frame: WalFrame) {
+        let (chunk, offset) = page_location(page);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let chunk = chunks.entry(chunk).or_default();
+        Arc::make_mut(chunk).frames[offset] = Some(frame);
+    }
+
+    fn truncate(&mut self, page_count: u32) {
+        let (last_chunk, last_offset) = page_location(page_count);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        chunks.retain(|chunk, _| *chunk <= last_chunk);
+        if let Some(chunk) = chunks.get_mut(&last_chunk) {
+            Arc::make_mut(chunk).frames[last_offset + 1..].fill(None);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, &WalFrame)> + '_ {
+        self.chunks.iter().flat_map(|(chunk_index, chunk)| {
+            chunk
+                .frames
+                .iter()
+                .enumerate()
+                .filter_map(move |(offset, frame)| {
+                    frame
+                        .as_ref()
+                        .map(|frame| ((*chunk_index << PAGE_CHUNK_BITS) | offset as u32, frame))
+                })
+        })
+    }
+}
+
+fn page_location(page: u32) -> (u32, usize) {
+    (
+        page >> PAGE_CHUNK_BITS,
+        (page & (PAGE_CHUNK_LEN as u32 - 1)) as usize,
+    )
 }
 
 /// Condition of bytes after the last checksum-valid frame.
@@ -142,7 +220,7 @@ struct ParserState {
     next_frame: u32,
     next_offset: usize,
     checksum: [u32; 2],
-    working_map: BTreeMap<u32, WalFrame>,
+    working_map: PageMap,
     committed: Option<WalSnapshot>,
 }
 
@@ -167,23 +245,39 @@ impl WalParser {
 
     /// Rebuild from scratch using the same state machine as incremental use.
     pub fn parse(bytes: &[u8]) -> Result<WalParse, WalError> {
-        Self::new().refresh(bytes)
+        Self::new().refresh_source(&bytes)
     }
 
     /// Extend or reset this parser to match the complete observed WAL prefix.
     pub fn refresh(&mut self, bytes: &[u8]) -> Result<WalParse, WalError> {
-        let header = parse_header(bytes)?;
+        self.refresh_source(&bytes)
+    }
+
+    /// Extend or reset this parser by streaming one fixed-length WAL observation.
+    pub fn refresh_source(&mut self, source: &impl WalSource) -> Result<WalParse, WalError> {
+        let length = usize::try_from(source.len()?).map_err(|_| {
+            WalError::from(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "WAL is too large",
+            ))
+        })?;
+        let mut header_bytes = [0; WAL_HEADER_SIZE];
+        read_exact_at(source, 0, &mut header_bytes[..length.min(WAL_HEADER_SIZE)])?;
+        if length < WAL_HEADER_SIZE {
+            return Err(WalError::IncompleteHeader(length));
+        }
+        let header = parse_header(&header_bytes)?;
         let reset = self
             .state
             .as_ref()
-            .is_none_or(|state| state.header != header || bytes.len() < state.next_offset);
+            .is_none_or(|state| state.header != header || length < state.next_offset);
         if reset {
             self.state = Some(ParserState {
                 header,
                 next_frame: 1,
                 next_offset: WAL_HEADER_SIZE,
                 checksum: header.checksum,
-                working_map: BTreeMap::new(),
+                working_map: PageMap::default(),
                 committed: None,
             });
         }
@@ -192,16 +286,17 @@ impl WalParser {
         let frame_size = FRAME_HEADER_SIZE
             .checked_add(state.header.page_size as usize)
             .ok_or(WalError::InvalidPageSize(state.header.page_size))?;
+        let mut frame = vec![0; frame_size];
         let mut tail = WalTail::Complete;
 
-        while state.next_offset < bytes.len() {
-            let remaining = bytes.len() - state.next_offset;
+        while state.next_offset < length {
+            let remaining = length - state.next_offset;
             if remaining < frame_size {
                 tail = WalTail::Incomplete { bytes: remaining };
                 break;
             }
+            read_exact_at(source, state.next_offset as u64, &mut frame)?;
             let frame_number = state.next_frame;
-            let frame = &bytes[state.next_offset..state.next_offset + frame_size];
             let page_number = be_u32(&frame[0..4]);
             let page_count = be_u32(&frame[4..8]);
             let salts = [be_u32(&frame[8..12]), be_u32(&frame[12..16])];
@@ -246,13 +341,13 @@ impl WalParser {
             state.next_offset += frame_size;
 
             if page_count != 0 {
-                state.working_map.retain(|page, _| *page <= page_count);
+                state.working_map.truncate(page_count);
                 state.committed = Some(WalSnapshot {
                     epoch: state.header.epoch,
                     max_frame: frame_number,
                     page_count,
                     page_size: state.header.page_size,
-                    page_map: Arc::new(state.working_map.clone()),
+                    page_map: state.working_map.clone(),
                 });
             }
         }
@@ -263,6 +358,29 @@ impl WalParser {
             valid_bytes: state.next_offset,
         })
     }
+
+    pub fn clear(&mut self) {
+        self.state = None;
+    }
+}
+
+fn read_exact_at(
+    source: &impl WalSource,
+    mut offset: u64,
+    mut destination: &mut [u8],
+) -> Result<(), WalError> {
+    while !destination.is_empty() {
+        let read = source.read_at(offset, destination)?;
+        if read == 0 {
+            return Err(WalError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL shrank during observation",
+            )));
+        }
+        offset += read as u64;
+        destination = &mut destination[read..];
+    }
+    Ok(())
 }
 
 fn parse_header(bytes: &[u8]) -> Result<WalHeader, WalError> {
@@ -324,6 +442,10 @@ fn be_u32(bytes: &[u8]) -> u32 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalError {
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
     IncompleteHeader(usize),
     InvalidMagic(u32),
     UnsupportedVersion(u32),
@@ -334,6 +456,7 @@ pub enum WalError {
 impl fmt::Display for WalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io { message, .. } => write!(f, "WAL I/O: {message}"),
             Self::IncompleteHeader(bytes) => {
                 write!(f, "incomplete SQLite WAL header ({bytes} bytes)")
             }
@@ -348,6 +471,15 @@ impl fmt::Display for WalError {
 }
 
 impl std::error::Error for WalError {}
+
+impl From<io::Error> for WalError {
+    fn from(error: io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -476,17 +608,20 @@ mod tests {
     }
 
     #[test]
-    fn fixed_observations_handle_short_reads_growth_shrink_and_io_failure() {
+    fn streaming_parser_handles_short_reads_and_io_failure() {
         let bytes = test_wal(ChecksumOrder::Little, &[(1, 1), (2, 2)]);
-        let source = FaultSource {
+        let short = FaultSource {
             bytes: bytes.clone(),
             reported_len: bytes.len(),
             max_chunk: 7,
             fail_on_read: None,
             reads: Cell::new(0),
         };
-        assert_eq!(read_observation(&source).unwrap(), bytes);
-        assert!(source.reads.get() > 2);
+        assert_eq!(
+            WalParser::new().refresh_source(&short).unwrap(),
+            WalParser::parse(&bytes).unwrap()
+        );
+        assert!(short.reads.get() > 2);
 
         let growing = FaultSource {
             bytes: [bytes.clone(), vec![9; 100]].concat(),
@@ -495,7 +630,10 @@ mod tests {
             fail_on_read: None,
             reads: Cell::new(0),
         };
-        assert_eq!(read_observation(&growing).unwrap(), bytes);
+        assert_eq!(
+            WalParser::new().refresh_source(&growing).unwrap(),
+            WalParser::parse(&bytes).unwrap()
+        );
 
         let shrinking = FaultSource {
             bytes: bytes[..bytes.len() - 1].to_vec(),
@@ -504,22 +642,25 @@ mod tests {
             fail_on_read: None,
             reads: Cell::new(0),
         };
-        assert_eq!(
-            read_observation(&shrinking).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
+        assert!(matches!(
+            WalParser::new().refresh_source(&shrinking),
+            Err(WalError::Io {
+                kind: io::ErrorKind::UnexpectedEof,
+                ..
+            })
+        ));
 
         let failing = FaultSource {
             bytes,
-            reported_len: growing.reported_len,
+            reported_len: short.reported_len,
             max_chunk: 17,
             fail_on_read: Some(2),
             reads: Cell::new(0),
         };
-        assert_eq!(
-            read_observation(&failing).unwrap_err().to_string(),
-            "injected WAL read"
-        );
+        assert!(matches!(
+            WalParser::new().refresh_source(&failing),
+            Err(WalError::Io { message, .. }) if message == "injected WAL read"
+        ));
     }
 
     #[test]
@@ -584,7 +725,7 @@ mod tests {
             assert_eq!(extended.tail, WalTail::Complete);
             let snapshot = extended.snapshot.unwrap();
             assert!(snapshot.max_frame() > previous_frame);
-            assert!(snapshot.page_map().keys().all(|page| *page > 0));
+            assert!(snapshot.page_map().keys().all(|page| page > 0));
             assert!(snapshot.page_map().values().all(|frame| {
                 frame.frame() <= snapshot.max_frame()
                     && frame.data_offset() >= (WAL_HEADER_SIZE + FRAME_HEADER_SIZE) as u64
@@ -717,7 +858,40 @@ mod tests {
             let snapshot = parsed.snapshot.unwrap();
             assert_eq!(snapshot.max_frame(), 3);
             assert_eq!(snapshot.page_count(), 2);
-            assert_eq!(snapshot.page_map().keys().copied().collect::<Vec<_>>(), [1]);
+            assert_eq!(snapshot.page_map().keys().collect::<Vec<_>>(), [1]);
         }
+    }
+
+    #[test]
+    fn page_map_snapshots_share_untouched_chunks() {
+        let mut map = PageMap::default();
+        map.insert(
+            1,
+            WalFrame {
+                frame: 1,
+                data_offset: 56,
+            },
+        );
+        map.insert(
+            300,
+            WalFrame {
+                frame: 2,
+                data_offset: 96,
+            },
+        );
+        let published = map.clone();
+        let published_second = Arc::clone(published.chunks.get(&1).unwrap());
+
+        map.insert(
+            1,
+            WalFrame {
+                frame: 3,
+                data_offset: 136,
+            },
+        );
+
+        assert_eq!(published.get(&1).unwrap().frame(), 1);
+        assert_eq!(map.get(&1).unwrap().frame(), 3);
+        assert!(Arc::ptr_eq(&published_second, map.chunks.get(&1).unwrap()));
     }
 }

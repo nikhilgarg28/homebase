@@ -38,6 +38,7 @@ struct Args {
 impl Args {
     fn parse() -> Self {
         let mut engine = Engine::Multilite;
+        let mut max_records = None;
         let mut output = None;
         let mut paths = Vec::new();
         let mut args = env::args().skip(1);
@@ -59,6 +60,18 @@ impl Args {
                         args.next().expect("--corpus requires a path"),
                     ));
                 }
+                "--max-records" => {
+                    max_records = Some(
+                        args.next()
+                            .expect("--max-records requires a positive integer")
+                            .parse::<usize>()
+                            .expect("--max-records requires a positive integer"),
+                    );
+                    assert!(
+                        max_records != Some(0),
+                        "--max-records requires a positive integer"
+                    );
+                }
                 "--output" => {
                     output = Some(PathBuf::from(
                         args.next().expect("--output requires a path"),
@@ -77,7 +90,10 @@ impl Args {
             panic!("at least one .slt/.test file or --corpus directory is required");
         }
         Self {
-            options: RunOptions { engine },
+            options: RunOptions {
+                engine,
+                max_records,
+            },
             output,
             paths,
         }
@@ -86,6 +102,6 @@ impl Args {
 
 fn print_help() {
     eprintln!(
-        "Usage: multilite-conformance [--engine sqlite|multilite|both] [--output report.json] [--corpus dir] <file-or-dir>..."
+        "Usage: multilite-conformance [--engine sqlite|multilite|both] [--max-records count] [--output report.json] [--corpus dir] <file-or-dir>..."
     );
 }

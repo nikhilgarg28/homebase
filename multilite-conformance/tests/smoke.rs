@@ -24,10 +24,25 @@ fn both_mode_runs_reference_and_candidate() {
         "tests/slt/basic.slt",
         &RunOptions {
             engine: multilite_conformance::Engine::Both,
+            max_records: None,
         },
     );
 
     assert_eq!(report.record_count(), 3);
+    assert_eq!(report.failed_count(), 0);
+}
+
+#[test]
+fn record_limit_stops_after_complete_records() {
+    let report = run_file(
+        "tests/slt/basic.slt",
+        &RunOptions {
+            engine: multilite_conformance::Engine::Both,
+            max_records: Some(2),
+        },
+    );
+
+    assert_eq!(report.record_count(), 2);
     assert_eq!(report.failed_count(), 0);
 }
 
@@ -37,6 +52,7 @@ fn affinity_fixture_matches_sqlite() {
         "tests/slt/affinity.slt",
         &RunOptions {
             engine: multilite_conformance::Engine::Both,
+            max_records: None,
         },
     );
 

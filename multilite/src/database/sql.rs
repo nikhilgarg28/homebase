@@ -2,10 +2,10 @@
 
 use fallible_iterator::FallibleIterator as _;
 #[cfg(test)]
-use sqlite3_parser::ast::{As, OneSelect, Operator, ResultColumn, SelectTable};
+use sqlite3_parser::ast::{As, Operator, ResultColumn};
 use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, Name, Stmt, TabFlags,
-    TableConstraint, Type, TypeSize, UnaryOperator,
+    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, Name, OneSelect, Select,
+    SelectTable, Stmt, TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -14,11 +14,17 @@ use super::schema::{
 };
 use crate::{Error, Result};
 
+#[derive(Clone)]
 pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
     Insert,
     Delete,
     Update,
+}
+
+pub enum ValidatedStatement {
+    Read,
+    Execute(ValidatedExecute),
 }
 
 /// Validate the initial transaction-read grammar and rewrite its sources.
@@ -138,7 +144,11 @@ fn unsupported_managed_read() -> Error {
 }
 
 pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
-    match parse_one(sql)? {
+    validate_execute_statement(parse_one(sql)?)
+}
+
+fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
+    match statement {
         Stmt::CreateTable {
             temporary,
             if_not_exists,
@@ -279,6 +289,40 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
     }
 }
 
+/// Classify one public prepared statement with a single AST parse.
+pub fn validate_statement(sql: &str) -> Result<ValidatedStatement> {
+    let command = parse_one_command(sql)?;
+    match command {
+        Cmd::Stmt(Stmt::Select(select))
+        | Cmd::Explain(Stmt::Select(select))
+        | Cmd::ExplainQueryPlan(Stmt::Select(select)) => {
+            if select_reads_reserved(&select) {
+                Err(Error::UnsupportedSql(
+                    "reserved Multilite tables are not readable",
+                ))
+            } else {
+                Ok(ValidatedStatement::Read)
+            }
+        }
+        Cmd::Stmt(Stmt::Pragma(_, None)) => Ok(ValidatedStatement::Read),
+        Cmd::Stmt(
+            Stmt::Begin(..)
+            | Stmt::Commit(..)
+            | Stmt::Rollback { .. }
+            | Stmt::Savepoint(..)
+            | Stmt::Release(..),
+        ) => Err(Error::UnsupportedSql(
+            "transaction control is owned by the managed closure",
+        )),
+        Cmd::Stmt(statement) => {
+            validate_execute_statement(statement).map(ValidatedStatement::Execute)
+        }
+        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(Error::UnsupportedSql(
+            "EXPLAIN is supported only for SELECT",
+        )),
+    }
+}
+
 /// Reject transaction lifecycle commands owned by a managed closure.
 pub fn validate_managed_statement(sql: &str) -> Result<()> {
     let command = parse_one_command(sql)?;
@@ -297,6 +341,81 @@ pub fn validate_managed_statement(sql: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate one statement intended for the public read-only surface.
+pub fn validate_read_statement(sql: &str) -> Result<()> {
+    let command = parse_one_command(sql)?;
+    match command {
+        Cmd::Stmt(Stmt::Select(select))
+        | Cmd::Explain(Stmt::Select(select))
+        | Cmd::ExplainQueryPlan(Stmt::Select(select))
+            if !select_reads_reserved(&select) =>
+        {
+            Ok(())
+        }
+        Cmd::Stmt(Stmt::Pragma(_, None)) => Ok(()),
+        Cmd::Stmt(
+            Stmt::Begin(..)
+            | Stmt::Commit(..)
+            | Stmt::Rollback { .. }
+            | Stmt::Savepoint(..)
+            | Stmt::Release(..),
+        ) => Err(Error::UnsupportedSql(
+            "transaction control is owned by the managed closure",
+        )),
+        _ => Err(Error::PreparedWrite),
+    }
+}
+
+fn select_reads_reserved(select: &Select) -> bool {
+    select
+        .with
+        .iter()
+        .flat_map(|with| &with.ctes)
+        .any(|cte| select_reads_reserved(&cte.select))
+        || one_select_reads_reserved(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .flatten()
+            .any(|compound| one_select_reads_reserved(&compound.select))
+}
+
+fn one_select_reads_reserved(select: &OneSelect) -> bool {
+    let OneSelect::Select {
+        from: Some(from), ..
+    } = select
+    else {
+        return false;
+    };
+    from.select
+        .iter()
+        .any(|table| select_table_reads_reserved(table))
+        || from
+            .joins
+            .iter()
+            .flatten()
+            .any(|join| select_table_reads_reserved(&join.table))
+}
+
+fn select_table_reads_reserved(table: &SelectTable) -> bool {
+    match table {
+        SelectTable::Table(name, ..) => super::has_multilite_prefix(name.name.0.as_ref()),
+        SelectTable::TableCall(..) => false,
+        SelectTable::Select(select, ..) => select_reads_reserved(select),
+        SelectTable::Sub(from, ..) => {
+            from.select
+                .iter()
+                .any(|table| select_table_reads_reserved(table))
+                || from
+                    .joins
+                    .iter()
+                    .flatten()
+                    .any(|join| select_table_reads_reserved(&join.table))
+        }
+    }
 }
 
 fn parse_one(sql: &str) -> Result<Stmt> {

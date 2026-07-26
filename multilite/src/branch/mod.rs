@@ -75,20 +75,45 @@ pub struct WritableBranch {
     connection: Option<Connection>,
     vfs: BranchVfs,
     baseline_connection: Option<Connection>,
-    _baseline_vfs: BranchVfs,
+    _baseline_vfs: Option<BranchVfs>,
 }
 
 impl WritableBranch {
     pub fn open(snapshot: PinnedSnapshot, options: OverlayOptions) -> Result<Self, BranchError> {
+        Self::open_inner(snapshot, options, false)
+    }
+
+    pub fn open_for_changeset_capture(
+        snapshot: PinnedSnapshot,
+        options: OverlayOptions,
+    ) -> Result<Self, BranchError> {
+        Self::open_inner(snapshot, options, true)
+    }
+
+    fn open_inner(
+        snapshot: PinnedSnapshot,
+        options: OverlayOptions,
+        with_baseline: bool,
+    ) -> Result<Self, BranchError> {
         let database_path = snapshot.database_path().to_owned();
-        let (reader, baseline_reader) = SnapshotReader::open_pair(snapshot)?;
-        let baseline_vfs = BranchVfs::register(BranchImage::read_only(baseline_reader))?;
-        let baseline_connection = Connection::open_with_flags_and_vfs(
-            &database_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            baseline_vfs.name(),
-        )?;
-        baseline_connection.execute_batch("PRAGMA query_only = ON; PRAGMA mmap_size = 0")?;
+        let (reader, baseline_reader) = if with_baseline {
+            let (reader, baseline) = SnapshotReader::open_pair(snapshot)?;
+            (reader, Some(baseline))
+        } else {
+            (SnapshotReader::open(snapshot)?, None)
+        };
+        let (baseline_connection, baseline_vfs) = if let Some(baseline_reader) = baseline_reader {
+            let baseline_vfs = BranchVfs::register(BranchImage::read_only(baseline_reader))?;
+            let baseline_connection = Connection::open_with_flags_and_vfs(
+                &database_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                baseline_vfs.name(),
+            )?;
+            baseline_connection.execute_batch("PRAGMA query_only = ON; PRAGMA mmap_size = 0")?;
+            (Some(baseline_connection), Some(baseline_vfs))
+        } else {
+            (None, None)
+        };
         let vfs = BranchVfs::register(BranchImage::writable(reader, options))?;
         let connection = Connection::open_with_flags_and_vfs(
             &database_path,
@@ -105,7 +130,7 @@ impl WritableBranch {
         Ok(Self {
             connection: Some(connection),
             vfs,
-            baseline_connection: Some(baseline_connection),
+            baseline_connection,
             _baseline_vfs: baseline_vfs,
         })
     }

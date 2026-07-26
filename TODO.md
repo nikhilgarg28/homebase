@@ -64,16 +64,18 @@ multilite
   conflicts, name-registry ownership, and whether old ownership cells are
   garbage-collected before admitting either statement.
 
-- Measure and reduce private-transaction startup overhead before pooling branch
-  connections blindly. The normal writable path still opens an unused baseline
-  Branch VFS connection retained for SQLite Session capture; split that into an
-  opt-in capture constructor. Drop the physical branch as soon as its logical
-  manifest is owned instead of retaining it through commit disposition or
-  authority work. Benchmark small and large schemas, then consider pooling
-  companion canonical readers, incrementally caching WAL-derived snapshot maps,
-  and replacing per-branch VFS registration with one process-wide routing VFS.
-  Reusing a branch SQLite handle itself requires a proven reset/rebind protocol
-  for schema caches, hooks, temp state, overlays, and snapshot identity.
+- Continue reducing private-transaction startup overhead. The committer now
+  incrementally streams appended WAL frames into its snapshot cache, native
+  views reuse generation-pinned canonical readers, the WAL map uses
+  structurally shared 256-page chunks, and the SQLite Session baseline
+  connection is opt-in rather than part of every writable branch. The
+  committer now attempts passive checkpoints above 64 MiB and refuses new
+  snapshots above 256 MiB when live readers prevent cleanup. Next benchmark
+  large databases and long-lived snapshots, replace per-branch VFS
+  registration with one process-wide routing VFS, cache decoded catalog/schema
+  metadata, and measure concurrent group-commit throughput. Reusing a writable
+  branch SQLite handle itself still requires a proven reset/rebind protocol for
+  schema caches, hooks, temp state, overlays, and snapshot identity.
 
 - Extend the landed per-database authority actor beyond FIFO push/pull. Exact
   per-submission targeting and typed replies have landed; add transport request

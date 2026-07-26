@@ -83,13 +83,12 @@ impl sqllogictest::DB for MultiliteDriver {
     type Error = DriverError;
 
     fn run(&mut self, sql: &str) -> DriverResult<DBOutput<Self::ColumnType>> {
-        match self.connection.prepare(sql) {
-            Ok(_) => run_multilite_query(&self.connection, sql),
-            Err(multilite::Error::PreparedWrite) => {
-                let changed = self.connection.execute(sql, ())?;
-                Ok(DBOutput::StatementComplete(changed as u64))
-            }
-            Err(error) => Err(error.into()),
+        let mut statement = self.connection.prepare(sql)?;
+        if statement.readonly() {
+            run_multilite_query(&mut statement)
+        } else {
+            let changed = statement.execute(())?;
+            Ok(DBOutput::StatementComplete(changed as u64))
         }
     }
 
@@ -102,20 +101,18 @@ fn run_sqlite(
     connection: &rusqlite::Connection,
     sql: &str,
 ) -> DriverResult<DBOutput<DefaultColumnType>> {
-    if connection.prepare(sql)?.readonly() {
-        let mut statement = connection.prepare(sql)?;
+    let mut statement = connection.prepare(sql)?;
+    if statement.readonly() {
         query_rows(&mut statement)
     } else {
-        let changed = connection.execute(sql, ())?;
+        let changed = statement.execute(())?;
         Ok(DBOutput::StatementComplete(changed as u64))
     }
 }
 
 fn run_multilite_query(
-    connection: &MultiliteConnection,
-    sql: &str,
+    statement: &mut multilite::MultiliteStatement,
 ) -> DriverResult<DBOutput<DefaultColumnType>> {
-    let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map((), |row| {
         let mut values = Vec::with_capacity(row.as_ref().column_count());
         for index in 0..row.as_ref().column_count() {

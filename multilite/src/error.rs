@@ -11,7 +11,7 @@ use crate::database::PushRejection;
 pub enum Error {
     /// SQLite rejected an operation. The original error is retained intact.
     Sqlite(rusqlite::Error),
-    /// Prepared statements are read-only; writes must use `execute`.
+    /// A prepared statement was used through the wrong execution mode.
     PreparedWrite,
     /// The statement uses SQL outside Multilite's current public surface.
     UnsupportedSql(&'static str),
@@ -25,6 +25,8 @@ pub enum Error {
     BackgroundWorker(String),
     /// The serial committer could not accept or complete an operation.
     Committer(String),
+    /// WAL pressure could not be relieved without invalidating a live snapshot.
+    Checkpoint(String),
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
     /// Durable Homebase metadata storage failed.
@@ -67,7 +69,7 @@ impl fmt::Display for Error {
         match self {
             Self::Sqlite(error) => write!(f, "sqlite error: {error}"),
             Self::PreparedWrite => {
-                f.write_str("prepared statements are read-only; use execute for writes")
+                f.write_str("prepared statement execution mode does not match its SQL")
             }
             Self::UnsupportedSql(message) => write!(f, "unsupported SQL: {message}"),
             Self::AuthorityRequired(policy) => {
@@ -86,6 +88,7 @@ impl fmt::Display for Error {
                 write!(f, "could not start Multilite background worker: {message}")
             }
             Self::Committer(message) => write!(f, "committer error: {message}"),
+            Self::Checkpoint(message) => write!(f, "checkpoint error: {message}"),
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
@@ -134,7 +137,8 @@ impl std::error::Error for Error {
             | Self::AuthorityRejected(_)
             | Self::RefreshPushRejected(_)
             | Self::BackgroundWorker(_)
-            | Self::Committer(_) => None,
+            | Self::Committer(_)
+            | Self::Checkpoint(_) => None,
             Self::CaptureInvariant(_) => None,
             Self::Storage(error) => Some(error),
             Self::InvalidDatabase(_)

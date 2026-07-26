@@ -10,7 +10,7 @@ use futures_channel::oneshot;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::branch::snapshot::PinnedSnapshot;
+use crate::branch::snapshot::{PinnedReader, PinnedSnapshot};
 use crate::commit::history::{self, PreparedRecord};
 use crate::commit::proposal::{CommitProposal, CommitReceipt};
 use crate::commit::snapshot::{CommitSeq, SnapshotDescriptor};
@@ -114,6 +114,9 @@ pub trait CommitBackend: Send + Sync + 'static {
 
     /// Capture one physical and logical snapshot at this exact queue position.
     fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot>;
+
+    /// Capture one read-only physical snapshot at this exact queue position.
+    fn capture_view(&self) -> Result<PinnedReader>;
 }
 
 enum Request {
@@ -124,6 +127,9 @@ enum Request {
     CaptureSnapshot {
         writable: bool,
         reply: oneshot::Sender<Result<CommitSnapshot>>,
+    },
+    CaptureView {
+        reply: oneshot::Sender<Result<PinnedReader>>,
     },
 }
 
@@ -215,6 +221,22 @@ impl Committer {
     pub fn capture_snapshot_blocking(&self, writable: bool) -> Result<CommitSnapshot> {
         pollster::block_on(self.capture_snapshot(writable))
     }
+
+    /// Capture an ordered read-only snapshot without proposal metadata.
+    pub async fn capture_view(&self) -> Result<PinnedReader> {
+        let (reply, response) = oneshot::channel();
+        self.outbox
+            .send(Request::CaptureView { reply })
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        response
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
+    }
+
+    pub fn capture_view_blocking(&self) -> Result<PinnedReader> {
+        pollster::block_on(self.capture_view())
+    }
 }
 
 impl WeakCommitter {
@@ -250,7 +272,10 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
                         Ok(Request::Propose { proposal, reply }) => {
                             group.push((proposal, reply));
                         }
-                        Ok(snapshot @ Request::CaptureSnapshot { .. }) => {
+                        Ok(
+                            snapshot @ (Request::CaptureSnapshot { .. }
+                            | Request::CaptureView { .. }),
+                        ) => {
                             deferred = Some(snapshot);
                             break;
                         }
@@ -281,6 +306,11 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
             Request::CaptureSnapshot { writable, reply } => {
                 let result = catch_unwind(AssertUnwindSafe(|| backend.capture_snapshot(writable)))
                     .unwrap_or_else(|_| Err(Error::Committer("snapshot capture panicked".into())));
+                let _ = reply.send(result);
+            }
+            Request::CaptureView { reply } => {
+                let result = catch_unwind(AssertUnwindSafe(|| backend.capture_view()))
+                    .unwrap_or_else(|_| Err(Error::Committer("view capture panicked".into())));
                 let _ = reply.send(result);
             }
         }
@@ -319,6 +349,7 @@ mod tests {
     use homebase_core::tag::AdmissionSeq;
 
     use super::*;
+    use crate::branch::snapshot::SnapshotCache;
     use crate::commit::snapshot::SnapshotDescriptor;
     use crate::database::isolation::IsolationLevel;
     use crate::database::operation::MultiliteOp;
@@ -378,6 +409,12 @@ mod tests {
                 },
                 history_pin: None,
             })
+        }
+
+        fn capture_view(&self) -> Result<PinnedReader> {
+            SnapshotCache::new()
+                .capture_reader(&self.database_path)
+                .map_err(|error| Error::Branch(error.to_string()))
         }
     }
 

@@ -171,6 +171,8 @@ fn backend_for<H: ServerHandle + Send + Sync + 'static>(
         database_id: database.database_id,
         client: Arc::clone(&database.client),
         commit_history: CommitHistory::default(),
+        snapshot_cache: parking_lot::Mutex::new(crate::branch::snapshot::SnapshotCache::new()),
+        checkpoint: parking_lot::Mutex::new(crate::commit::checkpoint::CheckpointPolicy::default()),
     }
 }
 

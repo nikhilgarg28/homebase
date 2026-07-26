@@ -15,18 +15,21 @@ pub enum Engine {
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub engine: Engine,
+    pub max_records: Option<usize>,
 }
 
 impl RunOptions {
     pub fn sqlite() -> Self {
         Self {
             engine: Engine::Sqlite,
+            max_records: None,
         }
     }
 
     pub fn multilite() -> Self {
         Self {
             engine: Engine::Multilite,
+            max_records: None,
         }
     }
 }
@@ -36,7 +39,7 @@ pub fn run_file(path: impl AsRef<Path>, options: &RunOptions) -> FileReport {
         Engine::Sqlite => {
             let directory = tempfile::tempdir().expect("temporary sqlite db directory");
             let database_path = directory.path().join("reference.sqlite");
-            run_with(path.as_ref(), "sqlite", move || {
+            run_with(path.as_ref(), "sqlite", options.max_records, move || {
                 let database_path = database_path.clone();
                 async move { SqliteDriver::open(database_path) }
             })
@@ -44,12 +47,12 @@ pub fn run_file(path: impl AsRef<Path>, options: &RunOptions) -> FileReport {
         Engine::Multilite => {
             let directory = tempfile::tempdir().expect("temporary multilite db directory");
             let database_path = directory.path().join("candidate.sqlite");
-            run_with(path.as_ref(), "multilite", move || {
+            run_with(path.as_ref(), "multilite", options.max_records, move || {
                 let database_path = database_path.clone();
                 async move { MultiliteDriver::open(database_path) }
             })
         }
-        Engine::Both => run_both(path.as_ref()),
+        Engine::Both => run_both(path.as_ref(), options.max_records),
     }
 }
 
@@ -101,9 +104,21 @@ fn is_test_file(path: &Path) -> bool {
         .is_some_and(|extension| matches!(extension, "slt" | "test"))
 }
 
-fn run_both(path: &Path) -> FileReport {
-    let sqlite = run_file(path, &RunOptions::sqlite());
-    let multilite = run_file(path, &RunOptions::multilite());
+fn run_both(path: &Path, max_records: Option<usize>) -> FileReport {
+    let sqlite = run_file(
+        path,
+        &RunOptions {
+            engine: Engine::Sqlite,
+            max_records,
+        },
+    );
+    let multilite = run_file(
+        path,
+        &RunOptions {
+            engine: Engine::Multilite,
+            max_records,
+        },
+    );
     let mut report = FileReport::new(path);
     let max_records = sqlite.records.len().max(multilite.records.len());
     for index in 0..max_records {
@@ -149,7 +164,12 @@ fn run_both(path: &Path) -> FileReport {
     report
 }
 
-fn run_with<D, F, Fut>(path: &Path, engine_name: &'static str, connect: F) -> FileReport
+fn run_with<D, F, Fut>(
+    path: &Path,
+    engine_name: &'static str,
+    max_records: Option<usize>,
+    connect: F,
+) -> FileReport
 where
     D: sqllogictest::DB<ColumnType = DefaultColumnType> + Send + 'static,
     F: Fn() -> Fut + Clone,
@@ -161,7 +181,11 @@ where
     let _ = runner.run(Record::Control(Control::ResultMode(ResultMode::ValueWise)));
     match parse_compat_file(path, engine_name) {
         Ok(records) => {
-            for (index, record) in records.into_iter().enumerate() {
+            for (index, record) in records
+                .into_iter()
+                .take(max_records.unwrap_or(usize::MAX))
+                .enumerate()
+            {
                 if matches!(record, Record::Halt { .. }) {
                     break;
                 }
