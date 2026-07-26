@@ -81,9 +81,13 @@ impl MultiliteTransaction {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(TRANSACTION_FRAME_VERSION);
-        put_field(&mut writer, TAG_TRANSACTION_ID, &self.id.0);
+        writer
+            .field(TAG_TRANSACTION_ID, &self.id.0)
+            .expect("transaction field length fits in u32");
         for operation in &self.operations {
-            put_field(&mut writer, TAG_OPERATION, &operation.encode());
+            writer
+                .field(TAG_OPERATION, &operation.encode())
+                .expect("transaction field length fits in u32");
         }
         writer.finish()
     }
@@ -98,7 +102,10 @@ impl MultiliteTransaction {
 
         let mut id = None;
         let mut operations = Vec::new();
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader
+            .field()
+            .map_err(|_| TransactionCodecError::Truncated)?
+        {
             match tag {
                 TAG_TRANSACTION_ID => {
                     if id.replace(TransactionId(uuid_bytes(value)?)).is_some() {
@@ -192,26 +199,6 @@ fn transaction_key(id: TransactionId) -> Key {
         id.0.as_slice(),
     ])
     .expect("transaction manifest key is bounded and non-empty")
-}
-
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
-    let len = u32::try_from(value.len()).expect("transaction field length fits in u32");
-    writer.u8(tag);
-    writer.u32(len);
-    writer.bytes(value);
-}
-
-fn next_field<'a>(
-    reader: &mut Reader<'a>,
-) -> std::result::Result<Option<(u8, &'a [u8])>, TransactionCodecError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(TransactionCodecError::Truncated)?;
-    let len = reader.u32().ok_or(TransactionCodecError::Truncated)?;
-    let len = usize::try_from(len).map_err(|_| TransactionCodecError::InvalidLength)?;
-    let value = reader.take(len).ok_or(TransactionCodecError::Truncated)?;
-    Ok(Some((tag, value)))
 }
 
 fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], TransactionCodecError> {
@@ -429,15 +416,17 @@ mod tests {
         );
         let mut empty = Writer::new();
         empty.u8(TRANSACTION_FRAME_VERSION);
-        put_field(&mut empty, TAG_TRANSACTION_ID, &test_uuid(1));
+        empty.field(TAG_TRANSACTION_ID, &test_uuid(1)).unwrap();
         assert_eq!(
             MultiliteTransaction::decode(&empty.finish()),
             Err(TransactionCodecError::Empty)
         );
         let mut invalid_id = Writer::new();
         invalid_id.u8(TRANSACTION_FRAME_VERSION);
-        put_field(&mut invalid_id, TAG_TRANSACTION_ID, &[0; 16]);
-        put_field(&mut invalid_id, TAG_OPERATION, &create_operation().encode());
+        invalid_id.field(TAG_TRANSACTION_ID, &[0; 16]).unwrap();
+        invalid_id
+            .field(TAG_OPERATION, &create_operation().encode())
+            .unwrap();
         assert_eq!(
             MultiliteTransaction::decode(&invalid_id.finish()),
             Err(TransactionCodecError::InvalidUuid)

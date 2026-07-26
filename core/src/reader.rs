@@ -1,5 +1,19 @@
 //! Bounds-checked reads over encoded byte records.
 
+use std::fmt;
+
+/// A tagged field header or payload ends before its declared boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TruncatedField;
+
+impl fmt::Display for TruncatedField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("truncated tagged field")
+    }
+}
+
+impl std::error::Error for TruncatedField {}
+
 /// A cursor over an immutable byte slice.
 ///
 /// Failed reads return `None` and leave the cursor unchanged. Record codecs
@@ -51,6 +65,26 @@ impl<'a> Reader<'a> {
         &self.bytes[self.position..]
     }
 
+    /// Read one `u8`-tagged, `u32`-length-prefixed field.
+    ///
+    /// A clean end of input returns `Ok(None)`. Malformed input returns an
+    /// error without advancing this reader.
+    pub fn field(&mut self) -> Result<Option<(u8, &'a [u8])>, TruncatedField> {
+        if self.end().is_some() {
+            return Ok(None);
+        }
+
+        let mut probe = Self {
+            bytes: self.bytes,
+            position: self.position,
+        };
+        let tag = probe.u8().ok_or(TruncatedField)?;
+        let length = probe.u32().ok_or(TruncatedField)?;
+        let value = probe.take(length as usize).ok_or(TruncatedField)?;
+        self.position = probe.position;
+        Ok(Some((tag, value)))
+    }
+
     /// Succeed only when the complete input has been consumed.
     pub fn end(&self) -> Option<()> {
         (self.position == self.bytes.len()).then_some(())
@@ -89,5 +123,14 @@ mod tests {
         assert_eq!(reader.take(usize::MAX), None);
         assert_eq!(reader.rest(), b"abc");
         assert_eq!(reader.take(3), Some(b"abc".as_slice()));
+    }
+
+    #[test]
+    fn malformed_tagged_fields_do_not_advance() {
+        for bytes in [&[3][..], &[3, 0, 0, 0][..], &[3, 0, 0, 0, 2, 9][..]] {
+            let mut reader = Reader::new(bytes);
+            assert_eq!(reader.field(), Err(TruncatedField));
+            assert_eq!(reader.rest(), bytes);
+        }
     }
 }

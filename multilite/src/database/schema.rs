@@ -241,9 +241,15 @@ impl CreateTable {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(SCHEMA_FRAME_VERSION);
-        put_field(&mut writer, TAG_MUTATION_ID, &self.mutation_id.0);
-        put_field(&mut writer, TAG_SQL, self.sql.as_bytes());
-        put_field(&mut writer, TAG_CREATE_TABLE, &encode_create_table(self));
+        writer
+            .field(TAG_MUTATION_ID, &self.mutation_id.0)
+            .expect("schema field length must fit in u32");
+        writer
+            .field(TAG_SQL, self.sql.as_bytes())
+            .expect("schema field length must fit in u32");
+        writer
+            .field(TAG_CREATE_TABLE, &encode_create_table(self))
+            .expect("schema field length must fit in u32");
         writer.finish()
     }
 
@@ -420,16 +426,22 @@ fn name_component(canonical: &[u8]) -> Vec<u8> {
 
 fn encode_create_table(table: &CreateTable) -> Vec<u8> {
     let mut writer = Writer::new();
-    put_field(&mut writer, TAG_TABLE_ID, &table.table_id.0);
-    put_field(&mut writer, TAG_TABLE_NAME, table.name.value().as_bytes());
-    put_field(
-        &mut writer,
-        TAG_SCHEMA_REVISION_ID,
-        &table.schema_revision_id.0,
-    );
-    put_field(&mut writer, TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0);
+    writer
+        .field(TAG_TABLE_ID, &table.table_id.0)
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_TABLE_NAME, table.name.value().as_bytes())
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_SCHEMA_REVISION_ID, &table.schema_revision_id.0)
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0)
+        .expect("schema field length must fit in u32");
     for column in &table.columns {
-        put_field(&mut writer, TAG_COLUMN, &encode_column(column));
+        writer
+            .field(TAG_COLUMN, &encode_column(column))
+            .expect("schema field length must fit in u32");
     }
     writer.finish()
 }
@@ -448,13 +460,15 @@ fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
 
 fn encode_column(column: &Column) -> Vec<u8> {
     let mut writer = Writer::new();
-    put_field(&mut writer, TAG_COLUMN_ID, &column.id.0);
-    put_field(&mut writer, TAG_COLUMN_NAME, column.name.value().as_bytes());
-    put_field(
-        &mut writer,
-        TAG_COLUMN_TYPE,
-        &[column.declared_type.to_u8()],
-    );
+    writer
+        .field(TAG_COLUMN_ID, &column.id.0)
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_COLUMN_NAME, column.name.value().as_bytes())
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_COLUMN_TYPE, &[column.declared_type.to_u8()])
+        .expect("schema field length must fit in u32");
     let mut flags = 0;
     if column.not_null {
         flags |= COLUMN_NOT_NULL;
@@ -462,15 +476,10 @@ fn encode_column(column: &Column) -> Vec<u8> {
     if column.primary_key {
         flags |= COLUMN_PRIMARY_KEY;
     }
-    put_field(&mut writer, TAG_COLUMN_FLAGS, &[flags]);
+    writer
+        .field(TAG_COLUMN_FLAGS, &[flags])
+        .expect("schema field length must fit in u32");
     writer.finish()
-}
-
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
-    let len = u32::try_from(value.len()).expect("schema field length must fit in u32");
-    writer.u8(tag);
-    writer.u32(len);
-    writer.bytes(value);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -522,7 +531,7 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     let mut mutation_id = None;
     let mut sql = None;
     let mut create_table = None;
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_MUTATION_ID => {
                 set_once(&mut mutation_id, MutationId(uuid_bytes(value)?))?;
@@ -550,19 +559,6 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
         name,
         columns,
     })
-}
-
-fn next_field<'a>(
-    reader: &mut homebase_core::reader::Reader<'a>,
-) -> std::result::Result<Option<(u8, &'a [u8])>, SchemaCodecError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(SchemaCodecError::Truncated)?;
-    let len = reader.u32().ok_or(SchemaCodecError::Truncated)?;
-    let len = usize::try_from(len).map_err(|_| SchemaCodecError::InvalidLength)?;
-    let value = reader.take(len).ok_or(SchemaCodecError::Truncated)?;
-    Ok(Some((tag, value)))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), SchemaCodecError> {
@@ -604,7 +600,7 @@ fn decode_create_table(
     let mut row_keyspace_id = None;
     let mut name = None;
     let mut columns = Vec::new();
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_TABLE_ID => set_once(&mut table_id, TableId(uuid_bytes(value)?))?,
             TAG_TABLE_NAME => set_once(&mut name, decode_name(value)?)?,
@@ -640,7 +636,7 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
     let mut name = None;
     let mut declared_type = None;
     let mut flags = None;
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut id, ColumnId(uuid_bytes(value)?))?,
             TAG_COLUMN_NAME => set_once(&mut name, decode_name(value)?)?,

@@ -23,6 +23,7 @@ use crate::{Error, Result};
 
 const ROW_FRAME_VERSION: u8 = 2;
 const ROW_SET_FRAME_VERSION: u8 = 1;
+const UPDATE_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
 const TAG_ROW_KEYSPACE: u8 = 2;
 const TAG_KEY_PART: u8 = 3;
@@ -33,6 +34,8 @@ const TAG_ROW: u8 = 2;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_TYPE: u8 = 2;
 const TAG_VALUE: u8 = 2;
+const TAG_UPDATE_BEFORE: u8 = 1;
+const TAG_UPDATE_AFTER: u8 = 2;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,9 +288,13 @@ impl InsertRows {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_SET_FRAME_VERSION);
-        put_field(&mut writer, TAG_TABLE, &self.table.as_bytes());
+        writer
+            .field(TAG_TABLE, &self.table.as_bytes())
+            .expect("row field length fits in u32");
         for row in &self.rows {
-            put_field(&mut writer, TAG_ROW, &self.encode_row(row));
+            writer
+                .field(TAG_ROW, &self.encode_row(row))
+                .expect("row field length fits in u32");
         }
         writer.finish()
     }
@@ -299,7 +306,7 @@ impl InsertRows {
         }
         let mut table = None;
         let mut operation = None::<Self>;
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
             match tag {
                 TAG_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
                 TAG_ROW => {
@@ -590,22 +597,24 @@ impl InsertRows {
     fn encode_row(&self, row: &Row) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_FRAME_VERSION);
-        put_field(
-            &mut writer,
-            TAG_SCHEMA_REVISION,
-            &self.schema_revision.as_bytes(),
-        );
-        put_field(&mut writer, TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes());
-        put_field(&mut writer, TAG_ROWID, &row.rowid.to_be_bytes());
+        writer
+            .field(TAG_SCHEMA_REVISION, &self.schema_revision.as_bytes())
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes())
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_ROWID, &row.rowid.to_be_bytes())
+            .expect("row field length fits in u32");
         for part in &self.key_parts {
-            put_field(&mut writer, TAG_KEY_PART, &encode_key_part(*part));
+            writer
+                .field(TAG_KEY_PART, &encode_key_part(*part))
+                .expect("row field length fits in u32");
         }
         for (column, value) in &row.values {
-            put_field(
-                &mut writer,
-                TAG_COLUMN_VALUE,
-                &encode_column_value(*column, value),
-            );
+            writer
+                .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
+                .expect("row field length fits in u32");
         }
         writer.finish()
     }
@@ -754,38 +763,34 @@ impl UpdateRows {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        const VERSION: u8 = 1;
-        const TAG_BEFORE: u8 = 1;
-        const TAG_AFTER: u8 = 2;
-
         let mut writer = Writer::new();
-        writer.u8(VERSION);
-        put_field(&mut writer, TAG_BEFORE, &self.before.encode());
-        put_field(&mut writer, TAG_AFTER, &self.after.encode());
+        writer.u8(UPDATE_FRAME_VERSION);
+        writer
+            .field(TAG_UPDATE_BEFORE, &self.before.encode())
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_UPDATE_AFTER, &self.after.encode())
+            .expect("row field length fits in u32");
         writer.finish()
     }
 
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
-        const VERSION: u8 = 1;
-        const TAG_BEFORE: u8 = 1;
-        const TAG_AFTER: u8 = 2;
-
         let mut reader = Reader::new(frame);
-        if reader.u8() != Some(VERSION) {
+        if reader.u8() != Some(UPDATE_FRAME_VERSION) {
             return Err(RowCodecError::UnknownVersion);
         }
         let mut before = None;
         let mut after = None;
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
             match tag {
-                TAG_BEFORE => set_once(&mut before, InsertRows::decode(value)?)?,
-                TAG_AFTER => set_once(&mut after, InsertRows::decode(value)?)?,
+                TAG_UPDATE_BEFORE => set_once(&mut before, InsertRows::decode(value)?)?,
+                TAG_UPDATE_AFTER => set_once(&mut after, InsertRows::decode(value)?)?,
                 _ => {}
             }
         }
         let updated = Self {
-            before: before.ok_or(RowCodecError::MissingField(TAG_BEFORE))?,
-            after: after.ok_or(RowCodecError::MissingField(TAG_AFTER))?,
+            before: before.ok_or(RowCodecError::MissingField(TAG_UPDATE_BEFORE))?,
+            after: after.ok_or(RowCodecError::MissingField(TAG_UPDATE_AFTER))?,
         };
         updated.validate_structure()?;
         Ok(updated)
@@ -958,8 +963,12 @@ fn key_image(
 
 fn encode_key_part(part: KeyPartRules) -> Vec<u8> {
     let mut writer = Writer::new();
-    put_field(&mut writer, TAG_COLUMN_ID, &part.column.as_bytes());
-    put_field(&mut writer, TAG_COLUMN_TYPE, &[part.declared_type.to_u8()]);
+    writer
+        .field(TAG_COLUMN_ID, &part.column.as_bytes())
+        .expect("row field length fits in u32");
+    writer
+        .field(TAG_COLUMN_TYPE, &[part.declared_type.to_u8()])
+        .expect("row field length fits in u32");
     writer.finish()
 }
 
@@ -967,7 +976,7 @@ fn decode_key_part(frame: &[u8]) -> std::result::Result<KeyPartRules, RowCodecEr
     let mut reader = Reader::new(frame);
     let mut column = None;
     let mut declared_type = None;
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
             TAG_COLUMN_TYPE => {
@@ -990,8 +999,12 @@ fn decode_key_part(frame: &[u8]) -> std::result::Result<KeyPartRules, RowCodecEr
 
 fn encode_column_value(column: ColumnId, value: &StoredValue) -> Vec<u8> {
     let mut writer = Writer::new();
-    put_field(&mut writer, TAG_COLUMN_ID, &column.as_bytes());
-    put_field(&mut writer, TAG_VALUE, &value.encode());
+    writer
+        .field(TAG_COLUMN_ID, &column.as_bytes())
+        .expect("row field length fits in u32");
+    writer
+        .field(TAG_VALUE, &value.encode())
+        .expect("row field length fits in u32");
     writer.finish()
 }
 
@@ -1001,7 +1014,7 @@ fn decode_column_value(
     let mut reader = Reader::new(frame);
     let mut column = None;
     let mut value = None;
-    while let Some((tag, bytes)) = next_field(&mut reader)? {
+    while let Some((tag, bytes)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(bytes)?))?,
             TAG_VALUE => set_once(&mut value, StoredValue::decode(bytes)?)?,
@@ -1026,7 +1039,7 @@ fn decode_row(
     let mut rowid = None;
     let mut key_parts = Vec::new();
     let mut values = Vec::new();
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
             TAG_SCHEMA_REVISION => set_once(
                 &mut schema_revision,
@@ -1149,26 +1162,6 @@ fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
 
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
-    let len = u32::try_from(value.len()).expect("row field length fits in u32");
-    writer.u8(tag);
-    writer.u32(len);
-    writer.bytes(value);
-}
-
-fn next_field<'a>(
-    reader: &mut Reader<'a>,
-) -> std::result::Result<Option<(u8, &'a [u8])>, RowCodecError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(RowCodecError::Truncated)?;
-    let len = reader.u32().ok_or(RowCodecError::Truncated)?;
-    let len = usize::try_from(len).map_err(|_| RowCodecError::InvalidLength)?;
-    let value = reader.take(len).ok_or(RowCodecError::Truncated)?;
-    Ok(Some((tag, value)))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), RowCodecError> {

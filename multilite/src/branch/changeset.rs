@@ -107,18 +107,20 @@ impl CapturedChangeset {
         let mut writer = Writer::new();
         writer.u8(CHANGESET_FRAME_VERSION);
         for table in &self.tables {
-            put_field(
-                &mut writer,
-                TAG_TABLE_BINDING,
-                &encode_table_binding(table)?,
-            )?;
+            writer
+                .field(TAG_TABLE_BINDING, &encode_table_binding(table)?)
+                .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
         }
-        put_field(&mut writer, TAG_SQLITE_CHANGESET, &self.sqlite)?;
+        writer
+            .field(TAG_SQLITE_CHANGESET, &self.sqlite)
+            .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
         for rowids in &self.rowids {
             let mut value = Writer::with_capacity(18);
             encode_optional_rowid(&mut value, rowids.before);
             encode_optional_rowid(&mut value, rowids.after);
-            put_field(&mut writer, TAG_ROWID_TRANSITION, &value.finish())?;
+            writer
+                .field(TAG_ROWID_TRANSITION, &value.finish())
+                .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
         }
         Ok(writer.finish())
     }
@@ -134,7 +136,10 @@ impl CapturedChangeset {
         let mut tables = Vec::new();
         let mut sqlite = None;
         let mut rowids = Vec::new();
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader
+            .field()
+            .map_err(|_| ChangesetError::Malformed("truncated captured changeset field"))?
+        {
             match tag {
                 TAG_TABLE_BINDING => tables.push(decode_table_binding(value)?),
                 TAG_SQLITE_CHANGESET => set_once(&mut sqlite, value.to_vec())?,
@@ -260,33 +265,6 @@ impl<'connection> ChangesetCapture<'connection> {
     }
 }
 
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) -> Result<(), ChangesetError> {
-    let length = u32::try_from(value.len())
-        .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
-    writer.u8(tag);
-    writer.u32(length);
-    writer.bytes(value);
-    Ok(())
-}
-
-fn next_field<'a>(reader: &mut Reader<'a>) -> Result<Option<(u8, &'a [u8])>, ChangesetError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(ChangesetError::Malformed(
-        "truncated captured changeset field",
-    ))?;
-    let length = reader.u32().ok_or(ChangesetError::Malformed(
-        "truncated captured changeset field",
-    ))?;
-    let length = usize::try_from(length)
-        .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
-    let value = reader.take(length).ok_or(ChangesetError::Malformed(
-        "truncated captured changeset field",
-    ))?;
-    Ok(Some((tag, value)))
-}
-
 fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), ChangesetError> {
     if slot.replace(value).is_some() {
         Err(ChangesetError::Malformed(
@@ -331,8 +309,12 @@ fn decode_optional_rowid(reader: &mut Reader<'_>) -> Result<Option<i64>, Changes
 fn encode_table_binding(binding: &TableBinding) -> Result<Vec<u8>, ChangesetError> {
     let mut writer = Writer::new();
     writer.u8(TABLE_BINDING_FRAME_VERSION);
-    put_field(&mut writer, TAG_TABLE_NAME, binding.name.as_bytes())?;
-    put_field(&mut writer, TAG_TABLE_FINGERPRINT, &binding.fingerprint)?;
+    writer
+        .field(TAG_TABLE_NAME, binding.name.as_bytes())
+        .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
+    writer
+        .field(TAG_TABLE_FINGERPRINT, &binding.fingerprint)
+        .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
     Ok(writer.finish())
 }
 
@@ -345,7 +327,10 @@ fn decode_table_binding(frame: &[u8]) -> Result<TableBinding, ChangesetError> {
     }
     let mut name = None;
     let mut fingerprint = None;
-    while let Some((tag, value)) = next_field(&mut reader)? {
+    while let Some((tag, value)) = reader
+        .field()
+        .map_err(|_| ChangesetError::Malformed("truncated captured changeset field"))?
+    {
         match tag {
             TAG_TABLE_NAME => {
                 let value = String::from_utf8(value.to_vec())
@@ -1776,12 +1761,12 @@ mod tests {
 
         let mut duplicate_binding = encoded.clone();
         let mut writer = Writer::new();
-        put_field(
-            &mut writer,
-            TAG_TABLE_BINDING,
-            &encode_table_binding(&changeset.tables[0]).unwrap(),
-        )
-        .unwrap();
+        writer
+            .field(
+                TAG_TABLE_BINDING,
+                &encode_table_binding(&changeset.tables[0]).unwrap(),
+            )
+            .unwrap();
         duplicate_binding.extend_from_slice(&writer.finish());
         assert!(matches!(
             CapturedChangeset::decode(&duplicate_binding),

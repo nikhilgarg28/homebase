@@ -453,92 +453,76 @@ impl CommitProposal {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = Writer::new();
         writer.u8(PROPOSAL_FRAME_VERSION);
-        put_field(&mut writer, TAG_PROPOSAL_ID, &self.id.0)?;
-        match &self.body {
-            ProposalBody::Transaction(proposal) => {
-                put_field(&mut writer, TAG_KIND, &[TRANSACTION_PROPOSAL])?;
-                put_field(&mut writer, TAG_SNAPSHOT, &proposal.snapshot.encode())?;
-                put_field(
-                    &mut writer,
-                    TAG_ISOLATION,
-                    &[encode_isolation(proposal.isolation)],
-                )?;
-                put_field(&mut writer, TAG_TRANSACTION, &proposal.transaction.encode())?;
-                for key in proposal.footprint.writes() {
-                    put_field(&mut writer, TAG_WRITE, &key.encode())?;
+        {
+            let mut field = |tag, value: &[u8]| {
+                writer
+                    .field(tag, value)
+                    .map_err(|_| Error::InvalidCommitProposal("proposal field is too large".into()))
+            };
+            field(TAG_PROPOSAL_ID, &self.id.0)?;
+            match &self.body {
+                ProposalBody::Transaction(proposal) => {
+                    field(TAG_KIND, &[TRANSACTION_PROPOSAL])?;
+                    field(TAG_SNAPSHOT, &proposal.snapshot.encode())?;
+                    field(TAG_ISOLATION, &[encode_isolation(proposal.isolation)])?;
+                    field(TAG_TRANSACTION, &proposal.transaction.encode())?;
+                    for key in proposal.footprint.writes() {
+                        field(TAG_WRITE, &key.encode())?;
+                    }
+                    for key in proposal.footprint.constraints() {
+                        field(TAG_CONSTRAINT, &key.encode())?;
+                    }
+                    for key in proposal.footprint.reads() {
+                        field(TAG_READ, &key.encode())?;
+                    }
                 }
-                for key in proposal.footprint.constraints() {
-                    put_field(&mut writer, TAG_CONSTRAINT, &key.encode())?;
+                ProposalBody::ApplyAdmissions(proposal) => {
+                    field(TAG_KIND, &[APPLY_ADMISSIONS_PROPOSAL])?;
+                    field(
+                        TAG_EXPECTED_SUBMIT,
+                        &encode_oplog_cursors(proposal.expected_submit),
+                    )?;
+                    field(
+                        TAG_EXPECTED_ADMITS,
+                        &encode_admit_cursors(proposal.expected_admits),
+                    )?;
+                    field(TAG_APPLY_THROUGH, &proposal.through.0.to_be_bytes())?;
+                    field(TAG_LOCAL_DEVICE, &proposal.local_device.0)?;
+                    for transaction in &proposal.transactions {
+                        field(
+                            TAG_ADMITTED_TRANSACTION,
+                            &encode_admitted_transaction(transaction)?,
+                        )?;
+                    }
                 }
-                for key in proposal.footprint.reads() {
-                    put_field(&mut writer, TAG_READ, &key.encode())?;
+                ProposalBody::RejectSubmissions(proposal) => {
+                    field(TAG_KIND, &[REJECT_SUBMISSIONS_PROPOSAL])?;
+                    field(
+                        TAG_EXPECTED_SUBMIT,
+                        &encode_oplog_cursors(proposal.expected_submit),
+                    )?;
+                    field(TAG_REJECTED_AT, &proposal.failed_at.0.to_be_bytes())?;
                 }
-            }
-            ProposalBody::ApplyAdmissions(proposal) => {
-                put_field(&mut writer, TAG_KIND, &[APPLY_ADMISSIONS_PROPOSAL])?;
-                put_field(
-                    &mut writer,
-                    TAG_EXPECTED_SUBMIT,
-                    &encode_oplog_cursors(proposal.expected_submit),
-                )?;
-                put_field(
-                    &mut writer,
-                    TAG_EXPECTED_ADMITS,
-                    &encode_admit_cursors(proposal.expected_admits),
-                )?;
-                put_field(
-                    &mut writer,
-                    TAG_APPLY_THROUGH,
-                    &proposal.through.0.to_be_bytes(),
-                )?;
-                put_field(&mut writer, TAG_LOCAL_DEVICE, &proposal.local_device.0)?;
-                for transaction in &proposal.transactions {
-                    put_field(
-                        &mut writer,
-                        TAG_ADMITTED_TRANSACTION,
-                        &encode_admitted_transaction(transaction)?,
+                ProposalBody::AcceptSubmissions(proposal) => {
+                    field(TAG_KIND, &[ACCEPT_SUBMISSIONS_PROPOSAL])?;
+                    field(
+                        TAG_EXPECTED_SUBMIT,
+                        &encode_oplog_cursors(proposal.expected_submit),
+                    )?;
+                    field(TAG_ACK_THROUGH, &proposal.through.0.to_be_bytes())?;
+                    field(TAG_ACK_CHECKSUM, &proposal.checksum.0)?;
+                }
+                ProposalBody::AppendAdmissions(proposal) => {
+                    field(TAG_KIND, &[APPEND_ADMISSIONS_PROPOSAL])?;
+                    field(
+                        TAG_EXPECTED_ADMITS,
+                        &encode_admit_cursors(proposal.expected_admits),
+                    )?;
+                    field(
+                        TAG_PULL_RESPONSE,
+                        &encode_pull_response(&proposal.response)?,
                     )?;
                 }
-            }
-            ProposalBody::RejectSubmissions(proposal) => {
-                put_field(&mut writer, TAG_KIND, &[REJECT_SUBMISSIONS_PROPOSAL])?;
-                put_field(
-                    &mut writer,
-                    TAG_EXPECTED_SUBMIT,
-                    &encode_oplog_cursors(proposal.expected_submit),
-                )?;
-                put_field(
-                    &mut writer,
-                    TAG_REJECTED_AT,
-                    &proposal.failed_at.0.to_be_bytes(),
-                )?;
-            }
-            ProposalBody::AcceptSubmissions(proposal) => {
-                put_field(&mut writer, TAG_KIND, &[ACCEPT_SUBMISSIONS_PROPOSAL])?;
-                put_field(
-                    &mut writer,
-                    TAG_EXPECTED_SUBMIT,
-                    &encode_oplog_cursors(proposal.expected_submit),
-                )?;
-                put_field(
-                    &mut writer,
-                    TAG_ACK_THROUGH,
-                    &proposal.through.0.to_be_bytes(),
-                )?;
-                put_field(&mut writer, TAG_ACK_CHECKSUM, &proposal.checksum.0)?;
-            }
-            ProposalBody::AppendAdmissions(proposal) => {
-                put_field(&mut writer, TAG_KIND, &[APPEND_ADMISSIONS_PROPOSAL])?;
-                put_field(
-                    &mut writer,
-                    TAG_EXPECTED_ADMITS,
-                    &encode_admit_cursors(proposal.expected_admits),
-                )?;
-                put_field(
-                    &mut writer,
-                    TAG_PULL_RESPONSE,
-                    &encode_pull_response(&proposal.response)?,
-                )?;
             }
         }
         Ok(writer.finish())
@@ -567,7 +551,7 @@ impl CommitProposal {
         let mut ack_through = None;
         let mut ack_checksum = None;
         let mut pull_response = None;
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader.field().map_err(|_| ProposalCodecError::Truncated)? {
             match tag {
                 TAG_PROPOSAL_ID => set_once(&mut id, ProposalId(uuid_bytes(value)?), tag)?,
                 TAG_KIND => {
@@ -1348,28 +1332,6 @@ fn bytes32(value: &[u8]) -> std::result::Result<[u8; 32], ProposalCodecError> {
     value
         .try_into()
         .map_err(|_| ProposalCodecError::InvalidLength)
-}
-
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) -> Result<()> {
-    let length = u32::try_from(value.len())
-        .map_err(|_| Error::InvalidCommitProposal("proposal field is too large".into()))?;
-    writer.u8(tag);
-    writer.u32(length);
-    writer.bytes(value);
-    Ok(())
-}
-
-fn next_field<'a>(
-    reader: &mut Reader<'a>,
-) -> std::result::Result<Option<(u8, &'a [u8])>, ProposalCodecError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(ProposalCodecError::Truncated)?;
-    let length = reader.u32().ok_or(ProposalCodecError::Truncated)?;
-    let length = usize::try_from(length).map_err(|_| ProposalCodecError::InvalidLength)?;
-    let value = reader.take(length).ok_or(ProposalCodecError::Truncated)?;
-    Ok(Some((tag, value)))
 }
 
 fn set_once<T>(

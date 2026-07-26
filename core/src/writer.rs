@@ -1,10 +1,24 @@
 //! Construction of encoded byte records.
 
+use std::fmt;
+
+/// A tagged field cannot encode a payload larger than its `u32` length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldTooLarge;
+
+impl fmt::Display for FieldTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("field payload is larger than u32")
+    }
+}
+
+impl std::error::Error for FieldTooLarge {}
+
 /// A growable byte sink symmetric with [`crate::reader::Reader`].
 ///
-/// Record codecs remain responsible for field ordering, length conversion,
-/// and their own framing rules. This type centralizes primitive byte order and
-/// removes direct `Vec<u8>` manipulation from those codecs.
+/// Record codecs remain responsible for field ordering and their own framing
+/// rules. This type centralizes primitive byte order, tagged-field lengths,
+/// and direct `Vec<u8>` manipulation.
 #[derive(Default)]
 pub struct Writer {
     bytes: Vec<u8>,
@@ -48,6 +62,15 @@ impl Writer {
         self.bytes.extend_from_slice(value);
     }
 
+    /// Write one `u8`-tagged, `u32`-length-prefixed field.
+    pub fn field(&mut self, tag: u8, value: &[u8]) -> Result<(), FieldTooLarge> {
+        let length = u32::try_from(value.len()).map_err(|_| FieldTooLarge)?;
+        self.u8(tag);
+        self.u32(length);
+        self.bytes(value);
+        Ok(())
+    }
+
     /// Finish the record and return its bytes.
     pub fn finish(self) -> Vec<u8> {
         self.bytes
@@ -84,5 +107,18 @@ mod tests {
         let mut writer = Writer::with_capacity(128);
         writer.bytes(b"record");
         assert_eq!(writer.finish(), b"record");
+    }
+
+    #[test]
+    fn tagged_fields_roundtrip_through_reader() {
+        let mut writer = Writer::new();
+        writer.field(3, b"value").unwrap();
+        writer.field(7, b"").unwrap();
+
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.field().unwrap(), Some((3, b"value".as_slice())));
+        assert_eq!(reader.field().unwrap(), Some((7, b"".as_slice())));
+        assert_eq!(reader.field().unwrap(), None);
     }
 }

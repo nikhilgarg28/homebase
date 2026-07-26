@@ -100,13 +100,21 @@ impl PendingCodec {
     fn encode(pending: &PendingTransaction) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(PENDING_FRAME_VERSION);
-        put_field(&mut writer, TAG_DEVICE_SEQ, &pending.seq.0.to_be_bytes());
-        put_field(&mut writer, TAG_TRANSACTION, &pending.transaction.encode());
+        writer
+            .field(TAG_DEVICE_SEQ, &pending.seq.0.to_be_bytes())
+            .expect("pending field length must fit in u32");
+        writer
+            .field(TAG_TRANSACTION, &pending.transaction.encode())
+            .expect("pending field length must fit in u32");
         for effect in &pending.on_accept {
-            put_field(&mut writer, TAG_ACCEPT_EFFECT, &Self::encode_effect(effect));
+            writer
+                .field(TAG_ACCEPT_EFFECT, &Self::encode_effect(effect))
+                .expect("pending field length must fit in u32");
         }
         for effect in &pending.on_reject {
-            put_field(&mut writer, TAG_REJECT_EFFECT, &Self::encode_effect(effect));
+            writer
+                .field(TAG_REJECT_EFFECT, &Self::encode_effect(effect))
+                .expect("pending field length must fit in u32");
         }
         writer.finish()
     }
@@ -125,7 +133,7 @@ impl PendingCodec {
         let mut transaction = None;
         let mut on_accept = Vec::new();
         let mut on_reject = Vec::new();
-        while let Some((tag, value)) = next_field(&mut reader)? {
+        while let Some((tag, value)) = reader.field().map_err(|_| PendingCodecError::Truncated)? {
             match tag {
                 TAG_DEVICE_SEQ => set_once(&mut seq, decode_seq(value)?)?,
                 TAG_TRANSACTION => set_once(
@@ -455,26 +463,6 @@ fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
 
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn put_field(writer: &mut Writer, tag: u8, value: &[u8]) {
-    let len = u32::try_from(value.len()).expect("pending field length must fit in u32");
-    writer.u8(tag);
-    writer.u32(len);
-    writer.bytes(value);
-}
-
-fn next_field<'a>(
-    reader: &mut Reader<'a>,
-) -> std::result::Result<Option<(u8, &'a [u8])>, PendingCodecError> {
-    if reader.end().is_some() {
-        return Ok(None);
-    }
-    let tag = reader.u8().ok_or(PendingCodecError::Truncated)?;
-    let len = reader.u32().ok_or(PendingCodecError::Truncated)?;
-    let len = usize::try_from(len).map_err(|_| PendingCodecError::InvalidLength)?;
-    let value = reader.take(len).ok_or(PendingCodecError::Truncated)?;
-    Ok(Some((tag, value)))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), PendingCodecError> {
