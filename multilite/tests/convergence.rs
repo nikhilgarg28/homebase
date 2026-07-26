@@ -36,6 +36,26 @@ where
         .unwrap()
 }
 
+fn membership_rows<H>(database: &MultiliteConnection<H>) -> Vec<(String, i64, String)>
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database
+        .query(
+            "SELECT tenant, member, body
+             FROM memberships ORDER BY member, tenant",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
 #[test]
 fn public_sql_create_and_insert_converge_across_two_replicas() {
     let directory = tempfile::tempdir().unwrap();
@@ -196,30 +216,149 @@ fn composite_without_rowid_rows_converge_and_repair_conflicts() {
     first.rebase().unwrap();
     second.rebase().unwrap();
 
-    let memberships = |database: &MultiliteConnection<_>| {
-        database
-            .query(
-                "SELECT tenant, member, body
-                 FROM memberships ORDER BY member, tenant",
-                (),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .unwrap()
-    };
     let expected = [
         ("north".into(), 1, "first".into()),
         ("south".into(), 1, "second".into()),
         ("shared".into(), 7, "winner".into()),
     ];
-    assert_eq!(memberships(&first), expected);
-    assert_eq!(memberships(&second), expected);
+    assert_eq!(membership_rows(&first), expected);
+    assert_eq!(membership_rows(&second), expected);
     assert_eq!(tables(&first), tables(&second));
+}
+
+#[test]
+fn composite_update_and_delete_repairs_survive_restart_and_converge() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let second_path = directory.path().join("composite-repair-second.sqlite");
+    let first = MultiliteConnection::open_with(
+        directory.path().join("composite-repair-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE memberships (
+                    tenant TEXT,
+                    member INTEGER,
+                    body TEXT NOT NULL,
+                    PRIMARY KEY (tenant, member)
+                ) WITHOUT ROWID",
+                (),
+            )?;
+            transaction.execute(
+                "INSERT INTO memberships VALUES
+                    ('north', 1, 'north-original'),
+                    ('south', 2, 'south-original'),
+                    ('doomed', 9, 'delete-original')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "UPDATE memberships
+             SET tenant = 'shared', member = 7, body = 'winner'
+             WHERE tenant = 'north' AND member = 1",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "UPDATE memberships
+             SET tenant = 'shared', member = 7, body = 'loser'
+             WHERE tenant = 'south' AND member = 2",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(update_rejection) = second.push().unwrap() else {
+        panic!("composite primary-key destination collision was not rejected")
+    };
+    drop(second);
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(membership_rows(&second).contains(&("shared".into(), 7, "loser".into())));
+    second.rollback(&update_rejection).unwrap();
+    assert!(membership_rows(&second).contains(&("south".into(), 2, "south-original".into())));
+    assert!(
+        !membership_rows(&second)
+            .iter()
+            .any(|(tenant, member, _)| tenant == "shared" && *member == 7)
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let after_update = [
+        ("south".into(), 2, "south-original".into()),
+        ("shared".into(), 7, "winner".into()),
+        ("doomed".into(), 9, "delete-original".into()),
+    ];
+    assert_eq!(membership_rows(&first), after_update);
+    assert_eq!(membership_rows(&second), after_update);
+
+    first
+        .execute(
+            "DELETE FROM memberships WHERE tenant = 'doomed' AND member = 9",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "DELETE FROM memberships WHERE tenant = 'doomed' AND member = 9",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(delete_rejection) = second.push().unwrap() else {
+        panic!("same composite primary-key DELETE was not rejected")
+    };
+    drop(second);
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(
+        !membership_rows(&second)
+            .iter()
+            .any(|(tenant, member, _)| tenant == "doomed" && *member == 9)
+    );
+    second.rollback(&delete_rejection).unwrap();
+    assert!(membership_rows(&second).contains(&("doomed".into(), 9, "delete-original".into())));
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let expected = [
+        ("south".into(), 2, "south-original".into()),
+        ("shared".into(), 7, "winner".into()),
+    ];
+    assert_eq!(membership_rows(&first), expected);
+    assert_eq!(membership_rows(&second), expected);
 }
 
 #[test]
