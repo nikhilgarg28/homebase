@@ -4,9 +4,10 @@
 //! mutable revision cells. It can be reconstructed only from a complete,
 //! self-consistent admitted envelope.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
-use homebase_core::key::Key;
+use homebase_core::key::{Key, MAX_COMPONENTS};
 #[cfg(test)]
 use homebase_core::messages::AdmittedBatch;
 use homebase_core::tag::Mutation;
@@ -49,6 +50,11 @@ const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
 
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
+const LOGICAL_KEY_PREFIX_COMPONENTS: usize = 5;
+const SQLITE_ROWID_ALIASES: [&str; 3] = ["_rowid_", "rowid", "oid"];
+
+/// Maximum number of value components in a row or UNIQUE Homebase key.
+pub const MAX_KEY_PARTS: usize = MAX_COMPONENTS - LOGICAL_KEY_PREFIX_COMPONENTS;
 
 /// SQLite identifier spelling plus its case-insensitive identity form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +77,18 @@ impl SqlName {
     pub fn canonical(&self) -> &[u8] {
         &self.canonical
     }
+}
+
+pub fn available_hidden_rowid_alias<'a>(
+    columns: impl IntoIterator<Item = &'a SqlName>,
+) -> Option<&'static str> {
+    let columns = columns
+        .into_iter()
+        .map(SqlName::canonical)
+        .collect::<Vec<_>>();
+    SQLITE_ROWID_ALIASES
+        .into_iter()
+        .find(|candidate| !columns.iter().any(|column| *column == candidate.as_bytes()))
 }
 
 /// SQLite's five ordinary-table type affinities.
@@ -665,6 +683,17 @@ impl CreateTable {
                 .is_some_and(|candidate| candidate.declared_type.is_exact_integer())
     }
 
+    pub fn hidden_rowid_alias(&self) -> Option<&'static str> {
+        if self.storage() == TableStorage::WithoutRowid
+            || self
+                .primary_key_columns()
+                .any(|column| self.is_rowid_alias(column.id()))
+        {
+            return None;
+        }
+        available_hidden_rowid_alias(self.columns().iter().map(Column::name))
+    }
+
     fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
         self.name == spec.name
             && self.schema.mode == spec.mode
@@ -1081,6 +1110,15 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     let sql = sql.ok_or(SchemaCodecError::MissingField(TAG_SQL))?;
     let (table_id, schema_revision_id, row_keyspace_id, name, schema) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
+    if !schema_identities_are_unique(
+        mutation_id,
+        table_id,
+        schema_revision_id,
+        row_keyspace_id,
+        &schema,
+    ) {
+        return Err(SchemaCodecError::InvalidSchema);
+    }
     Ok(CreateTable {
         mutation_id,
         sql,
@@ -1183,7 +1221,13 @@ fn decode_create_table(
                 .is_some_and(|column| column.declared_type.is_exact_integer())
         });
     if columns.is_empty()
+        || columns.iter().enumerate().any(|(index, column)| {
+            columns[..index]
+                .iter()
+                .any(|seen| seen.name.canonical() == column.name.canonical())
+        })
         || primary_key.columns.is_empty()
+        || primary_key.columns.len() > MAX_KEY_PARTS
         || primary_key
             .columns
             .iter()
@@ -1216,6 +1260,7 @@ fn decode_create_table(
             .enumerate()
             .any(|(index, unique)| {
                 unique.columns.is_empty()
+                    || unique.columns.len() > MAX_KEY_PARTS
                     || unique_constraints[..index]
                         .iter()
                         .any(|seen| seen.keyspace_id == unique.keyspace_id)
@@ -1228,6 +1273,9 @@ fn decode_create_table(
                                 || !columns.iter().any(|candidate| candidate.id == *column)
                         })
             })
+        || (storage == TableStorage::Rowid
+            && !rowid_alias
+            && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none())
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
@@ -1246,6 +1294,26 @@ fn decode_create_table(
             foreign_keys: Vec::new(),
         },
     ))
+}
+
+fn schema_identities_are_unique(
+    mutation: MutationId,
+    table: TableId,
+    schema_revision: SchemaRevisionId,
+    row_keyspace: RowKeyspaceId,
+    schema: &TableSchema,
+) -> bool {
+    let mut identities = BTreeSet::new();
+    std::iter::once(mutation.0)
+        .chain([table.0, schema_revision.0, row_keyspace.0])
+        .chain(schema.columns.iter().map(|column| column.id.0))
+        .chain(
+            schema
+                .unique_constraints
+                .iter()
+                .map(|unique| unique.keyspace_id.0),
+        )
+        .all(|identity| identities.insert(identity))
 }
 
 fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
@@ -1978,6 +2046,66 @@ mod tests {
             duplicate_primary.schema.primary_key.columns[0];
         assert_eq!(
             CreateTable::decode(&duplicate_primary.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_duplicate_names_and_reused_schema_identities() {
+        let created = deterministic_create("notes");
+
+        let mut duplicate_name = created.clone();
+        duplicate_name.schema.columns[1].name = SqlName::new("ID".into());
+        assert_eq!(
+            CreateTable::decode(&duplicate_name.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+
+        let mut duplicate_column_id = created.clone();
+        duplicate_column_id.schema.columns[1].id = duplicate_column_id.schema.columns[0].id;
+        assert_eq!(
+            CreateTable::decode(&duplicate_column_id.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+
+        let mut reused_identity = created;
+        reused_identity.row_keyspace_id = RowKeyspaceId(reused_identity.table_id.0);
+        assert_eq!(
+            CreateTable::decode(&reused_identity.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_rowid_tables_without_a_stable_hidden_alias() {
+        let mut spec = definition("shadowed");
+        spec.columns[0] = CreateColumn {
+            name: SqlName::new("key".into()),
+            declared_type: TypeDeclaration::text(),
+            not_null: true,
+            primary_key: Some(0),
+        };
+        for name in ["rowid", "oid", "_rowid_"] {
+            spec.columns.push(CreateColumn {
+                name: SqlName::new(name.into()),
+                declared_type: TypeDeclaration::text(),
+                not_null: false,
+                primary_key: None,
+            });
+        }
+        let created = CreateTable::new(
+            "CREATE TABLE shadowed (
+                key TEXT NOT NULL PRIMARY KEY,
+                body TEXT NOT NULL,
+                rowid TEXT,
+                oid TEXT,
+                _rowid_ TEXT
+            )",
+            spec,
+        );
+
+        assert_eq!(
+            CreateTable::decode(&created.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
     }

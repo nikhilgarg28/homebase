@@ -10,7 +10,8 @@ use sqlite3_parser::ast::{
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
-    CreateColumn, CreateTableSpec, CreateUnique, SqlName, TableMode, TableStorage, TypeDeclaration,
+    CreateColumn, CreateTableSpec, CreateUnique, MAX_KEY_PARTS, SqlName, TableMode, TableStorage,
+    TypeDeclaration, available_hidden_rowid_alias,
 };
 use crate::{Error, Result};
 
@@ -564,6 +565,15 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
         })
         .collect::<Result<Vec<_>>>()?;
     let mut table_primary_key = None;
+    if columns.iter().enumerate().any(|(index, column)| {
+        columns[..index]
+            .iter()
+            .any(|seen| seen.name.canonical() == column.name.canonical())
+    }) {
+        return Err(Error::UnsupportedSql(
+            "duplicate column names are not supported",
+        ));
+    }
     for constraint in constraints.into_iter().flatten() {
         match constraint.constraint {
             TableConstraint::Unique {
@@ -642,6 +652,14 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     let rowid_alias = storage == TableStorage::Rowid
         && primary.len() == 1
         && columns[primary[0].1].declared_type.is_exact_integer();
+    if storage == TableStorage::Rowid
+        && !rowid_alias
+        && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none()
+    {
+        return Err(Error::UnsupportedSql(
+            "tables with a non-integer primary key must leave one SQLite rowid alias unshadowed",
+        ));
+    }
     for (_, index) in primary {
         if mode == TableMode::Strict || storage == TableStorage::WithoutRowid {
             columns[index].not_null = true;
@@ -677,6 +695,12 @@ fn simple_key_columns(
             expression_identifier(column.expr)
         })
         .collect::<Result<Vec<_>>>()?;
+    if columns.len() > MAX_KEY_PARTS {
+        return Err(Error::UnsupportedSql(match kind {
+            "PRIMARY KEY" => "PRIMARY KEY has too many columns",
+            _ => "UNIQUE constraint has too many columns",
+        }));
+    }
     if columns.is_empty()
         || columns.iter().enumerate().any(|(index, column)| {
             columns[..index]
@@ -921,6 +945,61 @@ mod tests {
                 tenant TEXT NOT NULL,
                 id INTEGER NOT NULL,
                 PRIMARY KEY (tenant, id)
+            )",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn logical_keys_fit_within_homebase_component_limits() {
+        let key_columns = (0..=MAX_KEY_PARTS)
+            .map(|index| format!("key_{index} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key_names = (0..=MAX_KEY_PARTS)
+            .map(|index| format!("key_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        assert_unsupported(&format!(
+            "CREATE TABLE too_wide (
+                {key_columns},
+                PRIMARY KEY ({key_names})
+            ) WITHOUT ROWID"
+        ));
+        assert_unsupported(&format!(
+            "CREATE TABLE too_unique (
+                id INTEGER PRIMARY KEY,
+                {key_columns},
+                UNIQUE ({key_names})
+            )"
+        ));
+    }
+
+    #[test]
+    fn non_rowid_primary_keys_leave_a_stable_hidden_rowid_name() {
+        assert_unsupported(
+            "CREATE TABLE shadowed (
+                key TEXT NOT NULL PRIMARY KEY,
+                rowid TEXT,
+                oid TEXT,
+                _rowid_ TEXT
+            )",
+        );
+
+        validate_execute(
+            "CREATE TABLE available (
+                key TEXT NOT NULL PRIMARY KEY,
+                rowid TEXT,
+                oid TEXT
+            )",
+        )
+        .unwrap();
+        validate_execute(
+            "CREATE TABLE aliased (
+                rowid INTEGER PRIMARY KEY,
+                oid TEXT,
+                _rowid_ TEXT
             )",
         )
         .unwrap();

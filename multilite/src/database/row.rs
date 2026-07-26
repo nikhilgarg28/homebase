@@ -1564,23 +1564,17 @@ pub(super) fn normalize_insert_rowids(
 }
 
 fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
-    if created.storage() == TableStorage::WithoutRowid {
-        return Ok(None);
-    }
-    let primary = created.primary_key_columns().collect::<Vec<_>>();
-    if primary.len() == 1 && created.is_rowid_alias(primary[0].id()) {
-        return Ok(None);
-    }
-    ["_rowid_", "rowid", "oid"]
-        .into_iter()
-        .find(|candidate| {
-            created
-                .columns()
-                .iter()
-                .all(|column| !column.name().value().eq_ignore_ascii_case(candidate))
-        })
+    created
+        .hidden_rowid_alias()
         .map(Some)
-        .ok_or(Error::UnsupportedSql(
+        .or_else(|| {
+            (created.storage() == TableStorage::WithoutRowid
+                || created
+                    .primary_key_columns()
+                    .any(|column| created.is_rowid_alias(column.id())))
+            .then_some(None)
+        })
+        .ok_or(Error::InvalidDatabase(
             "tables with a non-integer primary key must leave one SQLite rowid alias unshadowed",
         ))
 }
