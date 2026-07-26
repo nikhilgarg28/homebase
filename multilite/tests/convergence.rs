@@ -56,6 +56,21 @@ where
         .unwrap()
 }
 
+fn index_names<H>(database: &MultiliteConnection<H>) -> Vec<String>
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database
+        .query(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY name",
+            (),
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 #[test]
 fn public_sql_create_and_insert_converge_across_two_replicas() {
     let directory = tempfile::tempdir().unwrap();
@@ -150,6 +165,293 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
             )]
         );
     }
+}
+
+#[test]
+fn adding_unique_index_fences_rows_compiled_against_the_old_write_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("add-index-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("add-index-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                slug TEXT,
+                body TEXT
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("INSERT INTO notes VALUES (1, 'one', 'home', 'seed')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute("INSERT INTO notes VALUES (2, 'two', 'queued', 'stale')", ())
+        .unwrap();
+    first
+        .execute(
+            "CREATE UNIQUE INDEX notes_tenant_slug ON notes (tenant, slug)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("row compiled before CREATE UNIQUE INDEX was admitted")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    first.pull().unwrap();
+    first.rebase().unwrap();
+
+    assert_eq!(index_names(&first), ["notes_tenant_slug"]);
+    assert_eq!(index_names(&second), ["notes_tenant_slug"]);
+    assert_eq!(
+        first
+            .query("SELECT id FROM notes ORDER BY id", (), |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert_eq!(
+        second
+            .query("SELECT id FROM notes ORDER BY id", (), |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+
+    first
+        .execute(
+            "INSERT INTO notes VALUES (3, 'shared', 'slug', 'winner')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO notes VALUES (4, 'shared', 'slug', 'loser')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("new UNIQUE index did not coordinate ownership")
+    };
+    second.rollback(&rejection).unwrap();
+}
+
+#[test]
+fn dropping_unique_index_keeps_stale_superset_row_operations_compatible() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("drop-index-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("drop-index-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    tenant TEXT,
+                    slug TEXT,
+                    body TEXT
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE UNIQUE INDEX notes_tenant_slug ON notes (tenant, slug)",
+                (),
+            )?;
+            transaction.execute("INSERT INTO notes VALUES (1, 'seed', 'one', 'initial')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute(
+            "INSERT INTO notes VALUES (2, 'stale', 'owner', 'queued')",
+            (),
+        )
+        .unwrap();
+    first.execute("DROP INDEX notes_tenant_slug", ()).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "DROP INDEX must not fence a stale writer doing superset bookkeeping"
+    );
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    assert!(index_names(&first).is_empty());
+    assert!(index_names(&second).is_empty());
+
+    first
+        .execute(
+            "INSERT INTO notes VALUES (3, 'duplicate', 'allowed', 'first')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO notes VALUES (4, 'duplicate', 'allowed', 'second')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let expected = [
+        (1, "seed".to_owned(), "one".to_owned()),
+        (2, "stale".to_owned(), "owner".to_owned()),
+        (3, "duplicate".to_owned(), "allowed".to_owned()),
+        (4, "duplicate".to_owned(), "allowed".to_owned()),
+    ];
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, tenant, slug FROM notes ORDER BY id",
+                    (),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn conflicting_index_ddl_repairs_local_sqlite_before_converging() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("index-ddl-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("index-ddl-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                slug TEXT,
+                body TEXT
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "CREATE UNIQUE INDEX notes_identity ON notes (tenant, slug)",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "CREATE UNIQUE INDEX notes_identity ON notes (slug, body)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("conflicting index-name ownership was admitted")
+    };
+    second.rollback(&rejection).unwrap();
+    assert!(
+        index_names(&second).is_empty(),
+        "CREATE rejection must drop its speculative physical index"
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(index_names(&second), ["notes_identity"]);
+    assert_eq!(
+        first
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE name = 'notes_identity'",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        second
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE name = 'notes_identity'",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    );
+
+    first.execute("DROP INDEX notes_identity", ()).unwrap();
+    second.execute("DROP INDEX notes_identity", ()).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("concurrent DROP INDEX operations were both admitted")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        index_names(&second),
+        ["notes_identity"],
+        "DROP rejection must recreate the physical index before returning"
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    assert!(index_names(&second).is_empty());
 }
 
 #[test]

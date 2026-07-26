@@ -52,17 +52,17 @@ multilite
   `DeleteRange`; range lowering must preserve precise local rollback data and
   correct snapshot/serializable conflict footprints.
 
-- Add post-create unique-index schema evolution. Create-time inline and
-  multi-column `UNIQUE` declarations now mint immutable unique-keyspace UUIDs
-  and participate in insert/update/delete synchronization. `CREATE UNIQUE
-  INDEX` must scan the pinned table image, encode every existing non-NULL tuple,
-  reject local collisions, write the complete keyspace definition and ownership
-  backfill, then atomically switch the table's active write revision. `DROP
-  INDEX` must retire the definition without reinterpreting its old key bytes;
-  pending transactions compiled against that definition must fail through the
-  write-revision guard. Define crash/restart behavior, concurrent DML/DDL
-  conflicts, name-registry ownership, and whether old ownership cells are
-  garbage-collected before admitting either statement.
+- Bound `CREATE UNIQUE INDEX` backfills by deterministic row and encoded-byte
+  limits before accepting unbounded tables. Later add spill/chunk support that
+  preserves one logical schema operation and one atomic SQLite transaction.
+  Retired unique-index definitions and ownership cells intentionally remain
+  inert: `DROP INDEX` advances the schema head but not the write-contract
+  revision, so operations compiled against the old index may still arrive and
+  perform harmless superset bookkeeping. Garbage collection therefore needs an
+  explicit device/frontier retirement protocol; never delete those keyspaces
+  merely because the local submit window is empty. Also extend the admitted
+  grammar only alongside exact key-image support for collations, sort rules,
+  partial/expression indexes, and eventually ordinary secondary indexes.
 
 - Continue reducing private-transaction startup overhead. The committer now
   incrementally streams appended WAL frames into its snapshot cache, native

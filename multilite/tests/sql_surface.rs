@@ -37,6 +37,72 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
 }
 
 #[test]
+fn unique_index_ddl_is_atomic_and_names_can_be_reused_after_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("unique-index-ddl.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            slug TEXT,
+            body TEXT
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO notes VALUES
+            (1, 'one', 'same', 'first'),
+            (2, 'two', 'same', 'second')",
+        (),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.execute("CREATE UNIQUE INDEX duplicate_slug ON notes (slug)", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'duplicate_slug'",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        [0]
+    );
+
+    db.execute(
+        "CREATE UNIQUE INDEX notes_identity ON notes (tenant, slug)",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO notes VALUES (3, 'one', 'same', 'duplicate')",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    db.execute("DROP INDEX notes_identity", ()).unwrap();
+    db.execute(
+        "CREATE UNIQUE INDEX notes_identity ON notes (tenant, body)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT sql FROM sqlite_schema WHERE name = 'notes_identity'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        ["CREATE UNIQUE INDEX notes_identity ON notes (tenant, body)"]
+    );
+}
+
+#[test]
 fn composite_primary_keys_and_without_rowid_support_full_row_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("composite-primary.sqlite")).unwrap();
