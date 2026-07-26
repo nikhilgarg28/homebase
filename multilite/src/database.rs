@@ -5,6 +5,7 @@ mod authority;
 pub(crate) mod catalog;
 mod codes;
 mod connection;
+mod index;
 pub(crate) mod isolation;
 pub(crate) mod operation;
 mod pending;
@@ -897,10 +898,28 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         } if index_name.starts_with("sqlite_autoindex_") => {
             authorize_user_table(context.database_name, table_name)
         }
+        AuthAction::CreateIndex {
+            index_name,
+            table_name,
+        }
+        | AuthAction::DropIndex {
+            index_name,
+            table_name,
+        } if !has_multilite_prefix(index_name) && !is_sqlite_internal_table(index_name) => {
+            authorize_user_table(context.database_name, table_name)
+        }
+        AuthAction::Reindex { index_name }
+            if !has_multilite_prefix(index_name) && !is_sqlite_internal_table(index_name) =>
+        {
+            authorize_main(context.database_name)
+        }
         AuthAction::Insert { table_name } if is_schema_table(table_name) => {
             authorize_main(context.database_name)
         }
         AuthAction::Update { table_name, .. } if is_schema_table(table_name) => {
+            authorize_main(context.database_name)
+        }
+        AuthAction::Delete { table_name } if is_schema_table(table_name) => {
             authorize_main(context.database_name)
         }
         AuthAction::Insert { table_name } => {

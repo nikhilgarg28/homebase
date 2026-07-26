@@ -10,6 +10,7 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, params};
 
 use super::catalog;
+use super::index::IndexOperation;
 use super::operation::MultiliteOp;
 use super::row::{DeleteRows, InsertRows, UpdateRows};
 use super::schema::CreateTable;
@@ -30,6 +31,7 @@ const DROP_TABLE_EFFECT: u8 = 1;
 const DELETE_ROWS_EFFECT: u8 = 2;
 const RESTORE_ROWS_EFFECT: u8 = 3;
 const RESTORE_UPDATED_ROWS_EFFECT: u8 = 4;
+const REVERT_INDEX_EFFECT: u8 = 5;
 
 /// A local effect to run when a speculative transaction gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub enum Effect {
     DeleteRows { inserted: InsertRows },
     RestoreRows { deleted: DeleteRows },
     RestoreUpdatedRows { updated: UpdateRows },
+    RevertIndex { operation: IndexOperation },
 }
 
 /// One speculative Multilite transaction keyed by its Homebase sequence.
@@ -181,6 +184,10 @@ impl PendingCodec {
                 writer.u8(RESTORE_UPDATED_ROWS_EFFECT);
                 writer.bytes(&updated.encode());
             }
+            Effect::RevertIndex { operation } => {
+                writer.u8(REVERT_INDEX_EFFECT);
+                writer.bytes(&operation.encode());
+            }
         }
         writer.finish()
     }
@@ -206,6 +213,9 @@ impl PendingCodec {
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             RESTORE_UPDATED_ROWS_EFFECT => UpdateRows::decode(reader.rest())
                 .map(|updated| Effect::RestoreUpdatedRows { updated })
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
+            REVERT_INDEX_EFFECT => IndexOperation::decode(reader.rest())
+                .map(|operation| Effect::RevertIndex { operation })
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             kind => Err(PendingCodecError::UnknownEffect(kind)),
         }
@@ -435,6 +445,12 @@ fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) 
                 updated: updated.clone(),
             }],
         ),
+        MultiliteOp::Index(operation) => (
+            Vec::new(),
+            vec![Effect::RevertIndex {
+                operation: operation.clone(),
+            }],
+        ),
     }
 }
 
@@ -456,6 +472,7 @@ fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
             Effect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
             Effect::RestoreRows { deleted } => deleted.restore_materialized(connection)?,
             Effect::RestoreUpdatedRows { updated } => updated.restore_materialized(connection)?,
+            Effect::RevertIndex { operation } => operation.rollback(connection)?,
         }
     }
     Ok(())

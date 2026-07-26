@@ -349,7 +349,7 @@ mod tests {
         );
 
         let lowered = transaction.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 8);
+        assert_eq!(lowered.mutations.len(), 9);
         assert_eq!(lowered.footprint.writes().len(), 2);
         assert_eq!(lowered.footprint.constraints().len(), 3);
         assert!(lowered.footprint.reads().is_empty());

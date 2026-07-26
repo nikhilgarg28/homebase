@@ -18,9 +18,23 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
+    CreateUniqueIndex(CreateUniqueIndexSpec),
+    DropIndex(DropIndexSpec),
     Insert,
     Delete,
     Update,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateUniqueIndexSpec {
+    pub name: SqlName,
+    pub table: SqlName,
+    pub columns: Vec<SqlName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropIndexSpec {
+    pub name: SqlName,
 }
 
 pub enum ValidatedStatement {
@@ -150,6 +164,82 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
 
 fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
     match statement {
+        Stmt::CreateIndex {
+            unique,
+            if_not_exists,
+            idx_name,
+            tbl_name,
+            columns,
+            where_clause,
+        } => {
+            if !unique {
+                return Err(Error::UnsupportedSql(
+                    "non-UNIQUE indexes are not supported",
+                ));
+            }
+            if if_not_exists {
+                return Err(Error::UnsupportedSql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS is not supported",
+                ));
+            }
+            if idx_name.db_name.is_some() || idx_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified CREATE UNIQUE INDEX names are not supported",
+                ));
+            }
+            if where_clause.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "partial UNIQUE indexes are not supported",
+                ));
+            }
+            if columns.is_empty() || columns.len() > MAX_KEY_PARTS {
+                return Err(Error::UnsupportedSql(
+                    "UNIQUE index has an unsupported number of key columns",
+                ));
+            }
+            let name = identifier(&idx_name.name)?;
+            let table = identifier(&tbl_name)?;
+            if super::has_multilite_prefix(name.value())
+                || super::is_sqlite_internal_table(name.value())
+                || super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite names are not supported",
+                ));
+            }
+            let mut key_columns = Vec::with_capacity(columns.len());
+            for column in columns {
+                if column.order.is_some() || column.nulls.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "UNIQUE index sort and NULLS clauses are not supported",
+                    ));
+                }
+                let column = match column.expr {
+                    Expr::Id(id) => identifier(&Name(id.0))?,
+                    Expr::Name(name) => identifier(&name)?,
+                    _ => {
+                        return Err(Error::UnsupportedSql(
+                            "UNIQUE index expressions and collations are not supported",
+                        ));
+                    }
+                };
+                if key_columns
+                    .iter()
+                    .any(|seen: &SqlName| seen.canonical() == column.canonical())
+                {
+                    return Err(Error::UnsupportedSql(
+                        "UNIQUE index columns must be distinct",
+                    ));
+                }
+                key_columns.push(column);
+            }
+            Ok(ValidatedExecute::CreateUniqueIndex(CreateUniqueIndexSpec {
+                name,
+                table,
+                columns: key_columns,
+            }))
+        }
         Stmt::CreateTable {
             temporary,
             if_not_exists,
@@ -170,6 +260,30 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_create_table(identifier(&tbl_name.name)?, body)
+        }
+        Stmt::DropIndex {
+            if_exists,
+            idx_name,
+        } => {
+            if if_exists {
+                return Err(Error::UnsupportedSql(
+                    "DROP INDEX IF EXISTS is not supported",
+                ));
+            }
+            if idx_name.db_name.is_some() || idx_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified DROP INDEX names are not supported",
+                ));
+            }
+            let name = identifier(&idx_name.name)?;
+            if super::has_multilite_prefix(name.value())
+                || super::is_sqlite_internal_table(name.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite index names are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::DropIndex(DropIndexSpec { name }))
         }
         Stmt::Insert {
             or_conflict,
@@ -285,7 +399,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             Ok(ValidatedExecute::Update)
         }
         _ => Err(Error::UnsupportedSql(
-            "execute accepts only CREATE TABLE, INSERT, DELETE, and UPDATE",
+            "execute accepts only supported schema changes, INSERT, DELETE, and UPDATE",
         )),
     }
 }
@@ -826,6 +940,9 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 email TEXT CONSTRAINT user_email UNIQUE
             )",
+            "CREATE UNIQUE INDEX notes_body ON notes (body)",
+            "CREATE UNIQUE INDEX notes_tenant_body ON notes (tenant, body)",
+            "DROP INDEX notes_body",
             "INSERT INTO notes VALUES (1, 'ON CONFLICT')",
             "INSERT INTO \"replace\" VALUES (1)",
             "WITH value(id) AS (SELECT 1) INSERT INTO notes SELECT id, 'x' FROM value",
@@ -1233,12 +1350,28 @@ mod tests {
             "",
             "SELECT 1",
             "ALTER TABLE notes ADD COLUMN body TEXT",
-            "CREATE UNIQUE INDEX notes_body ON notes (body)",
-            "DROP INDEX notes_body",
             "BEGIN",
             "EXPLAIN SELECT 1",
             "INSERT INTO notes VALUES (1) RETURNING id",
             "CREATE TABLE one (id); CREATE TABLE two (id)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn rejects_unique_index_extensions_outside_the_initial_slice() {
+        for sql in [
+            "CREATE INDEX notes_body ON notes (body)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes (body)",
+            "CREATE UNIQUE INDEX main.notes_body ON notes (body)",
+            "CREATE UNIQUE INDEX notes_body ON notes (body DESC)",
+            "CREATE UNIQUE INDEX notes_body ON notes (body COLLATE NOCASE)",
+            "CREATE UNIQUE INDEX notes_body ON notes (lower(body))",
+            "CREATE UNIQUE INDEX notes_body ON notes (body) WHERE body IS NOT NULL",
+            "CREATE UNIQUE INDEX notes_body ON notes (body, body)",
+            "DROP INDEX IF EXISTS notes_body",
+            "DROP INDEX main.notes_body",
         ] {
             assert_unsupported(sql);
         }

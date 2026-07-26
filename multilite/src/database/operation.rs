@@ -8,6 +8,7 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
 use super::catalog;
+use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::{CreateTable, CreateTableSpec};
 use crate::commit::footprint::ConflictFootprint;
@@ -18,6 +19,7 @@ const CREATE_TABLE_OPERATION: u8 = 1;
 const INSERT_ROWS_OPERATION: u8 = 2;
 const DELETE_ROWS_OPERATION: u8 = 3;
 const UPDATE_ROWS_OPERATION: u8 = 4;
+const INDEX_OPERATION: u8 = 5;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub enum MultiliteOp {
     InsertRows(InsertRows),
     DeleteRows(DeleteRows),
     UpdateRows(UpdateRows),
+    Index(IndexOperation),
 }
 
 /// Homebase mutations and conflict footprint for one [`MultiliteOp`].
@@ -69,6 +72,10 @@ impl MultiliteOp {
                 writer.u8(UPDATE_ROWS_OPERATION);
                 writer.bytes(&updated.encode());
             }
+            Self::Index(index) => {
+                writer.u8(INDEX_OPERATION);
+                writer.bytes(&index.encode());
+            }
         }
         writer.finish()
     }
@@ -92,6 +99,9 @@ impl MultiliteOp {
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             UPDATE_ROWS_OPERATION => UpdateRows::decode(reader.rest())
                 .map(Self::UpdateRows)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            INDEX_OPERATION => IndexOperation::decode(reader.rest())
+                .map(Self::Index)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             kind => Err(OperationCodecError::UnknownKind(kind)),
         }
@@ -131,6 +141,13 @@ impl MultiliteOp {
                     .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
                 (mutations, footprint)
             }
+            Self::Index(index) => {
+                let IndexHomebaseOp {
+                    mutations,
+                    footprint,
+                } = index.to_homebase()?;
+                (mutations, footprint)
+            }
         };
         Ok(HomebaseOp {
             mutations,
@@ -148,6 +165,7 @@ impl MultiliteOp {
             Self::InsertRows(inserted) => inserted.apply(connection),
             Self::DeleteRows(deleted) => deleted.apply(connection),
             Self::UpdateRows(updated) => updated.apply(connection),
+            Self::Index(index) => index.apply(connection),
         }
     }
 }
@@ -204,11 +222,11 @@ mod tests {
             MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
         let (mutations, footprint) = operation.to_homebase().unwrap().into_parts();
 
-        assert_eq!(mutations.len(), 6);
+        assert_eq!(mutations.len(), 7);
         assert_eq!(footprint.constraints().len(), 1);
         assert!(footprint.constraints().contains(mutations[1].key()));
         assert_eq!(footprint.writes().len(), 1);
-        assert!(footprint.writes().contains(mutations[5].key()));
+        assert!(footprint.writes().contains(mutations[6].key()));
         assert!(footprint.reads().is_empty());
     }
 

@@ -1,8 +1,10 @@
 //! Local lookup index for durable schema identities.
 
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::schema::{CreateTable, SqlName, TableId};
+use super::schema::{CreateTable, IndexDefinition, SqlName, TableId};
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__schema";
@@ -81,12 +83,23 @@ pub fn validate(connection: &Connection) -> Result<()> {
     let rows = statement.query_map((), |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
+    let mut active_indexes = BTreeSet::new();
     for row in rows {
         let (table_id, definition) = row?;
         let created = decode_definition(&definition)?;
         if table_id != created.table_id().as_bytes() {
             return Err(Error::InvalidDatabase(
                 "schema catalog table id contradicts its definition",
+            ));
+        }
+        if created
+            .indexes()
+            .iter()
+            .filter(|index| index.is_active())
+            .any(|index| !active_indexes.insert(index.name().canonical().to_vec()))
+        {
+            return Err(Error::InvalidDatabase(
+                "schema catalog contains duplicate active index names",
             ));
         }
     }
@@ -106,6 +119,27 @@ pub fn insert(connection: &Connection, created: &CreateTable) -> Result<()> {
             created.encode(),
         ],
     )?;
+    Ok(())
+}
+
+pub fn replace(connection: &Connection, definition: &CreateTable) -> Result<()> {
+    let changed = connection.execute(
+        &format!(
+            "UPDATE {TABLE} SET definition = ?1
+             WHERE schema_name = ?2 AND table_name = ?3 AND table_id = ?4"
+        ),
+        params![
+            definition.encode(),
+            MAIN_SCHEMA,
+            definition.table_name_identity().canonical(),
+            definition.table_id().as_bytes().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidDatabase(
+            "schema catalog table changed during DDL",
+        ));
+    }
     Ok(())
 }
 
@@ -146,6 +180,31 @@ pub fn by_id(connection: &Connection, table: TableId) -> Result<Option<CreateTab
     definition
         .map(|frame| decode_definition(&frame))
         .transpose()
+}
+
+pub fn index_by_name(
+    connection: &Connection,
+    name: &SqlName,
+) -> Result<Option<(CreateTable, IndexDefinition)>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT definition FROM {TABLE} ORDER BY schema_name, table_name"
+    ))?;
+    let definitions = statement
+        .query_map((), |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut found = None;
+    for definition in definitions {
+        let table = decode_definition(&definition)?;
+        if let Some(index) = table.index_named(name) {
+            if found.is_some() {
+                return Err(Error::InvalidDatabase(
+                    "schema catalog contains duplicate index names",
+                ));
+            }
+            found = Some((table.clone(), index.clone()));
+        }
+    }
+    Ok(found)
 }
 
 fn decode_definition(frame: &[u8]) -> Result<CreateTable> {

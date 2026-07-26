@@ -1316,7 +1316,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     else {
         panic!("captured schema operation was not a commit")
     };
-    assert_eq!(entries.len(), 7);
+    assert_eq!(entries.len(), 8);
     assert_eq!(range_asserts.len(), 2);
     assert_eq!(*submit_mode, SubmitMode::Unchecked);
     assert!(
@@ -1325,7 +1325,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
             .all(|assertion| assertion.upto == AdmissionSeq(0))
     );
     assert_eq!(range_asserts[0].prefix, *entries[2].key());
-    assert_eq!(range_asserts[1].prefix, *entries[6].key());
+    assert_eq!(range_asserts[1].prefix, *entries[7].key());
     let pending = pending_ops(&database);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].seq, DeviceSeq(1));
@@ -1815,7 +1815,7 @@ fn pull_fetches_admissions_without_applying_them_and_survives_reopen() {
         }
     );
     assert_eq!(space.admits.len(), 1);
-    assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 7);
+    assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 8);
     assert!(!table_exists(&replica, "notes"));
 
     assert_eq!(replica.pull().unwrap(), outcome);

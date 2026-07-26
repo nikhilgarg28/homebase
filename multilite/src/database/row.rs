@@ -13,8 +13,9 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
-    Affinity, Column, ColumnId, CreateTable, RowKeyspaceId, SchemaRevisionId, StrictType, TableId,
-    TableMode, TableStorage, UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
+    Affinity, Column, ColumnId, CreateTable, IndexDefinition, RowKeyspaceId, SchemaRevisionId,
+    StrictType, TableId, TableMode, TableStorage, UniqueKeyspaceId, active_row_keyspace_key,
+    write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -171,6 +172,13 @@ pub struct RowHomebaseOp {
     pub footprint: ConflictFootprint,
 }
 
+/// One ownership cell created while a new UNIQUE index scans existing rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniqueBackfillEntry {
+    pub key: Key,
+    pub owner: Vec<u8>,
+}
+
 impl InsertRows {
     pub fn from_captured(
         connection: &Connection,
@@ -201,29 +209,7 @@ impl InsertRows {
                 rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
-        let unique_keys = created
-            .unique_constraints()
-            .iter()
-            .map(|unique| UniqueKeyRules {
-                keyspace: unique.keyspace_id(),
-                key_parts: unique
-                    .columns()
-                    .iter()
-                    .map(|id| {
-                        let column = created
-                            .columns()
-                            .iter()
-                            .find(|column| column.id() == *id)
-                            .expect("validated UNIQUE column exists");
-                        KeyPartRules {
-                            column: column.id(),
-                            affinity: column.affinity(created.mode()),
-                            rowid_alias: false,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        let unique_keys = unique_key_rules(&created);
         let rows = captured
             .iter()
             .map(|captured| Row {
@@ -603,12 +589,18 @@ impl InsertRows {
             })
             .collect::<Vec<_>>();
         let expected_unique_keys = unique_key_rules(created);
+        let known_unique_keys = known_unique_key_rules(created);
         if self.table != created.table_id()
-            || self.schema_revision != created.schema_revision_id()
             || self.row_keyspace != created.row_keyspace_id()
             || self.storage != created.storage()
             || self.key_parts != expected_key_parts
-            || self.unique_keys != expected_unique_keys
+            || expected_unique_keys
+                .iter()
+                .any(|expected| !self.unique_keys.contains(expected))
+            || self
+                .unique_keys
+                .iter()
+                .any(|actual| !known_unique_keys.contains(actual))
         {
             return Err(Error::InvalidMultiliteOp(
                 "row operation contradicts the local schema catalog".into(),
@@ -1218,24 +1210,147 @@ fn unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
         .iter()
         .map(|unique| UniqueKeyRules {
             keyspace: unique.keyspace_id(),
-            key_parts: unique
+            key_parts: unique_key_parts(created, unique.columns()),
+        })
+        .chain(
+            created
+                .indexes()
+                .iter()
+                .filter(|index| index.is_unique() && index.is_active())
+                .map(|index| UniqueKeyRules {
+                    keyspace: index.keyspace_id(),
+                    key_parts: unique_key_parts(created, index.columns()),
+                }),
+        )
+        .collect()
+}
+
+fn known_unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
+    created
+        .unique_constraints()
+        .iter()
+        .map(|unique| UniqueKeyRules {
+            keyspace: unique.keyspace_id(),
+            key_parts: unique_key_parts(created, unique.columns()),
+        })
+        .chain(
+            created
+                .indexes()
+                .iter()
+                .filter(|index| index.is_unique())
+                .map(|index| UniqueKeyRules {
+                    keyspace: index.keyspace_id(),
+                    key_parts: unique_key_parts(created, index.columns()),
+                }),
+        )
+        .collect()
+}
+
+fn unique_key_parts(created: &CreateTable, columns: &[ColumnId]) -> Vec<KeyPartRules> {
+    columns
+        .iter()
+        .map(|id| {
+            let column = created
                 .columns()
                 .iter()
-                .map(|id| {
-                    let column = created
-                        .columns()
-                        .iter()
-                        .find(|column| column.id() == *id)
-                        .expect("validated UNIQUE column exists");
-                    KeyPartRules {
-                        column: column.id(),
-                        affinity: column.affinity(created.mode()),
-                        rowid_alias: false,
-                    }
-                })
-                .collect(),
+                .find(|column| column.id() == *id)
+                .expect("validated UNIQUE column exists");
+            KeyPartRules {
+                column: column.id(),
+                affinity: column.affinity(created.mode()),
+                rowid_alias: false,
+            }
         })
         .collect()
+}
+
+/// Scan the current table and encode ownership cells for one new UNIQUE index.
+pub fn backfill_unique_index(
+    connection: &Connection,
+    created: &CreateTable,
+    index: &IndexDefinition,
+) -> Result<Vec<UniqueBackfillEntry>> {
+    let captured = capture_table(connection, created)?;
+    if captured.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut inserted = InsertRows::from_captured(connection, &captured)?.ok_or(
+        Error::CaptureInvariant("UNIQUE index table is missing its schema catalog"),
+    )?;
+    inserted.unique_keys = vec![UniqueKeyRules {
+        keyspace: index.keyspace_id(),
+        key_parts: unique_key_parts(created, index.columns()),
+    }];
+    inserted
+        .validate_structure()
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+    let mut entries = BTreeMap::new();
+    for row in &inserted.rows {
+        for (key, owner) in inserted
+            .unique_entries(row)
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+        {
+            if entries.insert(key, owner).is_some() {
+                return Err(Error::InvalidMultiliteOp(
+                    "UNIQUE index backfill contains duplicate ownership".into(),
+                ));
+            }
+        }
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(key, owner)| UniqueBackfillEntry { key, owner })
+        .collect())
+}
+
+fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<CapturedRow>> {
+    let hidden_rowid = hidden_rowid_alias(created)?;
+    let mut selected = created
+        .columns()
+        .iter()
+        .map(|column| quote_identifier(column.name().value()))
+        .collect::<Vec<_>>();
+    if let Some(alias) = hidden_rowid {
+        selected.push(quote_identifier(alias));
+    }
+    let sql = format!(
+        "SELECT {} FROM {}",
+        selected.join(", "),
+        quote_identifier(created.table_name())
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map((), |row| {
+        let values = (0..created.columns().len())
+            .map(|index| row.get_ref(index).map(StoredValue::capture))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rowid = if let Some(_) = hidden_rowid {
+            row.get(created.columns().len())?
+        } else if created.storage() == TableStorage::Rowid {
+            let alias = created
+                .primary_key_columns()
+                .next()
+                .filter(|column| created.is_rowid_alias(column.id()))
+                .expect("rowid table without a hidden alias has an INTEGER PRIMARY KEY");
+            let position = created
+                .columns()
+                .iter()
+                .position(|column| column.id() == alias.id())
+                .expect("INTEGER PRIMARY KEY belongs to the table");
+            match values[position] {
+                StoredValue::Integer(value) => value,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
+        } else {
+            0
+        };
+        Ok(CapturedRow {
+            table: created.table_name().to_owned(),
+            rowid,
+            values,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn row_prefix(

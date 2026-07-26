@@ -31,6 +31,7 @@ const TAG_UNIQUE_CONSTRAINT: u8 = 6;
 const TAG_TABLE_MODE: u8 = 7;
 const TAG_PRIMARY_KEY: u8 = 8;
 const TAG_TABLE_STORAGE: u8 = 9;
+const TAG_INDEX_DEFINITION: u8 = 10;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_NAME: u8 = 2;
 const TAG_COLUMN_TYPE: u8 = 3;
@@ -41,6 +42,12 @@ const TAG_TYPE_ARGUMENT: u8 = 2;
 const TAG_UNIQUE_KEYSPACE_ID: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
 const TAG_UNIQUE_COLUMN_ID: u8 = 3;
+const TAG_INDEX_KEYSPACE_ID: u8 = 1;
+const TAG_INDEX_NAME: u8 = 2;
+const TAG_INDEX_UNIQUE: u8 = 3;
+const TAG_INDEX_COLUMN_ID: u8 = 4;
+const TAG_INDEX_SQL: u8 = 5;
+const TAG_INDEX_ACTIVE: u8 = 6;
 const TAG_PRIMARY_COLUMN_ID: u8 = 1;
 const COLUMN_NOT_NULL: u8 = 1;
 const TABLE_MODE_ORDINARY: u8 = 0;
@@ -383,9 +390,12 @@ pub struct UniqueConstraint {
 /// parallel database-level registry when that grammar is added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDefinition {
+    keyspace_id: UniqueKeyspaceId,
     name: SqlName,
     unique: bool,
     columns: Vec<ColumnId>,
+    sql: String,
+    active: bool,
 }
 
 /// A foreign-key definition attached to a table schema.
@@ -446,6 +456,7 @@ macro_rules! id_accessors {
 }
 
 id_accessors!(TableId);
+id_accessors!(MutationId);
 id_accessors!(SchemaRevisionId);
 id_accessors!(RowKeyspaceId);
 id_accessors!(UniqueKeyspaceId);
@@ -505,7 +516,6 @@ impl TableSchema {
         &self.unique_constraints
     }
 
-    #[allow(dead_code, reason = "populated when CREATE INDEX grammar is admitted")]
     pub fn indexes(&self) -> &[IndexDefinition] {
         &self.indexes
     }
@@ -526,6 +536,57 @@ impl UniqueConstraint {
     }
 }
 
+impl IndexDefinition {
+    pub fn new_unique(sql: String, name: SqlName, columns: Vec<ColumnId>) -> Self {
+        Self {
+            keyspace_id: UniqueKeyspaceId(Uuid::new_v4().into_bytes()),
+            name,
+            unique: true,
+            columns,
+            sql,
+            active: true,
+        }
+    }
+
+    pub fn keyspace_id(&self) -> UniqueKeyspaceId {
+        self.keyspace_id
+    }
+
+    pub fn name(&self) -> &SqlName {
+        &self.name
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+
+    pub fn columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn retired(&self) -> Self {
+        let mut retired = self.clone();
+        retired.active = false;
+        retired
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_index_definition(self)
+    }
+
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
+        decode_index_definition(frame)
+    }
+}
+
 impl CreateTable {
     /// Mint durable identities for one validated table creation.
     pub fn new(sql: &str, spec: CreateTableSpec) -> Self {
@@ -534,9 +595,10 @@ impl CreateTable {
 
     /// Lower this schema change to its complete Homebase representation.
     pub fn to_homebase(&self) -> SchemaHomebaseOp {
-        let log = log_key(self.mutation_id);
+        let log = schema_log_key(self.mutation_id);
         let name_scope = table_name_scope_key(&self.name);
         let schema = table_schema_key(self.table_id, self.schema_revision_id);
+        let active_schema_revision = active_schema_revision_key(self.table_id);
         let active_row_keyspace = active_row_keyspace_key(self.table_id);
         let row_keyspace = row_keyspace_key(self.table_id, self.row_keyspace_id);
         let write_revision = write_revision_key(self.table_id);
@@ -555,6 +617,10 @@ impl CreateTable {
             Mutation::Set {
                 key: schema,
                 value: self.encode(),
+            },
+            Mutation::Set {
+                key: active_schema_revision,
+                value: self.schema_revision_id.0.to_vec(),
             },
             Mutation::Set {
                 key: active_row_keyspace,
@@ -612,6 +678,7 @@ impl CreateTable {
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
         let created = decode_frame(frame)?;
         validate_literal_sql(&created)?;
+        validate_index_sql(&created)?;
         Ok(created)
     }
 
@@ -660,6 +727,41 @@ impl CreateTable {
 
     pub fn unique_constraints(&self) -> &[UniqueConstraint] {
         self.schema.unique_constraints()
+    }
+
+    pub fn indexes(&self) -> &[IndexDefinition] {
+        self.schema.indexes()
+    }
+
+    pub fn column_named(&self, name: &SqlName) -> Option<&Column> {
+        self.columns()
+            .iter()
+            .find(|column| column.name.canonical() == name.canonical())
+    }
+
+    pub fn index_named(&self, name: &SqlName) -> Option<&IndexDefinition> {
+        self.indexes()
+            .iter()
+            .find(|index| index.active && index.name.canonical() == name.canonical())
+    }
+
+    pub fn with_added_index(&self, revision: SchemaRevisionId, index: IndexDefinition) -> Self {
+        let mut evolved = self.clone();
+        evolved.schema_revision_id = revision;
+        evolved.schema.indexes.push(index);
+        evolved
+    }
+
+    pub fn with_retired_index(&self, revision: SchemaRevisionId, name: &SqlName) -> Option<Self> {
+        let mut evolved = self.clone();
+        let position = evolved
+            .schema
+            .indexes
+            .iter()
+            .position(|index| index.active && index.name.canonical() == name.canonical())?;
+        evolved.schema_revision_id = revision;
+        evolved.schema.indexes[position].active = false;
+        Some(evolved)
     }
 
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
@@ -827,7 +929,7 @@ fn spec_primary_key_ids_from_columns(
     Some(ordered.into_iter().map(|(_, id)| id).collect())
 }
 
-fn log_key(id: MutationId) -> Key {
+pub fn schema_log_key(id: MutationId) -> Key {
     Key::from_bytes([codes::ROOT, codes::SCHEMA, codes::LOG, id.0.as_slice()])
         .expect("schema log components are bounded and non-empty")
 }
@@ -845,7 +947,7 @@ fn table_name_scope_key(name: &SqlName) -> Key {
     .expect("table-name scope components are bounded and non-empty")
 }
 
-fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
+pub fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
@@ -872,6 +974,29 @@ pub fn active_row_keyspace_key(table: TableId) -> Key {
     .expect("active row keyspace key is bounded")
 }
 
+pub fn active_schema_revision_key(table: TableId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::ACTIVE_SCHEMA_REVISION,
+    ])
+    .expect("active schema revision key is bounded")
+}
+
+pub fn index_name_scope_key(name: &SqlName) -> Key {
+    let component = name_component(name.canonical());
+    Key::from_bytes([
+        codes::ROOT,
+        codes::SCHEMA,
+        codes::NAMES,
+        codes::INDEXES,
+        codes::MAIN,
+        component.as_slice(),
+    ])
+    .expect("index-name scope components are bounded and non-empty")
+}
+
 fn row_keyspace_key(table: TableId, keyspace: RowKeyspaceId) -> Key {
     Key::from_bytes([
         codes::ROOT,
@@ -883,7 +1008,7 @@ fn row_keyspace_key(table: TableId, keyspace: RowKeyspaceId) -> Key {
     .expect("row keyspace key is bounded")
 }
 
-fn unique_keyspace_key(table: TableId, keyspace: UniqueKeyspaceId) -> Key {
+pub fn unique_keyspace_key(table: TableId, keyspace: UniqueKeyspaceId) -> Key {
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
@@ -955,6 +1080,11 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
     for unique in &table.schema.unique_constraints {
         writer
             .field(TAG_UNIQUE_CONSTRAINT, &encode_unique_constraint(unique))
+            .expect("schema field length must fit in u32");
+    }
+    for index in &table.schema.indexes {
+        writer
+            .field(TAG_INDEX_DEFINITION, &encode_index_definition(index))
             .expect("schema field length must fit in u32");
     }
     writer.finish()
@@ -1034,6 +1164,31 @@ fn encode_unique_constraint(unique: &UniqueConstraint) -> Vec<u8> {
         writer
             .field(TAG_UNIQUE_COLUMN_ID, &column.0)
             .expect("schema field length must fit in u32");
+    }
+    writer.finish()
+}
+
+fn encode_index_definition(index: &IndexDefinition) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer
+        .field(TAG_INDEX_KEYSPACE_ID, &index.keyspace_id.0)
+        .expect("index field length must fit in u32");
+    writer
+        .field(TAG_INDEX_NAME, index.name.value().as_bytes())
+        .expect("index field length must fit in u32");
+    writer
+        .field(TAG_INDEX_UNIQUE, &[u8::from(index.unique)])
+        .expect("index field length must fit in u32");
+    writer
+        .field(TAG_INDEX_SQL, index.sql.as_bytes())
+        .expect("index field length must fit in u32");
+    writer
+        .field(TAG_INDEX_ACTIVE, &[u8::from(index.active)])
+        .expect("index field length must fit in u32");
+    for column in &index.columns {
+        writer
+            .field(TAG_INDEX_COLUMN_ID, &column.0)
+            .expect("index field length must fit in u32");
     }
     writer.finish()
 }
@@ -1173,6 +1328,7 @@ fn decode_create_table(
     let mut primary_key = None;
     let mut columns = Vec::new();
     let mut unique_constraints = Vec::new();
+    let mut indexes = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_TABLE_ID => set_once(&mut table_id, TableId(uuid_bytes(value)?))?,
@@ -1206,6 +1362,7 @@ fn decode_create_table(
             TAG_PRIMARY_KEY => set_once(&mut primary_key, decode_primary_key(value)?)?,
             TAG_COLUMN => columns.push(decode_column(value)?),
             TAG_UNIQUE_CONSTRAINT => unique_constraints.push(decode_unique_constraint(value)?),
+            TAG_INDEX_DEFINITION => indexes.push(decode_index_definition(value)?),
             _ => {}
         }
     }
@@ -1273,6 +1430,27 @@ fn decode_create_table(
                                 || !columns.iter().any(|candidate| candidate.id == *column)
                         })
             })
+        || indexes.iter().enumerate().any(|(index, definition)| {
+            !definition.unique
+                || definition.columns.is_empty()
+                || definition.columns.len() > MAX_KEY_PARTS
+                || definition.sql.is_empty()
+                || indexes[..index]
+                    .iter()
+                    .any(|seen| seen.keyspace_id == definition.keyspace_id)
+                || (definition.active
+                    && indexes[..index].iter().any(|seen| {
+                        seen.active && seen.name.canonical() == definition.name.canonical()
+                    }))
+                || definition
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(column_index, column)| {
+                        definition.columns[..column_index].contains(column)
+                            || !columns.iter().any(|candidate| candidate.id == *column)
+                    })
+        })
         || (storage == TableStorage::Rowid
             && !rowid_alias
             && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none())
@@ -1290,7 +1468,7 @@ fn decode_create_table(
             columns,
             primary_key,
             unique_constraints,
-            indexes: Vec::new(),
+            indexes,
             foreign_keys: Vec::new(),
         },
     ))
@@ -1313,7 +1491,64 @@ fn schema_identities_are_unique(
                 .iter()
                 .map(|unique| unique.keyspace_id.0),
         )
+        .chain(schema.indexes.iter().map(|index| index.keyspace_id.0))
         .all(|identity| identities.insert(identity))
+}
+
+fn decode_index_definition(frame: &[u8]) -> std::result::Result<IndexDefinition, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    let mut keyspace_id = None;
+    let mut name = None;
+    let mut unique = None;
+    let mut sql = None;
+    let mut active = None;
+    let mut columns = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_INDEX_KEYSPACE_ID => {
+                set_once(&mut keyspace_id, UniqueKeyspaceId(uuid_bytes(value)?))?
+            }
+            TAG_INDEX_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_INDEX_UNIQUE => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                let value = match value {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(SchemaCodecError::InvalidSchema),
+                };
+                set_once(&mut unique, value)?;
+            }
+            TAG_INDEX_COLUMN_ID => columns.push(ColumnId(uuid_bytes(value)?)),
+            TAG_INDEX_SQL => set_once(
+                &mut sql,
+                String::from_utf8(value.to_vec()).map_err(|_| SchemaCodecError::InvalidUtf8)?,
+            )?,
+            TAG_INDEX_ACTIVE => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                let value = match value {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(SchemaCodecError::InvalidSchema),
+                };
+                set_once(&mut active, value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(IndexDefinition {
+        keyspace_id: keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_INDEX_KEYSPACE_ID))?,
+        name: name.ok_or(SchemaCodecError::MissingField(TAG_INDEX_NAME))?,
+        unique: unique.ok_or(SchemaCodecError::MissingField(TAG_INDEX_UNIQUE))?,
+        columns,
+        sql: sql.ok_or(SchemaCodecError::MissingField(TAG_INDEX_SQL))?,
+        active: active.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ACTIVE))?,
+    })
 }
 
 fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
@@ -1458,7 +1693,7 @@ fn from_homebase_inner(
         return Err(SchemaCodecError::InvalidBatch);
     };
     let created = CreateTable::decode(frame)?;
-    if admitted_log_key != &log_key(created.mutation_id) {
+    if admitted_log_key != &schema_log_key(created.mutation_id) {
         return Err(SchemaCodecError::InvalidBatch);
     }
     let expected = created.to_homebase().mutations;
@@ -1477,6 +1712,29 @@ fn validate_literal_sql(created: &CreateTable) -> std::result::Result<(), Schema
     let parsed = parse_create_table(&created.sql)?;
     if !created.matches_spec(&parsed) {
         return Err(SchemaCodecError::SqlMismatch);
+    }
+    Ok(())
+}
+
+fn validate_index_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
+    for index in created.indexes() {
+        let super::sql::ValidatedExecute::CreateUniqueIndex(spec) =
+            super::sql::validate_execute(index.sql()).map_err(|_| SchemaCodecError::InvalidSql)?
+        else {
+            return Err(SchemaCodecError::InvalidSql);
+        };
+        if !index.is_unique()
+            || spec.name != *index.name()
+            || spec.table != *created.table_name_identity()
+            || spec.columns.len() != index.columns().len()
+            || spec.columns.iter().zip(index.columns()).any(|(name, id)| {
+                created
+                    .column_named(name)
+                    .is_none_or(|column| column.id() != *id)
+            })
+        {
+            return Err(SchemaCodecError::SqlMismatch);
+        }
     }
     Ok(())
 }
@@ -1700,7 +1958,7 @@ mod tests {
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 6);
+        assert_eq!(lowered.mutations.len(), 7);
         assert_eq!(lowered.footprint.constraints().len(), 1);
         assert_eq!(lowered.footprint.writes().len(), 1);
 
@@ -1720,7 +1978,7 @@ mod tests {
             lowered
                 .footprint
                 .writes()
-                .contains(lowered.mutations[5].key())
+                .contains(lowered.mutations[6].key())
         );
 
         let admitted = admit(lowered.mutations);
@@ -1740,9 +1998,9 @@ mod tests {
         let decoded = CreateTable::decode(&created.encode()).unwrap();
         assert_eq!(decoded, created);
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 7);
+        assert_eq!(lowered.mutations.len(), 8);
         assert_eq!(
-            lowered.mutations[5].key(),
+            lowered.mutations[6].key(),
             &unique_keyspace_key(created.table_id, unique.keyspace_id)
         );
         assert_eq!(
@@ -1781,8 +2039,8 @@ mod tests {
 
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 10);
-        for (mutation, unique) in lowered.mutations[5..9]
+        assert_eq!(lowered.mutations.len(), 11);
+        for (mutation, unique) in lowered.mutations[6..10]
             .iter()
             .zip(&created.schema.unique_constraints)
         {

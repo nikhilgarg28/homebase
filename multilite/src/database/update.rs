@@ -9,6 +9,7 @@ use homebase_core::key::Key;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
+use super::index::IndexOperation;
 use super::operation::MultiliteOp;
 use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
 use super::schema::table_prefix;
@@ -112,6 +113,56 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         "CREATE TABLE captured application rows",
                     ));
                 }
+                self.record_operation(operation, footprint);
+                Ok(changed)
+            }
+            ValidatedExecute::CreateUniqueIndex(spec) => {
+                let mut captured_operation = None;
+                let (changed, events) = self.hooks.run(
+                    || {
+                        let changed = self.connection.execute(sql, params)?;
+                        let operation = self.hooks.with_internal(|| {
+                            IndexOperation::prepare_create(self.connection, sql, &spec)
+                        })?;
+                        self.hooks
+                            .with_internal(|| operation.record_catalog(self.connection))?;
+                        captured_operation = Some(operation);
+                        Ok(changed)
+                    },
+                    |_| Ok(()),
+                )?;
+                if !events.is_empty() {
+                    return Err(Error::CaptureInvariant(
+                        "CREATE UNIQUE INDEX captured application rows",
+                    ));
+                }
+                let operation = MultiliteOp::Index(
+                    captured_operation.expect("successful index creation prepared an operation"),
+                );
+                let (_, footprint) = operation.to_homebase()?.into_parts();
+                self.record_operation(operation, footprint);
+                Ok(changed)
+            }
+            ValidatedExecute::DropIndex(spec) => {
+                let operation = self
+                    .hooks
+                    .with_internal(|| IndexOperation::prepare_drop(self.connection, sql, &spec))?;
+                let (changed, events) = self.hooks.run(
+                    || {
+                        let changed = self.connection.execute(sql, params)?;
+                        self.hooks
+                            .with_internal(|| operation.record_catalog(self.connection))?;
+                        Ok(changed)
+                    },
+                    |_| Ok(()),
+                )?;
+                if !events.is_empty() {
+                    return Err(Error::CaptureInvariant(
+                        "DROP INDEX captured application rows",
+                    ));
+                }
+                let operation = MultiliteOp::Index(operation);
+                let (_, footprint) = operation.to_homebase()?.into_parts();
                 self.record_operation(operation, footprint);
                 Ok(changed)
             }
