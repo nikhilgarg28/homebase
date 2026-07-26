@@ -232,6 +232,7 @@ fn create_operation(name: &str) -> MultiliteOp {
         &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
         schema::CreateTableSpec {
             name: schema::SqlName::new(name.into()),
+            mode: Default::default(),
             columns: vec![schema::CreateColumn {
                 name: schema::SqlName::new("id".into()),
                 declared_type: schema::TypeDeclaration::integer(),
@@ -3095,6 +3096,248 @@ fn ordinary_affinities_converge_and_numeric_unique_images_conflict() {
     );
     assert_eq!(storage_classes(&first), expected);
     assert_eq!(storage_classes(&second), expected);
+}
+
+#[test]
+fn strict_table_row_operations_preserve_storage_classes_across_replicas() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = Database::open_with(
+        directory.path().join("strict-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(first.database_id.space_id()));
+    let second = Database::open_with(
+        directory.path().join("strict-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let first_runtime = first.runtime().unwrap();
+    let second_runtime = second.runtime().unwrap();
+
+    first
+        .execute(
+            &first_runtime,
+            "CREATE TABLE strict_values (
+                id INTEGER PRIMARY KEY,
+                count INT,
+                ratio REAL,
+                label TEXT,
+                payload BLOB,
+                anything ANY UNIQUE
+            ) STRICT",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase(&second_runtime).unwrap();
+
+    assert!(
+        first
+            .execute(
+                &first_runtime,
+                "INSERT INTO strict_values
+                 VALUES (99, 'not-an-integer', 1, 'bad', x'00', 'bad')",
+                (),
+            )
+            .is_err()
+    );
+    first
+        .execute(
+            &first_runtime,
+            "INSERT INTO strict_values VALUES (1, '7', 2, 3, x'04', '000123')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            &second_runtime,
+            "INSERT INTO strict_values VALUES (2, 8, 2.5, '4', x'05', 123)",
+            (),
+        )
+        .unwrap();
+
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase(&first_runtime).unwrap();
+    second.rebase(&second_runtime).unwrap();
+
+    let rows = |database: &Database<_>| {
+        database.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, typeof(count), count, typeof(ratio), ratio,
+                            typeof(label), label, typeof(payload), hex(payload),
+                            typeof(anything), quote(anything)
+                     FROM strict_values ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let expected = vec![
+        (
+            1,
+            "integer".into(),
+            7,
+            "real".into(),
+            2.0,
+            "text".into(),
+            "3".into(),
+            "blob".into(),
+            "04".into(),
+            "text".into(),
+            "'000123'".into(),
+        ),
+        (
+            2,
+            "integer".into(),
+            8,
+            "real".into(),
+            2.5,
+            "text".into(),
+            "4".into(),
+            "blob".into(),
+            "05".into(),
+            "integer".into(),
+            "123".into(),
+        ),
+    ];
+    assert_eq!(rows(&first), expected);
+    assert_eq!(rows(&second), expected);
+
+    first
+        .execute(
+            &first_runtime,
+            "INSERT INTO strict_values VALUES
+                (3, 9, 3, 'winner', x'06', 'collision')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            &second_runtime,
+            "INSERT INTO strict_values VALUES
+                (4, 10, 4, 'rejected', x'07', 'collision')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("strict UNIQUE collision was not rejected")
+    };
+    assert!(matches!(
+        rejection.error(),
+        KernelError::RangeAssertFailed { .. }
+    ));
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase(&first_runtime).unwrap();
+    second.rebase(&second_runtime).unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database.with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT id FROM strict_values ORDER BY id")
+                    .unwrap();
+                statement
+                    .query_map((), |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            }),
+            [1, 2, 3]
+        );
+    }
+
+    assert!(
+        first
+            .execute(
+                &first_runtime,
+                "UPDATE strict_values SET count = 'bad' WHERE id = 1",
+                (),
+            )
+            .is_err()
+    );
+    first
+        .execute(
+            &first_runtime,
+            "UPDATE strict_values SET label = 5 WHERE id = 1",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase(&second_runtime).unwrap();
+    second
+        .execute(
+            &second_runtime,
+            "DELETE FROM strict_values WHERE id IN (2, 3)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    first.rebase(&first_runtime).unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database.with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT count, typeof(ratio), label, typeof(label),
+                                quote(anything), typeof(anything)
+                         FROM strict_values",
+                        (),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            }),
+            (
+                7,
+                "real".into(),
+                "5".into(),
+                "text".into(),
+                "'000123'".into(),
+                "text".into(),
+            )
+        );
+    }
 }
 
 #[test]

@@ -13,8 +13,8 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
-    Affinity, ColumnId, CreateTable, RowKeyspaceId, SchemaRevisionId, TableId, UniqueKeyspaceId,
-    active_row_keyspace_key, write_revision_key,
+    Affinity, Column, ColumnId, CreateTable, RowKeyspaceId, SchemaRevisionId, StrictType, TableId,
+    TableMode, UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -195,7 +195,7 @@ impl InsertRows {
             .primary_key_columns()
             .map(|column| KeyPartRules {
                 column: column.id(),
-                affinity: column.affinity(),
+                affinity: column.affinity(created.mode()),
                 rowid_alias: column.is_rowid_alias(),
             })
             .collect::<Vec<_>>();
@@ -215,7 +215,7 @@ impl InsertRows {
                             .expect("validated UNIQUE column exists");
                         KeyPartRules {
                             column: column.id(),
-                            affinity: column.affinity(),
+                            affinity: column.affinity(created.mode()),
                             rowid_alias: false,
                         }
                     })
@@ -232,7 +232,7 @@ impl InsertRows {
                     .map(|(column, value)| {
                         (
                             column.id(),
-                            normalize_captured_value(value, column.affinity()),
+                            normalize_captured_value(value, column.affinity(created.mode())),
                         )
                     })
                     .collect(),
@@ -585,7 +585,7 @@ impl InsertRows {
             .primary_key_columns()
             .map(|column| KeyPartRules {
                 column: column.id(),
-                affinity: column.affinity(),
+                affinity: column.affinity(created.mode()),
                 rowid_alias: column.is_rowid_alias(),
             })
             .collect::<Vec<_>>();
@@ -609,6 +609,21 @@ impl InsertRows {
             {
                 return Err(Error::InvalidMultiliteOp(
                     "row values contradict the local schema catalog".into(),
+                ));
+            }
+            if created.mode() == TableMode::Strict
+                && created.columns().iter().any(|column| {
+                    let value = row
+                        .values
+                        .iter()
+                        .find(|(id, _)| *id == column.id())
+                        .map(|(_, value)| value)
+                        .expect("row width and column identities were validated");
+                    !strict_value_matches(column, value)
+                })
+            {
+                return Err(Error::InvalidMultiliteOp(
+                    "row value has an invalid STRICT storage class".into(),
                 ));
             }
             self.key_images(row).map_err(|error| {
@@ -1117,7 +1132,7 @@ pub fn primary_key_prefix(
         .zip(values)
         .map(|(column, value)| {
             if matches!(
-                (column.affinity(), value),
+                (column.affinity(created.mode()), value),
                 (
                     Affinity::Integer | Affinity::Real | Affinity::Numeric,
                     StoredValue::Text(_)
@@ -1129,7 +1144,7 @@ pub fn primary_key_prefix(
                 value,
                 KeyPartRules {
                     column: column.id(),
-                    affinity: column.affinity(),
+                    affinity: column.affinity(created.mode()),
                     rowid_alias: column.is_rowid_alias(),
                 },
             )
@@ -1155,7 +1170,7 @@ fn unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
                         .expect("validated UNIQUE column exists");
                     KeyPartRules {
                         column: column.id(),
-                        affinity: column.affinity(),
+                        affinity: column.affinity(created.mode()),
                         rowid_alias: false,
                     }
                 })
@@ -1258,6 +1273,20 @@ fn normalize_captured_value(value: &StoredValue, affinity: Affinity) -> StoredVa
             StoredValue::Real((*value as f64).to_bits())
         }
         _ => value.clone(),
+    }
+}
+
+fn strict_value_matches(column: &Column, value: &StoredValue) -> bool {
+    if matches!(value, StoredValue::Null) {
+        return !column.is_not_null();
+    }
+    match (column.strict_type(), value) {
+        (Some(StrictType::Integer), StoredValue::Integer(_))
+        | (Some(StrictType::Real), StoredValue::Real(_))
+        | (Some(StrictType::Text), StoredValue::Text(_))
+        | (Some(StrictType::Blob), StoredValue::Blob(_))
+        | (Some(StrictType::Any), _) => true,
+        _ => false,
     }
 }
 
@@ -1575,6 +1604,7 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, payload BLOB)",
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -1618,6 +1648,7 @@ mod tests {
             )",
             CreateTableSpec {
                 name: SqlName::new("accounts".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -1661,6 +1692,7 @@ mod tests {
             )",
             CreateTableSpec {
                 name: SqlName::new("profiles".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -2086,7 +2118,11 @@ mod tests {
                 "{declaration}"
             );
             assert_eq!(
-                created.primary_key_columns().next().unwrap().affinity(),
+                created
+                    .primary_key_columns()
+                    .next()
+                    .unwrap()
+                    .affinity(created.mode()),
                 Affinity::Integer
             );
         }
@@ -2480,6 +2516,7 @@ mod tests {
             "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
             CreateTableSpec {
                 name: SqlName::new("documents".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -2847,11 +2884,103 @@ mod tests {
     }
 
     #[test]
+    fn strict_rows_preserve_any_and_reject_invalid_admitted_storage_classes() {
+        let sql = "CREATE TABLE strict_values (
+            id INTEGER PRIMARY KEY,
+            count INT,
+            ratio REAL,
+            label TEXT,
+            payload BLOB,
+            anything ANY UNIQUE
+        ) STRICT";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let connection = connection(&created);
+        connection
+            .execute(
+                "INSERT INTO strict_values VALUES
+                    (1, '7', 2, 3, x'04', '000123'),
+                    (2, 8, 2.5, '4', x'05', 123)",
+                (),
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO strict_values VALUES
+                        (3, 'not-an-integer', 1, 'x', x'00', 'bad')",
+                    (),
+                )
+                .is_err()
+        );
+
+        let mut statement = connection
+            .prepare(
+                "SELECT rowid, id, count, ratio, label, payload, anything
+                 FROM strict_values ORDER BY id",
+            )
+            .unwrap();
+        let captured = statement
+            .query_map((), |row| {
+                Ok(CapturedRow {
+                    table: "strict_values".into(),
+                    rowid: row.get(0)?,
+                    values: (1..=6)
+                        .map(|index| row.get_ref(index).map(StoredValue::capture))
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            captured[0].values,
+            [
+                StoredValue::Integer(1),
+                StoredValue::Integer(7),
+                StoredValue::Real(2.0_f64.to_bits()),
+                StoredValue::Text(b"3".to_vec()),
+                StoredValue::Blob(vec![4]),
+                StoredValue::Text(b"000123".to_vec()),
+            ]
+        );
+        assert_eq!(captured[1].values[5], StoredValue::Integer(123));
+
+        let inserted = InsertRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inserted.unique_keys[0].key_parts[0].affinity,
+            Affinity::Blob
+        );
+        assert_eq!(inserted.to_homebase().unwrap().mutations.len(), 4);
+
+        let mut invalid = inserted;
+        let count = created.columns()[1].id();
+        invalid.rows[0]
+            .values
+            .iter_mut()
+            .find(|(column, _)| *column == count)
+            .unwrap()
+            .1 = StoredValue::Text(b"invalid".to_vec());
+        assert!(matches!(
+            invalid.validate_against(&created),
+            Err(Error::InvalidMultiliteOp(message))
+                if message == "row value has an invalid STRICT storage class"
+        ));
+    }
+
+    #[test]
     fn non_integer_primary_keys_keep_collision_resistant_hidden_rowids() {
         let created = CreateTable::new(
             "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
             CreateTableSpec {
                 name: SqlName::new("documents".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),

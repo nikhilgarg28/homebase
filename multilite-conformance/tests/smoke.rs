@@ -40,7 +40,7 @@ fn affinity_fixture_matches_sqlite() {
         },
     );
 
-    assert_eq!(report.record_count(), 7);
+    assert_eq!(report.record_count(), 11);
     assert_eq!(report.failed_count(), 0);
 }
 

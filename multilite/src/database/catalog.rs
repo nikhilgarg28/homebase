@@ -162,6 +162,7 @@ mod tests {
             "CREATE TABLE Notes (id INTEGER PRIMARY KEY, body TEXT)",
             CreateTableSpec {
                 name: SqlName::new("Notes".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),

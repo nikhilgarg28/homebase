@@ -405,6 +405,7 @@ mod tests {
                 &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
+                    mode: Default::default(),
                     columns: vec![CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),

@@ -62,3 +62,46 @@ integer
 integer
 integer
 integer
+
+statement ok
+CREATE TABLE strict_values (
+  id INTEGER PRIMARY KEY,
+  count INT,
+  ratio REAL,
+  label TEXT,
+  payload BLOB,
+  anything ANY UNIQUE
+) STRICT
+
+statement ok
+INSERT INTO strict_values VALUES
+  (1, '7', 2, 3, x'04', '000123'),
+  (2, 8, 2.5, '4', x'05', 123)
+
+query TTTT
+SELECT
+  typeof(count),
+  typeof(ratio),
+  typeof(label),
+  typeof(payload)
+FROM strict_values
+ORDER BY id
+----
+integer
+real
+text
+blob
+integer
+real
+text
+blob
+
+query TT
+SELECT typeof(anything), quote(anything)
+FROM strict_values
+ORDER BY id
+----
+text
+'000123'
+integer
+123

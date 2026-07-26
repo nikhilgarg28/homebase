@@ -14,7 +14,7 @@ use rusqlite::vtab::{
 
 use super::catalog;
 use super::row::{StoredValue, primary_key_prefix, row_keyspace_prefix};
-use super::schema::{CreateTable, SchemaRevisionId, TableId};
+use super::schema::{CreateTable, SchemaRevisionId, StrictType, TableId, TableMode};
 use crate::commit::footprint::ReadTrace;
 use crate::{Error, Result};
 
@@ -203,15 +203,22 @@ impl Module {
     }
 
     fn schema_sql(&self) -> String {
+        let mode = self.definition.mode();
         let columns = self
             .definition
             .columns()
             .iter()
             .map(|column| {
+                let declaration =
+                    if mode == TableMode::Strict && column.strict_type() == Some(StrictType::Any) {
+                        "BLOB".to_owned()
+                    } else {
+                        column.declared_type().to_sql()
+                    };
                 format!(
                     "{} {}",
                     quote_identifier(column.name().value()),
-                    column.declared_type().to_sql()
+                    declaration
                 )
             })
             .collect::<Vec<_>>()
@@ -412,6 +419,7 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, day TEXT NOT NULL)",
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -442,6 +450,7 @@ mod tests {
             "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, payload BLOB)",
             CreateTableSpec {
                 name: SqlName::new("tasks".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -553,6 +562,79 @@ mod tests {
         assert_eq!(
             trace.footprint().reads(),
             &BTreeSet::from([row_keyspace_prefix(&created)])
+        );
+    }
+
+    #[test]
+    fn strict_any_primary_keys_keep_exact_storage_classes_in_tracked_reads() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let sql = "CREATE TABLE strict_values (
+            id ANY PRIMARY KEY,
+            body TEXT
+        ) STRICT";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        connection.execute(sql, ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        connection
+            .execute(
+                "INSERT INTO strict_values VALUES ('000123', 'text'), (123, 'integer')",
+                (),
+            )
+            .unwrap();
+
+        let registry = Registry::default();
+        let text_plan = registry
+            .plan(&connection, "SELECT body FROM strict_values WHERE id = ?1")
+            .unwrap()
+            .unwrap();
+        let text_trace = ReadTrace::new();
+        let text_rows = {
+            let _bindings = text_plan.bind(&connection, text_trace.clone()).unwrap();
+            connection
+                .prepare(text_plan.sql())
+                .unwrap()
+                .query_map(["000123"], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(text_rows, ["text"]);
+        assert_eq!(
+            text_trace.footprint().reads(),
+            &BTreeSet::from([primary_key_prefix(
+                &created,
+                &[StoredValue::Text(b"000123".to_vec())]
+            )
+            .unwrap()])
+        );
+
+        let integer_plan = registry
+            .plan(&connection, "SELECT body FROM strict_values WHERE id = ?1")
+            .unwrap()
+            .unwrap();
+        let integer_trace = ReadTrace::new();
+        let integer_rows = {
+            let _bindings = integer_plan
+                .bind(&connection, integer_trace.clone())
+                .unwrap();
+            connection
+                .prepare(integer_plan.sql())
+                .unwrap()
+                .query_map([123], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(integer_rows, ["integer"]);
+        assert_eq!(
+            integer_trace.footprint().reads(),
+            &BTreeSet::from([primary_key_prefix(&created, &[StoredValue::Integer(123)]).unwrap()])
         );
     }
 
@@ -699,6 +781,7 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
+                mode: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),

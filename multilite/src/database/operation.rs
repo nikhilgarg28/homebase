@@ -186,6 +186,7 @@ mod tests {
     fn table() -> CreateTableSpec {
         CreateTableSpec {
             name: SqlName::new("notes".into()),
+            mode: Default::default(),
             columns: vec![CreateColumn {
                 name: SqlName::new("id".into()),
                 declared_type: TypeDeclaration::integer(),
@@ -258,6 +259,7 @@ mod tests {
 
         let update_spec = CreateTableSpec {
             name: SqlName::new("updates".into()),
+            mode: Default::default(),
             columns: vec![
                 CreateColumn {
                     name: SqlName::new("id".into()),

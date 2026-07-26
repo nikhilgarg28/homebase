@@ -1449,6 +1449,7 @@ mod tests {
                 "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
                 CreateTableSpec {
                     name: SqlName::new("notes".into()),
+                    mode: Default::default(),
                     columns: vec![
                         CreateColumn {
                             name: SqlName::new("id".into()),
@@ -1528,6 +1529,7 @@ mod tests {
                 &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
+                    mode: Default::default(),
                     columns: vec![CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),

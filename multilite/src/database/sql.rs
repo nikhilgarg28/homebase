@@ -9,7 +9,9 @@ use sqlite3_parser::ast::{
 };
 use sqlite3_parser::lexer::sql::Parser;
 
-use super::schema::{CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration};
+use super::schema::{
+    CreateColumn, CreateTableSpec, CreateUnique, SqlName, TableMode, TypeDeclaration,
+};
 use crate::{Error, Result};
 
 pub enum ValidatedExecute {
@@ -340,11 +342,16 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             "CREATE TABLE AS SELECT is not supported",
         ));
     };
-    if flags.intersects(TabFlags::WithoutRowid | TabFlags::Strict) {
+    if flags.contains(TabFlags::WithoutRowid) {
         return Err(Error::UnsupportedSql(
-            "STRICT and WITHOUT ROWID tables are not supported",
+            "WITHOUT ROWID tables are not supported",
         ));
     }
+    let mode = if flags.contains(TabFlags::Strict) {
+        TableMode::Strict
+    } else {
+        TableMode::Ordinary
+    };
     let mut primary_keys = 0;
     let mut unique_constraints = Vec::new();
     let columns = columns
@@ -355,6 +362,11 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 .col_type
                 .ok_or(Error::UnsupportedSql("every column must declare a type"))?;
             let declared_type = type_declaration(declared_type)?;
+            if mode == TableMode::Strict && declared_type.strict_type().is_none() {
+                return Err(Error::UnsupportedSql(
+                    "STRICT columns must use INT, INTEGER, REAL, TEXT, BLOB, or ANY without size arguments",
+                ));
+            }
             let mut not_null = false;
             let mut primary_key = false;
             for constraint in column.constraints {
@@ -424,7 +436,9 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     }
                 }
             }
-            if primary_key && !declared_type.is_exact_integer() && !not_null {
+            if mode == TableMode::Strict && primary_key {
+                not_null = true;
+            } else if primary_key && !declared_type.is_exact_integer() && !not_null {
                 return Err(Error::UnsupportedSql(
                     "a non-INTEGER PRIMARY KEY must also be NOT NULL",
                 ));
@@ -491,6 +505,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     }
     Ok(ValidatedExecute::CreateTable(CreateTableSpec {
         name,
+        mode,
         columns,
         unique_constraints,
     }))
@@ -645,7 +660,6 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT GENERATED ALWAYS AS (id))",
             "CREATE TABLE notes (id INTEGER CONSTRAINT pk PRIMARY KEY)",
             "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id))",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY) STRICT",
             "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY ON CONFLICT REPLACE)",
@@ -750,6 +764,71 @@ mod tests {
                 ("ANY", vec![], Affinity::Numeric),
             ]
         );
+    }
+
+    #[test]
+    fn strict_tables_accept_only_strict_types_and_preserve_any_affinity() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE strict_values (
+                id INT PRIMARY KEY,
+                rowid_alias INTEGER UNIQUE,
+                count INT,
+                ratio REAL,
+                label TEXT,
+                payload BLOB,
+                anything ANY UNIQUE
+            ) STRICT",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(spec.mode, TableMode::Strict);
+        assert!(spec.columns[0].not_null);
+        assert!(!spec.columns[0].declared_type.is_exact_integer());
+        assert!(spec.columns[1].declared_type.is_exact_integer());
+        assert_eq!(
+            spec.columns
+                .iter()
+                .map(|column| column.declared_type.strict_type())
+                .collect::<Vec<_>>(),
+            [
+                Some(super::super::schema::StrictType::Integer),
+                Some(super::super::schema::StrictType::Integer),
+                Some(super::super::schema::StrictType::Integer),
+                Some(super::super::schema::StrictType::Real),
+                Some(super::super::schema::StrictType::Text),
+                Some(super::super::schema::StrictType::Blob),
+                Some(super::super::schema::StrictType::Any),
+            ]
+        );
+        assert_eq!(
+            spec.columns[6].declared_type.affinity_for(spec.mode),
+            super::super::schema::Affinity::Blob
+        );
+        assert_eq!(
+            TypeDeclaration::new("ANY".into(), Vec::new()).affinity_for(TableMode::Ordinary),
+            super::super::schema::Affinity::Numeric
+        );
+    }
+
+    #[test]
+    fn strict_tables_reject_ordinary_declarations_and_size_arguments() {
+        for declaration in [
+            "VARCHAR(40)",
+            "DECIMAL(10, 2)",
+            "BOOLEAN",
+            "DOUBLE",
+            "INTEGER(8)",
+            "\"UNSIGNED BIG INT\"",
+        ] {
+            assert_unsupported(&format!(
+                "CREATE TABLE strict_values (
+                    id INTEGER PRIMARY KEY,
+                    value {declaration}
+                ) STRICT"
+            ));
+        }
     }
 
     #[test]
