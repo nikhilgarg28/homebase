@@ -435,6 +435,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         );
         connection.execute(created.sql(), ()).unwrap();
@@ -470,6 +471,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         );
         connection.execute(created.sql(), ()).unwrap();
@@ -720,6 +722,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         );
         first.execute(created.sql(), ()).unwrap();

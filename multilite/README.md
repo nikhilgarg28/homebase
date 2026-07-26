@@ -6,10 +6,12 @@ the Homebase coordination kernel.
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits a restricted persistent
-`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE` against
-non-reserved tables. A table must use the initial four declared types and
-exactly one inline primary key; richer constraints and schema forms remain
-rejected. Other verbs,
+`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE`
+against non-reserved tables. A table must use the initial four declared types
+and exactly one inline primary key. Inline and table-level `UNIQUE`
+declarations, including ordered multi-column constraints, are supported with
+SQLite's default comparison rules. Post-create indexes, richer constraints,
+and other schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
@@ -37,22 +39,28 @@ The general database owns this SQL gate, reserved namespace, schema catalog,
 and row capture. Multilite does not create or require a built-in user table.
 
 Each translated table creation contains immutable UUID identities for its
-table, schema revision, row keyspace, and columns, plus the exact SQL. Its
+table, schema revision, row keyspace, columns, and unique keyspaces, plus the
+exact SQL. Its
 Homebase form records the immutable schema operation, canonical name lookup,
-schema revision, row-keyspace definition, active row keyspace, and one mutable
-`write-revision` cell whose value is the UUID of the latest DDL operation that
-changed valid row lowering. The inverse translation verifies the complete
-envelope and checks that stored SQL projects to the same structured operation.
+schema revision, row-keyspace and unique-keyspace definitions, active row
+keyspace, and one mutable `write-revision` cell whose value is the UUID of the
+latest DDL operation that changed valid row lowering. The inverse translation
+verifies the complete envelope and checks that stored SQL projects to the same
+structured operation.
 
 SQLite's preupdate hook captures final inserted values after affinity has run.
 One SQL statement becomes one `InsertRows` operation even when it inserts many
 rows. Row frames identify their schema revision and carry column-UUID/value
 pairs using lossless SQLite storage classes. Primary-key values become separate
 Homebase key components under the table and row-keyspace UUID. Submissions
-assert every exact row key plus the table's active-row-keyspace and
-write-revision cells. Accepted foreign rows replay by stable IDs through the
-local schema catalog; rejected local rows are deleted by the pending journal in
-the same transaction that rolls back the Homebase submit window.
+assert every exact row key, every non-NULL unique tuple, and the table's
+active-row-keyspace and write-revision cells. Composite unique values occupy
+one Homebase component per key part under their immutable unique-keyspace UUID;
+their value identifies the owning row. Tuples containing NULL emit no ownership
+cell, matching SQLite's distinct-NULL behavior. Accepted foreign rows replay by
+stable IDs through the local schema catalog; rejected local rows are deleted by
+the pending journal in the same transaction that rolls back the Homebase submit
+window.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and

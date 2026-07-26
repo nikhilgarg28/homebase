@@ -192,6 +192,7 @@ mod tests {
                 not_null: false,
                 primary_key: true,
             }],
+            unique_constraints: Vec::new(),
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
                     primary_key: false,
                 },
             ],
+            unique_constraints: Vec::new(),
         };
         let update_table = CreateTable::new(
             "CREATE TABLE updates (id INTEGER PRIMARY KEY, body TEXT)",

@@ -400,13 +400,7 @@ mod tests {
     }
 
     fn proposal(name: &str) -> CommitProposal {
-        CommitProposal::from_transaction(
-            SnapshotDescriptor {
-                commit_seq: CommitSeq(0),
-                authority_applied_through: AdmissionSeq(0),
-                submit_cursors: OplogCursors::default(),
-            },
-            IsolationLevel::Snapshot,
+        let transaction =
             MultiliteTransaction::new(vec![MultiliteOp::CreateTable(CreateTable::new(
                 &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY)"),
                 CreateTableSpec {
@@ -417,10 +411,20 @@ mod tests {
                         not_null: false,
                         primary_key: true,
                     }],
+                    unique_constraints: Vec::new(),
                 },
             ))])
-            .unwrap(),
-            std::iter::empty(),
+            .unwrap();
+        let (_, footprint) = transaction.to_homebase().unwrap().into_parts();
+        CommitProposal::from_transaction(
+            SnapshotDescriptor {
+                commit_seq: CommitSeq(0),
+                authority_applied_through: AdmissionSeq(0),
+                submit_cursors: OplogCursors::default(),
+            },
+            IsolationLevel::Snapshot,
+            transaction,
+            footprint,
         )
         .unwrap()
     }

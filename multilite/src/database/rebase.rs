@@ -134,6 +134,7 @@ mod tests {
                     not_null: false,
                     primary_key: true,
                 }],
+                unique_constraints: Vec::new(),
             },
         );
         let MultiliteOp::CreateTable(table) = &created else {

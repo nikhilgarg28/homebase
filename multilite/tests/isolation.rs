@@ -141,6 +141,76 @@ fn primary_key_collisions_are_mandatory_at_both_isolation_levels() {
 }
 
 #[test]
+fn composite_unique_collisions_are_mandatory_at_both_isolation_levels() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation) in [
+        ("snapshot", IsolationLevel::Snapshot),
+        ("serializable", IsolationLevel::Serializable),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-unique-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-unique-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        first
+            .execute(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    organization TEXT,
+                    email TEXT,
+                    UNIQUE (organization, email)
+                )",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        for (database, id) in [(&first, 1_i64), (&second, 2_i64)] {
+            database
+                .update_with(UpdateOptions::new(isolation), |transaction| {
+                    transaction.execute(
+                        "INSERT INTO accounts VALUES (?1, 'acme', 'shared@example.com')",
+                        [id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let rejection = rejected(second.push().unwrap());
+        assert_range_assertion_failed(&rejection);
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        converge(&first, &second);
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id FROM accounts", (), |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                [1],
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn coarse_serializable_table_reads_conflict_across_disjoint_point_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let authority = server();

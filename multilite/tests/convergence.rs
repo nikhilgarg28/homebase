@@ -133,6 +133,425 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn composite_unique_constraints_conflict_repair_and_converge() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let second_path = directory.path().join("unique-second.sqlite");
+    let first = MultiliteConnection::open_with(
+        directory.path().join("unique-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                organization TEXT,
+                email TEXT,
+                CONSTRAINT account_email UNIQUE (organization, email)
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "INSERT INTO accounts VALUES (1, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO accounts VALUES (2, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("composite UNIQUE collision was not rejected")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, organization, email FROM accounts ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            [(1, Some("acme".into()), "shared@example.com".into())]
+        );
+    }
+
+    first
+        .execute(
+            "INSERT INTO accounts VALUES
+                (10, 'alpha', 'a@example.com'),
+                (11, 'beta', 'b@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "UPDATE accounts
+             SET organization = 'shared', email = 'updated@example.com'
+             WHERE id = 10",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "UPDATE accounts
+             SET organization = 'shared', email = 'updated@example.com'
+             WHERE id = 11",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("UPDATE into a composite UNIQUE collision was not rejected")
+    };
+    drop(second);
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query(
+                "SELECT organization, email FROM accounts WHERE id = 11",
+                (),
+                |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,)) },
+            )
+            .unwrap(),
+        [("beta".into(), "b@example.com".into())]
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "INSERT INTO accounts VALUES (20, NULL, 'nullable@example.com')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO accounts VALUES (21, NULL, 'nullable@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let expected = [
+        (1, Some("acme".into()), "shared@example.com".into()),
+        (10, Some("shared".into()), "updated@example.com".into()),
+        (11, Some("beta".into()), "b@example.com".into()),
+        (20, None, "nullable@example.com".into()),
+        (21, None, "nullable@example.com".into()),
+    ];
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, organization, email FROM accounts ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            expected
+        );
+    }
+
+    first
+        .execute("DELETE FROM accounts WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    second
+        .execute(
+            "INSERT INTO accounts VALUES (30, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id FROM accounts
+                     WHERE organization = 'acme' AND email = 'shared@example.com'",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            [30]
+        );
+    }
+}
+
+#[test]
+fn overlapping_unique_constraints_conflict_independently_and_together() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let second_path = directory.path().join("overlapping-unique-second.sqlite");
+    let first = MultiliteConnection::open_with(
+        directory.path().join("overlapping-unique-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE profiles (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                email TEXT UNIQUE,
+                username TEXT UNIQUE,
+                UNIQUE (tenant, email),
+                UNIQUE (tenant, username)
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    // Different tenants avoid the composite key. Only UNIQUE(email) collides.
+    first
+        .execute(
+            "INSERT INTO profiles VALUES
+                (1, 'acme', 'shared@example.com', 'alpha')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO profiles VALUES
+                (2, 'other', 'shared@example.com', 'beta')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("global UNIQUE collision was not rejected")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "INSERT INTO profiles VALUES
+                (10, 'acme', 'ten@example.com', 'ten'),
+                (11, 'acme', 'eleven@example.com', 'eleven')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    // This collides in both UNIQUE(username) and UNIQUE(tenant, username).
+    first
+        .execute(
+            "UPDATE profiles
+             SET email = 'winner@example.com', username = 'claimed'
+             WHERE id = 10",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "UPDATE profiles
+             SET email = 'loser@example.com', username = 'claimed'
+             WHERE id = 11",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("overlapping UNIQUE collision was not rejected")
+    };
+    drop(second);
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    let expected = [
+        (
+            1,
+            "acme".into(),
+            "shared@example.com".into(),
+            "alpha".into(),
+        ),
+        (
+            10,
+            "acme".into(),
+            "winner@example.com".into(),
+            "claimed".into(),
+        ),
+        (
+            11,
+            "acme".into(),
+            "eleven@example.com".into(),
+            "eleven".into(),
+        ),
+    ];
+    assert_eq!(profiles(&first), expected);
+    assert_eq!(profiles(&second), expected);
+}
+
+#[test]
+fn unique_numeric_key_images_match_sqlite_storage_class_equality() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("numeric-unique-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("numeric-unique-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE values_by_type (
+                id INTEGER PRIMARY KEY,
+                value BLOB UNIQUE
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO values_by_type VALUES (1, 1)", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO values_by_type VALUES (2, 1.0)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("equal INTEGER and REAL unique values were both admitted")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO values_by_type VALUES (3, 2)", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO values_by_type VALUES (4, '2')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, typeof(value) FROM values_by_type ORDER BY id",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [
+                (1, "integer".into()),
+                (3, "integer".into()),
+                (4, "text".into()),
+            ]
+        );
+    }
+}
+
+#[test]
 fn disjoint_mixed_schema_and_row_transactions_converge_in_manifest_order() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -721,4 +1140,24 @@ where
         .into_iter()
         .next()
         .expect("document exists")
+}
+
+fn profiles<H>(database: &MultiliteConnection<H>) -> Vec<(i64, String, String, String)>
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database
+        .query(
+            "SELECT id, tenant, email, username FROM profiles ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap()
 }

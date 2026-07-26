@@ -203,7 +203,8 @@ pub enum PrepareOutcome {
 }
 
 impl CommitProposal {
-    /// Lower one insert-only captured branch into an owned logical proposal.
+    /// Lower one legacy captured branch into an owned logical proposal.
+    #[cfg(test)]
     pub fn from_captured(
         snapshot: SnapshotDescriptor,
         isolation: IsolationLevel,
@@ -219,7 +220,11 @@ impl CommitProposal {
             .map_err(invalid_changeset)?;
         let operations = lower_insert_operations(&changeset, connection)?;
         let transaction = MultiliteTransaction::new(operations)?;
-        Self::from_transaction(snapshot, isolation, transaction, reads).map(Some)
+        let (_, mut footprint) = transaction.to_homebase()?.into_parts();
+        for read in reads {
+            footprint.add_read(read);
+        }
+        Self::from_transaction(snapshot, isolation, transaction, footprint).map(Some)
     }
 
     /// Build one proposal from a complete ordered logical transaction.
@@ -227,20 +232,19 @@ impl CommitProposal {
         snapshot: SnapshotDescriptor,
         isolation: IsolationLevel,
         transaction: MultiliteTransaction,
-        reads: impl IntoIterator<Item = Key>,
+        footprint: ConflictFootprint,
     ) -> Result<Self> {
-        let (_, mut footprint) = transaction.to_homebase()?.into_parts();
-        for read in reads {
-            footprint.add_read(read);
-        }
+        let (_, mandatory) = transaction.to_homebase()?.into_parts();
+        let body = TransactionProposal {
+            snapshot,
+            isolation,
+            transaction,
+            footprint,
+        };
+        body.validate_mandatory_footprint(&mandatory)?;
         Ok(Self {
             id: ProposalId::new(),
-            body: ProposalBody::Transaction(TransactionProposal {
-                snapshot,
-                isolation,
-                transaction,
-                footprint,
-            }),
+            body: ProposalBody::Transaction(body),
         })
     }
 
@@ -1459,6 +1463,7 @@ mod tests {
                             primary_key: false,
                         },
                     ],
+                    unique_constraints: Vec::new(),
                 },
             );
             writer.execute(created.sql(), ()).unwrap();
@@ -1529,16 +1534,13 @@ mod tests {
                         not_null: false,
                         primary_key: true,
                     }],
+                    unique_constraints: Vec::new(),
                 },
             ))])
             .unwrap();
-        CommitProposal::from_transaction(
-            snapshot,
-            IsolationLevel::Snapshot,
-            transaction,
-            std::iter::empty(),
-        )
-        .unwrap()
+        let (_, footprint) = transaction.to_homebase().unwrap().into_parts();
+        CommitProposal::from_transaction(snapshot, IsolationLevel::Snapshot, transaction, footprint)
+            .unwrap()
     }
 
     fn pull_response() -> PullResponse {

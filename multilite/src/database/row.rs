@@ -1,6 +1,6 @@
 //! Captured SQLite rows and their durable Homebase representation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use homebase_core::key::{Key, KeyError};
@@ -14,7 +14,7 @@ use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
     ColumnId, CreateTable, DeclaredType, RowKeyspaceId, SchemaRevisionId, TableId,
-    active_row_keyspace_key, write_revision_key,
+    UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -29,6 +29,7 @@ const TAG_ROW_KEYSPACE: u8 = 2;
 const TAG_KEY_PART: u8 = 3;
 const TAG_COLUMN_VALUE: u8 = 4;
 const TAG_ROWID: u8 = 5;
+const TAG_UNIQUE_KEY: u8 = 6;
 const TAG_TABLE: u8 = 1;
 const TAG_ROW: u8 = 2;
 const TAG_COLUMN_ID: u8 = 1;
@@ -36,6 +37,8 @@ const TAG_COLUMN_TYPE: u8 = 2;
 const TAG_VALUE: u8 = 2;
 const TAG_UPDATE_BEFORE: u8 = 1;
 const TAG_UPDATE_AFTER: u8 = 2;
+const TAG_UNIQUE_KEYSPACE: u8 = 1;
+const TAG_UNIQUE_KEY_PART: u8 = 2;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +123,13 @@ pub struct KeyPartRules {
     pub declared_type: DeclaredType,
 }
 
+/// Ordered comparison rules for one table-owned UNIQUE keyspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniqueKeyRules {
+    keyspace: UniqueKeyspaceId,
+    key_parts: Vec<KeyPartRules>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     rowid: i64,
@@ -133,6 +143,7 @@ pub struct InsertRows {
     schema_revision: SchemaRevisionId,
     row_keyspace: RowKeyspaceId,
     key_parts: Vec<KeyPartRules>,
+    unique_keys: Vec<UniqueKeyRules>,
     rows: Vec<Row>,
 }
 
@@ -184,6 +195,28 @@ impl InsertRows {
                 declared_type: column.declared_type(),
             })
             .collect::<Vec<_>>();
+        let unique_keys = created
+            .unique_constraints()
+            .iter()
+            .map(|unique| UniqueKeyRules {
+                keyspace: unique.keyspace_id(),
+                key_parts: unique
+                    .columns()
+                    .iter()
+                    .map(|id| {
+                        let column = created
+                            .columns()
+                            .iter()
+                            .find(|column| column.id() == *id)
+                            .expect("validated UNIQUE column exists");
+                        KeyPartRules {
+                            column: column.id(),
+                            declared_type: column.declared_type(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
         let rows = captured
             .iter()
             .map(|captured| Row {
@@ -200,6 +233,7 @@ impl InsertRows {
             schema_revision: created.schema_revision_id(),
             row_keyspace: created.row_keyspace_id(),
             key_parts,
+            unique_keys,
             rows,
         };
         inserted.validate_against(&created)?;
@@ -209,7 +243,7 @@ impl InsertRows {
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(self.rows.len());
+        let mut mutations = Vec::with_capacity(self.rows.len() * (self.unique_keys.len() + 1));
         let mut footprint = ConflictFootprint::new();
         for row in &self.rows {
             let key = self
@@ -220,6 +254,15 @@ impl InsertRows {
                 key,
                 value: self.encode_row(row),
             });
+        }
+        for row in &self.rows {
+            for (key, owner) in self
+                .unique_entries(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Set { key, value: owner });
+            }
         }
         footprint.add_constraint(active_row_keyspace_key(self.table));
         footprint.add_constraint(write_revision_key(self.table));
@@ -243,16 +286,22 @@ impl InsertRows {
                 return Err(RowCodecError::InvalidBatch);
             };
             let components = key.components();
-            if components.len() < 6
+            if components.len() < 4
                 || components[0].as_bytes() != codes::ROOT
                 || components[1].as_bytes() != codes::TABLES
-                || components[3].as_bytes() != codes::ROWS
             {
+                return Err(RowCodecError::InvalidBatch);
+            }
+            if components[3].as_bytes() != codes::ROWS {
+                continue;
+            }
+            if components.len() < 6 {
                 return Err(RowCodecError::InvalidBatch);
             }
             let table = TableId::from_bytes(uuid_bytes(components[2].as_bytes())?);
             let row_keyspace = RowKeyspaceId::from_bytes(uuid_bytes(components[4].as_bytes())?);
-            let (schema_revision, encoded_keyspace, key_parts, row) = decode_row(value)?;
+            let (schema_revision, encoded_keyspace, key_parts, unique_keys, row) =
+                decode_row(value)?;
             if encoded_keyspace != row_keyspace {
                 return Err(RowCodecError::InvalidBatch);
             }
@@ -261,12 +310,14 @@ impl InsertRows {
                 schema_revision,
                 row_keyspace,
                 key_parts: key_parts.clone(),
+                unique_keys: unique_keys.clone(),
                 rows: Vec::new(),
             });
             if candidate.table != table
                 || candidate.schema_revision != schema_revision
                 || candidate.row_keyspace != row_keyspace
                 || candidate.key_parts != key_parts
+                || candidate.unique_keys != unique_keys
             {
                 return Err(RowCodecError::InvalidBatch);
             }
@@ -282,6 +333,18 @@ impl InsertRows {
         }
         let operation = operation.ok_or(RowCodecError::InvalidBatch)?;
         operation.validate_structure()?;
+        let expected = operation
+            .to_homebase()
+            .map_err(|_| RowCodecError::InvalidBatch)?
+            .mutations;
+        if expected.len() != batch.entries.len()
+            || expected
+                .iter()
+                .zip(&batch.entries)
+                .any(|(expected, admitted)| expected != &admitted.device_entry.mutation)
+        {
+            return Err(RowCodecError::InvalidBatch);
+        }
         Ok(operation)
     }
 
@@ -311,18 +374,21 @@ impl InsertRows {
                 TAG_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
                 TAG_ROW => {
                     let table = table.ok_or(RowCodecError::MissingField(TAG_TABLE))?;
-                    let (schema_revision, row_keyspace, key_parts, row) = decode_row(value)?;
+                    let (schema_revision, row_keyspace, key_parts, unique_keys, row) =
+                        decode_row(value)?;
                     let candidate = operation.get_or_insert_with(|| Self {
                         table,
                         schema_revision,
                         row_keyspace,
                         key_parts: key_parts.clone(),
+                        unique_keys: unique_keys.clone(),
                         rows: Vec::new(),
                     });
                     if candidate.table != table
                         || candidate.schema_revision != schema_revision
                         || candidate.row_keyspace != row_keyspace
                         || candidate.key_parts != key_parts
+                        || candidate.unique_keys != unique_keys
                     {
                         return Err(RowCodecError::InvalidBatch);
                     }
@@ -512,10 +578,12 @@ impl InsertRows {
                 declared_type: column.declared_type(),
             })
             .collect::<Vec<_>>();
+        let expected_unique_keys = unique_key_rules(created);
         if self.table != created.table_id()
             || self.schema_revision != created.schema_revision_id()
             || self.row_keyspace != created.row_keyspace_id()
             || self.key_parts != expected_key_parts
+            || self.unique_keys != expected_unique_keys
         {
             return Err(Error::InvalidMultiliteOp(
                 "row operation contradicts the local schema catalog".into(),
@@ -535,6 +603,9 @@ impl InsertRows {
             self.key_images(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
             })?;
+            self.unique_entries(row).map_err(|error| {
+                Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
+            })?;
         }
         Ok(())
     }
@@ -550,7 +621,25 @@ impl InsertRows {
         }) {
             return Err(RowCodecError::DuplicateField);
         }
+        if self.unique_keys.iter().enumerate().any(|(index, unique)| {
+            unique.key_parts.is_empty()
+                || self.unique_keys[..index]
+                    .iter()
+                    .any(|seen| seen.keyspace == unique.keyspace)
+                || unique
+                    .key_parts
+                    .iter()
+                    .enumerate()
+                    .any(|(part_index, part)| {
+                        unique.key_parts[..part_index]
+                            .iter()
+                            .any(|seen| seen.column == part.column)
+                    })
+        }) {
+            return Err(RowCodecError::InvalidRow);
+        }
         let mut keys = BTreeSet::new();
+        let mut unique_keys = BTreeSet::new();
         for row in &self.rows {
             if let [
                 KeyPartRules {
@@ -569,6 +658,11 @@ impl InsertRows {
             }
             if !keys.insert(self.row_key(row)?) {
                 return Err(RowCodecError::DuplicateRow);
+            }
+            for (key, _) in self.unique_entries(row)? {
+                if !unique_keys.insert(key) {
+                    return Err(RowCodecError::DuplicateUniqueKey);
+                }
             }
         }
         Ok(())
@@ -594,6 +688,52 @@ impl InsertRows {
             .collect()
     }
 
+    fn unique_entries(&self, row: &Row) -> std::result::Result<Vec<(Key, Vec<u8>)>, RowCodecError> {
+        let owner = self.row_key(row)?.encode();
+        let mut entries = Vec::with_capacity(self.unique_keys.len());
+        for unique in &self.unique_keys {
+            let values = unique
+                .key_parts
+                .iter()
+                .map(|part| {
+                    row.values
+                        .iter()
+                        .find(|(column, _)| *column == part.column)
+                        .map(|(_, value)| value)
+                        .ok_or(RowCodecError::InvalidRow)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if values
+                .iter()
+                .any(|value| matches!(value, StoredValue::Null))
+            {
+                continue;
+            }
+            let images = values
+                .into_iter()
+                .zip(&unique.key_parts)
+                .map(|(value, rules)| key_image(value, *rules))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            entries.push((
+                unique_prefix(self.table, unique.keyspace, images)?,
+                owner.clone(),
+            ));
+        }
+        Ok(entries)
+    }
+
+    fn unique_entry_map(&self) -> std::result::Result<BTreeMap<Key, Vec<u8>>, RowCodecError> {
+        let mut entries = BTreeMap::new();
+        for row in &self.rows {
+            for (key, owner) in self.unique_entries(row)? {
+                if entries.insert(key, owner).is_some() {
+                    return Err(RowCodecError::DuplicateUniqueKey);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     fn encode_row(&self, row: &Row) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_FRAME_VERSION);
@@ -611,6 +751,11 @@ impl InsertRows {
                 .field(TAG_KEY_PART, &encode_key_part(*part))
                 .expect("row field length fits in u32");
         }
+        for unique in &self.unique_keys {
+            writer
+                .field(TAG_UNIQUE_KEY, &encode_unique_key(unique))
+                .expect("row field length fits in u32");
+        }
         for (column, value) in &row.values {
             writer
                 .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
@@ -618,6 +763,48 @@ impl InsertRows {
         }
         writer.finish()
     }
+}
+
+fn encode_unique_key(unique: &UniqueKeyRules) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer
+        .field(TAG_UNIQUE_KEYSPACE, &unique.keyspace.as_bytes())
+        .expect("row field length fits in u32");
+    for part in &unique.key_parts {
+        writer
+            .field(TAG_UNIQUE_KEY_PART, &encode_key_part(*part))
+            .expect("row field length fits in u32");
+    }
+    writer.finish()
+}
+
+fn decode_unique_key(frame: &[u8]) -> std::result::Result<UniqueKeyRules, RowCodecError> {
+    let mut reader = Reader::new(frame);
+    let mut keyspace = None;
+    let mut key_parts = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        match tag {
+            TAG_UNIQUE_KEYSPACE => set_once(
+                &mut keyspace,
+                UniqueKeyspaceId::from_bytes(uuid_bytes(value)?),
+            )?,
+            TAG_UNIQUE_KEY_PART => key_parts.push(decode_key_part(value)?),
+            _ => {}
+        }
+    }
+    if key_parts.is_empty()
+        || key_parts.iter().enumerate().any(|(index, part)| {
+            key_parts[..index]
+                .iter()
+                .any(|seen| seen.column == part.column)
+        })
+    {
+        return Err(RowCodecError::InvalidRow);
+    }
+    Ok(UniqueKeyRules {
+        keyspace: keyspace.ok_or(RowCodecError::MissingField(TAG_UNIQUE_KEYSPACE))?,
+        key_parts,
+    })
 }
 
 impl DeleteRows {
@@ -632,7 +819,8 @@ impl DeleteRows {
         self.deleted
             .validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(self.deleted.rows.len());
+        let mut mutations =
+            Vec::with_capacity(self.deleted.rows.len() * (self.deleted.unique_keys.len() + 1));
         let mut footprint = ConflictFootprint::new();
         for row in &self.deleted.rows {
             let key = self
@@ -641,6 +829,16 @@ impl DeleteRows {
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
             footprint.add_write(key.clone());
             mutations.push(Mutation::Delete { key });
+        }
+        for row in &self.deleted.rows {
+            for (key, _) in self
+                .deleted
+                .unique_entries(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Delete { key });
+            }
         }
         footprint.add_constraint(active_row_keyspace_key(self.deleted.table));
         footprint.add_constraint(write_revision_key(self.deleted.table));
@@ -718,7 +916,8 @@ impl UpdateRows {
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(self.after.rows.len() * 2);
+        let mut mutations =
+            Vec::with_capacity(self.after.rows.len() * (self.after.unique_keys.len() * 2 + 2));
         let mut footprint = ConflictFootprint::new();
         let keys = self
             .before
@@ -748,11 +947,34 @@ impl UpdateRows {
                 });
             }
         }
+        let before_unique = self
+            .before
+            .unique_entry_map()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let after_unique = self
+            .after
+            .unique_entry_map()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        for (key, owner) in &before_unique {
+            if after_unique.get(key) != Some(owner) {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Delete { key: key.clone() });
+            }
+        }
         for (row, (_, key)) in self.after.rows.iter().zip(keys) {
             mutations.push(Mutation::Set {
                 key,
                 value: self.after.encode_row(row),
             });
+        }
+        for (key, owner) in &after_unique {
+            if before_unique.get(key) != Some(owner) {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Set {
+                    key: key.clone(),
+                    value: owner.clone(),
+                });
+            }
         }
         footprint.add_constraint(active_row_keyspace_key(self.after.table));
         footprint.add_constraint(write_revision_key(self.after.table));
@@ -830,6 +1052,7 @@ impl UpdateRows {
             || self.before.schema_revision != self.after.schema_revision
             || self.before.row_keyspace != self.after.row_keyspace
             || self.before.key_parts != self.after.key_parts
+            || self.before.unique_keys != self.after.unique_keys
             || self.before.rows.len() != self.after.rows.len()
         {
             return Err(RowCodecError::InvalidRow);
@@ -892,6 +1115,31 @@ pub fn primary_key_prefix(
     row_prefix(created.table_id(), created.row_keyspace_id(), images)
 }
 
+fn unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
+    created
+        .unique_constraints()
+        .iter()
+        .map(|unique| UniqueKeyRules {
+            keyspace: unique.keyspace_id(),
+            key_parts: unique
+                .columns()
+                .iter()
+                .map(|id| {
+                    let column = created
+                        .columns()
+                        .iter()
+                        .find(|column| column.id() == *id)
+                        .expect("validated UNIQUE column exists");
+                    KeyPartRules {
+                        column: column.id(),
+                        declared_type: column.declared_type(),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn row_prefix(
     table: TableId,
     row_keyspace: RowKeyspaceId,
@@ -904,6 +1152,25 @@ fn row_prefix(
             table.as_bytes().to_vec(),
             codes::ROWS.to_vec(),
             row_keyspace.as_bytes().to_vec(),
+        ]
+        .into_iter()
+        .chain(images),
+    )
+    .map_err(RowCodecError::InvalidKey)
+}
+
+fn unique_prefix(
+    table: TableId,
+    keyspace: UniqueKeyspaceId,
+    images: Vec<Vec<u8>>,
+) -> std::result::Result<Key, RowCodecError> {
+    Key::from_bytes(
+        [
+            codes::ROOT.to_vec(),
+            codes::TABLES.to_vec(),
+            table.as_bytes().to_vec(),
+            codes::UNIQUE.to_vec(),
+            keyspace.as_bytes().to_vec(),
         ]
         .into_iter()
         .chain(images),
@@ -1029,7 +1296,16 @@ fn decode_column_value(
 
 fn decode_row(
     frame: &[u8],
-) -> std::result::Result<(SchemaRevisionId, RowKeyspaceId, Vec<KeyPartRules>, Row), RowCodecError> {
+) -> std::result::Result<
+    (
+        SchemaRevisionId,
+        RowKeyspaceId,
+        Vec<KeyPartRules>,
+        Vec<UniqueKeyRules>,
+        Row,
+    ),
+    RowCodecError,
+> {
     let mut reader = Reader::new(frame);
     if reader.u8() != Some(ROW_FRAME_VERSION) {
         return Err(RowCodecError::UnknownVersion);
@@ -1038,6 +1314,7 @@ fn decode_row(
     let mut row_keyspace = None;
     let mut rowid = None;
     let mut key_parts = Vec::new();
+    let mut unique_keys = Vec::new();
     let mut values = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
@@ -1054,6 +1331,7 @@ fn decode_row(
                 set_once(&mut rowid, i64::from_be_bytes(bytes))?;
             }
             TAG_KEY_PART => key_parts.push(decode_key_part(value)?),
+            TAG_UNIQUE_KEY => unique_keys.push(decode_unique_key(value)?),
             TAG_COLUMN_VALUE => values.push(decode_column_value(value)?),
             _ => {}
         }
@@ -1072,6 +1350,7 @@ fn decode_row(
         schema_revision.ok_or(RowCodecError::MissingField(TAG_SCHEMA_REVISION))?,
         row_keyspace.ok_or(RowCodecError::MissingField(TAG_ROW_KEYSPACE))?,
         key_parts,
+        unique_keys,
         Row {
             rowid: rowid.ok_or(RowCodecError::MissingField(TAG_ROWID))?,
             values,
@@ -1192,6 +1471,7 @@ pub enum RowCodecError {
     InvalidValue,
     InvalidRow,
     DuplicateRow,
+    DuplicateUniqueKey,
     RowidChanged,
     NullPrimaryKey,
     InvalidKey(KeyError),
@@ -1210,6 +1490,9 @@ impl fmt::Display for RowCodecError {
             Self::InvalidValue => f.write_str("invalid stored SQLite value"),
             Self::InvalidRow => f.write_str("invalid row frame"),
             Self::DuplicateRow => f.write_str("row operation contains a duplicate logical row"),
+            Self::DuplicateUniqueKey => {
+                f.write_str("row operation contains a duplicate UNIQUE key")
+            }
             Self::RowidChanged => f.write_str("UPDATE of SQLite rowid is not supported"),
             Self::NullPrimaryKey => f.write_str("primary key value is NULL"),
             Self::InvalidKey(error) => write!(f, "invalid Homebase row key: {error}"),
@@ -1227,7 +1510,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, CreateUnique, SqlName};
 
     fn definition() -> CreateTable {
         CreateTable::new(
@@ -1254,6 +1537,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         )
     }
@@ -1264,6 +1548,123 @@ mod tests {
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, created).unwrap();
         connection
+    }
+
+    fn unique_definition() -> CreateTable {
+        CreateTable::new(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                organization TEXT,
+                email TEXT,
+                UNIQUE (organization, email)
+            )",
+            CreateTableSpec {
+                name: SqlName::new("accounts".into()),
+                columns: vec![
+                    CreateColumn {
+                        name: SqlName::new("id".into()),
+                        declared_type: DeclaredType::Integer,
+                        not_null: false,
+                        primary_key: true,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("organization".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("email".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                ],
+                unique_constraints: vec![CreateUnique {
+                    name: None,
+                    columns: vec![
+                        SqlName::new("organization".into()),
+                        SqlName::new("email".into()),
+                    ],
+                }],
+            },
+        )
+    }
+
+    fn overlapping_unique_definition() -> CreateTable {
+        CreateTable::new(
+            "CREATE TABLE profiles (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                email TEXT CONSTRAINT email_key UNIQUE,
+                username TEXT UNIQUE,
+                CONSTRAINT tenant_email UNIQUE (tenant, email),
+                CONSTRAINT tenant_username UNIQUE (tenant, username)
+            )",
+            CreateTableSpec {
+                name: SqlName::new("profiles".into()),
+                columns: vec![
+                    CreateColumn {
+                        name: SqlName::new("id".into()),
+                        declared_type: DeclaredType::Integer,
+                        not_null: false,
+                        primary_key: true,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("tenant".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("email".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                    CreateColumn {
+                        name: SqlName::new("username".into()),
+                        declared_type: DeclaredType::Text,
+                        not_null: false,
+                        primary_key: false,
+                    },
+                ],
+                unique_constraints: vec![
+                    CreateUnique {
+                        name: Some(SqlName::new("email_key".into())),
+                        columns: vec![SqlName::new("email".into())],
+                    },
+                    CreateUnique {
+                        name: None,
+                        columns: vec![SqlName::new("username".into())],
+                    },
+                    CreateUnique {
+                        name: Some(SqlName::new("tenant_email".into())),
+                        columns: vec![SqlName::new("tenant".into()), SqlName::new("email".into())],
+                    },
+                    CreateUnique {
+                        name: Some(SqlName::new("tenant_username".into())),
+                        columns: vec![
+                            SqlName::new("tenant".into()),
+                            SqlName::new("username".into()),
+                        ],
+                    },
+                ],
+            },
+        )
+    }
+
+    fn profile(id: i64, tenant: &str, email: &str, username: &str) -> CapturedRow {
+        CapturedRow {
+            table: "profiles".into(),
+            rowid: id,
+            values: vec![
+                StoredValue::Integer(id),
+                StoredValue::Text(tenant.as_bytes().to_vec()),
+                StoredValue::Text(email.as_bytes().to_vec()),
+                StoredValue::Text(username.as_bytes().to_vec()),
+            ],
+        }
     }
 
     fn inserted(connection: &Connection) -> InsertRows {
@@ -1349,6 +1750,213 @@ mod tests {
         assert_eq!(
             InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
             inserted
+        );
+    }
+
+    #[test]
+    fn composite_unique_keys_lower_per_part_and_skip_null_tuples() {
+        let created = unique_definition();
+        let connection = connection(&created);
+        let captured = [
+            CapturedRow {
+                table: "accounts".into(),
+                rowid: 1,
+                values: vec![
+                    StoredValue::Integer(1),
+                    StoredValue::Text(b"acme".to_vec()),
+                    StoredValue::Text(b"a@example.com".to_vec()),
+                ],
+            },
+            CapturedRow {
+                table: "accounts".into(),
+                rowid: 2,
+                values: vec![
+                    StoredValue::Integer(2),
+                    StoredValue::Text(b"other".to_vec()),
+                    StoredValue::Text(b"a@example.com".to_vec()),
+                ],
+            },
+            CapturedRow {
+                table: "accounts".into(),
+                rowid: 3,
+                values: vec![
+                    StoredValue::Integer(3),
+                    StoredValue::Null,
+                    StoredValue::Text(b"a@example.com".to_vec()),
+                ],
+            },
+            CapturedRow {
+                table: "accounts".into(),
+                rowid: 4,
+                values: vec![
+                    StoredValue::Integer(4),
+                    StoredValue::Null,
+                    StoredValue::Text(b"a@example.com".to_vec()),
+                ],
+            },
+        ];
+        let inserted = InsertRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 6);
+        assert_eq!(lowered.footprint.writes().len(), 6);
+        let unique = lowered
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+            .collect::<Vec<_>>();
+        assert_eq!(unique.len(), 2);
+        assert!(
+            unique
+                .iter()
+                .all(|mutation| mutation.key().components().len() == 7)
+        );
+        assert_eq!(
+            InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
+            inserted
+        );
+        let deleted = DeleteRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert_eq!(deleted.mutations.len(), 6);
+        assert!(
+            deleted
+                .mutations
+                .iter()
+                .all(|mutation| matches!(mutation, Mutation::Delete { .. }))
+        );
+    }
+
+    #[test]
+    fn overlapping_unique_keyspaces_lower_and_delete_independently() {
+        let created = overlapping_unique_definition();
+        let connection = connection(&created);
+        let captured = profile(1, "acme", "same", "same");
+        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&captured))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 5);
+        assert_eq!(lowered.footprint.writes().len(), 5);
+        let unique = lowered
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+            .collect::<Vec<_>>();
+        assert_eq!(unique.len(), 4);
+        assert_eq!(
+            unique
+                .iter()
+                .map(|mutation| mutation.key().components()[4].as_bytes().to_vec())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(
+            unique
+                .iter()
+                .map(|mutation| mutation.key().components().len())
+                .collect::<Vec<_>>(),
+            [6, 6, 7, 7]
+        );
+        assert_eq!(
+            InsertRows::from_homebase(&admit(lowered.mutations.clone())).unwrap(),
+            inserted
+        );
+
+        let deleted = DeleteRows::from_captured(&connection, &[captured])
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert_eq!(deleted.mutations.len(), lowered.mutations.len());
+        for (inserted, deleted) in lowered.mutations.iter().zip(&deleted.mutations) {
+            assert_eq!(inserted.key(), deleted.key());
+            assert!(matches!(deleted, Mutation::Delete { .. }));
+        }
+    }
+
+    #[test]
+    fn one_insert_operation_rejects_duplicates_in_any_unique_keyspace() {
+        let created = overlapping_unique_definition();
+        let connection = connection(&created);
+        let captured = [
+            profile(1, "acme", "shared@example.com", "alpha"),
+            profile(2, "other", "shared@example.com", "beta"),
+            profile(3, "acme", "third@example.com", "alpha"),
+        ];
+        assert!(matches!(
+            InsertRows::from_captured(&connection, &captured),
+            Err(Error::InvalidMultiliteOp(message))
+                if message == "row operation contains a duplicate UNIQUE key"
+        ));
+
+        let mut inserted =
+            InsertRows::from_captured(&connection, std::slice::from_ref(&captured[0]))
+                .unwrap()
+                .unwrap();
+        let duplicate = InsertRows::from_captured(&connection, std::slice::from_ref(&captured[1]))
+            .unwrap()
+            .unwrap();
+        inserted.rows.extend(duplicate.rows);
+
+        assert_eq!(
+            InsertRows::decode(&inserted.encode()),
+            Err(RowCodecError::DuplicateUniqueKey)
+        );
+        assert!(matches!(
+            inserted.to_homebase(),
+            Err(Error::InvalidMultiliteOp(message))
+                if message == "row operation contains a duplicate UNIQUE key"
+        ));
+    }
+
+    #[test]
+    fn admitted_insert_rejects_missing_crossed_extra_and_corrupt_unique_cells() {
+        let created = overlapping_unique_definition();
+        let connection = connection(&created);
+        let inserted =
+            InsertRows::from_captured(&connection, &[profile(1, "acme", "email", "username")])
+                .unwrap()
+                .unwrap();
+        let lowered = inserted.to_homebase().unwrap().mutations;
+
+        let mut missing = lowered.clone();
+        missing.pop();
+        assert_eq!(
+            InsertRows::from_homebase(&admit(missing)),
+            Err(RowCodecError::InvalidBatch)
+        );
+
+        let mut crossed = lowered.clone();
+        crossed.swap(1, 2);
+        assert_eq!(
+            InsertRows::from_homebase(&admit(crossed)),
+            Err(RowCodecError::InvalidBatch)
+        );
+
+        let mut extra = lowered.clone();
+        extra.push(lowered.last().unwrap().clone());
+        assert_eq!(
+            InsertRows::from_homebase(&admit(extra)),
+            Err(RowCodecError::InvalidBatch)
+        );
+
+        let mut corrupt = lowered;
+        let Mutation::Set { value, .. } = &mut corrupt[1] else {
+            unreachable!()
+        };
+        value.push(0);
+        assert_eq!(
+            InsertRows::from_homebase(&admit(corrupt)),
+            Err(RowCodecError::InvalidBatch)
         );
     }
 
@@ -1510,6 +2118,202 @@ mod tests {
     }
 
     #[test]
+    fn update_replaces_changed_composite_unique_ownership() {
+        let created = unique_definition();
+        let connection = connection(&created);
+        connection
+            .execute(
+                "INSERT INTO accounts VALUES (1, 'acme', 'before@example.com')",
+                (),
+            )
+            .unwrap();
+        let before = CapturedRow {
+            table: "accounts".into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Text(b"acme".to_vec()),
+                StoredValue::Text(b"before@example.com".to_vec()),
+            ],
+        };
+        let after = CapturedRow {
+            table: "accounts".into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Text(b"acme".to_vec()),
+                StoredValue::Text(b"after@example.com".to_vec()),
+            ],
+        };
+        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+            .unwrap()
+            .unwrap();
+
+        let lowered = updated.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 3);
+        assert_eq!(
+            lowered
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+                .count(),
+            2
+        );
+        updated.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT email FROM accounts WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "after@example.com"
+        );
+        updated.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT email FROM accounts WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "before@example.com"
+        );
+    }
+
+    #[test]
+    fn update_changes_only_the_affected_overlapping_unique_keyspaces() {
+        let created = overlapping_unique_definition();
+        let connection = connection(&created);
+        let before = profile(1, "acme", "same@example.com", "before");
+        let after = profile(1, "other", "same@example.com", "after");
+        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+            .unwrap()
+            .unwrap();
+
+        let lowered = updated.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 7);
+        assert_eq!(lowered.footprint.writes().len(), 7);
+        let counts = lowered
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+            .fold(BTreeMap::<Vec<u8>, usize>::new(), |mut counts, mutation| {
+                *counts
+                    .entry(mutation.key().components()[4].as_bytes().to_vec())
+                    .or_default() += 1;
+                counts
+            });
+        assert_eq!(counts.len(), 3);
+        assert!(counts.values().all(|count| *count == 2));
+        assert!(
+            !counts.contains_key(
+                created.unique_constraints()[0]
+                    .keyspace_id()
+                    .as_bytes()
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn primary_key_moves_reassign_unchanged_unique_ownership() {
+        let created = unique_definition();
+        let connection = connection(&created);
+        let before = CapturedRow {
+            table: "accounts".into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Text(b"acme".to_vec()),
+                StoredValue::Text(b"owner@example.com".to_vec()),
+            ],
+        };
+        let after = CapturedRow {
+            table: "accounts".into(),
+            rowid: 2,
+            values: vec![
+                StoredValue::Integer(2),
+                StoredValue::Text(b"acme".to_vec()),
+                StoredValue::Text(b"owner@example.com".to_vec()),
+            ],
+        };
+        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+            .unwrap()
+            .unwrap();
+
+        let lowered = updated.to_homebase().unwrap();
+        let unique = lowered
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            unique.as_slice(),
+            [
+                Mutation::Delete { key: deleted },
+                Mutation::Set {
+                    key: inserted,
+                    value: _
+                }
+            ] if deleted == inserted
+        ));
+        assert_eq!(lowered.footprint.writes().len(), 3);
+    }
+
+    #[test]
+    fn null_transitions_remove_and_create_unique_ownership() {
+        let created = unique_definition();
+        let connection = connection(&created);
+        let present = CapturedRow {
+            table: "accounts".into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Text(b"acme".to_vec()),
+                StoredValue::Text(b"nullable@example.com".to_vec()),
+            ],
+        };
+        let absent = CapturedRow {
+            table: "accounts".into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Null,
+                StoredValue::Text(b"nullable@example.com".to_vec()),
+            ],
+        };
+
+        let removed = UpdateRows::from_captured(&connection, &[(present.clone(), absent.clone())])
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert_eq!(
+            removed
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+                .filter(|mutation| matches!(mutation, Mutation::Delete { .. }))
+                .count(),
+            1
+        );
+
+        let created = UpdateRows::from_captured(&connection, &[(absent, present)])
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert_eq!(
+            created
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.key().components()[3].as_bytes() == codes::UNIQUE)
+                .filter(|mutation| matches!(mutation, Mutation::Set { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn primary_key_update_moves_the_row_and_hidden_rowid_changes_stay_rejected() {
         let created = definition();
         let notes_connection = connection(&created);
@@ -1610,6 +2414,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         );
         let documents_connection = connection(&documents);
@@ -1892,6 +2697,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         );
         let source = connection(&created);

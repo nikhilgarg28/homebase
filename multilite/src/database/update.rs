@@ -18,6 +18,7 @@ use super::view::TransactionStatement;
 use super::{Database, DatabaseRuntime, IsolationLevel, UpdateOptions, catalog};
 use crate::branch::{OverlayOptions, WritableBranch};
 use crate::commit::committer::{CommitSnapshot, HistoryPin};
+use crate::commit::footprint::ConflictFootprint;
 use crate::commit::proposal::CommitProposal;
 use crate::runtime::ExecutionMode;
 use crate::{Error, Params, Result};
@@ -31,6 +32,7 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
     connection: &'a Connection,
     hooks: BranchHooks<'a>,
     operations: Vec<MultiliteOp>,
+    footprint: ConflictFootprint,
     _server: PhantomData<fn() -> H>,
 }
 
@@ -41,6 +43,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             connection,
             hooks: BranchHooks::install(connection, isolation == IsolationLevel::Serializable)?,
             operations: Vec::new(),
+            footprint: ConflictFootprint::new(),
             _server: PhantomData,
         })
     }
@@ -91,6 +94,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         match validated {
             ValidatedExecute::CreateTable(table) => {
                 let operation = MultiliteOp::create_table(sql, table);
+                let (_, footprint) = operation.to_homebase()?.into_parts();
                 let MultiliteOp::CreateTable(created) = &operation else {
                     unreachable!("create-table constructor returned another operation")
                 };
@@ -108,11 +112,11 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         "CREATE TABLE captured application rows",
                     ));
                 }
-                self.operations.push(operation);
+                self.record_operation(operation, footprint);
                 Ok(changed)
             }
             ValidatedExecute::Insert => {
-                let mut inserted = None;
+                let mut captured_operation = None;
                 let (changed, _) = self.hooks.run(
                     || Ok(self.connection.execute(sql, params)?),
                     |events| {
@@ -129,22 +133,27 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                                 }
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        inserted = InsertRows::from_captured(self.connection, &captured)?;
+                        let inserted = InsertRows::from_captured(self.connection, &captured)?;
                         if inserted.is_none() && had_events {
                             return Err(Error::UnsupportedSql(
                                 "INSERT target has no synchronized schema identity",
                             ));
                         }
+                        if let Some(inserted) = inserted {
+                            let operation = MultiliteOp::InsertRows(inserted);
+                            let (_, footprint) = operation.to_homebase()?.into_parts();
+                            captured_operation = Some((operation, footprint));
+                        }
                         Ok(())
                     },
                 )?;
-                if let Some(inserted) = inserted {
-                    self.operations.push(MultiliteOp::InsertRows(inserted));
+                if let Some((operation, footprint)) = captured_operation {
+                    self.record_operation(operation, footprint);
                 }
                 Ok(changed)
             }
             ValidatedExecute::Delete => {
-                let mut deleted = None;
+                let mut captured_operation = None;
                 let (changed, _) = self.hooks.run(
                     || Ok(self.connection.execute(sql, params)?),
                     |events| {
@@ -160,22 +169,27 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                                 }
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        deleted = DeleteRows::from_captured(self.connection, &captured)?;
+                        let deleted = DeleteRows::from_captured(self.connection, &captured)?;
                         if deleted.is_none() && had_events {
                             return Err(Error::UnsupportedSql(
                                 "DELETE target has no synchronized schema identity",
                             ));
                         }
+                        if let Some(deleted) = deleted {
+                            let operation = MultiliteOp::DeleteRows(deleted);
+                            let (_, footprint) = operation.to_homebase()?.into_parts();
+                            captured_operation = Some((operation, footprint));
+                        }
                         Ok(())
                     },
                 )?;
-                if let Some(deleted) = deleted {
-                    self.operations.push(MultiliteOp::DeleteRows(deleted));
+                if let Some((operation, footprint)) = captured_operation {
+                    self.record_operation(operation, footprint);
                 }
                 Ok(changed)
             }
             ValidatedExecute::Update => {
-                let mut updated = None;
+                let mut captured_operation = None;
                 let (changed, _) = self.hooks.run(
                     || Ok(self.connection.execute(sql, params)?),
                     |events| {
@@ -191,7 +205,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                                 }
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        updated = UpdateRows::from_captured(self.connection, &captured)?;
+                        let updated = UpdateRows::from_captured(self.connection, &captured)?;
                         if updated.is_none()
                             && had_events
                             && let Some((before, _)) = captured.first()
@@ -201,20 +215,33 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                                 "UPDATE target has no synchronized schema identity",
                             ));
                         }
+                        if let Some(updated) = updated {
+                            let operation = MultiliteOp::UpdateRows(updated);
+                            let (_, footprint) = operation.to_homebase()?.into_parts();
+                            captured_operation = Some((operation, footprint));
+                        }
                         Ok(())
                     },
                 )?;
-                if let Some(updated) = updated {
-                    self.operations.push(MultiliteOp::UpdateRows(updated));
+                if let Some((operation, footprint)) = captured_operation {
+                    self.record_operation(operation, footprint);
                 }
                 Ok(changed)
             }
         }
     }
 
-    fn into_branch_parts(self) -> Result<(Vec<MultiliteOp>, Vec<Key>)> {
+    fn record_operation(&mut self, operation: MultiliteOp, footprint: ConflictFootprint) {
+        self.operations.push(operation);
+        self.footprint.extend(footprint);
+    }
+
+    fn into_branch_parts(mut self) -> Result<(Vec<MultiliteOp>, ConflictFootprint)> {
         let reads = self.hooks.read_prefixes(self.connection)?;
-        Ok((self.operations, reads))
+        for read in reads {
+            self.footprint.add_read(read);
+        }
+        Ok((self.operations, self.footprint))
     }
 }
 
@@ -409,7 +436,7 @@ where
         .map_err(|error| Error::Branch(error.to_string()))?;
     let mut update = UpdateTransaction::branch(branch.connection(), isolation)?;
     let value = operation(&mut update)?;
-    let (operations, reads) = update.into_branch_parts()?;
+    let (operations, footprint) = update.into_branch_parts()?;
     let proposal = if operations.is_empty() {
         None
     } else {
@@ -418,7 +445,7 @@ where
             logical,
             isolation,
             transaction,
-            reads,
+            footprint,
         )?)
     };
     Ok(BranchUpdate {

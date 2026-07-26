@@ -52,6 +52,18 @@ multilite
   `DeleteRange`; range lowering must preserve precise local rollback data and
   correct snapshot/serializable conflict footprints.
 
+- Add post-create unique-index schema evolution. Create-time inline and
+  multi-column `UNIQUE` declarations now mint immutable unique-keyspace UUIDs
+  and participate in insert/update/delete synchronization. `CREATE UNIQUE
+  INDEX` must scan the pinned table image, encode every existing non-NULL tuple,
+  reject local collisions, write the complete keyspace definition and ownership
+  backfill, then atomically switch the table's active write revision. `DROP
+  INDEX` must retire the definition without reinterpreting its old key bytes;
+  pending transactions compiled against that definition must fail through the
+  write-revision guard. Define crash/restart behavior, concurrent DML/DDL
+  conflicts, name-registry ownership, and whether old ownership cells are
+  garbage-collected before admitting either statement.
+
 - Measure and reduce private-transaction startup overhead before pooling branch
   connections blindly. The normal writable path still opens an unused baseline
   Branch VFS connection retained for SQLite Session capture; split that into an

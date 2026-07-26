@@ -238,19 +238,16 @@ fn create_operation(name: &str) -> MultiliteOp {
                 not_null: false,
                 primary_key: true,
             }],
+            unique_constraints: Vec::new(),
         },
     )
 }
 
 fn create_proposal(snapshot: SnapshotDescriptor, name: &str) -> CommitProposal {
     let transaction = MultiliteTransaction::new(vec![create_operation(name)]).unwrap();
-    CommitProposal::from_transaction(
-        snapshot,
-        IsolationLevel::Snapshot,
-        transaction,
-        std::iter::empty(),
-    )
-    .unwrap()
+    let (_, footprint) = transaction.to_homebase().unwrap().into_parts();
+    CommitProposal::from_transaction(snapshot, IsolationLevel::Snapshot, transaction, footprint)
+        .unwrap()
 }
 
 fn pending_apply_proposal<H: ServerHandle + Send + Sync + 'static>(
@@ -3516,6 +3513,74 @@ fn concurrent_snapshot_updates_reject_one_primary_key_collision() {
         database.with_connection(|connection| {
             connection
                 .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap()
+        }),
+        1
+    );
+    assert_eq!(
+        database.with_connection(history::current).unwrap(),
+        crate::commit::snapshot::CommitSeq(2)
+    );
+    assert_eq!(pending_ops(&database).len(), 2);
+}
+
+#[test]
+fn concurrent_snapshot_updates_reject_one_overlapping_unique_collision() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        Database::open(directory.path().join("concurrent-unique-collision.sqlite")).unwrap();
+    let runtime = database.runtime().unwrap();
+    database
+        .execute(
+            &runtime,
+            "CREATE TABLE profiles (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                email TEXT UNIQUE,
+                UNIQUE (tenant, email)
+            )",
+            (),
+        )
+        .unwrap();
+
+    let rendezvous = Arc::new(Barrier::new(3));
+    let handles = [(1_i64, "acme"), (2_i64, "other")]
+        .into_iter()
+        .map(|(id, tenant)| {
+            let database = Arc::clone(&database);
+            let rendezvous = Arc::clone(&rendezvous);
+            std::thread::spawn(move || {
+                let runtime = database.runtime().unwrap();
+                database.update(&runtime, |update| {
+                    rendezvous.wait();
+                    update.execute(
+                        "INSERT INTO profiles VALUES (?1, ?2, 'shared@example.com')",
+                        (id, tenant),
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    rendezvous.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(Error::CommitConflict(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        database.with_connection(|connection| {
+            connection
+                .query_row("SELECT count(*) FROM profiles", (), |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap()
         }),
         1

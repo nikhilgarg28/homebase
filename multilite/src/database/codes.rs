@@ -9,5 +9,7 @@ pub const MAIN: &[u8] = b"main";
 pub const ACTIVE_ROW_KEYSPACE: &[u8] = b"active-row-keyspace";
 pub const ROW_KEYSPACES: &[u8] = b"row-keyspaces";
 pub const ROWS: &[u8] = b"rows";
+pub const UNIQUE_KEYSPACES: &[u8] = b"unique-keyspaces";
+pub const UNIQUE: &[u8] = b"unique";
 pub const WRITE_REVISION: &[u8] = b"write-revision";
 pub const TRANSACTIONS: &[u8] = b"transactions";

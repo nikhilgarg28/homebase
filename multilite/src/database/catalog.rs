@@ -176,6 +176,7 @@ mod tests {
                         primary_key: false,
                     },
                 ],
+                unique_constraints: Vec::new(),
             },
         )
     }

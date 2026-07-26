@@ -2,13 +2,13 @@
 
 use fallible_iterator::FallibleIterator as _;
 #[cfg(test)]
-use sqlite3_parser::ast::{As, Expr, OneSelect, Operator, ResultColumn, SelectTable};
+use sqlite3_parser::ast::{As, OneSelect, Operator, ResultColumn, SelectTable};
 use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, InsertBody, Name, Stmt, TabFlags,
+    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Name, Stmt, TabFlags, TableConstraint,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
-use super::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
+use super::schema::{CreateColumn, CreateTableSpec, CreateUnique, DeclaredType, SqlName};
 use crate::{Error, Result};
 
 pub enum ValidatedExecute {
@@ -344,14 +344,8 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             "STRICT and WITHOUT ROWID tables are not supported",
         ));
     }
-    if constraints
-        .as_ref()
-        .is_some_and(|constraints| !constraints.is_empty())
-    {
-        return Err(Error::UnsupportedSql("table constraints are not supported"));
-    }
-
     let mut primary_keys = 0;
+    let mut unique_constraints = Vec::new();
     let columns = columns
         .into_values()
         .map(|column| {
@@ -378,17 +372,17 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             let mut not_null = false;
             let mut primary_key = false;
             for constraint in column.constraints {
-                if constraint.name.is_some() {
-                    return Err(Error::UnsupportedSql(
-                        "named column constraints are not supported",
-                    ));
-                }
                 match constraint.constraint {
                     ColumnConstraint::PrimaryKey {
                         order,
                         conflict_clause,
                         auto_increment,
                     } => {
+                        if constraint.name.is_some() {
+                            return Err(Error::UnsupportedSql(
+                                "named PRIMARY KEY constraints are not supported",
+                            ));
+                        }
                         if auto_increment {
                             return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
                         }
@@ -409,6 +403,11 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         nullable: false,
                         conflict_clause: None,
                     } => {
+                        if constraint.name.is_some() {
+                            return Err(Error::UnsupportedSql(
+                                "named NOT NULL constraints are not supported",
+                            ));
+                        }
                         if not_null {
                             return Err(Error::UnsupportedSql(
                                 "duplicate NOT NULL constraints are not supported",
@@ -421,9 +420,20 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                             "NULL and NOT NULL conflict clauses are not supported",
                         ));
                     }
+                    ColumnConstraint::Unique(conflict_clause) => {
+                        if conflict_clause.is_some() {
+                            return Err(Error::UnsupportedSql(
+                                "UNIQUE conflict clauses are not supported",
+                            ));
+                        }
+                        unique_constraints.push(CreateUnique {
+                            name: constraint.name.map(|name| identifier(&name)).transpose()?,
+                            columns: vec![name.clone()],
+                        });
+                    }
                     _ => {
                         return Err(Error::UnsupportedSql(
-                            "only PRIMARY KEY and NOT NULL column constraints are supported",
+                            "only PRIMARY KEY, NOT NULL, and UNIQUE column constraints are supported",
                         ));
                     }
                 }
@@ -441,6 +451,53 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for constraint in constraints.into_iter().flatten() {
+        let TableConstraint::Unique {
+            columns: unique_columns,
+            conflict_clause,
+        } = constraint.constraint
+        else {
+            return Err(Error::UnsupportedSql(
+                "only UNIQUE table constraints are supported",
+            ));
+        };
+        if conflict_clause.is_some() {
+            return Err(Error::UnsupportedSql(
+                "UNIQUE conflict clauses are not supported",
+            ));
+        }
+        let unique_columns = unique_columns
+            .into_iter()
+            .map(|column| {
+                if column.order.is_some() || column.nulls.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "UNIQUE ordering and NULLS placement are not supported",
+                    ));
+                }
+                expression_identifier(column.expr)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if unique_columns.is_empty()
+            || unique_columns.iter().enumerate().any(|(index, column)| {
+                unique_columns[..index]
+                    .iter()
+                    .any(|seen| seen.canonical() == column.canonical())
+            })
+            || unique_columns.iter().any(|unique| {
+                !columns
+                    .iter()
+                    .any(|column| column.name.canonical() == unique.canonical())
+            })
+        {
+            return Err(Error::UnsupportedSql(
+                "UNIQUE constraints require distinct table columns",
+            ));
+        }
+        unique_constraints.push(CreateUnique {
+            name: constraint.name.map(|name| identifier(&name)).transpose()?,
+            columns: unique_columns,
+        });
+    }
     if primary_keys != 1 {
         return Err(Error::UnsupportedSql(
             "CREATE TABLE requires exactly one inline PRIMARY KEY",
@@ -449,7 +506,18 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     Ok(ValidatedExecute::CreateTable(CreateTableSpec {
         name,
         columns,
+        unique_constraints,
     }))
+}
+
+fn expression_identifier(expression: Expr) -> Result<SqlName> {
+    match expression {
+        Expr::Id(id) => identifier(&Name(id.0)),
+        Expr::Name(name) => identifier(&name),
+        _ => Err(Error::UnsupportedSql(
+            "UNIQUE expressions and collations are not supported",
+        )),
+    }
 }
 
 fn identifier(name: &Name) -> Result<SqlName> {
@@ -497,6 +565,16 @@ mod tests {
         for sql in [
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
             "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                organization TEXT,
+                email TEXT,
+                CONSTRAINT account_email UNIQUE (Organization, EMAIL)
+            )",
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                email TEXT CONSTRAINT user_email UNIQUE
+            )",
             "INSERT INTO notes VALUES (1, 'ON CONFLICT')",
             "INSERT INTO \"replace\" VALUES (1)",
             "WITH value(id) AS (SELECT 1) INSERT INTO notes SELECT id, 'x' FROM value",
@@ -534,7 +612,6 @@ mod tests {
             "CREATE TABLE notes (id)",
             "CREATE TABLE notes (id VARCHAR PRIMARY KEY)",
             "CREATE TABLE notes (id TEXT PRIMARY KEY)",
-            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY, body TEXT UNIQUE)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'x')",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT CHECK(length(body) > 0))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT COLLATE nocase)",
@@ -550,10 +627,53 @@ mod tests {
             "CREATE TABLE notes (id INTEGER UNIQUE ON CONFLICT FAIL)",
             "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id) ON CONFLICT ABORT)",
             "CREATE TABLE notes (id INTEGER, UNIQUE (id) ON CONFLICT ROLLBACK)",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body COLLATE NOCASE))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body DESC))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (lower(body)))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, UNIQUE (missing))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, body))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, BODY))",
             "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
         ] {
             assert_unsupported(sql);
         }
+    }
+
+    #[test]
+    fn normalizes_inline_and_composite_unique_constraints() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                email TEXT CONSTRAINT email_key UNIQUE,
+                organization TEXT,
+                CONSTRAINT account_key UNIQUE (organization, email)
+            )",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(spec.unique_constraints.len(), 2);
+        assert_eq!(
+            spec.unique_constraints[0].name.as_ref().map(SqlName::value),
+            Some("email_key")
+        );
+        assert_eq!(
+            spec.unique_constraints[0]
+                .columns
+                .iter()
+                .map(SqlName::value)
+                .collect::<Vec<_>>(),
+            ["email"]
+        );
+        assert_eq!(
+            spec.unique_constraints[1]
+                .columns
+                .iter()
+                .map(SqlName::value)
+                .collect::<Vec<_>>(),
+            ["organization", "email"]
+        );
     }
 
     #[test]
@@ -597,6 +717,8 @@ mod tests {
             "",
             "SELECT 1",
             "ALTER TABLE notes ADD COLUMN body TEXT",
+            "CREATE UNIQUE INDEX notes_body ON notes (body)",
+            "DROP INDEX notes_body",
             "BEGIN",
             "EXPLAIN SELECT 1",
             "INSERT INTO notes VALUES (1) RETURNING id",

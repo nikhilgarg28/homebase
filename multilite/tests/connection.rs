@@ -108,6 +108,98 @@ fn sqlite_constraint_error_retains_extended_detail() {
 }
 
 #[test]
+fn overlapping_unique_constraint_failures_are_atomic_and_recoverable() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("unique-atomic.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE profiles (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            email TEXT UNIQUE,
+            username TEXT UNIQUE,
+            UNIQUE (tenant, email),
+            UNIQUE (tenant, username)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO profiles VALUES
+            (1, 'acme', 'a@example.com', 'alpha'),
+            (2, 'acme', 'b@example.com', 'beta')",
+        (),
+    )
+    .unwrap();
+
+    let insert_error = db
+        .execute(
+            "INSERT INTO profiles VALUES
+                (3, 'other', 'c@example.com', 'gamma'),
+                (4, 'other', 'a@example.com', 'delta')",
+            (),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        insert_error,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == ErrorCode::ConstraintViolation
+    ));
+    assert_eq!(
+        db.query("SELECT id FROM profiles ORDER BY id", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [1, 2]
+    );
+
+    let update_error = db
+        .execute(
+            "UPDATE profiles SET username = 'same' WHERE tenant = 'acme'",
+            (),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        update_error,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == ErrorCode::ConstraintViolation
+    ));
+    assert_eq!(
+        db.query("SELECT id, username FROM profiles ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        },)
+            .unwrap(),
+        [(1, "alpha".into()), (2, "beta".into())]
+    );
+
+    db.update(|transaction| {
+        assert!(
+            transaction
+                .execute(
+                    "INSERT INTO profiles VALUES
+                        (5, 'third', 'e@example.com', 'echo'),
+                        (6, 'third', 'f@example.com', 'echo')",
+                    (),
+                )
+                .is_err()
+        );
+        transaction.execute(
+            "INSERT INTO profiles VALUES
+                (7, 'third', 'g@example.com', 'golf')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT id FROM profiles ORDER BY id", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [1, 2, 7]
+    );
+}
+
+#[test]
 fn query_conversion_error_remains_a_sqlite_error() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("conversion.sqlite")).unwrap();
