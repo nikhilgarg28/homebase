@@ -31,6 +31,9 @@ const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_NAME: u8 = 2;
 const TAG_COLUMN_TYPE: u8 = 3;
 const TAG_COLUMN_FLAGS: u8 = 4;
+const TYPE_DECLARATION_FRAME_VERSION: u8 = 1;
+const TAG_TYPE_NAME: u8 = 1;
+const TAG_TYPE_ARGUMENT: u8 = 2;
 const TAG_UNIQUE_KEYSPACE_ID: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
 const TAG_UNIQUE_COLUMN_ID: u8 = 3;
@@ -63,41 +66,148 @@ impl SqlName {
     }
 }
 
-/// Declared SQL type accepted by the initial schema format.
+/// SQLite's five ordinary-table type affinities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeclaredType {
+pub enum Affinity {
     Integer,
     Real,
     Text,
     Blob,
+    Numeric,
 }
 
-impl DeclaredType {
+impl Affinity {
     pub fn to_u8(self) -> u8 {
         match self {
             Self::Integer => 1,
             Self::Real => 2,
             Self::Text => 3,
             Self::Blob => 4,
+            Self::Numeric => 5,
         }
     }
 
-    pub fn from_u8(value: u8) -> std::result::Result<Self, SchemaCodecError> {
+    pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            1 => Ok(Self::Integer),
-            2 => Ok(Self::Real),
-            3 => Ok(Self::Text),
-            4 => Ok(Self::Blob),
-            _ => Err(SchemaCodecError::InvalidColumnType(value)),
+            1 => Some(Self::Integer),
+            2 => Some(Self::Real),
+            3 => Some(Self::Text),
+            4 => Some(Self::Blob),
+            5 => Some(Self::Numeric),
+            _ => None,
         }
     }
+}
+
+/// Canonical SQLite type declaration plus its ignored size annotations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeDeclaration {
+    name: String,
+    arguments: Vec<String>,
+}
+
+impl TypeDeclaration {
+    pub fn new(name: String, arguments: Vec<String>) -> Self {
+        let name = unquote_type_name(name.trim())
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase();
+        Self { name, arguments }
+    }
+
+    #[cfg(test)]
+    pub fn integer() -> Self {
+        Self::new("INTEGER".into(), Vec::new())
+    }
+
+    #[cfg(test)]
+    pub fn text() -> Self {
+        Self::new("TEXT".into(), Vec::new())
+    }
+
+    #[cfg(test)]
+    pub fn blob() -> Self {
+        Self::new("BLOB".into(), Vec::new())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[cfg(test)]
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn affinity(&self) -> Affinity {
+        if self.name.contains("INT") {
+            Affinity::Integer
+        } else if ["CHAR", "CLOB", "TEXT"]
+            .into_iter()
+            .any(|part| self.name.contains(part))
+        {
+            Affinity::Text
+        } else if self.name.contains("BLOB") {
+            Affinity::Blob
+        } else if ["REAL", "FLOA", "DOUB"]
+            .into_iter()
+            .any(|part| self.name.contains(part))
+        {
+            Affinity::Real
+        } else {
+            Affinity::Numeric
+        }
+    }
+
+    pub fn is_exact_integer(&self) -> bool {
+        self.name == "INTEGER" && self.arguments.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn to_sql(&self) -> String {
+        if self.arguments.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}({})", self.name, self.arguments.join(", "))
+        }
+    }
+}
+
+fn unquote_type_name(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let Some((&open, middle_and_close)) = bytes.split_first() else {
+        return String::new();
+    };
+    let Some((&close, middle)) = middle_and_close.split_last() else {
+        return name.to_owned();
+    };
+    let escaped = match (open, close) {
+        (b'"', b'"') | (b'`', b'`') | (b'\'', b'\'') => Some(open),
+        (b'[', b']') => Some(close),
+        _ => None,
+    };
+    let Some(escaped) = escaped else {
+        return name.to_owned();
+    };
+
+    let mut value = Vec::with_capacity(middle.len());
+    let mut index = 0;
+    while index < middle.len() {
+        value.push(middle[index]);
+        if middle[index] == escaped && middle.get(index + 1) == Some(&escaped) {
+            index += 1;
+        }
+        index += 1;
+    }
+    String::from_utf8(value).expect("SQLite type names originate in UTF-8 SQL")
 }
 
 /// One validated column in a restricted `CREATE TABLE` statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateColumn {
     pub name: SqlName,
-    pub declared_type: DeclaredType,
+    pub declared_type: TypeDeclaration,
     pub not_null: bool,
     pub primary_key: bool,
 }
@@ -139,7 +249,7 @@ pub struct ColumnId([u8; 16]);
 pub struct Column {
     id: ColumnId,
     name: SqlName,
-    declared_type: DeclaredType,
+    declared_type: TypeDeclaration,
     not_null: bool,
     primary_key: bool,
 }
@@ -201,8 +311,17 @@ impl Column {
         &self.name
     }
 
-    pub fn declared_type(&self) -> DeclaredType {
-        self.declared_type
+    #[cfg(test)]
+    pub fn declared_type(&self) -> &TypeDeclaration {
+        &self.declared_type
+    }
+
+    pub fn affinity(&self) -> Affinity {
+        self.declared_type.affinity()
+    }
+
+    pub fn is_rowid_alias(&self) -> bool {
+        self.primary_key && self.declared_type.is_exact_integer()
     }
 }
 
@@ -553,7 +672,21 @@ fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
     writer.u8(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
     for column in primary {
         writer.bytes16(&column.id.0);
-        writer.u8(column.declared_type.to_u8());
+        writer.u8(column.affinity().to_u8());
+    }
+    writer.finish()
+}
+
+fn encode_type_declaration(declaration: &TypeDeclaration) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.u8(TYPE_DECLARATION_FRAME_VERSION);
+    writer
+        .field(TAG_TYPE_NAME, declaration.name.as_bytes())
+        .expect("type declaration field length must fit in u32");
+    for argument in &declaration.arguments {
+        writer
+            .field(TAG_TYPE_ARGUMENT, argument.as_bytes())
+            .expect("type declaration field length must fit in u32");
     }
     writer.finish()
 }
@@ -567,7 +700,10 @@ fn encode_column(column: &Column) -> Vec<u8> {
         .field(TAG_COLUMN_NAME, column.name.value().as_bytes())
         .expect("schema field length must fit in u32");
     writer
-        .field(TAG_COLUMN_TYPE, &[column.declared_type.to_u8()])
+        .field(
+            TAG_COLUMN_TYPE,
+            &encode_type_declaration(&column.declared_type),
+        )
         .expect("schema field length must fit in u32");
     let mut flags = 0;
     if column.not_null {
@@ -608,7 +744,7 @@ pub enum SchemaCodecError {
     MissingField(u8),
     InvalidLength,
     InvalidUtf8,
-    InvalidColumnType(u8),
+    InvalidColumnType,
     InvalidColumnFlags(u8),
     InvalidSchema,
     InvalidUuid,
@@ -627,7 +763,7 @@ impl fmt::Display for SchemaCodecError {
             Self::MissingField(tag) => write!(f, "missing schema field {tag}"),
             Self::InvalidLength => f.write_str("invalid schema field length"),
             Self::InvalidUtf8 => f.write_str("schema name or SQL is not UTF-8"),
-            Self::InvalidColumnType(value) => write!(f, "invalid column type {value}"),
+            Self::InvalidColumnType => f.write_str("invalid column type declaration"),
             Self::InvalidColumnFlags(value) => write!(f, "invalid column flags {value}"),
             Self::InvalidSchema => f.write_str("invalid structured schema"),
             Self::InvalidUuid => f.write_str("schema id is not a UUID v4"),
@@ -782,12 +918,7 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         match tag {
             TAG_COLUMN_ID => set_once(&mut id, ColumnId(uuid_bytes(value)?))?,
             TAG_COLUMN_NAME => set_once(&mut name, decode_name(value)?)?,
-            TAG_COLUMN_TYPE => {
-                let [value] = value else {
-                    return Err(SchemaCodecError::InvalidLength);
-                };
-                set_once(&mut declared_type, DeclaredType::from_u8(*value)?)?;
-            }
+            TAG_COLUMN_TYPE => set_once(&mut declared_type, decode_type_declaration(value)?)?,
             TAG_COLUMN_FLAGS => {
                 let [value] = value else {
                     return Err(SchemaCodecError::InvalidLength);
@@ -808,6 +939,40 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         not_null: flags & COLUMN_NOT_NULL != 0,
         primary_key: flags & COLUMN_PRIMARY_KEY != 0,
     })
+}
+
+fn decode_type_declaration(frame: &[u8]) -> std::result::Result<TypeDeclaration, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(TYPE_DECLARATION_FRAME_VERSION) {
+        return Err(SchemaCodecError::InvalidColumnType);
+    }
+    let mut name = None;
+    let mut arguments = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_TYPE_NAME => set_once(
+                &mut name,
+                String::from_utf8(value.to_vec()).map_err(|_| SchemaCodecError::InvalidUtf8)?,
+            )?,
+            TAG_TYPE_ARGUMENT => arguments.push(
+                String::from_utf8(value.to_vec()).map_err(|_| SchemaCodecError::InvalidUtf8)?,
+            ),
+            _ => {}
+        }
+    }
+    let declaration = TypeDeclaration::new(
+        name.ok_or(SchemaCodecError::MissingField(TAG_TYPE_NAME))?,
+        arguments,
+    );
+    if declaration.name.is_empty()
+        || declaration.arguments.len() > 2
+        || declaration.arguments.iter().any(String::is_empty)
+    {
+        return Err(SchemaCodecError::InvalidColumnType);
+    }
+    Ok(declaration)
 }
 
 fn decode_unique_constraint(
@@ -916,13 +1081,13 @@ mod tests {
             columns: vec![
                 CreateColumn {
                     name: SqlName::new("id".into()),
-                    declared_type: DeclaredType::Integer,
+                    declared_type: TypeDeclaration::integer(),
                     not_null: false,
                     primary_key: true,
                 },
                 CreateColumn {
                     name: SqlName::new("body".into()),
-                    declared_type: DeclaredType::Text,
+                    declared_type: TypeDeclaration::text(),
                     not_null: true,
                     primary_key: false,
                 },
@@ -958,19 +1123,19 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("organization".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -1007,25 +1172,25 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("tenant".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("username".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -1295,6 +1460,69 @@ mod tests {
         assert_eq!(
             validate_literal_sql(&mismatch),
             Err(SchemaCodecError::SqlMismatch)
+        );
+    }
+
+    #[test]
+    fn type_declaration_codec_roundtrips_names_sizes_and_numeric_affinity() {
+        let declaration = TypeDeclaration::new("decimal".into(), vec!["10".into(), "2".into()]);
+        assert_eq!(
+            decode_type_declaration(&encode_type_declaration(&declaration)).unwrap(),
+            declaration
+        );
+        assert_eq!(declaration.name(), "DECIMAL");
+        assert_eq!(declaration.arguments(), ["10", "2"]);
+        assert_eq!(declaration.affinity(), Affinity::Numeric);
+        assert_eq!(declaration.to_sql(), "DECIMAL(10, 2)");
+
+        assert_eq!(
+            decode_type_declaration(&[]),
+            Err(SchemaCodecError::InvalidColumnType)
+        );
+        let mut missing_name = Writer::new();
+        missing_name.u8(TYPE_DECLARATION_FRAME_VERSION);
+        missing_name
+            .field(TAG_TYPE_ARGUMENT, b"10")
+            .expect("test field is bounded");
+        assert_eq!(
+            decode_type_declaration(&missing_name.finish()),
+            Err(SchemaCodecError::MissingField(TAG_TYPE_NAME))
+        );
+    }
+
+    #[test]
+    fn complete_schema_codec_preserves_ordinary_sqlite_declarations() {
+        let sql = "CREATE TABLE measurements (
+            id INTEGER PRIMARY KEY,
+            label VARCHAR(40),
+            amount DECIMAL(10, 2),
+            enabled BOOLEAN
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let decoded = CreateTable::decode(&created.encode()).unwrap();
+
+        assert_eq!(decoded, created);
+        assert_eq!(
+            decoded
+                .columns()
+                .iter()
+                .map(|column| (
+                    column.declared_type().to_sql(),
+                    column.affinity(),
+                    column.is_rowid_alias(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("INTEGER".into(), Affinity::Integer, true),
+                ("VARCHAR(40)".into(), Affinity::Text, false),
+                ("DECIMAL(10, 2)".into(), Affinity::Numeric, false),
+                ("BOOLEAN".into(), Affinity::Numeric, false),
+            ]
         );
     }
 

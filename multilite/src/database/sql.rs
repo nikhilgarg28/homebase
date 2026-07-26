@@ -4,11 +4,12 @@ use fallible_iterator::FallibleIterator as _;
 #[cfg(test)]
 use sqlite3_parser::ast::{As, OneSelect, Operator, ResultColumn, SelectTable};
 use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Name, Stmt, TabFlags, TableConstraint,
+    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, Name, Stmt, TabFlags,
+    TableConstraint, Type, TypeSize, UnaryOperator,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
-use super::schema::{CreateColumn, CreateTableSpec, CreateUnique, DeclaredType, SqlName};
+use super::schema::{CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration};
 use crate::{Error, Result};
 
 pub enum ValidatedExecute {
@@ -353,22 +354,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             let declared_type = column
                 .col_type
                 .ok_or(Error::UnsupportedSql("every column must declare a type"))?;
-            if declared_type.size.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "sized column types are not supported",
-                ));
-            }
-            let declared_type = match declared_type.name.trim() {
-                name if name.eq_ignore_ascii_case("INTEGER") => DeclaredType::Integer,
-                name if name.eq_ignore_ascii_case("REAL") => DeclaredType::Real,
-                name if name.eq_ignore_ascii_case("TEXT") => DeclaredType::Text,
-                name if name.eq_ignore_ascii_case("BLOB") => DeclaredType::Blob,
-                _ => {
-                    return Err(Error::UnsupportedSql(
-                        "column types must be INTEGER, REAL, TEXT, or BLOB",
-                    ));
-                }
-            };
+            let declared_type = type_declaration(declared_type)?;
             let mut not_null = false;
             let mut primary_key = false;
             for constraint in column.constraints {
@@ -438,7 +424,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     }
                 }
             }
-            if primary_key && declared_type != DeclaredType::Integer && !not_null {
+            if primary_key && !declared_type.is_exact_integer() && !not_null {
                 return Err(Error::UnsupportedSql(
                     "a non-INTEGER PRIMARY KEY must also be NOT NULL",
                 ));
@@ -510,6 +496,45 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     }))
 }
 
+fn type_declaration(declared: Type) -> Result<TypeDeclaration> {
+    let arguments = match declared.size {
+        None => Vec::new(),
+        Some(TypeSize::MaxSize(argument)) => vec![type_argument(*argument)?],
+        Some(TypeSize::TypeSize(first, second)) => {
+            vec![type_argument(*first)?, type_argument(*second)?]
+        }
+    };
+    let declaration = TypeDeclaration::new(declared.name, arguments);
+    if declaration.name().is_empty() {
+        return Err(Error::UnsupportedSql(
+            "empty column types are not supported",
+        ));
+    }
+    Ok(declaration)
+}
+
+fn type_argument(argument: Expr) -> Result<String> {
+    match argument {
+        Expr::Literal(Literal::Numeric(value)) => Ok(value.into()),
+        Expr::Unary(operator @ (UnaryOperator::Positive | UnaryOperator::Negative), value) => {
+            let Expr::Literal(Literal::Numeric(value)) = *value else {
+                return Err(Error::UnsupportedSql(
+                    "column type sizes must be numeric literals",
+                ));
+            };
+            let sign = match operator {
+                UnaryOperator::Positive => "+",
+                UnaryOperator::Negative => "-",
+                _ => unreachable!(),
+            };
+            Ok(format!("{sign}{value}"))
+        }
+        _ => Err(Error::UnsupportedSql(
+            "column type sizes must be numeric literals",
+        )),
+    }
+}
+
 fn expression_identifier(expression: Expr) -> Result<SqlName> {
     match expression {
         Expr::Id(id) => identifier(&Name(id.0)),
@@ -552,6 +577,7 @@ fn unescape_identifier(bytes: &[u8], quote: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::schema::Affinity;
 
     fn assert_unsupported(sql: &str) {
         assert!(
@@ -674,6 +700,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["organization", "email"]
         );
+    }
+
+    #[test]
+    fn retains_type_declarations_and_derives_sqlite_affinity_in_rule_order() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE values_by_type (
+                id INTEGER PRIMARY KEY,
+                short_name VARCHAR(40),
+                amount DECIMAL(10, 2),
+                flag BOOLEAN,
+                payload BLOB,
+                ratio DOUBLE PRECISION,
+                surprising FLOATING POINT,
+                label STRING,
+                anything ANY
+            )",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        let declarations = spec
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.declared_type.name(),
+                    column.declared_type.arguments().to_vec(),
+                    column.declared_type.affinity(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            [
+                ("INTEGER", vec![], Affinity::Integer),
+                ("VARCHAR", vec!["40".to_owned()], Affinity::Text),
+                (
+                    "DECIMAL",
+                    vec!["10".to_owned(), "2".to_owned()],
+                    Affinity::Numeric,
+                ),
+                ("BOOLEAN", vec![], Affinity::Numeric),
+                ("BLOB", vec![], Affinity::Blob),
+                ("DOUBLE PRECISION", vec![], Affinity::Real),
+                ("FLOATING POINT", vec![], Affinity::Integer),
+                ("STRING", vec![], Affinity::Numeric),
+                ("ANY", vec![], Affinity::Numeric),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_exact_unsized_integer_primary_keys_alias_the_rowid() {
+        for (declaration, rowid_alias) in [
+            ("INTEGER", true),
+            ("\"INTEGER\"", true),
+            ("INT", false),
+            ("INTEGER(8)", false),
+            ("UNSIGNED BIG INT", false),
+        ] {
+            let not_null = if rowid_alias { "" } else { " NOT NULL" };
+            let sql =
+                format!("CREATE TABLE items (id {declaration}{not_null} PRIMARY KEY, body TEXT)");
+            let ValidatedExecute::CreateTable(spec) = validate_execute(&sql).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(
+                spec.columns[0].declared_type.is_exact_integer(),
+                rowid_alias,
+                "{declaration}"
+            );
+            assert_eq!(spec.columns[0].declared_type.affinity(), Affinity::Integer);
+        }
+    }
+
+    #[test]
+    fn type_sizes_must_be_literal_numbers() {
+        for sql in [
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body VARCHAR(length('x')))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, amount DECIMAL(10, ?1))",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, amount DECIMAL('10', 2))",
+        ] {
+            assert_unsupported(sql);
+        }
     }
 
     #[test]

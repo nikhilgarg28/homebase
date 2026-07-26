@@ -13,8 +13,8 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
-    ColumnId, CreateTable, DeclaredType, RowKeyspaceId, SchemaRevisionId, TableId,
-    UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
+    Affinity, ColumnId, CreateTable, RowKeyspaceId, SchemaRevisionId, TableId, UniqueKeyspaceId,
+    active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -33,12 +33,14 @@ const TAG_UNIQUE_KEY: u8 = 6;
 const TAG_TABLE: u8 = 1;
 const TAG_ROW: u8 = 2;
 const TAG_COLUMN_ID: u8 = 1;
-const TAG_COLUMN_TYPE: u8 = 2;
+const TAG_COLUMN_AFFINITY: u8 = 2;
+const TAG_KEY_PART_FLAGS: u8 = 3;
 const TAG_VALUE: u8 = 2;
 const TAG_UPDATE_BEFORE: u8 = 1;
 const TAG_UPDATE_AFTER: u8 = 2;
 const TAG_UNIQUE_KEYSPACE: u8 = 1;
 const TAG_UNIQUE_KEY_PART: u8 = 2;
+const KEY_PART_ROWID_ALIAS: u8 = 1;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +122,8 @@ impl StoredValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyPartRules {
     pub column: ColumnId,
-    pub declared_type: DeclaredType,
+    pub affinity: Affinity,
+    pub rowid_alias: bool,
 }
 
 /// Ordered comparison rules for one table-owned UNIQUE keyspace.
@@ -192,7 +195,8 @@ impl InsertRows {
             .primary_key_columns()
             .map(|column| KeyPartRules {
                 column: column.id(),
-                declared_type: column.declared_type(),
+                affinity: column.affinity(),
+                rowid_alias: column.is_rowid_alias(),
             })
             .collect::<Vec<_>>();
         let unique_keys = created
@@ -211,7 +215,8 @@ impl InsertRows {
                             .expect("validated UNIQUE column exists");
                         KeyPartRules {
                             column: column.id(),
-                            declared_type: column.declared_type(),
+                            affinity: column.affinity(),
+                            rowid_alias: false,
                         }
                     })
                     .collect(),
@@ -224,7 +229,12 @@ impl InsertRows {
                 values: columns
                     .iter()
                     .zip(&captured.values)
-                    .map(|(column, value)| (column.id(), value.clone()))
+                    .map(|(column, value)| {
+                        (
+                            column.id(),
+                            normalize_captured_value(value, column.affinity()),
+                        )
+                    })
                     .collect(),
             })
             .collect();
@@ -575,7 +585,8 @@ impl InsertRows {
             .primary_key_columns()
             .map(|column| KeyPartRules {
                 column: column.id(),
-                declared_type: column.declared_type(),
+                affinity: column.affinity(),
+                rowid_alias: column.is_rowid_alias(),
             })
             .collect::<Vec<_>>();
         let expected_unique_keys = unique_key_rules(created);
@@ -618,11 +629,21 @@ impl InsertRows {
             self.key_parts[..index]
                 .iter()
                 .any(|seen| seen.column == part.column)
-        }) {
+        }) || (self.key_parts.iter().any(|part| part.rowid_alias)
+            && !matches!(
+                self.key_parts.as_slice(),
+                [KeyPartRules {
+                    affinity: Affinity::Integer,
+                    rowid_alias: true,
+                    ..
+                }]
+            ))
+        {
             return Err(RowCodecError::DuplicateField);
         }
         if self.unique_keys.iter().enumerate().any(|(index, unique)| {
             unique.key_parts.is_empty()
+                || unique.key_parts.iter().any(|part| part.rowid_alias)
                 || self.unique_keys[..index]
                     .iter()
                     .any(|seen| seen.keyspace == unique.keyspace)
@@ -644,7 +665,8 @@ impl InsertRows {
             if let [
                 KeyPartRules {
                     column,
-                    declared_type: DeclaredType::Integer,
+                    rowid_alias: true,
+                    ..
                 },
             ] = self.key_parts.as_slice()
             {
@@ -1060,7 +1082,7 @@ impl UpdateRows {
         let integer_primary_key = matches!(
             self.before.key_parts.as_slice(),
             [KeyPartRules {
-                declared_type: DeclaredType::Integer,
+                rowid_alias: true,
                 ..
             }]
         );
@@ -1095,9 +1117,9 @@ pub fn primary_key_prefix(
         .zip(values)
         .map(|(column, value)| {
             if matches!(
-                (column.declared_type(), value),
+                (column.affinity(), value),
                 (
-                    DeclaredType::Integer | DeclaredType::Real,
+                    Affinity::Integer | Affinity::Real | Affinity::Numeric,
                     StoredValue::Text(_)
                 )
             ) {
@@ -1107,7 +1129,8 @@ pub fn primary_key_prefix(
                 value,
                 KeyPartRules {
                     column: column.id(),
-                    declared_type: column.declared_type(),
+                    affinity: column.affinity(),
+                    rowid_alias: column.is_rowid_alias(),
                 },
             )
         })
@@ -1132,7 +1155,8 @@ fn unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
                         .expect("validated UNIQUE column exists");
                     KeyPartRules {
                         column: column.id(),
-                        declared_type: column.declared_type(),
+                        affinity: column.affinity(),
+                        rowid_alias: false,
                     }
                 })
                 .collect(),
@@ -1182,7 +1206,7 @@ fn key_image(
     value: &StoredValue,
     rules: KeyPartRules,
 ) -> std::result::Result<Vec<u8>, RowCodecError> {
-    if rules.declared_type == DeclaredType::Text
+    if rules.affinity == Affinity::Text
         && matches!(value, StoredValue::Integer(_) | StoredValue::Real(_))
     {
         return Err(RowCodecError::InvalidRow);
@@ -1228,13 +1252,28 @@ fn key_image(
     }
 }
 
+fn normalize_captured_value(value: &StoredValue, affinity: Affinity) -> StoredValue {
+    match (affinity, value) {
+        (Affinity::Real, StoredValue::Integer(value)) => {
+            StoredValue::Real((*value as f64).to_bits())
+        }
+        _ => value.clone(),
+    }
+}
+
 fn encode_key_part(part: KeyPartRules) -> Vec<u8> {
     let mut writer = Writer::new();
     writer
         .field(TAG_COLUMN_ID, &part.column.as_bytes())
         .expect("row field length fits in u32");
     writer
-        .field(TAG_COLUMN_TYPE, &[part.declared_type.to_u8()])
+        .field(TAG_COLUMN_AFFINITY, &[part.affinity.to_u8()])
+        .expect("row field length fits in u32");
+    writer
+        .field(
+            TAG_KEY_PART_FLAGS,
+            &[u8::from(part.rowid_alias) * KEY_PART_ROWID_ALIAS],
+        )
         .expect("row field length fits in u32");
     writer.finish()
 }
@@ -1242,26 +1281,43 @@ fn encode_key_part(part: KeyPartRules) -> Vec<u8> {
 fn decode_key_part(frame: &[u8]) -> std::result::Result<KeyPartRules, RowCodecError> {
     let mut reader = Reader::new(frame);
     let mut column = None;
-    let mut declared_type = None;
+    let mut affinity = None;
+    let mut flags = None;
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
-            TAG_COLUMN_TYPE => {
+            TAG_COLUMN_AFFINITY => {
                 let [value] = value else {
                     return Err(RowCodecError::InvalidLength);
                 };
                 set_once(
-                    &mut declared_type,
-                    DeclaredType::from_u8(*value).map_err(|_| RowCodecError::InvalidRow)?,
+                    &mut affinity,
+                    Affinity::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
                 )?;
+            }
+            TAG_KEY_PART_FLAGS => {
+                let [value] = value else {
+                    return Err(RowCodecError::InvalidLength);
+                };
+                if value & !KEY_PART_ROWID_ALIAS != 0 {
+                    return Err(RowCodecError::InvalidRow);
+                }
+                set_once(&mut flags, *value)?;
             }
             _ => {}
         }
     }
-    Ok(KeyPartRules {
+    let part = KeyPartRules {
         column: column.ok_or(RowCodecError::MissingField(TAG_COLUMN_ID))?,
-        declared_type: declared_type.ok_or(RowCodecError::MissingField(TAG_COLUMN_TYPE))?,
-    })
+        affinity: affinity.ok_or(RowCodecError::MissingField(TAG_COLUMN_AFFINITY))?,
+        rowid_alias: flags.ok_or(RowCodecError::MissingField(TAG_KEY_PART_FLAGS))?
+            & KEY_PART_ROWID_ALIAS
+            != 0,
+    };
+    if part.rowid_alias && part.affinity != Affinity::Integer {
+        return Err(RowCodecError::InvalidRow);
+    }
+    Ok(part)
 }
 
 fn encode_column_value(column: ColumnId, value: &StoredValue) -> Vec<u8> {
@@ -1422,7 +1478,7 @@ pub(super) fn normalize_insert_rowids(
 
 fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
     let primary = created.primary_key_columns().collect::<Vec<_>>();
-    if primary.len() == 1 && primary[0].declared_type() == DeclaredType::Integer {
+    if primary.len() == 1 && primary[0].is_rowid_alias() {
         return Ok(None);
     }
     ["_rowid_", "rowid", "oid"]
@@ -1510,7 +1566,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, CreateUnique, SqlName};
+    use crate::database::schema::{
+        CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
+    };
 
     fn definition() -> CreateTable {
         CreateTable::new(
@@ -1520,19 +1578,19 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("payload".into()),
-                        declared_type: DeclaredType::Blob,
+                        declared_type: TypeDeclaration::blob(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -1563,19 +1621,19 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("organization".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -1606,25 +1664,25 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("tenant".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("username".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -2010,6 +2068,28 @@ mod tests {
                 .unwrap(),
             [(7, Some("hello".into()), vec![0, 1]), (9, None, Vec::new()),]
         );
+    }
+
+    #[test]
+    fn integer_affinity_does_not_imply_a_rowid_alias() {
+        for (declaration, expected_hidden) in [("INTEGER", false), ("INT NOT NULL", true)] {
+            let sql = format!("CREATE TABLE aliases (id {declaration} PRIMARY KEY, body TEXT)");
+            let super::super::sql::ValidatedExecute::CreateTable(spec) =
+                super::super::sql::validate_execute(&sql).unwrap()
+            else {
+                unreachable!()
+            };
+            let created = CreateTable::new(&sql, spec);
+            assert_eq!(
+                hidden_rowid_alias(&created).unwrap().is_some(),
+                expected_hidden,
+                "{declaration}"
+            );
+            assert_eq!(
+                created.primary_key_columns().next().unwrap().affinity(),
+                Affinity::Integer
+            );
+        }
     }
 
     #[test]
@@ -2403,13 +2483,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: true,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -2665,7 +2745,8 @@ mod tests {
     fn key_images_normalize_equal_integer_and_real_values() {
         let part = KeyPartRules {
             column: ColumnId::from_bytes(Uuid::new_v4().into_bytes()),
-            declared_type: DeclaredType::Blob,
+            affinity: Affinity::Blob,
+            rowid_alias: false,
         };
         assert_eq!(
             key_image(&StoredValue::Integer(1), part).unwrap(),
@@ -2678,6 +2759,94 @@ mod tests {
     }
 
     #[test]
+    fn key_rule_codec_roundtrips_every_affinity_and_the_rowid_marker() {
+        let column = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
+        for affinity in [
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::Text,
+            Affinity::Blob,
+            Affinity::Numeric,
+        ] {
+            let part = KeyPartRules {
+                column,
+                affinity,
+                rowid_alias: affinity == Affinity::Integer,
+            };
+            assert_eq!(decode_key_part(&encode_key_part(part)).unwrap(), part);
+        }
+
+        let mut malformed = Writer::new();
+        malformed
+            .field(TAG_COLUMN_ID, &column.as_bytes())
+            .expect("test field is bounded");
+        malformed
+            .field(TAG_COLUMN_AFFINITY, &[Affinity::Text.to_u8()])
+            .expect("test field is bounded");
+        malformed
+            .field(TAG_KEY_PART_FLAGS, &[KEY_PART_ROWID_ALIAS])
+            .expect("test field is bounded");
+        assert_eq!(
+            decode_key_part(&malformed.finish()),
+            Err(RowCodecError::InvalidRow)
+        );
+    }
+
+    #[test]
+    fn sqlite_affinity_is_captured_before_row_and_unique_key_lowering() {
+        let sql = "CREATE TABLE typed_values (
+            id INTEGER PRIMARY KEY,
+            amount DECIMAL(10, 2) UNIQUE,
+            label VARCHAR(40),
+            payload BLOB,
+            ratio DOUBLE
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let connection = connection(&created);
+        connection
+            .execute("INSERT INTO typed_values VALUES (1, '7', 8, 9, '10.5')", ())
+            .unwrap();
+        let captured = connection
+            .query_row(
+                "SELECT rowid, id, amount, label, payload, ratio FROM typed_values",
+                (),
+                |row| {
+                    Ok(CapturedRow {
+                        table: "typed_values".into(),
+                        rowid: row.get(0)?,
+                        values: (1..=5)
+                            .map(|index| row.get_ref(index).map(StoredValue::capture))
+                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            captured.values,
+            [
+                StoredValue::Integer(1),
+                StoredValue::Integer(7),
+                StoredValue::Text(b"8".to_vec()),
+                StoredValue::Integer(9),
+                StoredValue::Real(10.5_f64.to_bits()),
+            ]
+        );
+
+        let inserted = InsertRows::from_captured(&connection, &[captured])
+            .unwrap()
+            .unwrap();
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 2);
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+    }
+
+    #[test]
     fn non_integer_primary_keys_keep_collision_resistant_hidden_rowids() {
         let created = CreateTable::new(
             "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
@@ -2686,13 +2855,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: true,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },

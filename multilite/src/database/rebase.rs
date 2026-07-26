@@ -120,7 +120,7 @@ mod tests {
     use crate::database::catalog;
     use crate::database::operation::MultiliteOp;
     use crate::database::row::{CapturedRow, InsertRows, StoredValue};
-    use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     #[test]
     fn foreign_mixed_transaction_applies_operations_in_manifest_order() {
@@ -130,7 +130,7 @@ mod tests {
                 name: SqlName::new("notes".into()),
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
-                    declared_type: DeclaredType::Integer,
+                    declared_type: TypeDeclaration::integer(),
                     not_null: false,
                     primary_key: true,
                 }],

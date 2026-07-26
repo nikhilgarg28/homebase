@@ -155,7 +155,7 @@ fn decode_definition(frame: &[u8]) -> Result<CreateTable> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, TypeDeclaration};
 
     fn created() -> CreateTable {
         CreateTable::new(
@@ -165,13 +165,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },

@@ -323,7 +323,7 @@ mod tests {
     use crate::database::isolation::IsolationLevel;
     use crate::database::operation::MultiliteOp;
     use crate::database::schema::{
-        CreateColumn, CreateTable, CreateTableSpec, DeclaredType, SqlName,
+        CreateColumn, CreateTable, CreateTableSpec, SqlName, TypeDeclaration,
     };
     use crate::database::transaction::MultiliteTransaction;
 
@@ -407,7 +407,7 @@ mod tests {
                     name: SqlName::new(name.into()),
                     columns: vec![CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     }],

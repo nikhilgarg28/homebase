@@ -234,7 +234,7 @@ fn create_operation(name: &str) -> MultiliteOp {
             name: schema::SqlName::new(name.into()),
             columns: vec![schema::CreateColumn {
                 name: schema::SqlName::new("id".into()),
-                declared_type: schema::DeclaredType::Integer,
+                declared_type: schema::TypeDeclaration::integer(),
                 not_null: false,
                 primary_key: true,
             }],
@@ -2981,6 +2981,120 @@ fn two_replicas_converge_rows_and_reject_only_a_conflicting_insert() {
     ];
     assert_eq!(rows(&first), expected);
     assert_eq!(rows(&second), expected);
+}
+
+#[test]
+fn ordinary_affinities_converge_and_numeric_unique_images_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = Database::open_with(
+        directory.path().join("affinity-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(first.database_id.space_id()));
+    let second = Database::open_with(
+        directory.path().join("affinity-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let first_runtime = first.runtime().unwrap();
+    let second_runtime = second.runtime().unwrap();
+
+    first
+        .execute(
+            &first_runtime,
+            "CREATE TABLE typed_values (
+                id INTEGER PRIMARY KEY,
+                amount DECIMAL(10, 2) UNIQUE,
+                label VARCHAR(40),
+                payload BLOB,
+                ratio DOUBLE PRECISION,
+                anything ANY
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase(&second_runtime).unwrap();
+
+    first
+        .execute(
+            &first_runtime,
+            "INSERT INTO typed_values VALUES (1, '1', 8, 9, '10.5', '12')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            &second_runtime,
+            "INSERT INTO typed_values VALUES (2, 1.0, 'other', x'00', 3, '13')",
+            (),
+        )
+        .unwrap();
+
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("numeric UNIQUE collision was not rejected")
+    };
+    assert!(matches!(
+        rejection.error(),
+        KernelError::RangeAssertFailed { .. }
+    ));
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase(&first_runtime).unwrap();
+    second.rebase(&second_runtime).unwrap();
+
+    let storage_classes = |database: &Database<_>| {
+        database.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, amount, label, payload, ratio, anything,
+                            typeof(amount), typeof(label), typeof(payload),
+                            typeof(ratio), typeof(anything)
+                     FROM typed_values",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, f64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, String>(10)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        })
+    };
+    let expected = (
+        1,
+        1,
+        "8".into(),
+        9,
+        10.5,
+        12,
+        "integer".into(),
+        "text".into(),
+        "integer".into(),
+        "real".into(),
+        "integer".into(),
+    );
+    assert_eq!(storage_classes(&first), expected);
+    assert_eq!(storage_classes(&second), expected);
 }
 
 #[test]

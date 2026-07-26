@@ -255,7 +255,7 @@ mod tests {
     use super::*;
     use crate::database::catalog;
     use crate::database::row::{CapturedRow, InsertRows, StoredValue};
-    use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     fn create_operation() -> MultiliteOp {
         MultiliteOp::create_table(
@@ -264,7 +264,7 @@ mod tests {
                 name: SqlName::new("notes".into()),
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
-                    declared_type: DeclaredType::Integer,
+                    declared_type: TypeDeclaration::integer(),
                     not_null: false,
                     primary_key: true,
                 }],

@@ -14,7 +14,7 @@ use rusqlite::vtab::{
 
 use super::catalog;
 use super::row::{StoredValue, primary_key_prefix, row_keyspace_prefix};
-use super::schema::{CreateTable, DeclaredType, SchemaRevisionId, TableId};
+use super::schema::{CreateTable, SchemaRevisionId, TableId};
 use crate::commit::footprint::ReadTrace;
 use crate::{Error, Result};
 
@@ -211,7 +211,7 @@ impl Module {
                 format!(
                     "{} {}",
                     quote_identifier(column.name().value()),
-                    declared_type_sql(column.declared_type())
+                    column.declared_type().to_sql()
                 )
             })
             .collect::<Vec<_>>()
@@ -391,15 +391,6 @@ fn cursor_not_filtered() -> rusqlite::Error {
     rusqlite::Error::ModuleError("vtable cursor is not filtered".into())
 }
 
-fn declared_type_sql(declared_type: DeclaredType) -> &'static str {
-    match declared_type {
-        DeclaredType::Integer => "INTEGER",
-        DeclaredType::Real => "REAL",
-        DeclaredType::Text => "TEXT",
-        DeclaredType::Blob => "BLOB",
-    }
-}
-
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -412,7 +403,7 @@ mod tests {
 
     use super::*;
     use crate::database::IsolationLevel;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     fn connection() -> (Connection, CreateTable) {
         let connection = Connection::open_in_memory().unwrap();
@@ -424,13 +415,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("day".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: true,
                         primary_key: false,
                     },
@@ -454,19 +445,19 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("title".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
                     CreateColumn {
                         name: SqlName::new("payload".into()),
-                        declared_type: DeclaredType::Blob,
+                        declared_type: TypeDeclaration::blob(),
                         not_null: false,
                         primary_key: false,
                     },
@@ -711,13 +702,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },

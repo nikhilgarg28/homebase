@@ -540,7 +540,7 @@ mod tests {
 
     use super::*;
     use crate::database::row::{CapturedRow, StoredValue};
-    use crate::database::schema::{CreateColumn, CreateTableSpec, DeclaredType, SqlName};
+    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     fn operation(name: &str) -> MultiliteOp {
         MultiliteOp::create_table(
@@ -549,7 +549,7 @@ mod tests {
                 name: SqlName::new(name.into()),
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
-                    declared_type: DeclaredType::Integer,
+                    declared_type: TypeDeclaration::integer(),
                     not_null: false,
                     primary_key: true,
                 }],
@@ -596,13 +596,13 @@ mod tests {
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
-                        declared_type: DeclaredType::Integer,
+                        declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         primary_key: true,
                     },
                     CreateColumn {
                         name: SqlName::new("body".into()),
-                        declared_type: DeclaredType::Text,
+                        declared_type: TypeDeclaration::text(),
                         not_null: false,
                         primary_key: false,
                     },
