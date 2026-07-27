@@ -260,6 +260,109 @@ fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
             [(20, 2)]
         );
     }
+
+    first
+        .execute("DELETE FROM children WHERE id = 20", ())
+        .unwrap();
+    first
+        .execute("DELETE FROM parents WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT count(*) FROM parents", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [0]
+        );
+        assert_eq!(
+            database
+                .query("SELECT count(*) FROM children", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [0]
+        );
+    }
+}
+
+#[test]
+fn foreign_references_do_not_conflict_across_disjoint_parent_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-precise-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-precise-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id)
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("INSERT INTO parents VALUES (1, 'one'), (2, 'two')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("DELETE FROM parents WHERE id = 1", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO children VALUES (20, 2)", ())
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [2]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, parent FROM children", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            [(20, 2)]
+        );
+    }
 }
 
 #[test]

@@ -13,18 +13,14 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
-- Replace the initial coarse parent-side foreign-key guard with a durable
-  reverse-reference keyspace. Child insert/update should write one reference
-  ownership cell under `(parent table, relationship UUID, parent key image,
-  child key image)`; child delete should remove it; parent delete/key movement
-  can then assert the exact parent-image prefix instead of the child table's
-  complete row keyspace. Preserve the landed write-contract fence when an
-  incoming relationship is created. Before widening the grammar, define and
-  test targets backed by UNIQUE keyspaces, affinity/collation coercion,
-  self-references and cycles, deferred constraints, mutating actions, and
-  add/drop relationship evolution. Existence remains established by SQLite
-  against the branch snapshot; Homebase assertions certify freshness of the
-  exact parent/reference keys, not an independent boolean witness.
+- Reverse foreign-reference cells and exact parent-image assertions have
+  landed. Before widening the grammar, define retirement and GC for dropped
+  relationships, then support targets backed by UNIQUE keyspaces,
+  affinity/collation coercion, self-references and cycles, deferred
+  constraints, mutating actions, and add/drop relationship evolution.
+  Existence remains established by SQLite against the branch snapshot;
+  Homebase assertions certify freshness of exact parent/reference keys, not an
+  independent boolean witness.
 
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
   remains one cooperating Multilite committer per file. The WAL-derived map,

@@ -169,6 +169,12 @@ struct IncomingForeignKeyRules {
     child_row_keyspace: RowKeyspaceId,
 }
 
+struct ForeignReference {
+    parent: Key,
+    key: Key,
+    owner: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     rowid: Option<i64>,
@@ -282,7 +288,9 @@ impl InsertRows {
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(self.rows.len() * (self.unique_keys.len() + 1));
+        let mut mutations = Vec::with_capacity(
+            self.rows.len() * (self.unique_keys.len() + self.foreign_keys.len() + 1),
+        );
         let mut footprint = ConflictFootprint::new();
         for row in &self.rows {
             let key = self
@@ -302,11 +310,16 @@ impl InsertRows {
                 footprint.add_write(key.clone());
                 mutations.push(Mutation::Set { key, value: owner });
             }
-            for parent in self
-                .foreign_parent_keys(row)
+            for reference in self
+                .foreign_references(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_constraint(parent);
+                footprint.add_constraint(reference.parent);
+                footprint.add_write(reference.key.clone());
+                mutations.push(Mutation::Set {
+                    key: reference.key,
+                    value: reference.owner,
+                });
             }
         }
         footprint.add_constraint(active_row_keyspace_key(self.table));
@@ -712,7 +725,7 @@ impl InsertRows {
             self.unique_entries(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
             })?;
-            self.foreign_parent_keys(row).map_err(|error| {
+            self.foreign_references(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid foreign-key image: {error}"))
             })?;
         }
@@ -824,7 +837,7 @@ impl InsertRows {
                     return Err(RowCodecError::DuplicateUniqueKey);
                 }
             }
-            self.foreign_parent_keys(row)?;
+            self.foreign_references(row)?;
         }
         Ok(())
     }
@@ -895,8 +908,25 @@ impl InsertRows {
         Ok(entries)
     }
 
-    fn foreign_parent_keys(&self, row: &Row) -> std::result::Result<Vec<Key>, RowCodecError> {
-        let mut parents = Vec::with_capacity(self.foreign_keys.len());
+    fn foreign_reference_map(&self) -> std::result::Result<BTreeMap<Key, Vec<u8>>, RowCodecError> {
+        let mut references = BTreeMap::new();
+        for row in &self.rows {
+            for reference in self.foreign_references(row)? {
+                if references.insert(reference.key, reference.owner).is_some() {
+                    return Err(RowCodecError::InvalidRow);
+                }
+            }
+        }
+        Ok(references)
+    }
+
+    fn foreign_references(
+        &self,
+        row: &Row,
+    ) -> std::result::Result<Vec<ForeignReference>, RowCodecError> {
+        let owner = self.row_key(row)?.encode();
+        let child_images = self.key_images(row)?;
+        let mut references = Vec::with_capacity(self.foreign_keys.len());
         for foreign_key in &self.foreign_keys {
             let values = foreign_key
                 .key_parts
@@ -920,24 +950,37 @@ impl InsertRows {
                 .zip(&foreign_key.key_parts)
                 .map(|(value, part)| key_image(value, part.parent))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            parents.push(row_prefix(
+            let parent = row_prefix(
                 foreign_key.parent_table,
                 foreign_key.parent_row_keyspace,
+                images.clone(),
+            )?;
+            let key = foreign_reference_key(
+                foreign_key.parent_table,
+                foreign_key.id,
+                foreign_key.parent_row_keyspace,
                 images,
-            )?);
+                self.row_keyspace,
+                child_images.clone(),
+            )?;
+            references.push(ForeignReference {
+                parent,
+                key,
+                owner: owner.clone(),
+            });
         }
-        Ok(parents)
+        Ok(references)
     }
 
-    fn incoming_child_prefixes(&self) -> std::result::Result<Vec<Key>, RowCodecError> {
+    fn incoming_reference_prefixes(
+        &self,
+        row: &Row,
+    ) -> std::result::Result<Vec<Key>, RowCodecError> {
+        let images = self.key_images(row)?;
         self.incoming_foreign_keys
             .iter()
             .map(|incoming| {
-                row_prefix(
-                    incoming.child_table,
-                    incoming.child_row_keyspace,
-                    Vec::new(),
-                )
+                foreign_reference_prefix(self.table, incoming.id, self.row_keyspace, images.clone())
             })
             .collect()
     }
@@ -1182,8 +1225,10 @@ impl DeleteRows {
         self.deleted
             .validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations =
-            Vec::with_capacity(self.deleted.rows.len() * (self.deleted.unique_keys.len() + 1));
+        let mut mutations = Vec::with_capacity(
+            self.deleted.rows.len()
+                * (self.deleted.unique_keys.len() + self.deleted.foreign_keys.len() + 1),
+        );
         let mut footprint = ConflictFootprint::new();
         for row in &self.deleted.rows {
             let key = self
@@ -1202,13 +1247,23 @@ impl DeleteRows {
                 footprint.add_write(key.clone());
                 mutations.push(Mutation::Delete { key });
             }
+            for reference in self
+                .deleted
+                .foreign_references(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_write(reference.key.clone());
+                mutations.push(Mutation::Delete { key: reference.key });
+            }
         }
-        for child_prefix in self
-            .deleted
-            .incoming_child_prefixes()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-        {
-            footprint.add_constraint(child_prefix);
+        for row in &self.deleted.rows {
+            for reference_prefix in self
+                .deleted
+                .incoming_reference_prefixes(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_constraint(reference_prefix);
+            }
         }
         footprint.add_constraint(active_row_keyspace_key(self.deleted.table));
         footprint.add_constraint(write_revision_key(self.deleted.table));
@@ -1301,8 +1356,10 @@ impl UpdateRows {
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations =
-            Vec::with_capacity(self.after.rows.len() * (self.after.unique_keys.len() * 2 + 2));
+        let mut mutations = Vec::with_capacity(
+            self.after.rows.len()
+                * (self.after.unique_keys.len() * 2 + self.after.foreign_keys.len() * 2 + 2),
+        );
         let mut footprint = ConflictFootprint::new();
         let keys = self
             .before
@@ -1347,17 +1404,31 @@ impl UpdateRows {
                 mutations.push(Mutation::Delete { key: key.clone() });
             }
         }
-        for (row, (_, key)) in self.after.rows.iter().zip(keys) {
+        let before_references = self
+            .before
+            .foreign_reference_map()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let after_references = self
+            .after
+            .foreign_reference_map()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        for (key, owner) in &before_references {
+            if after_references.get(key) != Some(owner) {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Delete { key: key.clone() });
+            }
+        }
+        for (row, (_, key)) in self.after.rows.iter().zip(&keys) {
             mutations.push(Mutation::Set {
-                key,
+                key: key.clone(),
                 value: self.after.encode_row(row),
             });
-            for parent in self
+            for reference in self
                 .after
-                .foreign_parent_keys(row)
+                .foreign_references(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_constraint(parent);
+                footprint.add_constraint(reference.parent);
             }
         }
         for (key, owner) in &after_unique {
@@ -1369,13 +1440,27 @@ impl UpdateRows {
                 });
             }
         }
+        for (key, owner) in &after_references {
+            if before_references.get(key) != Some(owner) {
+                footprint.add_write(key.clone());
+                mutations.push(Mutation::Set {
+                    key: key.clone(),
+                    value: owner.clone(),
+                });
+            }
+        }
         if primary_key_changed {
-            for child_prefix in self
-                .before
-                .incoming_child_prefixes()
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                footprint.add_constraint(child_prefix);
+            for (row, (before, after)) in self.before.rows.iter().zip(&keys) {
+                if before == after {
+                    continue;
+                }
+                for reference_prefix in self
+                    .before
+                    .incoming_reference_prefixes(row)
+                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+                {
+                    footprint.add_constraint(reference_prefix);
+                }
             }
         }
         footprint.add_constraint(active_row_keyspace_key(self.after.table));
@@ -1806,6 +1891,52 @@ fn unique_prefix(
         ]
         .into_iter()
         .chain(images),
+    )
+    .map_err(RowCodecError::InvalidKey)
+}
+
+fn foreign_reference_prefix(
+    parent: TableId,
+    relationship: ForeignKeyId,
+    parent_keyspace: RowKeyspaceId,
+    parent_images: Vec<Vec<u8>>,
+) -> std::result::Result<Key, RowCodecError> {
+    Key::from_bytes(
+        [
+            codes::ROOT.to_vec(),
+            codes::TABLES.to_vec(),
+            parent.as_bytes().to_vec(),
+            codes::FOREIGN_REFERENCES.to_vec(),
+            relationship.as_bytes().to_vec(),
+            parent_keyspace.as_bytes().to_vec(),
+        ]
+        .into_iter()
+        .chain(parent_images),
+    )
+    .map_err(RowCodecError::InvalidKey)
+}
+
+fn foreign_reference_key(
+    parent: TableId,
+    relationship: ForeignKeyId,
+    parent_keyspace: RowKeyspaceId,
+    parent_images: Vec<Vec<u8>>,
+    child_keyspace: RowKeyspaceId,
+    child_images: Vec<Vec<u8>>,
+) -> std::result::Result<Key, RowCodecError> {
+    Key::from_bytes(
+        [
+            codes::ROOT.to_vec(),
+            codes::TABLES.to_vec(),
+            parent.as_bytes().to_vec(),
+            codes::FOREIGN_REFERENCES.to_vec(),
+            relationship.as_bytes().to_vec(),
+            parent_keyspace.as_bytes().to_vec(),
+        ]
+        .into_iter()
+        .chain(parent_images)
+        .chain([child_keyspace.as_bytes().to_vec()])
+        .chain(child_images),
     )
     .map_err(RowCodecError::InvalidKey)
 }
@@ -2419,6 +2550,35 @@ mod tests {
         .unwrap()
     }
 
+    fn foreign_key_tables() -> (Connection, CreateTable, CreateTable) {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent_sql = "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT)";
+        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
+            super::super::sql::validate_execute(parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::new(parent_sql, parent_spec);
+        connection.execute(parent.sql(), ()).unwrap();
+        catalog::insert(&connection, &parent).unwrap();
+
+        let child_sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent INTEGER REFERENCES parents(id),
+            body TEXT
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
+            super::super::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
+        connection.execute(child.sql(), ()).unwrap();
+        catalog::insert(&connection, &child).unwrap();
+        (connection, parent, child)
+    }
+
     fn admit(mutations: Vec<Mutation>) -> AdmittedBatch<Vec<u8>> {
         let device = DeviceId([7; 16]);
         let device_seq = DeviceSeq(3);
@@ -2475,6 +2635,214 @@ mod tests {
             InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
             inserted
         );
+    }
+
+    #[test]
+    fn foreign_reference_cells_follow_child_rows_and_guard_one_parent_image() {
+        let (connection, parent, child) = foreign_key_tables();
+        let child_row = CapturedRow {
+            table: "children".into(),
+            rowid: 10,
+            values: vec![
+                StoredValue::Integer(10),
+                StoredValue::Integer(7),
+                StoredValue::Text(b"body".to_vec()),
+            ],
+        };
+        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&child_row))
+            .unwrap()
+            .unwrap();
+        let child_key = inserted.row_key(&inserted.rows[0]).unwrap();
+        let references = inserted.foreign_references(&inserted.rows[0]).unwrap();
+        let reference = &references[0];
+        let relationship = child.foreign_keys()[0].id();
+        let parent_image = key_image(
+            &StoredValue::Integer(7),
+            KeyPartRules {
+                column: parent.columns()[0].id(),
+                affinity: Affinity::Integer,
+                rowid_alias: true,
+            },
+        )
+        .unwrap();
+        let expected_prefix = foreign_reference_prefix(
+            parent.table_id(),
+            relationship,
+            parent.row_keyspace_id(),
+            vec![parent_image],
+        )
+        .unwrap();
+
+        assert!(reference.key.starts_with(&expected_prefix));
+        assert_eq!(reference.owner, child_key.encode());
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 2);
+        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert!(lowered.footprint.constraints().contains(&reference.parent));
+        assert!(matches!(
+            &lowered.mutations[1],
+            Mutation::Set { key, value }
+                if key == &reference.key && value == &child_key.encode()
+        ));
+        assert_eq!(
+            InsertRows::from_homebase(&admit(lowered.mutations.clone())).unwrap(),
+            inserted
+        );
+        let mut missing_reference = admit(lowered.mutations.clone());
+        missing_reference.entries.pop();
+        assert_eq!(
+            InsertRows::from_homebase(&missing_reference),
+            Err(RowCodecError::InvalidBatch)
+        );
+        let mut corrupt_reference = admit(lowered.mutations);
+        let Mutation::Set { value, .. } = &mut corrupt_reference.entries[1].device_entry.mutation
+        else {
+            unreachable!()
+        };
+        value.push(0);
+        assert_eq!(
+            InsertRows::from_homebase(&corrupt_reference),
+            Err(RowCodecError::InvalidBatch)
+        );
+
+        let deleted = DeleteRows::from_captured(&connection, std::slice::from_ref(&child_row))
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert!(matches!(
+            &deleted.mutations[1],
+            Mutation::Delete { key } if key == &reference.key
+        ));
+
+        let parent_delete = DeleteRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "parents".into(),
+                rowid: 7,
+                values: vec![
+                    StoredValue::Integer(7),
+                    StoredValue::Text(b"parent".to_vec()),
+                ],
+            }],
+        )
+        .unwrap()
+        .unwrap()
+        .to_homebase()
+        .unwrap();
+        assert!(
+            parent_delete
+                .footprint
+                .constraints()
+                .contains(&expected_prefix)
+        );
+        assert!(
+            !parent_delete.footprint.constraints().contains(
+                &row_prefix(child.table_id(), child.row_keyspace_id(), Vec::new()).unwrap()
+            )
+        );
+
+        let parent_move = UpdateRows::from_captured(
+            &connection,
+            &[(
+                CapturedRow {
+                    table: "parents".into(),
+                    rowid: 7,
+                    values: vec![
+                        StoredValue::Integer(7),
+                        StoredValue::Text(b"parent".to_vec()),
+                    ],
+                },
+                CapturedRow {
+                    table: "parents".into(),
+                    rowid: 8,
+                    values: vec![
+                        StoredValue::Integer(8),
+                        StoredValue::Text(b"parent".to_vec()),
+                    ],
+                },
+            )],
+        )
+        .unwrap()
+        .unwrap()
+        .to_homebase()
+        .unwrap();
+        assert!(
+            parent_move
+                .footprint
+                .constraints()
+                .contains(&expected_prefix)
+        );
+
+        let null_child = InsertRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "children".into(),
+                rowid: 11,
+                values: vec![
+                    StoredValue::Integer(11),
+                    StoredValue::Null,
+                    StoredValue::Text(b"null".to_vec()),
+                ],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            null_child
+                .foreign_references(&null_child.rows[0])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(null_child.to_homebase().unwrap().mutations.len(), 1);
+    }
+
+    #[test]
+    fn foreign_key_updates_move_reverse_reference_cells() {
+        let (connection, _, _) = foreign_key_tables();
+        let before = CapturedRow {
+            table: "children".into(),
+            rowid: 10,
+            values: vec![
+                StoredValue::Integer(10),
+                StoredValue::Integer(7),
+                StoredValue::Text(b"before".to_vec()),
+            ],
+        };
+        let after = CapturedRow {
+            table: "children".into(),
+            rowid: 10,
+            values: vec![
+                StoredValue::Integer(10),
+                StoredValue::Integer(8),
+                StoredValue::Text(b"after".to_vec()),
+            ],
+        };
+        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+            .unwrap()
+            .unwrap();
+        let before_reference = updated.before.foreign_reference_map().unwrap();
+        let after_reference = updated.after.foreign_reference_map().unwrap();
+        let lowered = updated.to_homebase().unwrap();
+
+        assert_eq!(before_reference.len(), 1);
+        assert_eq!(after_reference.len(), 1);
+        assert_ne!(
+            before_reference.first_key_value().unwrap().0,
+            after_reference.first_key_value().unwrap().0
+        );
+        assert!(lowered.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::Delete { key } if before_reference.contains_key(key)
+            )
+        }));
+        assert!(lowered.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::Set { key, .. } if after_reference.contains_key(key)
+            )
+        }));
     }
 
     #[test]

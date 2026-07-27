@@ -67,12 +67,14 @@ window.
 
 Foreign-key declarations retain stable parent table, row-keyspace, and
 primary-column identities. Non-NULL child tuples assert the exact parent row
-key. Parent deletes and primary-key moves currently assert the complete row
-keyspace of every referring child table, which is conservative but catches
-child creation and deletion across devices. Creating an incoming relationship
-also advances the parent's write contract so a parent write compiled against
-the older catalog cannot slip through. SQLite continues to enforce immediate
-local existence and `MATCH SIMPLE` NULL behavior.
+key and maintain a reverse-reference cell keyed by the relationship UUID,
+parent row identity, and child row identity. Child deletes remove that cell;
+foreign-key or child-primary-key updates move it. Parent deletes and
+primary-key moves assert only the exact relationship/parent prefixes they
+remove, so operations on different parent rows remain independent. Creating an
+incoming relationship also advances the parent's write contract so a parent
+write compiled against the older catalog cannot slip through. SQLite continues
+to enforce immediate local existence and `MATCH SIMPLE` NULL behavior.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and
