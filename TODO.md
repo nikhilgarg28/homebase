@@ -13,6 +13,13 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
+- Add a randomized, two-replica integrity-audit simulation. Generate parent
+  and child inserts, retargets, primary-key moves, and deletes; vary
+  push/pull/rebase/restart order; then require converged SQLite rows, a valid
+  schema relationship graph, an empty `PRAGMA foreign_key_check`, and exact
+  agreement between materialized rows and reverse-reference cells. Generalize
+  the resulting checker into a broader explicit database integrity audit.
+
 - Reverse foreign-reference cells and exact parent-image assertions have
   landed. Before widening the grammar, define retirement and GC for dropped
   relationships, then support targets backed by UNIQUE keyspaces,

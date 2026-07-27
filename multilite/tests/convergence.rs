@@ -293,6 +293,164 @@ fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
 }
 
 #[test]
+fn composite_foreign_reference_conflicts_with_the_exact_parent_delete() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("composite-foreign-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("composite-foreign-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    tenant TEXT NOT NULL,
+                    id INTEGER NOT NULL,
+                    body TEXT,
+                    PRIMARY KEY (tenant, id)
+                ) WITHOUT ROWID",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent_tenant TEXT,
+                    parent_id INTEGER,
+                    FOREIGN KEY (parent_tenant, parent_id)
+                        REFERENCES parents (tenant, id)
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES ('acme', 7, 'parent')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("DELETE FROM parents WHERE tenant = 'acme' AND id = 7", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO children VALUES (10, 'acme', 7)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("composite child reference did not conflict with its parent deletion")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT count(*) FROM parents", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [0]
+        );
+        assert_eq!(
+            database
+                .query("SELECT count(*) FROM children", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [0]
+        );
+    }
+}
+
+#[test]
+fn child_retarget_conflicts_with_deleting_its_new_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("retarget-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("retarget-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES parents(id)
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (1), (2)", ())?;
+            transaction.execute("INSERT INTO children VALUES (10, 1)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("UPDATE children SET parent = 2 WHERE id = 10", ())
+        .unwrap();
+    second
+        .execute("DELETE FROM parents WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("parent deletion did not conflict with an admitted child retarget")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, parent FROM children", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            [(10, 2)]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [1, 2]
+        );
+    }
+}
+
+#[test]
 fn foreign_references_do_not_conflict_across_disjoint_parent_rows() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

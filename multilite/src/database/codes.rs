@@ -16,3 +16,9 @@ pub const UNIQUE: &[u8] = b"unique";
 pub const FOREIGN_REFERENCES: &[u8] = b"foreign-references";
 pub const WRITE_REVISION: &[u8] = b"write-revision";
 pub const TRANSACTIONS: &[u8] = b"transactions";
+
+/// Components before the value images in row and UNIQUE keys.
+pub const VALUE_KEY_PREFIX_COMPONENTS: usize = 5;
+
+/// Components outside the parent and child value images in a foreign-reference key.
+pub const FOREIGN_REFERENCE_KEY_FIXED_COMPONENTS: usize = 7;

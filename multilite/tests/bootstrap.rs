@@ -196,6 +196,58 @@ fn general_schema_reopens_without_changes_and_is_stock_sqlite_readable() {
 }
 
 #[test]
+fn foreign_key_catalog_reopens_and_remains_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("foreign-keys.sqlite");
+    {
+        let database = MultiliteConnection::open(&path).unwrap();
+        database
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE parents (
+                        tenant TEXT NOT NULL,
+                        id INTEGER NOT NULL,
+                        PRIMARY KEY (tenant, id)
+                    ) WITHOUT ROWID",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE children (
+                        id INTEGER PRIMARY KEY,
+                        parent_tenant TEXT,
+                        parent_id INTEGER,
+                        FOREIGN KEY (parent_tenant, parent_id)
+                            REFERENCES parents (tenant, id)
+                    )",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO parents VALUES ('acme', 7)", ())?;
+                transaction.execute("INSERT INTO children VALUES (10, 'acme', 7)", ())?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let database = MultiliteConnection::open(&path).unwrap();
+    database
+        .execute("INSERT INTO children VALUES (11, 'acme', 7)", ())
+        .unwrap();
+    assert_eq!(
+        database
+            .query("SELECT id FROM children ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        [10, 11]
+    );
+    drop(database);
+
+    let stock = Connection::open(&path).unwrap();
+    let mut check = stock.prepare("PRAGMA foreign_key_check").unwrap();
+    assert_eq!(check.query_map((), |_| Ok(())).unwrap().count(), 0);
+}
+
+#[test]
 fn lifecycle_accepts_an_explicit_server_handle() {
     let directory = tempfile::tempdir().unwrap();
     let server = |_: &SpaceId| None::<UnreachableSpace>;

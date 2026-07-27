@@ -1731,21 +1731,15 @@ fn incoming_foreign_key_rules(
     parent: &CreateTable,
 ) -> Result<Vec<IncomingForeignKeyRules>> {
     let mut incoming = Vec::new();
-    for child in catalog::all(connection)? {
-        for foreign_key in child
-            .foreign_keys()
-            .iter()
-            .filter(|foreign_key| foreign_key.referenced_table() == parent.table_id())
-        {
-            // Reuse full relationship validation so corrupt catalog links do
-            // not silently weaken parent-side deletion guards.
-            let _ = foreign_key_rule(connection, &child, foreign_key)?;
-            incoming.push(IncomingForeignKeyRules {
-                id: foreign_key.id(),
-                child_table: child.table_id(),
-                child_row_keyspace: child.row_keyspace_id(),
-            });
-        }
+    for (child, foreign_key) in catalog::incoming_foreign_keys(connection, parent.table_id())? {
+        // Reuse full relationship validation so corrupt catalog links do not
+        // silently weaken parent-side deletion guards.
+        let _ = foreign_key_rule(connection, &child, &foreign_key)?;
+        incoming.push(IncomingForeignKeyRules {
+            id: foreign_key.id(),
+            child_table: child.table_id(),
+            child_row_keyspace: child.row_keyspace_id(),
+        });
     }
     Ok(incoming)
 }
@@ -2674,6 +2668,10 @@ mod tests {
         .unwrap();
 
         assert!(reference.key.starts_with(&expected_prefix));
+        assert_eq!(
+            reference.key.components().len(),
+            codes::FOREIGN_REFERENCE_KEY_FIXED_COMPONENTS + 1 + 1
+        );
         assert_eq!(reference.owner, child_key.encode());
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
@@ -2795,6 +2793,62 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(null_child.to_homebase().unwrap().mutations.len(), 1);
+    }
+
+    #[test]
+    fn separate_foreign_keys_to_one_parent_keep_distinct_reference_cells() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent_sql = "CREATE TABLE people (id INTEGER PRIMARY KEY)";
+        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
+            super::super::sql::validate_execute(parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::new(parent_sql, parent_spec);
+        connection.execute(parent_sql, ()).unwrap();
+        catalog::insert(&connection, &parent).unwrap();
+
+        let child_sql = "CREATE TABLE families (
+            id INTEGER PRIMARY KEY,
+            mother INTEGER REFERENCES people(id),
+            father INTEGER REFERENCES people(id)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
+            super::super::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
+        connection.execute(child_sql, ()).unwrap();
+        catalog::insert(&connection, &child).unwrap();
+
+        let inserted = InsertRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "families".into(),
+                rowid: 10,
+                values: vec![
+                    StoredValue::Integer(10),
+                    StoredValue::Integer(1),
+                    StoredValue::Integer(2),
+                ],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let references = inserted.foreign_references(&inserted.rows[0]).unwrap();
+        assert_eq!(references.len(), 2);
+        assert_ne!(references[0].key, references[1].key);
+        assert_eq!(references[0].owner, references[1].owner);
+
+        let lowered = inserted.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 3);
+        assert!(
+            references
+                .iter()
+                .all(|reference| lowered.footprint.constraints().contains(&reference.parent))
+        );
     }
 
     #[test]

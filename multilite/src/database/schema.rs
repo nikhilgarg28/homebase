@@ -68,11 +68,10 @@ const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
 
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
-const LOGICAL_KEY_PREFIX_COMPONENTS: usize = 5;
 const SQLITE_ROWID_ALIASES: [&str; 3] = ["_rowid_", "rowid", "oid"];
 
 /// Maximum number of value components in a row or UNIQUE Homebase key.
-pub const MAX_KEY_PARTS: usize = MAX_COMPONENTS - LOGICAL_KEY_PREFIX_COMPONENTS;
+pub const MAX_KEY_PARTS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
 
 /// SQLite identifier spelling plus its case-insensitive identity form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -663,6 +662,7 @@ impl CreateTable {
     /// Resolve stable parent identities and mint one table definition.
     pub fn prepare(connection: &Connection, sql: &str, spec: CreateTableSpec) -> Result<Self> {
         let resolved = resolve_foreign_keys(connection, &spec)?;
+        validate_foreign_reference_key_shapes(&spec, &resolved)?;
         Ok(build_create_table(sql, spec, resolved, || {
             Uuid::new_v4().into_bytes()
         }))
@@ -892,21 +892,7 @@ impl CreateTable {
             let parent = catalog::by_id(connection, foreign_key.referenced_table)?.ok_or(
                 Error::InvalidDatabase("foreign key references an unknown parent table"),
             )?;
-            if parent.table_name_identity() != foreign_key.referenced_table_name()
-                || parent.row_keyspace_id() != foreign_key.referenced_row_keyspace()
-                || parent
-                    .primary_key_columns()
-                    .map(Column::id)
-                    .ne(foreign_key.referenced_columns.iter().copied())
-                || parent
-                    .primary_key_columns()
-                    .map(Column::name)
-                    .ne(foreign_key.referenced_column_names.iter())
-            {
-                return Err(Error::InvalidDatabase(
-                    "foreign key parent identity contradicts the schema catalog",
-                ));
-            }
+            validate_foreign_key_link(self, foreign_key, &parent)?;
         }
         Ok(())
     }
@@ -1047,6 +1033,106 @@ fn resolve_foreign_keys(
             })
         })
         .collect()
+}
+
+fn validate_foreign_reference_key_shapes(
+    spec: &CreateTableSpec,
+    resolved: &[ResolvedForeignKey],
+) -> Result<()> {
+    let child_key_parts = spec
+        .columns
+        .iter()
+        .filter(|column| column.primary_key.is_some())
+        .count();
+    for foreign_key in resolved {
+        let parent_key_parts = foreign_key.parent.primary_key_columns().count();
+        if !foreign_reference_key_fits(parent_key_parts, child_key_parts) {
+            return Err(Error::UnsupportedSql(
+                "foreign-key reference key exceeds the Homebase component limit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_foreign_key_link(
+    child: &CreateTable,
+    foreign_key: &ForeignKeyDefinition,
+    parent: &CreateTable,
+) -> Result<()> {
+    if !foreign_reference_key_fits(
+        parent.primary_key_columns().count(),
+        child.primary_key_columns().count(),
+    ) {
+        return Err(Error::InvalidDatabase(
+            "foreign-key reference key exceeds the Homebase component limit",
+        ));
+    }
+    if parent.table_name_identity() != foreign_key.referenced_table_name()
+        || parent.row_keyspace_id() != foreign_key.referenced_row_keyspace()
+        || parent
+            .primary_key_columns()
+            .map(Column::id)
+            .ne(foreign_key.referenced_columns.iter().copied())
+        || parent
+            .primary_key_columns()
+            .map(Column::name)
+            .ne(foreign_key.referenced_column_names.iter())
+    {
+        return Err(Error::InvalidDatabase(
+            "foreign key parent identity contradicts the schema catalog",
+        ));
+    }
+    let child_columns = foreign_key
+        .columns
+        .iter()
+        .map(|id| child.columns().iter().find(|column| column.id() == *id));
+    if child_columns
+        .zip(parent.primary_key_columns())
+        .any(|(child_column, parent_column)| {
+            child_column.is_none_or(|child_column| {
+                child_column.affinity(child.mode()) != parent_column.affinity(parent.mode())
+            })
+        })
+    {
+        return Err(Error::InvalidDatabase(
+            "foreign key child identity contradicts the schema catalog",
+        ));
+    }
+    Ok(())
+}
+
+fn foreign_reference_key_fits(parent_key_parts: usize, child_key_parts: usize) -> bool {
+    codes::FOREIGN_REFERENCE_KEY_FIXED_COMPONENTS
+        .checked_add(parent_key_parts)
+        .and_then(|components| components.checked_add(child_key_parts))
+        .is_some_and(|components| components <= MAX_COMPONENTS)
+}
+
+/// Validate links whose correctness depends on more than one catalog row.
+pub(super) fn validate_foreign_key_graph(tables: &[CreateTable]) -> Result<()> {
+    let mut relationships = BTreeSet::new();
+    for child in tables {
+        for foreign_key in child.foreign_keys() {
+            let parent = tables
+                .iter()
+                .find(|table| table.table_id() == foreign_key.referenced_table())
+                .ok_or(Error::InvalidDatabase(
+                    "foreign key references an unknown parent table",
+                ))?;
+            let identity = (
+                foreign_key.referenced_table().as_bytes(),
+                foreign_key.id().as_bytes(),
+            );
+            if !relationships.insert(identity) {
+                return Err(Error::InvalidDatabase(
+                    "schema catalog contains duplicate foreign-key identities",
+                ));
+            }
+            validate_foreign_key_link(child, foreign_key, parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_create_table(
@@ -2475,6 +2561,122 @@ mod tests {
             CreateTable::decode(&malformed.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
+    }
+
+    #[test]
+    fn foreign_reference_key_shape_is_rejected_at_schema_preparation() {
+        fn child_spec(child_primary_parts: usize, parent_parts: usize) -> CreateTableSpec {
+            let primary_columns = (0..child_primary_parts).map(|index| CreateColumn {
+                name: SqlName::new(format!("child_key_{index}")),
+                declared_type: TypeDeclaration::integer(),
+                not_null: true,
+                primary_key: Some(index),
+            });
+            let foreign_columns = (0..parent_parts).map(|index| CreateColumn {
+                name: SqlName::new(format!("parent_key_{index}")),
+                declared_type: TypeDeclaration::integer(),
+                not_null: false,
+                primary_key: None,
+            });
+            CreateTableSpec {
+                name: SqlName::new("child".into()),
+                mode: TableMode::Ordinary,
+                storage: TableStorage::WithoutRowid,
+                columns: primary_columns.chain(foreign_columns).collect(),
+                unique_constraints: Vec::new(),
+                foreign_keys: vec![CreateForeignKey {
+                    name: None,
+                    columns: (0..parent_parts)
+                        .map(|index| SqlName::new(format!("parent_key_{index}")))
+                        .collect(),
+                    referenced_table: SqlName::new("parent".into()),
+                    referenced_columns: Some(
+                        (0..parent_parts)
+                            .map(|index| SqlName::new(format!("key_{index}")))
+                            .collect(),
+                    ),
+                }],
+            }
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent_columns = (0..125)
+            .map(|index| format!("key_{index} INTEGER NOT NULL"))
+            .collect::<Vec<_>>();
+        let parent_primary_key = (0..125)
+            .map(|index| format!("key_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parent_sql = format!(
+            "CREATE TABLE parent ({}, PRIMARY KEY ({parent_primary_key})) WITHOUT ROWID",
+            parent_columns.join(", ")
+        );
+        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
+            super::super::sql::validate_execute(&parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::new(&parent_sql, parent_spec);
+        catalog::insert(&connection, &parent).unwrap();
+
+        CreateTable::prepare(
+            &connection,
+            "CREATE TABLE child (...) WITHOUT ROWID",
+            child_spec(124, 125),
+        )
+        .unwrap();
+        assert!(matches!(
+            CreateTable::prepare(
+                &connection,
+                "CREATE TABLE child (...) WITHOUT ROWID",
+                child_spec(125, 125),
+            ),
+            Err(Error::UnsupportedSql(
+                "foreign-key reference key exceeds the Homebase component limit"
+            ))
+        ));
+    }
+
+    #[test]
+    fn foreign_key_graph_rejects_missing_parents_and_duplicate_relationship_ids() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent = deterministic_create("parents");
+        catalog::insert(&connection, &parent).unwrap();
+
+        let make_child = |name: &str| {
+            let sql = format!(
+                "CREATE TABLE {name} (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES parents(id)
+                )"
+            );
+            let super::super::sql::ValidatedExecute::CreateTable(spec) =
+                super::super::sql::validate_execute(&sql).unwrap()
+            else {
+                unreachable!()
+            };
+            CreateTable::prepare(&connection, &sql, spec).unwrap()
+        };
+        let first = make_child("first_child");
+        let mut second = make_child("second_child");
+
+        validate_foreign_key_graph(&[parent.clone(), first.clone(), second.clone()]).unwrap();
+        assert!(matches!(
+            validate_foreign_key_graph(std::slice::from_ref(&first)),
+            Err(Error::InvalidDatabase(
+                "foreign key references an unknown parent table"
+            ))
+        ));
+
+        second.schema.foreign_keys[0].id = first.schema.foreign_keys[0].id;
+        assert!(matches!(
+            validate_foreign_key_graph(&[parent, first, second]),
+            Err(Error::InvalidDatabase(
+                "schema catalog contains duplicate foreign-key identities"
+            ))
+        ));
     }
 
     #[test]

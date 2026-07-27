@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::schema::{CreateTable, IndexDefinition, SqlName, TableId};
+use super::schema::{
+    CreateTable, ForeignKeyDefinition, IndexDefinition, SqlName, TableId,
+    validate_foreign_key_graph,
+};
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__schema";
@@ -84,6 +87,7 @@ pub fn validate(connection: &Connection) -> Result<()> {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
     let mut active_indexes = BTreeSet::new();
+    let mut tables = Vec::new();
     for row in rows {
         let (table_id, definition) = row?;
         let created = decode_definition(&definition)?;
@@ -102,7 +106,9 @@ pub fn validate(connection: &Connection) -> Result<()> {
                 "schema catalog contains duplicate active index names",
             ));
         }
+        tables.push(created);
     }
+    validate_foreign_key_graph(&tables)?;
     Ok(())
 }
 
@@ -192,6 +198,24 @@ pub fn all(connection: &Connection) -> Result<Vec<CreateTable>> {
         .collect()
 }
 
+pub fn incoming_foreign_keys(
+    connection: &Connection,
+    parent: TableId,
+) -> Result<Vec<(CreateTable, ForeignKeyDefinition)>> {
+    let mut incoming = Vec::new();
+    for child in all(connection)? {
+        incoming.extend(
+            child
+                .foreign_keys()
+                .iter()
+                .filter(|foreign_key| foreign_key.referenced_table() == parent)
+                .cloned()
+                .map(|foreign_key| (child.clone(), foreign_key)),
+        );
+    }
+    Ok(incoming)
+}
+
 pub fn index_by_name(
     connection: &Connection,
     name: &SqlName,
@@ -269,5 +293,38 @@ mod tests {
             Some(created)
         );
         validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn catalog_validation_rejects_a_dangling_foreign_key_parent() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let parent = created();
+        insert(&connection, &parent).unwrap();
+        let sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES Notes(id)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, sql, spec).unwrap();
+        insert(&connection, &child).unwrap();
+        validate(&connection).unwrap();
+
+        connection
+            .execute(
+                &format!("DELETE FROM {TABLE} WHERE table_id = ?1"),
+                [parent.table_id().as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            validate(&connection),
+            Err(Error::InvalidDatabase(
+                "foreign key references an unknown parent table"
+            ))
+        ));
     }
 }
