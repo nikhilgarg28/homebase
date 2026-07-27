@@ -12,7 +12,7 @@ use rusqlite::{Connection, Row};
 use super::index::IndexOperation;
 use super::operation::MultiliteOp;
 use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
-use super::schema::table_prefix;
+use super::schema::{CreateTable, table_prefix};
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
@@ -94,7 +94,10 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     ) -> Result<usize> {
         match validated {
             ValidatedExecute::CreateTable(table) => {
-                let operation = MultiliteOp::create_table(sql, table);
+                let operation = MultiliteOp::CreateTable(
+                    self.hooks
+                        .with_internal(|| CreateTable::prepare(self.connection, sql, table))?,
+                );
                 let (_, footprint) = operation.to_homebase()?.into_parts();
                 let MultiliteOp::CreateTable(created) = &operation else {
                     unreachable!("create-table constructor returned another operation")

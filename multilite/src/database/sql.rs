@@ -4,14 +4,15 @@ use fallible_iterator::FallibleIterator as _;
 #[cfg(test)]
 use sqlite3_parser::ast::{As, Operator, ResultColumn};
 use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, Name, OneSelect, Select,
-    SelectTable, Stmt, TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
+    Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, IndexedColumn, InsertBody,
+    Literal, Name, OneSelect, RefAct, RefArg, Select, SelectTable, Stmt, TabFlags, TableConstraint,
+    Type, TypeSize, UnaryOperator,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
-    CreateColumn, CreateTableSpec, CreateUnique, MAX_KEY_PARTS, SqlName, TableMode, TableStorage,
-    TypeDeclaration, available_hidden_rowid_alias,
+    CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique, MAX_KEY_PARTS, SqlName,
+    TableMode, TableStorage, TypeDeclaration, available_hidden_rowid_alias,
 };
 use crate::{Error, Result};
 
@@ -588,6 +589,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     };
     let mut inline_primary_keys = 0;
     let mut unique_constraints = Vec::new();
+    let mut foreign_keys = Vec::new();
     let mut columns = columns
         .into_values()
         .map(|column| {
@@ -663,9 +665,20 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                             columns: vec![name.clone()],
                         });
                     }
+                    ColumnConstraint::ForeignKey {
+                        clause,
+                        defer_clause,
+                    } => {
+                        foreign_keys.push(validate_foreign_key(
+                            constraint.name.map(|name| identifier(&name)).transpose()?,
+                            vec![name.clone()],
+                            clause,
+                            defer_clause,
+                        )?);
+                    }
                     _ => {
                         return Err(Error::UnsupportedSql(
-                            "only PRIMARY KEY, NOT NULL, and UNIQUE column constraints are supported",
+                            "only PRIMARY KEY, NOT NULL, UNIQUE, and REFERENCES column constraints are supported",
                         ));
                     }
                 }
@@ -734,9 +747,22 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     "PRIMARY KEY",
                 )?);
             }
+            TableConstraint::ForeignKey {
+                columns: child_columns,
+                clause,
+                defer_clause,
+            } => {
+                let child_columns = simple_indexed_columns(child_columns, &columns, "FOREIGN KEY")?;
+                foreign_keys.push(validate_foreign_key(
+                    constraint.name.map(|name| identifier(&name)).transpose()?,
+                    child_columns,
+                    clause,
+                    defer_clause,
+                )?);
+            }
             _ => {
                 return Err(Error::UnsupportedSql(
-                    "only PRIMARY KEY and UNIQUE table constraints are supported",
+                    "only PRIMARY KEY, UNIQUE, and FOREIGN KEY table constraints are supported",
                 ));
             }
         }
@@ -789,7 +815,106 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
         storage,
         columns,
         unique_constraints,
+        foreign_keys,
     }))
+}
+
+fn validate_foreign_key(
+    name: Option<SqlName>,
+    columns: Vec<SqlName>,
+    clause: ForeignKeyClause,
+    defer_clause: Option<sqlite3_parser::ast::DeferSubclause>,
+) -> Result<CreateForeignKey> {
+    if defer_clause.is_some() {
+        return Err(Error::UnsupportedSql(
+            "deferred foreign keys are not supported",
+        ));
+    }
+    let mut on_delete = false;
+    let mut on_update = false;
+    for argument in clause.args {
+        match argument {
+            RefArg::OnDelete(RefAct::NoAction) if !on_delete => on_delete = true,
+            RefArg::OnUpdate(RefAct::NoAction) if !on_update => on_update = true,
+            RefArg::OnDelete(_) | RefArg::OnUpdate(_) => {
+                return Err(Error::UnsupportedSql(
+                    "foreign-key actions other than NO ACTION are not supported",
+                ));
+            }
+            RefArg::OnInsert(_) | RefArg::Match(_) => {
+                return Err(Error::UnsupportedSql(
+                    "foreign-key MATCH and ON INSERT clauses are not supported",
+                ));
+            }
+        }
+    }
+    let referenced_columns = clause
+        .columns
+        .map(|columns| simple_indexed_column_names(columns, "REFERENCES"))
+        .transpose()?;
+    if referenced_columns
+        .as_ref()
+        .is_some_and(|referenced| referenced.len() != columns.len())
+    {
+        return Err(Error::UnsupportedSql(
+            "foreign-key child and parent column counts must match",
+        ));
+    }
+    Ok(CreateForeignKey {
+        name,
+        columns,
+        referenced_table: identifier(&clause.tbl_name)?,
+        referenced_columns,
+    })
+}
+
+fn simple_indexed_columns(
+    columns: Vec<IndexedColumn>,
+    table_columns: &[CreateColumn],
+    kind: &'static str,
+) -> Result<Vec<SqlName>> {
+    let names = simple_indexed_column_names(columns, kind)?;
+    if names.iter().any(|key| {
+        !table_columns
+            .iter()
+            .any(|column| column.name.canonical() == key.canonical())
+    }) {
+        return Err(Error::UnsupportedSql(
+            "FOREIGN KEY constraints reference unknown child columns",
+        ));
+    }
+    Ok(names)
+}
+
+fn simple_indexed_column_names(
+    columns: Vec<IndexedColumn>,
+    kind: &'static str,
+) -> Result<Vec<SqlName>> {
+    let columns = columns
+        .into_iter()
+        .map(|column| {
+            if column.collation_name.is_some() || column.order.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "foreign-key collations and ordering are not supported",
+                ));
+            }
+            identifier(&column.col_name)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty()
+        || columns.len() > MAX_KEY_PARTS
+        || columns.iter().enumerate().any(|(index, column)| {
+            columns[..index]
+                .iter()
+                .any(|seen| seen.canonical() == column.canonical())
+        })
+    {
+        return Err(Error::UnsupportedSql(match kind {
+            "REFERENCES" => "REFERENCES requires distinct parent columns",
+            _ => "FOREIGN KEY requires distinct child columns",
+        }));
+    }
+    Ok(columns)
 }
 
 fn simple_key_columns(
@@ -983,7 +1108,6 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'x')",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT CHECK(length(body) > 0))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT COLLATE nocase)",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES other(id))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT GENERATED ALWAYS AS (id))",
             "CREATE TABLE notes (id INTEGER CONSTRAINT pk PRIMARY KEY)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
@@ -999,6 +1123,67 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, body))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, BODY))",
             "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn normalizes_immediate_primary_key_foreign_references() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE children (
+                tenant TEXT NOT NULL,
+                child INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents,
+                CONSTRAINT composite_parent
+                    FOREIGN KEY (tenant, parent)
+                    REFERENCES memberships (tenant, member)
+                    ON UPDATE NO ACTION ON DELETE NO ACTION
+            )",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(spec.foreign_keys.len(), 2);
+        assert_eq!(spec.foreign_keys[0].columns[0].value(), "parent");
+        assert_eq!(spec.foreign_keys[0].referenced_table.value(), "parents");
+        assert!(spec.foreign_keys[0].referenced_columns.is_none());
+        assert_eq!(
+            spec.foreign_keys[1].name.as_ref().map(SqlName::value),
+            Some("composite_parent")
+        );
+        assert_eq!(
+            spec.foreign_keys[1]
+                .columns
+                .iter()
+                .map(SqlName::value)
+                .collect::<Vec<_>>(),
+            ["tenant", "parent"]
+        );
+        assert_eq!(
+            spec.foreign_keys[1]
+                .referenced_columns
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(SqlName::value)
+                .collect::<Vec<_>>(),
+            ["tenant", "member"]
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_key_extensions_outside_the_initial_slice() {
+        for sql in [
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE SET NULL)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) MATCH FULL)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id, tenant))",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (missing) REFERENCES parents(id))",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES parents(id, id))",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent DESC) REFERENCES parents(id))",
         ] {
             assert_unsupported(sql);
         }

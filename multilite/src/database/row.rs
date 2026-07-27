@@ -13,9 +13,9 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
-    Affinity, Column, ColumnId, CreateTable, IndexDefinition, RowKeyspaceId, SchemaRevisionId,
-    StrictType, TableId, TableMode, TableStorage, UniqueKeyspaceId, active_row_keyspace_key,
-    write_revision_key,
+    Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexDefinition,
+    RowKeyspaceId, SchemaRevisionId, StrictType, TableId, TableMode, TableStorage,
+    UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -32,6 +32,8 @@ const TAG_COLUMN_VALUE: u8 = 4;
 const TAG_ROWID: u8 = 5;
 const TAG_UNIQUE_KEY: u8 = 6;
 const TAG_TABLE_STORAGE: u8 = 7;
+const TAG_FOREIGN_KEY: u8 = 8;
+const TAG_INCOMING_FOREIGN_KEY: u8 = 9;
 const TAG_TABLE: u8 = 1;
 const TAG_ROW: u8 = 2;
 const TAG_COLUMN_ID: u8 = 1;
@@ -42,6 +44,15 @@ const TAG_UPDATE_BEFORE: u8 = 1;
 const TAG_UPDATE_AFTER: u8 = 2;
 const TAG_UNIQUE_KEYSPACE: u8 = 1;
 const TAG_UNIQUE_KEY_PART: u8 = 2;
+const TAG_FOREIGN_KEY_ID: u8 = 1;
+const TAG_FOREIGN_KEY_PARENT_TABLE: u8 = 2;
+const TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE: u8 = 3;
+const TAG_FOREIGN_KEY_PART: u8 = 4;
+const TAG_FOREIGN_KEY_CHILD_COLUMN: u8 = 1;
+const TAG_FOREIGN_KEY_PARENT_PART: u8 = 2;
+const TAG_INCOMING_FOREIGN_KEY_ID: u8 = 1;
+const TAG_INCOMING_CHILD_TABLE: u8 = 2;
+const TAG_INCOMING_CHILD_ROW_KEYSPACE: u8 = 3;
 const KEY_PART_ROWID_ALIAS: u8 = 1;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
@@ -135,6 +146,29 @@ pub struct UniqueKeyRules {
     key_parts: Vec<KeyPartRules>,
 }
 
+/// One child-to-parent key mapping used for parent-existence assertions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForeignKeyRules {
+    id: ForeignKeyId,
+    parent_table: TableId,
+    parent_row_keyspace: RowKeyspaceId,
+    key_parts: Vec<ForeignKeyPartRules>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForeignKeyPartRules {
+    child_column: ColumnId,
+    parent: KeyPartRules,
+}
+
+/// One child row keyspace that may prevent deletion of this table's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IncomingForeignKeyRules {
+    id: ForeignKeyId,
+    child_table: TableId,
+    child_row_keyspace: RowKeyspaceId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     rowid: Option<i64>,
@@ -150,6 +184,8 @@ pub struct InsertRows {
     storage: TableStorage,
     key_parts: Vec<KeyPartRules>,
     unique_keys: Vec<UniqueKeyRules>,
+    foreign_keys: Vec<ForeignKeyRules>,
+    incoming_foreign_keys: Vec<IncomingForeignKeyRules>,
     rows: Vec<Row>,
 }
 
@@ -210,6 +246,8 @@ impl InsertRows {
             })
             .collect::<Vec<_>>();
         let unique_keys = unique_key_rules(&created);
+        let foreign_keys = foreign_key_rules(connection, &created)?;
+        let incoming_foreign_keys = incoming_foreign_key_rules(connection, &created)?;
         let rows = captured
             .iter()
             .map(|captured| Row {
@@ -233,9 +271,11 @@ impl InsertRows {
             storage: created.storage(),
             key_parts,
             unique_keys,
+            foreign_keys,
+            incoming_foreign_keys,
             rows,
         };
-        inserted.validate_against(&created)?;
+        inserted.validate_against(connection, &created)?;
         Ok(Some(inserted))
     }
 
@@ -261,6 +301,12 @@ impl InsertRows {
             {
                 footprint.add_write(key.clone());
                 mutations.push(Mutation::Set { key, value: owner });
+            }
+            for parent in self
+                .foreign_parent_keys(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_constraint(parent);
             }
         }
         footprint.add_constraint(active_row_keyspace_key(self.table));
@@ -299,8 +345,16 @@ impl InsertRows {
             }
             let table = TableId::from_bytes(uuid_bytes(components[2].as_bytes())?);
             let row_keyspace = RowKeyspaceId::from_bytes(uuid_bytes(components[4].as_bytes())?);
-            let (schema_revision, encoded_keyspace, storage, key_parts, unique_keys, row) =
-                decode_row(value)?;
+            let (
+                schema_revision,
+                encoded_keyspace,
+                storage,
+                key_parts,
+                unique_keys,
+                foreign_keys,
+                incoming_foreign_keys,
+                row,
+            ) = decode_row(value)?;
             if encoded_keyspace != row_keyspace {
                 return Err(RowCodecError::InvalidBatch);
             }
@@ -311,6 +365,8 @@ impl InsertRows {
                 storage,
                 key_parts: key_parts.clone(),
                 unique_keys: unique_keys.clone(),
+                foreign_keys: foreign_keys.clone(),
+                incoming_foreign_keys: incoming_foreign_keys.clone(),
                 rows: Vec::new(),
             });
             if candidate.table != table
@@ -319,6 +375,8 @@ impl InsertRows {
                 || candidate.storage != storage
                 || candidate.key_parts != key_parts
                 || candidate.unique_keys != unique_keys
+                || candidate.foreign_keys != foreign_keys
+                || candidate.incoming_foreign_keys != incoming_foreign_keys
             {
                 return Err(RowCodecError::InvalidBatch);
             }
@@ -375,8 +433,16 @@ impl InsertRows {
                 TAG_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
                 TAG_ROW => {
                     let table = table.ok_or(RowCodecError::MissingField(TAG_TABLE))?;
-                    let (schema_revision, row_keyspace, storage, key_parts, unique_keys, row) =
-                        decode_row(value)?;
+                    let (
+                        schema_revision,
+                        row_keyspace,
+                        storage,
+                        key_parts,
+                        unique_keys,
+                        foreign_keys,
+                        incoming_foreign_keys,
+                        row,
+                    ) = decode_row(value)?;
                     let candidate = operation.get_or_insert_with(|| Self {
                         table,
                         schema_revision,
@@ -384,6 +450,8 @@ impl InsertRows {
                         storage,
                         key_parts: key_parts.clone(),
                         unique_keys: unique_keys.clone(),
+                        foreign_keys: foreign_keys.clone(),
+                        incoming_foreign_keys: incoming_foreign_keys.clone(),
                         rows: Vec::new(),
                     });
                     if candidate.table != table
@@ -392,6 +460,8 @@ impl InsertRows {
                         || candidate.storage != storage
                         || candidate.key_parts != key_parts
                         || candidate.unique_keys != unique_keys
+                        || candidate.foreign_keys != foreign_keys
+                        || candidate.incoming_foreign_keys != incoming_foreign_keys
                     {
                         return Err(RowCodecError::InvalidBatch);
                     }
@@ -573,11 +643,11 @@ impl InsertRows {
         let created = catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
             "row operation references an unknown table",
         ))?;
-        self.validate_against(&created)?;
+        self.validate_against(connection, &created)?;
         Ok(created)
     }
 
-    fn validate_against(&self, created: &CreateTable) -> Result<()> {
+    fn validate_against(&self, connection: &Connection, created: &CreateTable) -> Result<()> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let expected_key_parts = created
@@ -590,6 +660,8 @@ impl InsertRows {
             .collect::<Vec<_>>();
         let expected_unique_keys = unique_key_rules(created);
         let known_unique_keys = known_unique_key_rules(created);
+        let expected_foreign_keys = foreign_key_rules(connection, created)?;
+        let expected_incoming_foreign_keys = incoming_foreign_key_rules(connection, created)?;
         if self.table != created.table_id()
             || self.row_keyspace != created.row_keyspace_id()
             || self.storage != created.storage()
@@ -601,6 +673,8 @@ impl InsertRows {
                 .unique_keys
                 .iter()
                 .any(|actual| !known_unique_keys.contains(actual))
+            || self.foreign_keys != expected_foreign_keys
+            || self.incoming_foreign_keys != expected_incoming_foreign_keys
         {
             return Err(Error::InvalidMultiliteOp(
                 "row operation contradicts the local schema catalog".into(),
@@ -637,6 +711,9 @@ impl InsertRows {
             })?;
             self.unique_entries(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
+            })?;
+            self.foreign_parent_keys(row).map_err(|error| {
+                Error::InvalidMultiliteOp(format!("invalid foreign-key image: {error}"))
             })?;
         }
         Ok(())
@@ -687,6 +764,37 @@ impl InsertRows {
         }) {
             return Err(RowCodecError::InvalidRow);
         }
+        if self
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .any(|(index, foreign_key)| {
+                foreign_key.key_parts.is_empty()
+                    || self.foreign_keys[..index]
+                        .iter()
+                        .any(|seen| seen.id == foreign_key.id)
+                    || foreign_key
+                        .key_parts
+                        .iter()
+                        .enumerate()
+                        .any(|(part_index, part)| {
+                            foreign_key.key_parts[..part_index]
+                                .iter()
+                                .any(|seen| seen.child_column == part.child_column)
+                        })
+            })
+            || self
+                .incoming_foreign_keys
+                .iter()
+                .enumerate()
+                .any(|(index, incoming)| {
+                    self.incoming_foreign_keys[..index]
+                        .iter()
+                        .any(|seen| seen.id == incoming.id)
+                })
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
         let mut keys = BTreeSet::new();
         let mut unique_keys = BTreeSet::new();
         for row in &self.rows {
@@ -716,6 +824,7 @@ impl InsertRows {
                     return Err(RowCodecError::DuplicateUniqueKey);
                 }
             }
+            self.foreign_parent_keys(row)?;
         }
         Ok(())
     }
@@ -786,6 +895,53 @@ impl InsertRows {
         Ok(entries)
     }
 
+    fn foreign_parent_keys(&self, row: &Row) -> std::result::Result<Vec<Key>, RowCodecError> {
+        let mut parents = Vec::with_capacity(self.foreign_keys.len());
+        for foreign_key in &self.foreign_keys {
+            let values = foreign_key
+                .key_parts
+                .iter()
+                .map(|part| {
+                    row.values
+                        .iter()
+                        .find(|(column, _)| *column == part.child_column)
+                        .map(|(_, value)| value)
+                        .ok_or(RowCodecError::InvalidRow)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if values
+                .iter()
+                .any(|value| matches!(value, StoredValue::Null))
+            {
+                continue;
+            }
+            let images = values
+                .into_iter()
+                .zip(&foreign_key.key_parts)
+                .map(|(value, part)| key_image(value, part.parent))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            parents.push(row_prefix(
+                foreign_key.parent_table,
+                foreign_key.parent_row_keyspace,
+                images,
+            )?);
+        }
+        Ok(parents)
+    }
+
+    fn incoming_child_prefixes(&self) -> std::result::Result<Vec<Key>, RowCodecError> {
+        self.incoming_foreign_keys
+            .iter()
+            .map(|incoming| {
+                row_prefix(
+                    incoming.child_table,
+                    incoming.child_row_keyspace,
+                    Vec::new(),
+                )
+            })
+            .collect()
+    }
+
     fn encode_row(&self, row: &Row) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_FRAME_VERSION);
@@ -811,6 +967,19 @@ impl InsertRows {
         for unique in &self.unique_keys {
             writer
                 .field(TAG_UNIQUE_KEY, &encode_unique_key(unique))
+                .expect("row field length fits in u32");
+        }
+        for foreign_key in &self.foreign_keys {
+            writer
+                .field(TAG_FOREIGN_KEY, &encode_foreign_key(foreign_key))
+                .expect("row field length fits in u32");
+        }
+        for incoming in &self.incoming_foreign_keys {
+            writer
+                .field(
+                    TAG_INCOMING_FOREIGN_KEY,
+                    &encode_incoming_foreign_key(*incoming),
+                )
                 .expect("row field length fits in u32");
         }
         for (column, value) in &row.values {
@@ -864,6 +1033,143 @@ fn decode_unique_key(frame: &[u8]) -> std::result::Result<UniqueKeyRules, RowCod
     })
 }
 
+fn encode_foreign_key(foreign_key: &ForeignKeyRules) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer
+        .field(TAG_FOREIGN_KEY_ID, &foreign_key.id.as_bytes())
+        .expect("row field length fits in u32");
+    writer
+        .field(
+            TAG_FOREIGN_KEY_PARENT_TABLE,
+            &foreign_key.parent_table.as_bytes(),
+        )
+        .expect("row field length fits in u32");
+    writer
+        .field(
+            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE,
+            &foreign_key.parent_row_keyspace.as_bytes(),
+        )
+        .expect("row field length fits in u32");
+    for part in &foreign_key.key_parts {
+        let mut encoded = Writer::new();
+        encoded
+            .field(TAG_FOREIGN_KEY_CHILD_COLUMN, &part.child_column.as_bytes())
+            .expect("row field length fits in u32");
+        encoded
+            .field(TAG_FOREIGN_KEY_PARENT_PART, &encode_key_part(part.parent))
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_FOREIGN_KEY_PART, &encoded.finish())
+            .expect("row field length fits in u32");
+    }
+    writer.finish()
+}
+
+fn decode_foreign_key(frame: &[u8]) -> std::result::Result<ForeignKeyRules, RowCodecError> {
+    let mut reader = Reader::new(frame);
+    let mut id = None;
+    let mut parent_table = None;
+    let mut parent_row_keyspace = None;
+    let mut key_parts = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        match tag {
+            TAG_FOREIGN_KEY_ID => set_once(&mut id, ForeignKeyId::from_bytes(uuid_bytes(value)?))?,
+            TAG_FOREIGN_KEY_PARENT_TABLE => {
+                set_once(&mut parent_table, TableId::from_bytes(uuid_bytes(value)?))?
+            }
+            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE => set_once(
+                &mut parent_row_keyspace,
+                RowKeyspaceId::from_bytes(uuid_bytes(value)?),
+            )?,
+            TAG_FOREIGN_KEY_PART => {
+                let mut part_reader = Reader::new(value);
+                let mut child_column = None;
+                let mut parent = None;
+                while let Some((part_tag, part_value)) =
+                    part_reader.field().map_err(|_| RowCodecError::Truncated)?
+                {
+                    match part_tag {
+                        TAG_FOREIGN_KEY_CHILD_COLUMN => set_once(
+                            &mut child_column,
+                            ColumnId::from_bytes(uuid_bytes(part_value)?),
+                        )?,
+                        TAG_FOREIGN_KEY_PARENT_PART => {
+                            set_once(&mut parent, decode_key_part(part_value)?)?
+                        }
+                        _ => {}
+                    }
+                }
+                key_parts.push(ForeignKeyPartRules {
+                    child_column: child_column
+                        .ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_CHILD_COLUMN))?,
+                    parent: parent
+                        .ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_PARENT_PART))?,
+                });
+            }
+            _ => {}
+        }
+    }
+    if key_parts.is_empty() {
+        return Err(RowCodecError::InvalidRow);
+    }
+    Ok(ForeignKeyRules {
+        id: id.ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_ID))?,
+        parent_table: parent_table
+            .ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_PARENT_TABLE))?,
+        parent_row_keyspace: parent_row_keyspace.ok_or(RowCodecError::MissingField(
+            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE,
+        ))?,
+        key_parts,
+    })
+}
+
+fn encode_incoming_foreign_key(incoming: IncomingForeignKeyRules) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer
+        .field(TAG_INCOMING_FOREIGN_KEY_ID, &incoming.id.as_bytes())
+        .expect("row field length fits in u32");
+    writer
+        .field(TAG_INCOMING_CHILD_TABLE, &incoming.child_table.as_bytes())
+        .expect("row field length fits in u32");
+    writer
+        .field(
+            TAG_INCOMING_CHILD_ROW_KEYSPACE,
+            &incoming.child_row_keyspace.as_bytes(),
+        )
+        .expect("row field length fits in u32");
+    writer.finish()
+}
+
+fn decode_incoming_foreign_key(
+    frame: &[u8],
+) -> std::result::Result<IncomingForeignKeyRules, RowCodecError> {
+    let mut reader = Reader::new(frame);
+    let mut id = None;
+    let mut child_table = None;
+    let mut child_row_keyspace = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        match tag {
+            TAG_INCOMING_FOREIGN_KEY_ID => {
+                set_once(&mut id, ForeignKeyId::from_bytes(uuid_bytes(value)?))?
+            }
+            TAG_INCOMING_CHILD_TABLE => {
+                set_once(&mut child_table, TableId::from_bytes(uuid_bytes(value)?))?
+            }
+            TAG_INCOMING_CHILD_ROW_KEYSPACE => set_once(
+                &mut child_row_keyspace,
+                RowKeyspaceId::from_bytes(uuid_bytes(value)?),
+            )?,
+            _ => {}
+        }
+    }
+    Ok(IncomingForeignKeyRules {
+        id: id.ok_or(RowCodecError::MissingField(TAG_INCOMING_FOREIGN_KEY_ID))?,
+        child_table: child_table.ok_or(RowCodecError::MissingField(TAG_INCOMING_CHILD_TABLE))?,
+        child_row_keyspace: child_row_keyspace
+            .ok_or(RowCodecError::MissingField(TAG_INCOMING_CHILD_ROW_KEYSPACE))?,
+    })
+}
+
 impl DeleteRows {
     pub fn from_captured(
         connection: &Connection,
@@ -896,6 +1202,13 @@ impl DeleteRows {
                 footprint.add_write(key.clone());
                 mutations.push(Mutation::Delete { key });
             }
+        }
+        for child_prefix in self
+            .deleted
+            .incoming_child_prefixes()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+        {
+            footprint.add_constraint(child_prefix);
         }
         footprint.add_constraint(active_row_keyspace_key(self.deleted.table));
         footprint.add_constraint(write_revision_key(self.deleted.table));
@@ -1007,6 +1320,7 @@ impl UpdateRows {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let primary_key_changed = keys.iter().any(|(before, after)| before != after);
 
         // Remove every moved source before publishing any destination. If one
         // row moves into another row's former key, the later Set must win.
@@ -1038,6 +1352,13 @@ impl UpdateRows {
                 key,
                 value: self.after.encode_row(row),
             });
+            for parent in self
+                .after
+                .foreign_parent_keys(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_constraint(parent);
+            }
         }
         for (key, owner) in &after_unique {
             if before_unique.get(key) != Some(owner) {
@@ -1046,6 +1367,15 @@ impl UpdateRows {
                     key: key.clone(),
                     value: owner.clone(),
                 });
+            }
+        }
+        if primary_key_changed {
+            for child_prefix in self
+                .before
+                .incoming_child_prefixes()
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                footprint.add_constraint(child_prefix);
             }
         }
         footprint.add_constraint(active_row_keyspace_key(self.after.table));
@@ -1126,6 +1456,8 @@ impl UpdateRows {
             || self.before.storage != self.after.storage
             || self.before.key_parts != self.after.key_parts
             || self.before.unique_keys != self.after.unique_keys
+            || self.before.foreign_keys != self.after.foreign_keys
+            || self.before.incoming_foreign_keys != self.after.incoming_foreign_keys
             || self.before.rows.len() != self.after.rows.len()
         {
             return Err(RowCodecError::InvalidRow);
@@ -1244,6 +1576,93 @@ fn known_unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
                 }),
         )
         .collect()
+}
+
+fn foreign_key_rules(
+    connection: &Connection,
+    created: &CreateTable,
+) -> Result<Vec<ForeignKeyRules>> {
+    created
+        .foreign_keys()
+        .iter()
+        .map(|foreign_key| foreign_key_rule(connection, created, foreign_key))
+        .collect()
+}
+
+fn foreign_key_rule(
+    connection: &Connection,
+    child: &CreateTable,
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<ForeignKeyRules> {
+    let parent = catalog::by_id(connection, foreign_key.referenced_table())?.ok_or(
+        Error::InvalidDatabase("foreign key references an unknown parent table"),
+    )?;
+    if parent.table_name_identity() != foreign_key.referenced_table_name()
+        || parent.row_keyspace_id() != foreign_key.referenced_row_keyspace()
+        || parent
+            .primary_key_columns()
+            .map(Column::id)
+            .ne(foreign_key.referenced_columns().iter().copied())
+    {
+        return Err(Error::InvalidDatabase(
+            "foreign key parent identity contradicts the schema catalog",
+        ));
+    }
+    let key_parts = foreign_key
+        .columns()
+        .iter()
+        .copied()
+        .zip(parent.primary_key_columns())
+        .map(|(child_column, parent_column)| {
+            if !child
+                .columns()
+                .iter()
+                .any(|column| column.id() == child_column)
+            {
+                return Err(Error::InvalidDatabase(
+                    "foreign key references an unknown child column",
+                ));
+            }
+            Ok(ForeignKeyPartRules {
+                child_column,
+                parent: KeyPartRules {
+                    column: parent_column.id(),
+                    affinity: parent_column.affinity(parent.mode()),
+                    rowid_alias: parent.is_rowid_alias(parent_column.id()),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ForeignKeyRules {
+        id: foreign_key.id(),
+        parent_table: parent.table_id(),
+        parent_row_keyspace: parent.row_keyspace_id(),
+        key_parts,
+    })
+}
+
+fn incoming_foreign_key_rules(
+    connection: &Connection,
+    parent: &CreateTable,
+) -> Result<Vec<IncomingForeignKeyRules>> {
+    let mut incoming = Vec::new();
+    for child in catalog::all(connection)? {
+        for foreign_key in child
+            .foreign_keys()
+            .iter()
+            .filter(|foreign_key| foreign_key.referenced_table() == parent.table_id())
+        {
+            // Reuse full relationship validation so corrupt catalog links do
+            // not silently weaken parent-side deletion guards.
+            let _ = foreign_key_rule(connection, &child, foreign_key)?;
+            incoming.push(IncomingForeignKeyRules {
+                id: foreign_key.id(),
+                child_table: child.table_id(),
+                child_row_keyspace: child.row_keyspace_id(),
+            });
+        }
+    }
+    Ok(incoming)
 }
 
 fn unique_key_parts(created: &CreateTable, columns: &[ColumnId]) -> Vec<KeyPartRules> {
@@ -1562,6 +1981,8 @@ fn decode_row(
         TableStorage,
         Vec<KeyPartRules>,
         Vec<UniqueKeyRules>,
+        Vec<ForeignKeyRules>,
+        Vec<IncomingForeignKeyRules>,
         Row,
     ),
     RowCodecError,
@@ -1576,6 +1997,8 @@ fn decode_row(
     let mut rowid = None;
     let mut key_parts = Vec::new();
     let mut unique_keys = Vec::new();
+    let mut foreign_keys = Vec::new();
+    let mut incoming_foreign_keys = Vec::new();
     let mut values = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
@@ -1602,6 +2025,10 @@ fn decode_row(
             }
             TAG_KEY_PART => key_parts.push(decode_key_part(value)?),
             TAG_UNIQUE_KEY => unique_keys.push(decode_unique_key(value)?),
+            TAG_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
+            TAG_INCOMING_FOREIGN_KEY => {
+                incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
+            }
             TAG_COLUMN_VALUE => values.push(decode_column_value(value)?),
             _ => {}
         }
@@ -1626,6 +2053,8 @@ fn decode_row(
         storage,
         key_parts,
         unique_keys,
+        foreign_keys,
+        incoming_foreign_keys,
         Row { rowid, values },
     ))
 }
@@ -1811,6 +2240,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         )
     }
@@ -1877,6 +2307,7 @@ mod tests {
                         SqlName::new("email".into()),
                     ],
                 }],
+                foreign_keys: Vec::new(),
             },
         )
     }
@@ -1942,6 +2373,7 @@ mod tests {
                         ],
                     },
                 ],
+                foreign_keys: Vec::new(),
             },
         )
     }
@@ -2775,6 +3207,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let documents_connection = connection(&documents);
@@ -3211,7 +3644,7 @@ mod tests {
             .unwrap()
             .1 = StoredValue::Text(b"invalid".to_vec());
         assert!(matches!(
-            invalid.validate_against(&created),
+            invalid.validate_against(&connection, &created),
             Err(Error::InvalidMultiliteOp(message))
                 if message == "row value has an invalid STRICT storage class"
         ));
@@ -3240,6 +3673,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let source = connection(&created);

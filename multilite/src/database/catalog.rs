@@ -182,6 +182,16 @@ pub fn by_id(connection: &Connection, table: TableId) -> Result<Option<CreateTab
         .transpose()
 }
 
+pub fn all(connection: &Connection) -> Result<Vec<CreateTable>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT definition FROM {TABLE} ORDER BY schema_name, table_name"
+    ))?;
+    statement
+        .query_map((), |row| row.get::<_, Vec<u8>>(0))?
+        .map(|row| decode_definition(&row?))
+        .collect()
+}
+
 pub fn index_by_name(
     connection: &Connection,
     name: &SqlName,
@@ -238,6 +248,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         )
     }

@@ -540,6 +540,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         )
     }

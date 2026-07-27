@@ -10,8 +10,11 @@ Homebase metadata. Public SQL currently permits a restricted persistent
 against non-reserved tables. A table must use the initial four declared types
 and exactly one inline primary key. Inline and table-level `UNIQUE`
 declarations, including ordered multi-column constraints, are supported with
-SQLite's default comparison rules. Post-create indexes, richer constraints,
-and other schema forms remain rejected. Other verbs,
+SQLite's default comparison rules, as are explicit composite
+`CREATE UNIQUE INDEX`/`DROP INDEX` operations. Immediate `NO ACTION` foreign
+keys may target the complete primary key of an existing synchronized table
+when child and parent affinities match. Other foreign-key targets, actions,
+deferral, self-references, and richer schema forms remain rejected. Other verbs,
 caller-owned transactions, conflict clauses, attached databases, and
 `AUTOINCREMENT` are rejected, and the `__multilite__` namespace is reserved.
 The internal operation layer translates restricted table creation and captured
@@ -61,6 +64,15 @@ cell, matching SQLite's distinct-NULL behavior. Accepted foreign rows replay by
 stable IDs through the local schema catalog; rejected local rows are deleted by
 the pending journal in the same transaction that rolls back the Homebase submit
 window.
+
+Foreign-key declarations retain stable parent table, row-keyspace, and
+primary-column identities. Non-NULL child tuples assert the exact parent row
+key. Parent deletes and primary-key moves currently assert the complete row
+keyspace of every referring child table, which is conservative but catches
+child creation and deletion across devices. Creating an incoming relationship
+also advances the parent's write contract so a parent write compiled against
+the older catalog cannot slip through. SQLite continues to enforce immediate
+local existence and `MATCH SIMPLE` NULL behavior.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and

@@ -103,6 +103,139 @@ fn unique_index_ddl_is_atomic_and_names_can_be_reused_after_drop() {
 }
 
 #[test]
+fn immediate_composite_foreign_keys_follow_sqlite_match_simple_semantics() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("foreign-key.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE parents (
+            tenant TEXT NOT NULL,
+            parent_id INTEGER NOT NULL,
+            body TEXT,
+            PRIMARY KEY (tenant, parent_id)
+        ) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (
+            child_id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            parent_id INTEGER,
+            body TEXT,
+            CONSTRAINT parent_fk
+                FOREIGN KEY (tenant, parent_id)
+                REFERENCES PARENTS (TENANT, PARENT_ID)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO parents VALUES ('north', 1, 'parent')", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO children VALUES
+            (1, 'north', 1, 'valid'),
+            (2, NULL, 999, 'partial null'),
+            (3, 'missing', NULL, 'other partial null')",
+        (),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO children VALUES (4, 'north', 999, 'orphan')",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(matches!(
+        db.execute("UPDATE children SET parent_id = 999 WHERE child_id = 1", (),),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(matches!(
+        db.execute(
+            "DELETE FROM parents WHERE tenant = 'north' AND parent_id = 1",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+
+    db.execute("DELETE FROM children WHERE child_id = 1", ())
+        .unwrap();
+    assert_eq!(
+        db.execute(
+            "DELETE FROM parents WHERE tenant = 'north' AND parent_id = 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT child_id FROM children ORDER BY child_id",
+            (),
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        [2, 3]
+    );
+}
+
+#[test]
+fn foreign_keys_require_an_existing_matching_primary_key_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("foreign-key-shape.sqlite")).unwrap();
+
+    assert!(matches!(
+        db.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES missing(id)
+            )",
+            (),
+        ),
+        Err(Error::UnsupportedSql(
+            "foreign-key parent must already be a synchronized table"
+        ))
+    ));
+    db.execute(
+        "CREATE TABLE parents (
+            tenant TEXT NOT NULL,
+            id INTEGER NOT NULL,
+            slug TEXT UNIQUE,
+            PRIMARY KEY (tenant, id)
+        ) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+
+    for sql in [
+        "CREATE TABLE wrong_order (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            parent INTEGER NOT NULL,
+            FOREIGN KEY (parent, tenant) REFERENCES parents (id, tenant)
+        )",
+        "CREATE TABLE unique_parent (
+            id INTEGER PRIMARY KEY,
+            slug TEXT REFERENCES parents (slug)
+        )",
+        "CREATE TABLE affinity_mismatch (
+            id INTEGER PRIMARY KEY,
+            tenant BLOB NOT NULL,
+            parent INTEGER NOT NULL,
+            FOREIGN KEY (tenant, parent) REFERENCES parents (tenant, id)
+        )",
+        "CREATE TABLE recursive (
+            id INTEGER PRIMARY KEY,
+            parent INTEGER REFERENCES recursive (id)
+        )",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
+    }
+}
+
+#[test]
 fn composite_primary_keys_and_without_rowid_support_full_row_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("composite-primary.sqlite")).unwrap();

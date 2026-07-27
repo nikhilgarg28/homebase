@@ -1466,6 +1466,7 @@ mod tests {
                         },
                     ],
                     unique_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             );
             writer.execute(created.sql(), ()).unwrap();
@@ -1540,6 +1541,7 @@ mod tests {
                         primary_key: Some(0),
                     }],
                     unique_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             ))])
             .unwrap();

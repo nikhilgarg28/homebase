@@ -125,6 +125,7 @@ impl WritableBranch {
              PRAGMA synchronous = OFF;
              PRAGMA temp_store = MEMORY;
              PRAGMA locking_mode = EXCLUSIVE;
+             PRAGMA foreign_keys = ON;
              PRAGMA mmap_size = 0",
         )?;
         Ok(Self {

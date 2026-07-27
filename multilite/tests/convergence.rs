@@ -168,6 +168,178 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id),
+                body TEXT
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("INSERT INTO parents VALUES (1, 'first'), (2, 'second')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("DELETE FROM parents WHERE id = 1", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO children VALUES (10, 1, 'loser')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("child insert did not conflict with admitted parent deletion")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute("INSERT INTO children VALUES (20, 2, 'winner')", ())
+        .unwrap();
+    first
+        .execute("DELETE FROM parents WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+        panic!("parent deletion did not conflict with admitted child insert")
+    };
+    first.rollback(&rejection).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [2]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, parent FROM children ORDER BY id", (), |row| Ok(
+                    (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)
+                ),)
+                .unwrap(),
+            [(20, 2)]
+        );
+    }
+}
+
+#[test]
+fn creating_an_incoming_foreign_key_fences_stale_parent_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-ddl-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-ddl-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("INSERT INTO parents VALUES (1, 'keep')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("DELETE FROM parents WHERE id = 1", ())
+        .unwrap();
+    second
+        .execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id)
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+        panic!("parent write compiled before the relationship was admitted")
+    };
+    first.rollback(&rejection).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, body FROM parents", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(1, "keep".into())]
+        );
+        assert_eq!(
+            database
+                .query(
+                    "SELECT count(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'children'",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            [1]
+        );
+    }
+}
+
+#[test]
 fn adding_unique_index_fences_rows_compiled_against_the_old_write_contract() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

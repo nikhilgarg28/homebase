@@ -10,7 +10,9 @@ use rusqlite::Connection;
 use super::catalog;
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
-use super::schema::{CreateTable, CreateTableSpec};
+use super::schema::CreateTable;
+#[cfg(test)]
+use super::schema::CreateTableSpec;
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
@@ -47,6 +49,7 @@ impl HomebaseOp {
 
 impl MultiliteOp {
     /// Mint durable schema identities for one validated table creation.
+    #[cfg(test)]
     pub fn create_table(sql: &str, spec: CreateTableSpec) -> Self {
         Self::CreateTable(CreateTable::new(sql, spec))
     }
@@ -159,6 +162,7 @@ impl MultiliteOp {
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         match self {
             Self::CreateTable(created) => {
+                created.validate_foreign_key_parents(connection)?;
                 connection.execute(created.sql(), ())?;
                 catalog::insert(connection, created)
             }
@@ -213,6 +217,7 @@ mod tests {
                 primary_key: Some(0),
             }],
             unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -295,6 +300,7 @@ mod tests {
                 },
             ],
             unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         let update_table = CreateTable::new(
             "CREATE TABLE updates (id INTEGER PRIMARY KEY, body TEXT)",

@@ -573,6 +573,7 @@ mod tests {
                     primary_key: Some(0),
                 }],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         )
     }
@@ -629,6 +630,7 @@ mod tests {
                     },
                 ],
                 unique_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         connection.execute(created.sql(), ()).unwrap();

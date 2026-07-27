@@ -444,6 +444,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         owner.with_connection(|connection| {
             connection.pragma_update(None, "journal_mode", "WAL")?;
             connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+            connection.pragma_update(None, "foreign_keys", true)?;
             Ok::<_, rusqlite::Error>(())
         })?;
         let database = open_on(owner, path, options)?;
