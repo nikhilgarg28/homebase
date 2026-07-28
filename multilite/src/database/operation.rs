@@ -13,7 +13,7 @@ use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::CreateTable;
 #[cfg(test)]
-use super::schema::CreateTableSpec;
+use super::schema::{CreateTableSpec, write_revision_key};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
@@ -249,11 +249,18 @@ mod tests {
             MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
         let (mutations, footprint) = operation.to_homebase().unwrap().into_parts();
 
-        assert_eq!(mutations.len(), 7);
+        assert_eq!(mutations.len(), 8);
         assert_eq!(footprint.constraints().len(), 1);
         assert!(footprint.constraints().contains(mutations[1].key()));
         assert_eq!(footprint.writes().len(), 1);
-        assert!(footprint.writes().contains(mutations[6].key()));
+        assert!(
+            footprint
+                .writes()
+                .contains(&write_revision_key(match &operation {
+                    MultiliteOp::CreateTable(created) => created.table_id(),
+                    _ => unreachable!(),
+                }))
+        );
         assert!(footprint.reads().is_empty());
     }
 

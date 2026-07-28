@@ -2005,14 +2005,14 @@ mod tests {
         let fixture = Fixture::new();
         fixture
             .writer
-            .execute_batch(&format!(
+            .execute_batch(
                 "CREATE TABLE failure_switch (enabled INTEGER NOT NULL);
                  INSERT INTO failure_switch VALUES (1);
                  CREATE TRIGGER fail_commit_receipt
                  BEFORE INSERT ON __multilite__commits
                  WHEN (SELECT enabled FROM failure_switch) = 1
-                 BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END"
-            ))
+                 BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END",
+            )
             .unwrap();
         let proposal = proposal_for_sql(
             &fixture,

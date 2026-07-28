@@ -919,6 +919,12 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         {
             authorize_main(context.database_name)
         }
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value: Some(table_name),
+        } if pragma_name.eq_ignore_ascii_case("quick_check") => {
+            authorize_user_table(Some("main"), table_name)
+        }
         AuthAction::Insert { table_name } if is_schema_table(table_name) => {
             authorize_schema(context.database_name)
         }
@@ -1017,7 +1023,7 @@ where
 
 enum StatementKind {
     Read,
-    Execute(sql::ValidatedExecute),
+    Execute(Box<sql::ValidatedExecute>),
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
@@ -1032,7 +1038,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
             return Err(Error::PreparedWrite);
         };
         self.database
-            .execute_validated(&self.runtime, &self.sql, params, validated.clone())
+            .execute_validated(&self.runtime, &self.sql, params, (**validated).clone())
     }
 
     /// Asynchronously execute a prepared mutating statement.
@@ -1044,7 +1050,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
             return Err(Error::PreparedWrite);
         };
         self.database
-            .execute_validated_async(self.sql.clone(), params, validated.clone())
+            .execute_validated_async(self.sql.clone(), params, (**validated).clone())
             .await
     }
 

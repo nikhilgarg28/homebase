@@ -1127,6 +1127,128 @@ fn table_rename_preserves_rows_indexes_foreign_keys_and_reopens() {
 }
 
 #[test]
+fn column_rename_preserves_stable_row_identity_and_managed_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rename-column.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE notes (
+            tenant TEXT NOT NULL,
+            note_id INTEGER NOT NULL,
+            body TEXT,
+            PRIMARY KEY (tenant, note_id),
+            UNIQUE (tenant, body)
+        ) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO notes VALUES ('acme', 1, 'first')", ())
+        .unwrap();
+
+    db.execute("ALTER TABLE notes RENAME COLUMN body TO contents", ())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE notes ADD COLUMN summary TEXT
+         DEFAULT 'none'",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE notes SET contents = 'updated', summary = 'changed'
+         WHERE tenant = 'acme' AND note_id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO notes (tenant, note_id, contents, summary)
+         VALUES ('acme', 2, 'second', 'added')",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX notes_contents_lookup ON notes (contents)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE note_links (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            contents TEXT NOT NULL,
+            FOREIGN KEY (tenant, contents)
+                REFERENCES notes (tenant, contents)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO note_links VALUES (1, 'acme', 'second')", ())
+        .unwrap();
+    assert_eq!(
+        db.update(|transaction| {
+            transaction.query(
+                "SELECT contents || ':' || summary FROM notes
+                 WHERE tenant = 'acme' AND note_id = 2",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .unwrap(),
+        ["second:added"]
+    );
+    db.execute(
+        "DELETE FROM notes WHERE tenant = 'acme' AND note_id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE notes DROP COLUMN summary", ())
+        .unwrap();
+
+    drop(db);
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT tenant, note_id, contents
+                 FROM notes ORDER BY note_id",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        [("acme".into(), 2, "second".into())]
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT tenant, contents FROM note_links", (), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [("acme".into(), "second".into())]
+    );
+    drop(reopened);
+
+    let stock = Connection::open(&path).unwrap();
+    stock.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    assert_eq!(
+        stock
+            .query_row("PRAGMA integrity_check", (), |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        stock
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map((), |_| Ok(()))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn table_rename_preserves_strict_and_without_rowid_storage_modes() {
     let directory = tempfile::tempdir().unwrap();
     let database =
@@ -1206,7 +1328,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
         .unwrap();
 
     for sql in [
-        "ALTER TABLE notes ADD COLUMN extra TEXT",
         "DROP TABLE notes",
         "CREATE VIEW note_view AS SELECT * FROM notes",
         "PRAGMA user_version = 9",
@@ -1622,6 +1743,112 @@ fn autoincrement_and_schema_conflict_policies_are_rejected_without_schema_change
     assert_eq!(
         statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
         [0]
+    );
+}
+
+#[test]
+fn alter_column_rejects_shapes_that_cannot_be_replayed_safely() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("alter-safety.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE aliases (
+            id TEXT PRIMARY KEY NOT NULL,
+            rowid TEXT,
+            oid TEXT,
+            spare TEXT
+        )",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute("ALTER TABLE aliases RENAME COLUMN spare TO _rowid_", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    assert!(matches!(
+        db.execute("ALTER TABLE aliases ADD COLUMN _rowid_ TEXT", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    db.execute(
+        "INSERT INTO aliases (id, rowid, oid, spare)
+         VALUES ('one', 'row', 'oid', 'still here')",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "CREATE TABLE strict_notes (id INTEGER PRIMARY KEY) STRICT",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE strict_notes ADD COLUMN payload ANY", ())
+        .unwrap();
+    assert!(matches!(
+        db.execute(
+            "ALTER TABLE strict_notes ADD COLUMN unsupported VARCHAR",
+            ()
+        ),
+        Err(Error::UnsupportedSql(_))
+    ));
+
+    db.execute(
+        "CREATE TABLE keyed (
+            id INTEGER PRIMARY KEY,
+            value TEXT UNIQUE
+        )",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute("ALTER TABLE keyed DROP COLUMN value", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    db.execute(
+        "CREATE TABLE checked (
+            id INTEGER PRIMARY KEY,
+            value TEXT CHECK (length(value) > 0)
+        )",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute("ALTER TABLE checked DROP COLUMN value", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    db.execute(
+        "CREATE TABLE required (
+            id INTEGER PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute("ALTER TABLE required DROP COLUMN value", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+
+    assert_eq!(
+        db.query("SELECT spare FROM aliases", (), |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        ["still here"]
+    );
+    assert_eq!(
+        db.execute(
+            "INSERT INTO strict_notes (id, payload) VALUES (1, x'01')",
+            ()
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT typeof(payload) FROM strict_notes", (), |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        ["blob"]
     );
 }
 

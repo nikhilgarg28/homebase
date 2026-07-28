@@ -705,7 +705,7 @@ mod tests {
             unreachable!()
         };
         MultiliteOp::AlterTable(
-            AlterTableOperation::prepare_rename(&connection, sql, &spec).unwrap(),
+            AlterTableOperation::prepare_rename_table(&connection, sql, &spec).unwrap(),
         )
     }
 

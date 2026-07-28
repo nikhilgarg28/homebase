@@ -21,7 +21,7 @@ use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
-const SCHEMA_FRAME_VERSION: u8 = 4;
+const SCHEMA_FRAME_VERSION: u8 = 5;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -35,10 +35,20 @@ const TAG_PRIMARY_KEY: u8 = 8;
 const TAG_TABLE_STORAGE: u8 = 9;
 const TAG_INDEX_DEFINITION: u8 = 10;
 const TAG_FOREIGN_KEY_DEFINITION: u8 = 11;
+const TAG_CHECK_DEFINITION: u8 = 12;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_NAME: u8 = 2;
 const TAG_COLUMN_TYPE: u8 = 3;
 const TAG_COLUMN_FLAGS: u8 = 4;
+const TAG_COLUMN_NOT_NULL_NAME: u8 = 5;
+const TAG_COLUMN_DEFAULT: u8 = 6;
+const TAG_DEFAULT_NAME: u8 = 1;
+const TAG_DEFAULT_EXPRESSION: u8 = 2;
+const TAG_PRIMARY_INDEX: u8 = 1;
+const TAG_PRIMARY_NAME: u8 = 2;
+const TAG_CHECK_COLUMN: u8 = 1;
+const TAG_CHECK_NAME: u8 = 2;
+const TAG_CHECK_EXPRESSION: u8 = 3;
 const TYPE_DECLARATION_FRAME_VERSION: u8 = 1;
 const TAG_TYPE_NAME: u8 = 1;
 const TAG_TYPE_ARGUMENT: u8 = 2;
@@ -117,7 +127,7 @@ pub fn available_hidden_rowid_alias<'a>(
         .collect::<Vec<_>>();
     SQLITE_ROWID_ALIASES
         .into_iter()
-        .find(|candidate| !columns.iter().any(|column| *column == candidate.as_bytes()))
+        .find(|candidate| !columns.contains(&candidate.as_bytes()))
 }
 
 /// SQLite's five ordinary-table type affinities.
@@ -300,7 +310,6 @@ impl TypeDeclaration {
         self.name == "INTEGER" && self.arguments.is_empty()
     }
 
-    #[cfg(test)]
     pub fn to_sql(&self) -> String {
         if self.arguments.is_empty() {
             self.name.clone()
@@ -586,7 +595,6 @@ impl Column {
         &self.name
     }
 
-    #[cfg(test)]
     pub fn declared_type(&self) -> &TypeDeclaration {
         &self.declared_type
     }
@@ -603,19 +611,16 @@ impl Column {
         self.not_null
     }
 
-    #[cfg(test)]
     pub fn not_null_name(&self) -> Option<&SqlName> {
         self.not_null_name.as_ref()
     }
 
-    #[cfg(test)]
     pub fn default(&self) -> Option<&DefaultDefinition> {
         self.default.as_ref()
     }
 }
 
 impl PrimaryKey {
-    #[cfg(test)]
     pub fn name(&self) -> Option<&SqlName> {
         self.name.as_ref()
     }
@@ -659,7 +664,6 @@ impl TableSchema {
         &self.foreign_keys
     }
 
-    #[cfg(test)]
     pub fn checks(&self) -> &[CheckConstraint] {
         &self.checks
     }
@@ -695,10 +699,6 @@ impl ForeignKeyDefinition {
 
     pub fn referenced_table(&self) -> TableId {
         self.referenced_table
-    }
-
-    pub fn referenced_table_name(&self) -> &SqlName {
-        &self.referenced_table_name
     }
 
     pub fn referenced_index(&self) -> IndexId {
@@ -931,6 +931,10 @@ impl CreateTable {
                     value: unique.index.encode(),
                 }),
         );
+        mutations.extend(self.schema.columns.iter().map(|column| Mutation::Set {
+            key: column_name_scope_key(self.table_id, column.name()),
+            value: column.id().as_bytes().to_vec(),
+        }));
         mutations.push(Mutation::Set {
             key: write_revision.clone(),
             value: self.mutation_id.0.to_vec(),
@@ -971,9 +975,8 @@ impl CreateTable {
 
     /// Decode and validate one complete locally stored schema operation.
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
-        let mut created = decode_frame(frame)?;
-        hydrate_literal_sql(&mut created)?;
-        validate_index_sql(&created)?;
+        let created = decode_frame(frame)?;
+        validate_provenance_sql(&created)?;
         Ok(created)
     }
 
@@ -991,26 +994,7 @@ impl CreateTable {
 
     /// Render immutable CREATE TABLE provenance against current parent bindings.
     pub fn materialization_sql(&self, connection: &Connection) -> Result<String> {
-        let mut parents = Vec::<(SqlName, SqlName)>::new();
-        for foreign_key in self.foreign_keys() {
-            let current = catalog::name_by_id(connection, foreign_key.referenced_table())?.ok_or(
-                Error::InvalidDatabase("foreign key references an unknown parent table"),
-            )?;
-            let source = foreign_key.referenced_table_name().clone();
-            if let Some((_, existing)) = parents
-                .iter()
-                .find(|(candidate, _)| candidate.canonical() == source.canonical())
-            {
-                if existing != &current {
-                    return Err(Error::InvalidDatabase(
-                        "foreign-key SQL name resolves to multiple parent identities",
-                    ));
-                }
-            } else {
-                parents.push((source, current));
-            }
-        }
-        super::sql::render_create_table(&self.sql, &parents)
+        render_structural_create_table(self, connection)
     }
 
     pub fn table_id(&self) -> TableId {
@@ -1058,6 +1042,7 @@ impl CreateTable {
         self.schema.foreign_keys()
     }
 
+    #[cfg(test)]
     pub fn column_named(&self, name: &SqlName) -> Option<&Column> {
         self.columns()
             .iter()
@@ -1066,10 +1051,11 @@ impl CreateTable {
 
     pub fn prepare_named_index(
         &self,
+        connection: &Connection,
         sql: &str,
         spec: &super::sql::CreateIndexSpec,
     ) -> Result<NamedIndex> {
-        let (columns, terms) = self.resolve_index_terms(spec)?;
+        let (columns, terms) = self.resolve_index_terms(connection, spec)?;
         if spec.unique {
             Ok(NamedIndex::new_unique(
                 sql.to_owned(),
@@ -1094,23 +1080,62 @@ impl CreateTable {
         if spec.name != *index.name() || spec.unique != index.is_unique() {
             return false;
         }
-        let Ok((columns, terms)) = self.resolve_index_terms(spec) else {
-            return false;
-        };
         if spec.unique {
-            index.columns() == columns
+            index.columns().len() == spec.terms.len()
                 && index.terms().is_empty()
                 && index.predicate().is_none()
                 && spec.predicate.is_none()
+                && spec.terms.iter().all(|term| {
+                    matches!(
+                        term,
+                        super::sql::CreateIndexTerm::Column {
+                            collation: None,
+                            order: None,
+                            ..
+                        }
+                    )
+                })
         } else {
             index.columns().is_empty()
-                && index.terms() == terms
+                && index.terms().len() == spec.terms.len()
                 && index.predicate() == spec.predicate.as_ref()
+                && index
+                    .terms()
+                    .iter()
+                    .zip(&spec.terms)
+                    .all(|(encoded, parsed)| match (encoded, parsed) {
+                        (
+                            IndexTerm::Column {
+                                collation: encoded_collation,
+                                order: encoded_order,
+                                ..
+                            },
+                            super::sql::CreateIndexTerm::Column {
+                                collation: parsed_collation,
+                                order: parsed_order,
+                                ..
+                            },
+                        ) => encoded_collation == parsed_collation && encoded_order == parsed_order,
+                        (
+                            IndexTerm::Expression {
+                                expression: encoded_expression,
+                                order: encoded_order,
+                            },
+                            super::sql::CreateIndexTerm::Expression {
+                                expression: parsed_expression,
+                                order: parsed_order,
+                            },
+                        ) => {
+                            encoded_expression == parsed_expression && encoded_order == parsed_order
+                        }
+                        _ => false,
+                    })
         }
     }
 
     fn resolve_index_terms(
         &self,
+        connection: &Connection,
         spec: &super::sql::CreateIndexSpec,
     ) -> Result<(Vec<ColumnId>, Vec<IndexTerm>)> {
         let mut columns = Vec::new();
@@ -1122,19 +1147,20 @@ impl CreateTable {
                     collation,
                     order,
                 } => {
-                    let column = self.column_named(name).ok_or(Error::UnsupportedSql(
-                        "CREATE INDEX references an unknown column",
-                    ))?;
+                    let column_id = catalog::column_id_by_name(connection, self.table_id(), name)?
+                        .ok_or(Error::UnsupportedSql(
+                            "CREATE INDEX references an unknown column",
+                        ))?;
                     if spec.unique {
                         if collation.is_some() || order.is_some() {
                             return Err(Error::UnsupportedSql(
                                 "UNIQUE index collations and ordering are not supported",
                             ));
                         }
-                        columns.push(column.id());
+                        columns.push(column_id);
                     } else {
                         terms.push(IndexTerm::Column {
-                            column: column.id(),
+                            column: column_id,
                             collation: collation.clone(),
                             order: *order,
                         });
@@ -1181,6 +1207,132 @@ impl CreateTable {
         Some(evolved)
     }
 
+    pub fn with_added_column(
+        &self,
+        revision: SchemaRevisionId,
+        spec: &CreateColumn,
+        checks: &[CreateCheckConstraint],
+    ) -> Result<(Self, ColumnId)> {
+        if self.mode() == TableMode::Strict && spec.declared_type.strict_type().is_none() {
+            return Err(Error::UnsupportedSql(
+                "STRICT columns must use INT, INTEGER, REAL, TEXT, BLOB, or ANY without size arguments",
+            ));
+        }
+        let id = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
+        let evolved = self.with_added_column_identity(revision, id, spec, checks)?;
+        Ok((evolved, id))
+    }
+
+    pub fn with_added_column_identity(
+        &self,
+        revision: SchemaRevisionId,
+        id: ColumnId,
+        spec: &CreateColumn,
+        checks: &[CreateCheckConstraint],
+    ) -> Result<Self> {
+        let mut evolved = self.clone();
+        evolved.schema_revision_id = revision;
+        evolved.schema.columns.push(Column {
+            id,
+            name: spec.name.clone(),
+            declared_type: spec.declared_type.clone(),
+            not_null: spec.not_null,
+            not_null_name: spec.not_null_name.clone(),
+            default: spec.default.clone(),
+        });
+        evolved
+            .schema
+            .checks
+            .extend(checks.iter().map(|check| CheckConstraint {
+                column: check.column.as_ref().map(|_| id),
+                name: check.name.clone(),
+                expression: check.expression.clone(),
+            }));
+        Ok(evolved)
+    }
+
+    pub fn with_removed_column(
+        &self,
+        revision: SchemaRevisionId,
+        column: ColumnId,
+    ) -> Result<Self> {
+        if self.schema.primary_key.columns().contains(&column)
+            || self
+                .schema
+                .unique_constraints
+                .iter()
+                .any(|unique| unique.columns().contains(&column))
+            || self.schema.indexes.iter().any(|index| {
+                index.active
+                    && (index.columns().contains(&column)
+                        || index.terms().iter().any(
+                            |term| matches!(term, IndexTerm::Column { column: id, .. } if *id == column),
+                        ))
+            })
+            || self
+                .schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.columns().contains(&column))
+        {
+            return Err(Error::UnsupportedSql(
+                "DROP COLUMN does not support key, index, or foreign-key columns",
+            ));
+        }
+        let mut evolved = self.clone();
+        let position = evolved
+            .schema
+            .columns
+            .iter()
+            .position(|candidate| candidate.id() == column)
+            .ok_or(Error::UnsupportedSql(
+                "ALTER TABLE DROP COLUMN references an unknown column",
+            ))?;
+        evolved.schema_revision_id = revision;
+        evolved.schema.columns.remove(position);
+        evolved
+            .schema
+            .checks
+            .retain(|check| check.column != Some(column));
+        Ok(evolved)
+    }
+
+    pub fn reversible_column_sql(
+        &self,
+        column: ColumnId,
+        current_name: &SqlName,
+    ) -> Result<String> {
+        let column = self
+            .columns()
+            .iter()
+            .find(|candidate| candidate.id() == column)
+            .ok_or(Error::UnsupportedSql(
+                "ALTER TABLE DROP COLUMN references an unknown column",
+            ))?;
+        if column.is_not_null()
+            || self
+                .schema
+                .checks
+                .iter()
+                .any(|check| check.column == Some(column.id()))
+        {
+            return Err(Error::UnsupportedSql(
+                "DROP COLUMN currently requires a nullable column without an inline CHECK",
+            ));
+        }
+        let mut sql = format!(
+            "{} {}",
+            quote_identifier(current_name.value()),
+            column.declared_type().to_sql()
+        );
+        if let Some(default) = column.default() {
+            push_constraint_name(&mut sql, default.name.as_ref());
+            sql.push_str(" DEFAULT ");
+            sql.push_str(&default.expression.to_string());
+        }
+        Ok(sql)
+    }
+
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
         self.schema.primary_key().columns().iter().map(|id| {
             self.schema
@@ -1224,7 +1376,7 @@ impl CreateTable {
 
     fn resolve_foreign_key_target(
         &self,
-        referenced: Option<&[SqlName]>,
+        referenced: Option<&[ColumnId]>,
     ) -> Option<(IndexId, Vec<&Column>)> {
         let primary = self.primary_index_id();
         if referenced.is_none() {
@@ -1235,14 +1387,7 @@ impl CreateTable {
             ));
         }
         let referenced = referenced.expect("absence was handled above");
-        let matches = |columns: &[ColumnId]| {
-            columns.len() == referenced.len()
-                && columns.iter().zip(referenced).all(|(id, name)| {
-                    self.schema.columns.iter().any(|column| {
-                        column.id == *id && column.name.canonical() == name.canonical()
-                    })
-                })
-        };
+        let matches = |columns: &[ColumnId]| columns == referenced;
         if matches(self.schema.primary_key.columns()) {
             return Some((
                 primary,
@@ -1281,17 +1426,6 @@ impl CreateTable {
                 .is_some_and(|candidate| candidate.declared_type.is_exact_integer())
     }
 
-    pub fn hidden_rowid_alias(&self) -> Option<&'static str> {
-        if self.storage() == TableStorage::WithoutRowid
-            || self
-                .primary_key_columns()
-                .any(|column| self.is_rowid_alias(column.id()))
-        {
-            return None;
-        }
-        available_hidden_rowid_alias(self.columns().iter().map(Column::name))
-    }
-
     /// Ensure every stable parent identity still names the declared primary key.
     pub fn validate_foreign_key_parents(&self, connection: &Connection) -> Result<()> {
         for foreign_key in self.foreign_keys() {
@@ -1302,85 +1436,150 @@ impl CreateTable {
         }
         Ok(())
     }
+}
 
-    fn matches_structural_spec(&self, spec: &CreateTableSpec) -> bool {
-        self.name == spec.name
-            && self.schema.mode == spec.mode
-            && self.schema.storage == spec.storage
-            && self.schema.columns.len() == spec.columns.len()
-            && self
-                .schema
-                .columns
-                .iter()
-                .zip(&spec.columns)
-                .all(|(encoded, parsed)| {
-                    encoded.name == parsed.name
-                        && encoded.declared_type == parsed.declared_type
-                        && encoded.not_null == parsed.not_null
-                })
-            && spec_primary_key_ids(spec, &self.schema.columns)
-                .is_some_and(|ids| ids == self.schema.primary_key.columns())
-            && self.schema.unique_constraints.len() == spec.unique_constraints.len()
-            && self
-                .schema
-                .unique_constraints
-                .iter()
-                .zip(&spec.unique_constraints)
-                .all(|(encoded, parsed)| {
-                    encoded.name == parsed.name
-                        && encoded.columns().len() == parsed.columns.len()
-                        && encoded.columns().iter().zip(&parsed.columns).all(
-                            |(encoded_column, parsed_column)| {
-                                self.schema.columns.iter().any(|column| {
-                                    column.id == *encoded_column
-                                        && column.name.canonical() == parsed_column.canonical()
-                                })
-                            },
-                        )
-                })
-            && self.schema.foreign_keys.len() == spec.foreign_keys.len()
-            && self
-                .schema
-                .foreign_keys
-                .iter()
-                .zip(&spec.foreign_keys)
-                .all(|(encoded, parsed)| {
-                    encoded.name == parsed.name
-                        && encoded.referenced_table_name.canonical()
-                            == parsed.referenced_table.canonical()
-                        && encoded.columns.len() == parsed.columns.len()
-                        && encoded.columns.iter().zip(&parsed.columns).all(
-                            |(encoded_column, parsed_column)| {
-                                self.schema.columns.iter().any(|column| {
-                                    column.id == *encoded_column
-                                        && column.name.canonical() == parsed_column.canonical()
-                                })
-                            },
-                        )
-                        && parsed
-                            .referenced_columns
-                            .as_ref()
-                            .is_none_or(|parsed_columns| {
-                                encoded.referenced_column_names.len() == parsed_columns.len()
-                                    && encoded
-                                        .referenced_column_names
-                                        .iter()
-                                        .zip(parsed_columns)
-                                        .all(|(encoded, parsed)| {
-                                            encoded.canonical() == parsed.canonical()
-                                        })
-                            })
-                })
-    }
+fn render_structural_create_table(table: &CreateTable, connection: &Connection) -> Result<String> {
+    let owner = catalog::name_by_id(connection, table.table_id())?
+        .unwrap_or_else(|| table.table_name_identity().clone());
+    let column_names = if catalog::by_id(connection, table.table_id())?.is_some() {
+        catalog::column_names(connection, table)?
+    } else {
+        table
+            .columns()
+            .iter()
+            .map(|column| column.name().clone())
+            .collect()
+    };
+    let name_for = |id: ColumnId| {
+        table
+            .columns()
+            .iter()
+            .position(|column| column.id() == id)
+            .and_then(|position| column_names.get(position))
+            .ok_or(Error::InvalidDatabase(
+                "schema constraint references an unknown column identity",
+            ))
+    };
 
-    fn hydrate_sql_metadata(&mut self, spec: CreateTableSpec) {
-        for (column, parsed) in self.schema.columns.iter_mut().zip(spec.columns) {
-            column.not_null_name = parsed.not_null_name;
-            column.default = parsed.default;
+    let mut declarations = Vec::new();
+    for (column, name) in table.columns().iter().zip(&column_names) {
+        let mut declaration = format!(
+            "{} {}",
+            quote_identifier(name.value()),
+            column.declared_type().to_sql()
+        );
+        if column.is_not_null() {
+            push_constraint_name(&mut declaration, column.not_null_name());
+            declaration.push_str(" NOT NULL");
         }
-        self.schema.primary_key.name = spec.primary_key_name;
-        self.schema.checks = lower_checks(spec.checks, &self.schema.columns);
+        if let Some(default) = column.default() {
+            push_constraint_name(&mut declaration, default.name.as_ref());
+            declaration.push_str(" DEFAULT ");
+            declaration.push_str(&default.expression.to_string());
+        }
+        declarations.push(declaration);
     }
+
+    let primary = table
+        .schema
+        .primary_key
+        .columns()
+        .iter()
+        .map(|id| name_for(*id).map(|name| quote_identifier(name.value())))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let mut declaration = String::new();
+    push_constraint_name(&mut declaration, table.schema.primary_key.name());
+    declaration.push_str(" PRIMARY KEY (");
+    declaration.push_str(&primary);
+    declaration.push(')');
+    declarations.push(declaration.trim_start().to_owned());
+
+    for unique in table.unique_constraints() {
+        let columns = unique
+            .columns()
+            .iter()
+            .map(|id| name_for(*id).map(|name| quote_identifier(name.value())))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let mut declaration = String::new();
+        push_constraint_name(&mut declaration, unique.name.as_ref());
+        declaration.push_str(" UNIQUE (");
+        declaration.push_str(&columns);
+        declaration.push(')');
+        declarations.push(declaration.trim_start().to_owned());
+    }
+
+    for foreign_key in table.foreign_keys() {
+        let child = foreign_key
+            .columns()
+            .iter()
+            .map(|id| name_for(*id).map(|name| quote_identifier(name.value())))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let parent = catalog::by_id(connection, foreign_key.referenced_table())?.ok_or(
+            Error::InvalidDatabase("foreign key references an unknown parent table"),
+        )?;
+        let parent_name = catalog::name_by_id(connection, foreign_key.referenced_table())?.ok_or(
+            Error::InvalidDatabase("foreign key parent has no current name binding"),
+        )?;
+        let parent_columns = foreign_key
+            .referenced_columns()
+            .iter()
+            .map(|id| {
+                catalog::column_name_by_id(connection, parent.table_id(), *id)?.ok_or(
+                    Error::InvalidDatabase("foreign key parent column has no current name binding"),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| quote_identifier(name.value()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut declaration = String::new();
+        push_constraint_name(&mut declaration, foreign_key.name.as_ref());
+        declaration.push_str(" FOREIGN KEY (");
+        declaration.push_str(&child);
+        declaration.push_str(") REFERENCES ");
+        declaration.push_str(&quote_identifier(parent_name.value()));
+        declaration.push_str(" (");
+        declaration.push_str(&parent_columns);
+        declaration.push(')');
+        declarations.push(declaration.trim_start().to_owned());
+    }
+
+    for check in table.schema.checks() {
+        let mut declaration = String::new();
+        push_constraint_name(&mut declaration, check.name.as_ref());
+        declaration.push_str(" CHECK (");
+        declaration.push_str(&check.expression.to_string());
+        declaration.push(')');
+        declarations.push(declaration.trim_start().to_owned());
+    }
+
+    let mut sql = format!(
+        "CREATE TABLE {} ({})",
+        quote_identifier(owner.value()),
+        declarations.join(", ")
+    );
+    match (table.storage(), table.mode()) {
+        (TableStorage::Rowid, TableMode::Ordinary) => {}
+        (TableStorage::WithoutRowid, TableMode::Ordinary) => sql.push_str(" WITHOUT ROWID"),
+        (TableStorage::Rowid, TableMode::Strict) => sql.push_str(" STRICT"),
+        (TableStorage::WithoutRowid, TableMode::Strict) => sql.push_str(" WITHOUT ROWID, STRICT"),
+    }
+    Ok(sql)
+}
+
+fn push_constraint_name(sql: &mut String, name: Option<&SqlName>) {
+    if let Some(name) = name {
+        sql.push_str(" CONSTRAINT ");
+        sql.push_str(&quote_identifier(name.value()));
+    }
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 struct ResolvedForeignKey {
@@ -1406,8 +1605,24 @@ fn resolve_foreign_keys(
                 .ok_or(Error::UnsupportedSql(
                     "foreign-key parent must already be a synchronized table",
                 ))?;
+            let referenced_columns = foreign_key
+                .referenced_columns
+                .as_ref()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|name| {
+                            catalog::column_id_by_name(connection, parent.table_id(), name)?.ok_or(
+                                Error::UnsupportedSql(
+                                    "foreign key references an unknown parent column",
+                                ),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
             let (target, parent_columns) = parent
-                .resolve_foreign_key_target(foreign_key.referenced_columns.as_deref())
+                .resolve_foreign_key_target(referenced_columns.as_deref())
                 .ok_or(Error::UnsupportedSql(
                     "foreign keys must reference a complete primary or UNIQUE key in order",
                 ))?;
@@ -1680,10 +1895,6 @@ fn lower_checks(checks: Vec<CreateCheckConstraint>, columns: &[Column]) -> Vec<C
         .collect()
 }
 
-fn spec_primary_key_ids(spec: &CreateTableSpec, columns: &[Column]) -> Option<Vec<ColumnId>> {
-    spec_primary_key_ids_from_columns(&spec.columns, columns)
-}
-
 fn spec_primary_key_ids_from_columns(
     specs: &[CreateColumn],
     columns: &[Column],
@@ -1736,6 +1947,19 @@ pub fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
         revision.0.as_slice(),
     ])
     .expect("table schema key is bounded")
+}
+
+pub fn column_name_scope_key(table: TableId, name: &SqlName) -> Key {
+    let component = name_component(name.canonical());
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::NAMES,
+        codes::COLUMNS,
+        component.as_slice(),
+    ])
+    .expect("column-name scope components are bounded and non-empty")
 }
 
 /// Prefix covering every durable schema and row cell owned by one table.
@@ -1861,6 +2085,11 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
             )
             .expect("schema field length must fit in u32");
     }
+    for check in &table.schema.checks {
+        writer
+            .field(TAG_CHECK_DEFINITION, &encode_check_constraint(check))
+            .expect("schema field length must fit in u32");
+    }
     writer.finish()
 }
 
@@ -1899,11 +2128,67 @@ fn encode_column(column: &Column) -> Vec<u8> {
     writer
         .field(TAG_COLUMN_FLAGS, &[flags])
         .expect("schema field length must fit in u32");
+    if let Some(name) = &column.not_null_name {
+        writer
+            .field(TAG_COLUMN_NOT_NULL_NAME, name.value().as_bytes())
+            .expect("schema field length must fit in u32");
+    }
+    if let Some(default) = &column.default {
+        writer
+            .field(TAG_COLUMN_DEFAULT, &encode_default(default))
+            .expect("schema field length must fit in u32");
+    }
     writer.finish()
 }
 
 fn encode_primary_key(primary_key: &PrimaryKey) -> Vec<u8> {
-    primary_key.index.encode()
+    let mut writer = Writer::new();
+    writer
+        .field(TAG_PRIMARY_INDEX, &primary_key.index.encode())
+        .expect("primary-key field length must fit in u32");
+    if let Some(name) = &primary_key.name {
+        writer
+            .field(TAG_PRIMARY_NAME, name.value().as_bytes())
+            .expect("primary-key field length must fit in u32");
+    }
+    writer.finish()
+}
+
+fn encode_default(default: &DefaultDefinition) -> Vec<u8> {
+    let mut writer = Writer::new();
+    if let Some(name) = &default.name {
+        writer
+            .field(TAG_DEFAULT_NAME, name.value().as_bytes())
+            .expect("default field length must fit in u32");
+    }
+    writer
+        .field(
+            TAG_DEFAULT_EXPRESSION,
+            default.expression.to_string().as_bytes(),
+        )
+        .expect("default field length must fit in u32");
+    writer.finish()
+}
+
+fn encode_check_constraint(check: &CheckConstraint) -> Vec<u8> {
+    let mut writer = Writer::new();
+    if let Some(column) = check.column {
+        writer
+            .field(TAG_CHECK_COLUMN, &column.as_bytes())
+            .expect("CHECK field length must fit in u32");
+    }
+    if let Some(name) = &check.name {
+        writer
+            .field(TAG_CHECK_NAME, name.value().as_bytes())
+            .expect("CHECK field length must fit in u32");
+    }
+    writer
+        .field(
+            TAG_CHECK_EXPRESSION,
+            check.expression.to_string().as_bytes(),
+        )
+        .expect("CHECK field length must fit in u32");
+    writer.finish()
 }
 
 fn encode_unique_constraint(unique: &UniqueConstraint) -> Vec<u8> {
@@ -2205,6 +2490,7 @@ fn decode_create_table(
     let mut unique_constraints = Vec::new();
     let mut indexes = Vec::new();
     let mut foreign_keys = Vec::new();
+    let mut checks = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_TABLE_ID => set_once(&mut table_id, TableId(uuid_bytes(value)?))?,
@@ -2237,6 +2523,7 @@ fn decode_create_table(
             TAG_UNIQUE_CONSTRAINT => unique_constraints.push(decode_unique_constraint(value)?),
             TAG_INDEX_DEFINITION => indexes.push(decode_named_index(value)?),
             TAG_FOREIGN_KEY_DEFINITION => foreign_keys.push(decode_foreign_key_definition(value)?),
+            TAG_CHECK_DEFINITION => checks.push(decode_check_constraint(value)?),
             _ => {}
         }
     }
@@ -2257,6 +2544,9 @@ fn decode_create_table(
                 .iter()
                 .any(|seen| seen.name.canonical() == column.name.canonical())
         })
+        || columns
+            .iter()
+            .any(|column| !column.not_null && column.not_null_name.is_some())
         || primary_key.index.kind != IndexKind::Primary
         || primary_key.columns().is_empty()
         || !index_columns_supported(IndexKind::Primary, primary_key.columns().len())
@@ -2343,6 +2633,11 @@ fn decode_create_table(
                     },
                 )
         })
+        || checks.iter().any(|check| {
+            check
+                .column
+                .is_some_and(|id| !columns.iter().any(|column| column.id == id))
+        })
         || (storage == TableStorage::Rowid
             && !rowid_alias
             && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none())
@@ -2361,7 +2656,7 @@ fn decode_create_table(
             unique_constraints,
             indexes,
             foreign_keys,
-            checks: Vec::new(),
+            checks,
         },
     ))
 }
@@ -2556,11 +2851,23 @@ fn decode_index_term(frame: &[u8]) -> std::result::Result<IndexTerm, SchemaCodec
 }
 
 fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
-    let index = decode_logical_index(frame)?;
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    let mut index = None;
+    let mut name = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_PRIMARY_INDEX => set_once(&mut index, decode_logical_index(value)?)?,
+            TAG_PRIMARY_NAME => set_once(&mut name, decode_name(value)?)?,
+            _ => {}
+        }
+    }
+    let index = index.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_INDEX))?;
     if index.kind != IndexKind::Primary {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(PrimaryKey { name: None, index })
+    Ok(PrimaryKey { name, index })
 }
 
 fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> {
@@ -2571,6 +2878,8 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
     let mut name = None;
     let mut declared_type = None;
     let mut flags = None;
+    let mut not_null_name = None;
+    let mut default = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut id, ColumnId(uuid_bytes(value)?))?,
@@ -2585,6 +2894,8 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
                 }
                 set_once(&mut flags, *value)?;
             }
+            TAG_COLUMN_NOT_NULL_NAME => set_once(&mut not_null_name, decode_name(value)?)?,
+            TAG_COLUMN_DEFAULT => set_once(&mut default, decode_default(value)?)?,
             _ => {}
         }
     }
@@ -2595,8 +2906,65 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         name: name.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_NAME))?,
         declared_type: declared_type.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_TYPE))?,
         not_null,
-        not_null_name: None,
-        default: None,
+        not_null_name,
+        default,
+    })
+}
+
+fn decode_default(frame: &[u8]) -> std::result::Result<DefaultDefinition, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    let mut name = None;
+    let mut expression = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_DEFAULT_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_DEFAULT_EXPRESSION => {
+                let encoded =
+                    std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
+                set_once(
+                    &mut expression,
+                    super::sql::parse_schema_expression(encoded)
+                        .map_err(|_| SchemaCodecError::InvalidSql)?,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(DefaultDefinition {
+        name,
+        expression: expression.ok_or(SchemaCodecError::MissingField(TAG_DEFAULT_EXPRESSION))?,
+    })
+}
+
+fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    let mut column = None;
+    let mut name = None;
+    let mut expression = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_CHECK_COLUMN => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
+            TAG_CHECK_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_CHECK_EXPRESSION => {
+                let encoded =
+                    std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
+                set_once(
+                    &mut expression,
+                    super::sql::parse_schema_expression(encoded)
+                        .map_err(|_| SchemaCodecError::InvalidSql)?,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(CheckConstraint {
+        column,
+        name,
+        expression: expression.ok_or(SchemaCodecError::MissingField(TAG_CHECK_EXPRESSION))?,
     })
 }
 
@@ -2739,23 +3107,18 @@ fn from_homebase_inner(
     Ok(created)
 }
 
-fn hydrate_literal_sql(created: &mut CreateTable) -> std::result::Result<(), SchemaCodecError> {
+fn validate_provenance_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
     let parsed = parse_create_table(&created.sql)?;
-    if !created.matches_structural_spec(&parsed) {
+    if parsed.name != created.name {
         return Err(SchemaCodecError::SqlMismatch);
     }
-    created.hydrate_sql_metadata(parsed);
-    Ok(())
-}
-
-fn validate_index_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
     for index in created.indexes() {
         let super::sql::ValidatedExecute::CreateIndex(spec) =
             super::sql::validate_execute(index.sql()).map_err(|_| SchemaCodecError::InvalidSql)?
         else {
             return Err(SchemaCodecError::InvalidSql);
         };
-        if !created.named_index_matches_spec(index, &spec) {
+        if spec.name != *index.name() || spec.unique != index.is_unique() {
             return Err(SchemaCodecError::SqlMismatch);
         }
     }
@@ -3012,7 +3375,7 @@ mod tests {
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 7);
+        assert_eq!(lowered.mutations.len(), 9);
         assert_eq!(lowered.footprint.constraints().len(), 1);
         assert_eq!(lowered.footprint.writes().len(), 1);
         assert_explicit_range_assertions(
@@ -3036,7 +3399,7 @@ mod tests {
             lowered
                 .footprint
                 .writes()
-                .contains(lowered.mutations[6].key())
+                .contains(&write_revision_key(created.table_id()))
         );
 
         let admitted = admit(lowered.mutations);
@@ -3056,7 +3419,7 @@ mod tests {
         let decoded = CreateTable::decode(&created.encode()).unwrap();
         assert_eq!(decoded, created);
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 8);
+        assert_eq!(lowered.mutations.len(), 11);
         assert_eq!(
             lowered.mutations[6].key(),
             &index_definition_key(created.table_id, unique.index.id)
@@ -3134,7 +3497,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_sql_metadata_is_hydrated_but_not_duplicated_in_the_codec() {
+    fn defaults_checks_and_constraint_names_are_structurally_encoded() {
         let sql = "CREATE TABLE accounts (
             id INTEGER CONSTRAINT account_pk PRIMARY KEY,
             state TEXT CONSTRAINT state_required NOT NULL
@@ -3151,23 +3514,7 @@ mod tests {
         let created = CreateTable::new(sql, spec);
         let encoded = created.encode();
         let raw = decode_frame(&encoded).unwrap();
-        assert_eq!(raw.schema.primary_key.name, None);
-        assert!(
-            raw.schema
-                .columns
-                .iter()
-                .all(|column| column.not_null_name.is_none() && column.default.is_none())
-        );
-        assert!(raw.schema.checks.is_empty());
-
-        let mut without_derived_metadata = created.clone();
-        without_derived_metadata.schema.primary_key.name = None;
-        for column in &mut without_derived_metadata.schema.columns {
-            column.not_null_name = None;
-            column.default = None;
-        }
-        without_derived_metadata.schema.checks.clear();
-        assert_eq!(without_derived_metadata.encode(), encoded);
+        assert_eq!(raw, created);
         assert_eq!(CreateTable::decode(&encoded).unwrap(), created);
 
         let mut changed_sql = raw;
@@ -3183,23 +3530,23 @@ mod tests {
         let hydrated = CreateTable::decode(&changed_sql.encode()).unwrap();
         assert_eq!(
             hydrated.schema.primary_key.name(),
-            Some(&SqlName::new("renamed_pk".into()))
+            Some(&SqlName::new("account_pk".into()))
         );
         assert_eq!(
             hydrated.columns()[1].not_null_name(),
-            Some(&SqlName::new("renamed_required".into()))
+            Some(&SqlName::new("state_required".into()))
         );
         let default = hydrated.columns()[1].default().unwrap();
-        assert_eq!(default.name, Some(SqlName::new("renamed_default".into())));
-        assert_eq!(default.expression.to_string(), "'changed'");
+        assert_eq!(default.name, Some(SqlName::new("state_default".into())));
+        assert_eq!(default.expression.to_string(), "'new'");
         assert_eq!(hydrated.schema.checks.len(), 2);
         assert_eq!(
             hydrated.schema.checks[0].expression.to_string(),
-            "length (state) > 1"
+            "length (state) > 0"
         );
         assert_eq!(
             hydrated.schema.checks[1].expression.to_string(),
-            "score < 10"
+            "score >= 0"
         );
     }
 
@@ -3489,7 +3836,7 @@ mod tests {
 
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
         let lowered = created.to_homebase();
-        assert_eq!(lowered.mutations.len(), 11);
+        assert_eq!(lowered.mutations.len(), 15);
         for (mutation, unique) in lowered.mutations[6..10]
             .iter()
             .zip(&created.schema.unique_constraints)
@@ -3593,23 +3940,21 @@ mod tests {
     }
 
     #[test]
-    fn stored_sql_must_match_the_structural_schema() {
+    fn structural_schema_is_self_contained_and_sql_remains_valid_provenance() {
         let created = deterministic_create("notes");
-        let mut decoded = decode_frame(&created.encode()).unwrap();
-        hydrate_literal_sql(&mut decoded).unwrap();
-        assert_eq!(decoded, created);
+        assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
 
         let mut mismatch = decode_frame(&created.encode()).unwrap();
         mismatch.sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body BLOB NOT NULL)".into();
         assert_eq!(
-            hydrate_literal_sql(&mut mismatch),
-            Err(SchemaCodecError::SqlMismatch)
+            CreateTable::decode(&mismatch.encode()).unwrap().schema,
+            created.schema
         );
 
         let mut invalid = decode_frame(&created.encode()).unwrap();
         invalid.sql = "CREATE TABLE".into();
         assert_eq!(
-            hydrate_literal_sql(&mut invalid),
+            CreateTable::decode(&invalid.encode()),
             Err(SchemaCodecError::InvalidSql)
         );
     }
@@ -3715,8 +4060,8 @@ mod tests {
         let mut mode_mismatch = created.clone();
         mode_mismatch.schema.mode = TableMode::Ordinary;
         assert_eq!(
-            CreateTable::decode(&mode_mismatch.encode()),
-            Err(SchemaCodecError::SqlMismatch)
+            CreateTable::decode(&mode_mismatch.encode()).unwrap().mode(),
+            TableMode::Ordinary
         );
 
         let mut invalid_type = created;

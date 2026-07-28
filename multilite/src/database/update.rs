@@ -96,26 +96,27 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         match validated {
             ValidatedExecute::RenameTable(spec) => {
                 let operation = self.hooks.with_internal(|| {
-                    AlterTableOperation::prepare_rename(self.connection, sql, &spec)
+                    AlterTableOperation::prepare_rename_table(self.connection, sql, &spec)
                 })?;
-                let logical = MultiliteOp::AlterTable(operation.clone());
-                let (_, footprint) = logical.to_homebase()?.into_parts();
-                let (changed, events) = self.hooks.run_schema(
-                    || {
-                        let changed = self.connection.execute(sql, params)?;
-                        self.hooks
-                            .with_internal(|| operation.record_catalog(self.connection))?;
-                        Ok(changed)
-                    },
-                    |_| Ok(()),
-                )?;
-                if !events.is_empty() {
-                    return Err(Error::CaptureInvariant(
-                        "ALTER TABLE captured application rows",
-                    ));
-                }
-                self.record_operation(logical, footprint);
-                Ok(changed)
+                self.execute_alter(sql, params, operation)
+            }
+            ValidatedExecute::RenameColumn(spec) => {
+                let operation = self.hooks.with_internal(|| {
+                    AlterTableOperation::prepare_rename_column(self.connection, sql, &spec)
+                })?;
+                self.execute_alter(sql, params, operation)
+            }
+            ValidatedExecute::AddColumn(spec) => {
+                let operation = self.hooks.with_internal(|| {
+                    AlterTableOperation::prepare_add_column(self.connection, sql, &spec)
+                })?;
+                self.execute_alter(sql, params, operation)
+            }
+            ValidatedExecute::DropColumn(spec) => {
+                let operation = self.hooks.with_internal(|| {
+                    AlterTableOperation::prepare_drop_column(self.connection, sql, &spec)
+                })?;
+                self.execute_alter(sql, params, operation)
             }
             ValidatedExecute::CreateTable(table) => {
                 let operation = MultiliteOp::CreateTable(
@@ -126,9 +127,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 let MultiliteOp::CreateTable(created) = &operation else {
                     unreachable!("create-table constructor returned another operation")
                 };
+                let materialization_sql = self
+                    .hooks
+                    .with_internal(|| created.materialization_sql(self.connection))?;
                 let (changed, events) = self.hooks.run_schema(
                     || {
-                        let changed = self.connection.execute(sql, params)?;
+                        let changed = self.connection.execute(&materialization_sql, params)?;
                         self.hooks
                             .with_internal(|| catalog::insert(self.connection, created))?;
                         Ok(changed)
@@ -307,6 +311,32 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 Ok(changed)
             }
         }
+    }
+
+    fn execute_alter<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        operation: AlterTableOperation,
+    ) -> Result<usize> {
+        let logical = MultiliteOp::AlterTable(operation.clone());
+        let (_, footprint) = logical.to_homebase()?.into_parts();
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(sql, params)?;
+                self.hooks
+                    .with_internal(|| operation.record_catalog(self.connection))?;
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        if !events.is_empty() {
+            return Err(Error::CaptureInvariant(
+                "ALTER TABLE captured application rows",
+            ));
+        }
+        self.record_operation(logical, footprint);
+        Ok(changed)
     }
 
     fn record_operation(&mut self, operation: MultiliteOp, footprint: ConflictFootprint) {

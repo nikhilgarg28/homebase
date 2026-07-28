@@ -20,6 +20,9 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub enum ValidatedExecute {
     RenameTable(RenameTableSpec),
+    RenameColumn(RenameColumnSpec),
+    AddColumn(AddColumnSpec),
+    DropColumn(DropColumnSpec),
     CreateTable(CreateTableSpec),
     CreateIndex(CreateIndexSpec),
     DropIndex(DropIndexSpec),
@@ -32,6 +35,26 @@ pub enum ValidatedExecute {
 pub struct RenameTableSpec {
     pub table: SqlName,
     pub new_name: SqlName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameColumnSpec {
+    pub table: SqlName,
+    pub old_name: SqlName,
+    pub new_name: SqlName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddColumnSpec {
+    pub table: SqlName,
+    pub column: CreateColumn,
+    pub checks: Vec<CreateCheckConstraint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropColumnSpec {
+    pub table: SqlName,
+    pub column: SqlName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,7 +86,7 @@ pub struct DropIndexSpec {
 
 pub enum ValidatedStatement {
     Read,
-    Execute(ValidatedExecute),
+    Execute(Box<ValidatedExecute>),
 }
 
 /// Validate the initial transaction-read grammar and rewrite its sources.
@@ -215,8 +238,131 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 new_name,
             }))
         }
+        Stmt::AlterTable(table, AlterTableBody::RenameColumn { old, new }) => {
+            if table.db_name.is_some() || table.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified ALTER TABLE names are not supported",
+                ));
+            }
+            let table = identifier(&table.name)?;
+            let old_name = identifier(&old)?;
+            let new_name = identifier(&new)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            if old_name.canonical() == new_name.canonical() {
+                return Err(Error::UnsupportedSql(
+                    "ALTER TABLE RENAME COLUMN must change the column's case-insensitive identity",
+                ));
+            }
+            Ok(ValidatedExecute::RenameColumn(RenameColumnSpec {
+                table,
+                old_name,
+                new_name,
+            }))
+        }
+        Stmt::AlterTable(table, AlterTableBody::AddColumn(column)) => {
+            if table.db_name.is_some() || table.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified ALTER TABLE names are not supported",
+                ));
+            }
+            let table = identifier(&table.name)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            let name = identifier(&column.col_name)?;
+            let declared_type = column
+                .col_type
+                .ok_or(Error::UnsupportedSql("every column must declare a type"))
+                .and_then(type_declaration)?;
+            let mut not_null = false;
+            let mut not_null_name = None;
+            let mut default = None;
+            let mut checks = Vec::new();
+            for constraint in column.constraints {
+                let constraint_name = constraint.name.map(|name| identifier(&name)).transpose()?;
+                match constraint.constraint {
+                    ColumnConstraint::NotNull {
+                        nullable: false,
+                        conflict_clause: None,
+                    } if !not_null => {
+                        not_null = true;
+                        not_null_name = constraint_name;
+                    }
+                    ColumnConstraint::Default(expression) if default.is_none() => {
+                        default = Some(DefaultDefinition {
+                            name: constraint_name,
+                            expression: schema_expression(expression),
+                        });
+                    }
+                    ColumnConstraint::Check(expression) => {
+                        checks.push(CreateCheckConstraint {
+                            column: Some(name.clone()),
+                            name: constraint_name,
+                            expression: schema_expression(expression),
+                        });
+                    }
+                    ColumnConstraint::NotNull { .. } => {
+                        return Err(Error::UnsupportedSql(
+                            "duplicate, nullable, and conflict-clause NOT NULL forms are not supported",
+                        ));
+                    }
+                    ColumnConstraint::Default(_) => {
+                        return Err(Error::UnsupportedSql(
+                            "duplicate DEFAULT constraints are not supported",
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::UnsupportedSql(
+                            "ADD COLUMN supports NOT NULL, DEFAULT, and CHECK constraints",
+                        ));
+                    }
+                }
+            }
+            Ok(ValidatedExecute::AddColumn(AddColumnSpec {
+                table,
+                column: CreateColumn {
+                    name,
+                    declared_type,
+                    not_null,
+                    not_null_name,
+                    default,
+                    primary_key: None,
+                },
+                checks,
+            }))
+        }
+        Stmt::AlterTable(table, AlterTableBody::DropColumn(column)) => {
+            if table.db_name.is_some() || table.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified ALTER TABLE names are not supported",
+                ));
+            }
+            let table = identifier(&table.name)?;
+            let column = identifier(&column)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::DropColumn(DropColumnSpec {
+                table,
+                column,
+            }))
+        }
         Stmt::AlterTable(..) => Err(Error::UnsupportedSql(
-            "only ALTER TABLE RENAME TO is supported",
+            "this ALTER TABLE form is not supported",
         )),
         Stmt::CreateIndex {
             unique,
@@ -498,9 +644,9 @@ pub fn validate_statement(sql: &str) -> Result<ValidatedStatement> {
         ) => Err(Error::UnsupportedSql(
             "transaction control is owned by the managed closure",
         )),
-        Cmd::Stmt(statement) => {
-            validate_execute_statement(statement).map(ValidatedStatement::Execute)
-        }
+        Cmd::Stmt(statement) => validate_execute_statement(statement)
+            .map(Box::new)
+            .map(ValidatedStatement::Execute),
         Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(Error::UnsupportedSql(
             "EXPLAIN is supported only for SELECT",
         )),
@@ -617,7 +763,22 @@ pub(super) fn render_create_index(sql: &str, table: &SqlName) -> Result<String> 
     Ok(Cmd::Stmt(statement).to_string())
 }
 
+/// Render an immutable ALTER TABLE statement for its owner's current name.
+pub(super) fn render_alter_table(sql: &str, table: &SqlName) -> Result<String> {
+    let mut statement = parse_one(sql)?;
+    let Stmt::AlterTable(name, _) = &mut statement else {
+        return Err(Error::InvalidMultiliteOp(
+            "table alteration is not ALTER TABLE".into(),
+        ));
+    };
+    name.db_name = None;
+    name.name = quoted_name(table);
+    name.alias = None;
+    Ok(Cmd::Stmt(statement).to_string())
+}
+
 /// Render immutable CREATE TABLE provenance with current foreign-parent names.
+#[cfg(test)]
 pub(super) fn render_create_table(sql: &str, parents: &[(SqlName, SqlName)]) -> Result<String> {
     if parents
         .iter()
@@ -657,6 +818,7 @@ pub(super) fn render_create_table(sql: &str, parents: &[(SqlName, SqlName)]) -> 
     Ok(Cmd::Stmt(statement).to_string())
 }
 
+#[cfg(test)]
 fn rewrite_parent_clause(
     clause: &mut ForeignKeyClause,
     parents: &[(SqlName, SqlName)],
@@ -1410,6 +1572,9 @@ mod tests {
     fn accepts_restricted_create_insert_delete_and_update_forms() {
         for sql in [
             "ALTER TABLE notes RENAME TO archived_notes",
+            "ALTER TABLE notes RENAME COLUMN body TO contents",
+            "ALTER TABLE notes ADD COLUMN extra TEXT DEFAULT 'x'",
+            "ALTER TABLE notes DROP COLUMN extra",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
             "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
             "CREATE TABLE accounts (
@@ -1477,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn table_rename_preserves_case_insensitive_names_and_rejects_other_alter_forms() {
+    fn alter_rename_preserves_case_insensitive_names_and_rejects_other_forms() {
         let ValidatedExecute::RenameTable(spec) =
             validate_execute("ALTER TABLE \"Old Notes\" RENAME TO `Archived Notes`").unwrap()
         else {
@@ -1486,14 +1651,42 @@ mod tests {
         assert_eq!(spec.table, SqlName::new("Old Notes".into()));
         assert_eq!(spec.new_name, SqlName::new("Archived Notes".into()));
 
+        let ValidatedExecute::RenameColumn(spec) =
+            validate_execute("ALTER TABLE notes RENAME COLUMN body TO text").unwrap()
+        else {
+            panic!("column rename parsed as another statement kind")
+        };
+        assert_eq!(spec.table, SqlName::new("notes".into()));
+        assert_eq!(spec.old_name, SqlName::new("body".into()));
+        assert_eq!(spec.new_name, SqlName::new("text".into()));
+
+        let ValidatedExecute::AddColumn(spec) = validate_execute(
+            "ALTER TABLE notes ADD COLUMN summary TEXT DEFAULT 'none' CHECK (length(summary) > 0)",
+        )
+        .unwrap() else {
+            panic!("ADD COLUMN parsed as another statement kind")
+        };
+        assert_eq!(spec.table, SqlName::new("notes".into()));
+        assert_eq!(spec.column.name, SqlName::new("summary".into()));
+        assert!(spec.column.default.is_some());
+        assert_eq!(spec.checks.len(), 1);
+
+        let ValidatedExecute::DropColumn(spec) =
+            validate_execute("ALTER TABLE notes DROP COLUMN summary").unwrap()
+        else {
+            panic!("DROP COLUMN parsed as another statement kind")
+        };
+        assert_eq!(spec.table, SqlName::new("notes".into()));
+        assert_eq!(spec.column, SqlName::new("summary".into()));
+
         for sql in [
             "ALTER TABLE main.notes RENAME TO archived",
             "ALTER TABLE notes RENAME TO NOTES",
             "ALTER TABLE notes RENAME TO __multilite__notes",
             "ALTER TABLE notes RENAME TO sqlite_notes",
-            "ALTER TABLE notes RENAME COLUMN body TO text",
-            "ALTER TABLE notes ADD COLUMN extra TEXT",
-            "ALTER TABLE notes DROP COLUMN body",
+            "ALTER TABLE notes RENAME COLUMN body TO BODY",
+            "ALTER TABLE notes ADD COLUMN extra TEXT UNIQUE",
+            "ALTER TABLE notes ADD COLUMN extra TEXT REFERENCES parents(id)",
         ] {
             assert_unsupported(sql);
         }
@@ -2096,7 +2289,6 @@ mod tests {
         for sql in [
             "",
             "SELECT 1",
-            "ALTER TABLE notes ADD COLUMN body TEXT",
             "BEGIN",
             "EXPLAIN SELECT 1",
             "INSERT INTO notes VALUES (1) RETURNING id",

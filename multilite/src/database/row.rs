@@ -15,8 +15,8 @@ use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
-    NamedIndex, SchemaRevisionId, StrictType, TableId, TableMode, TableStorage,
-    active_primary_index_key, write_revision_key,
+    NamedIndex, SchemaRevisionId, SqlName, StrictType, TableId, TableMode, TableStorage,
+    active_primary_index_key, available_hidden_rowid_alias, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
@@ -524,10 +524,11 @@ impl InsertRows {
         let created = self.catalog_definition(connection)?;
         let table_name = materialized_table_name(connection, self.table)?;
         let columns = created.columns();
-        let hidden_rowid = hidden_rowid_alias(&created)?;
-        let mut names = columns
+        let column_names = catalog::column_names(connection, &created)?;
+        let hidden_rowid = hidden_rowid_alias(connection, &created)?;
+        let mut names = column_names
             .iter()
-            .map(|column| quote_identifier(column.name().value()))
+            .map(|name| quote_identifier(name.value()))
             .collect::<Vec<_>>();
         if let Some(alias) = hidden_rowid {
             names.insert(0, quote_identifier(alias));
@@ -587,9 +588,12 @@ impl InsertRows {
         let primary = created.primary_key_columns().collect::<Vec<_>>();
         let mut predicates = primary
             .iter()
-            .map(|column| format!("{} = ?", quote_identifier(column.name().value())))
+            .map(|column| materialized_column_name(connection, self.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
             .collect::<Vec<_>>();
-        let hidden_rowid = hidden_rowid_alias(&created)?;
+        let hidden_rowid = hidden_rowid_alias(connection, &created)?;
         if let Some(alias) = hidden_rowid {
             predicates.push(format!("{} = ?", quote_identifier(alias)));
         }
@@ -628,16 +632,19 @@ impl InsertRows {
         let primary = created.primary_key_columns().collect::<Vec<_>>();
         let mut predicates = primary
             .iter()
-            .map(|column| format!("{} = ?", quote_identifier(column.name().value())))
+            .map(|column| materialized_column_name(connection, self.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
             .collect::<Vec<_>>();
-        let hidden_rowid = hidden_rowid_alias(created)?;
+        let hidden_rowid = hidden_rowid_alias(connection, created)?;
         if let Some(alias) = hidden_rowid {
             predicates.push(format!("{} = ?", quote_identifier(alias)));
         }
         let predicate = predicates.join(" AND ");
-        let mut selected = columns
+        let mut selected = catalog::column_names(connection, created)?
             .iter()
-            .map(|column| quote_identifier(column.name().value()))
+            .map(|name| quote_identifier(name.value()))
             .collect::<Vec<_>>();
         if let Some(alias) = hidden_rowid {
             selected.push(quote_identifier(alias));
@@ -1662,16 +1669,19 @@ impl UpdateRows {
             return Ok(());
         }
         let columns = created.columns();
-        let assignments = columns
+        let assignments = catalog::column_names(connection, created)?
             .iter()
-            .map(|column| format!("{} = ?", quote_identifier(column.name().value())))
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
             .collect::<Vec<_>>()
             .join(", ");
         let mut predicates = created
             .primary_key_columns()
-            .map(|column| format!("{} = ?", quote_identifier(column.name().value())))
+            .map(|column| materialized_column_name(connection, created.table_id(), column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
             .collect::<Vec<_>>();
-        let hidden_rowid = hidden_rowid_alias(created)?;
+        let hidden_rowid = hidden_rowid_alias(connection, created)?;
         if let Some(alias) = hidden_rowid {
             predicates.push(format!("{} = ?", quote_identifier(alias)));
         }
@@ -2022,11 +2032,10 @@ pub fn backfill_unique_index(
 
 fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<CapturedRow>> {
     let table_name = materialized_table_name(connection, created.table_id())?;
-    let hidden_rowid = hidden_rowid_alias(created)?;
-    let mut selected = created
-        .columns()
+    let hidden_rowid = hidden_rowid_alias(connection, created)?;
+    let mut selected = catalog::column_names(connection, created)?
         .iter()
-        .map(|column| quote_identifier(column.name().value()))
+        .map(|name| quote_identifier(name.value()))
         .collect::<Vec<_>>();
     if let Some(alias) = hidden_rowid {
         selected.push(quote_identifier(alias));
@@ -2041,7 +2050,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
         let values = (0..created.columns().len())
             .map(|index| row.get_ref(index).map(StoredValue::capture))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let rowid = if let Some(_) = hidden_rowid {
+        let rowid = if hidden_rowid.is_some() {
             row.get(created.columns().len())?
         } else if created.storage() == TableStorage::Rowid {
             let alias = created
@@ -2235,14 +2244,14 @@ fn strict_value_matches(column: &Column, value: &StoredValue) -> bool {
     if matches!(value, StoredValue::Null) {
         return !column.is_not_null();
     }
-    match (column.strict_type(), value) {
+    matches!(
+        (column.strict_type(), value),
         (Some(StrictType::Integer), StoredValue::Integer(_))
-        | (Some(StrictType::Real), StoredValue::Real(_))
-        | (Some(StrictType::Text), StoredValue::Text(_))
-        | (Some(StrictType::Blob), StoredValue::Blob(_))
-        | (Some(StrictType::Any), _) => true,
-        _ => false,
-    }
+            | (Some(StrictType::Real), StoredValue::Real(_))
+            | (Some(StrictType::Text), StoredValue::Text(_))
+            | (Some(StrictType::Blob), StoredValue::Blob(_))
+            | (Some(StrictType::Any), _)
+    )
 }
 
 fn encode_key_part(part: KeyPartRules) -> Vec<u8> {
@@ -2334,21 +2343,18 @@ fn decode_column_value(
     ))
 }
 
-fn decode_row(
-    frame: &[u8],
-) -> std::result::Result<
-    (
-        SchemaRevisionId,
-        IndexId,
-        TableStorage,
-        Vec<KeyPartRules>,
-        Vec<IndexRules>,
-        Vec<ForeignKeyRules>,
-        Vec<IncomingForeignKeyRules>,
-        Row,
-    ),
-    RowCodecError,
-> {
+type DecodedRow = (
+    SchemaRevisionId,
+    IndexId,
+    TableStorage,
+    Vec<KeyPartRules>,
+    Vec<IndexRules>,
+    Vec<ForeignKeyRules>,
+    Vec<IncomingForeignKeyRules>,
+    Row,
+);
+
+fn decode_row(frame: &[u8]) -> std::result::Result<DecodedRow, RowCodecError> {
     let mut reader = Reader::new(frame);
     if reader.u8() != Some(ROW_FRAME_VERSION) {
         return Err(RowCodecError::UnknownVersion);
@@ -2447,7 +2453,7 @@ pub(super) fn normalize_insert_rowids(
     let Some(created) = catalog::by_name(connection, &first.table)? else {
         return Ok(());
     };
-    let Some(alias) = hidden_rowid_alias(&created)? else {
+    let Some(alias) = hidden_rowid_alias(connection, &created)? else {
         return Ok(());
     };
     let table = quote_identifier(&first.table);
@@ -2482,17 +2488,19 @@ pub(super) fn normalize_insert_rowids(
     Ok(())
 }
 
-fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
-    created
-        .hidden_rowid_alias()
+fn hidden_rowid_alias(
+    connection: &Connection,
+    created: &CreateTable,
+) -> Result<Option<&'static str>> {
+    if created.storage() == TableStorage::WithoutRowid
+        || created
+            .primary_key_columns()
+            .any(|column| created.is_rowid_alias(column.id()))
+    {
+        return Ok(None);
+    }
+    available_hidden_rowid_alias(catalog::column_names(connection, created)?.iter())
         .map(Some)
-        .or_else(|| {
-            (created.storage() == TableStorage::WithoutRowid
-                || created
-                    .primary_key_columns()
-                    .any(|column| created.is_rowid_alias(column.id())))
-            .then_some(None)
-        })
         .ok_or(Error::InvalidDatabase(
             "tables with a non-integer primary key must leave one SQLite rowid alias unshadowed",
         ))
@@ -2508,6 +2516,16 @@ fn materialized_table_name(connection: &Connection, table: TableId) -> Result<St
 
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn materialized_column_name(
+    connection: &Connection,
+    table: TableId,
+    column: ColumnId,
+) -> Result<SqlName> {
+    catalog::column_name_by_id(connection, table, column)?.ok_or(Error::InvalidDatabase(
+        "row operation references a column without a current name binding",
+    ))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), RowCodecError> {
@@ -3845,8 +3863,9 @@ mod tests {
                 unreachable!()
             };
             let created = CreateTable::new(&sql, spec);
+            let connection = connection(&created);
             assert_eq!(
-                hidden_rowid_alias(&created).unwrap().is_some(),
+                hidden_rowid_alias(&connection, &created).unwrap().is_some(),
                 expected_hidden,
                 "{declaration}"
             );

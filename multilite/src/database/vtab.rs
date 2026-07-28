@@ -16,7 +16,7 @@ use super::catalog;
 use super::row::{
     StoredValue, primary_index_prefix, primary_key_equality_prefix, primary_key_prefix,
 };
-use super::schema::{CreateTable, SchemaRevisionId, StrictType, TableId, TableMode};
+use super::schema::{CreateTable, SchemaRevisionId, SqlName, StrictType, TableId, TableMode};
 use crate::commit::footprint::ReadTrace;
 use crate::{Error, Result};
 
@@ -54,14 +54,19 @@ impl Registry {
         let definition = catalog::by_name(connection, table)?.ok_or(Error::UnsupportedSql(
             "managed update SELECT requires a synchronized table",
         ))?;
-        let name = module_name(definition.table_id(), definition.schema_revision_id());
+        let columns = catalog::column_names(connection, &definition)?;
+        let name = module_name(
+            definition.table_id(),
+            definition.schema_revision_id(),
+            &columns,
+        );
         let mut modules = self.modules.lock();
         if let Some(module) = modules.get(&name) {
-            module.validate_definition(&definition)?;
+            module.validate_definition(&definition, &columns)?;
             return Ok(module.clone());
         }
 
-        let module = Module::new(name.clone(), definition);
+        let module = Module::new(name.clone(), definition, columns);
         connection.create_module(
             name.as_str(),
             eponymous_only_module::<MultiliteVTab>(),
@@ -106,10 +111,12 @@ impl Plan {
             let current = catalog::by_id(connection, module.definition.table_id())?.ok_or(
                 Error::InvalidDatabase("vtable plan references a missing table identity"),
             )?;
-            module.validate_definition(&current)?;
+            let columns = catalog::column_names(connection, &current)?;
+            module.validate_definition(&current, &columns)?;
             module.bind(Arc::new(EagerSource::load(
                 connection,
                 module.definition.clone(),
+                columns,
                 trace.clone(),
             )?));
             guard.modules.push(module.clone());
@@ -131,8 +138,20 @@ impl Drop for BindingGuard {
     }
 }
 
-fn module_name(table: TableId, revision: SchemaRevisionId) -> String {
-    let mut name = String::with_capacity(MODULE_PREFIX.len() + 65);
+fn module_name(table: TableId, revision: SchemaRevisionId, columns: &[SqlName]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut binding = Sha256::new();
+    for column in columns {
+        binding.update(
+            u32::try_from(column.canonical().len())
+                .expect("SQLite column name length fits in u32")
+                .to_be_bytes(),
+        );
+        binding.update(column.canonical());
+    }
+    let binding = binding.finalize();
+    let mut name = String::with_capacity(MODULE_PREFIX.len() + 82);
     name.push_str(MODULE_PREFIX);
     for (index, id) in [table.as_bytes(), revision.as_bytes()].iter().enumerate() {
         if index > 0 {
@@ -143,6 +162,11 @@ fn module_name(table: TableId, revision: SchemaRevisionId) -> String {
             write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");
         }
     }
+    name.push('_');
+    for byte in &binding[..8] {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");
+    }
     name
 }
 
@@ -150,12 +174,13 @@ fn module_name(table: TableId, revision: SchemaRevisionId) -> String {
 struct Module {
     name: String,
     definition: CreateTable,
+    columns: Vec<SqlName>,
     primary_columns: Vec<c_int>,
     source: Arc<Mutex<Option<Arc<EagerSource>>>>,
 }
 
 impl Module {
-    fn new(name: String, definition: CreateTable) -> Self {
+    fn new(name: String, definition: CreateTable, columns: Vec<SqlName>) -> Self {
         let primary_columns = definition
             .primary_key_columns()
             .map(|primary| {
@@ -170,13 +195,14 @@ impl Module {
         Self {
             name,
             definition,
+            columns,
             primary_columns,
             source: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn validate_definition(&self, definition: &CreateTable) -> Result<()> {
-        if &self.definition == definition {
+    fn validate_definition(&self, definition: &CreateTable, columns: &[SqlName]) -> Result<()> {
+        if &self.definition == definition && self.columns == columns {
             Ok(())
         } else {
             Err(Error::InvalidDatabase(
@@ -210,18 +236,15 @@ impl Module {
             .definition
             .columns()
             .iter()
-            .map(|column| {
+            .zip(&self.columns)
+            .map(|(column, name)| {
                 let declaration =
                     if mode == TableMode::Strict && column.strict_type() == Some(StrictType::Any) {
                         "BLOB".to_owned()
                     } else {
                         column.declared_type().to_sql()
                     };
-                format!(
-                    "{} {}",
-                    quote_identifier(column.name().value()),
-                    declaration
-                )
+                format!("{} {}", quote_identifier(name.value()), declaration)
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -236,14 +259,18 @@ struct EagerSource {
 }
 
 impl EagerSource {
-    fn load(connection: &Connection, definition: CreateTable, trace: ReadTrace) -> Result<Self> {
+    fn load(
+        connection: &Connection,
+        definition: CreateTable,
+        columns: Vec<SqlName>,
+        trace: ReadTrace,
+    ) -> Result<Self> {
         let table = catalog::name_by_id(connection, definition.table_id())?.ok_or(
             Error::InvalidDatabase("vtable source has no current table-name binding"),
         )?;
-        let columns = definition
-            .columns()
+        let columns = columns
             .iter()
-            .map(|column| quote_identifier(column.name().value()))
+            .map(|column| quote_identifier(column.value()))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -814,7 +841,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.modules[0].name,
-            module_name(created.table_id(), created.schema_revision_id())
+            module_name(
+                created.table_id(),
+                created.schema_revision_id(),
+                &catalog::column_names(&connection, &created).unwrap(),
+            )
         );
         assert!(plan.sql().contains(" AS n"));
 
@@ -846,12 +877,13 @@ mod tests {
     #[test]
     fn module_identity_includes_the_schema_revision() {
         let table = TableId::from_bytes([1; 16]);
-        let first = module_name(table, SchemaRevisionId::from_bytes([2; 16]));
-        let second = module_name(table, SchemaRevisionId::from_bytes([3; 16]));
+        let columns = [SqlName::new("id".into())];
+        let first = module_name(table, SchemaRevisionId::from_bytes([2; 16]), &columns);
+        let second = module_name(table, SchemaRevisionId::from_bytes([3; 16]), &columns);
 
         assert_ne!(first, second);
         assert!(first.starts_with(MODULE_PREFIX));
-        assert_eq!(first.len(), MODULE_PREFIX.len() + 65);
+        assert_eq!(first.len(), MODULE_PREFIX.len() + 82);
     }
 
     #[test]
@@ -894,8 +926,16 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
             [
-                module_name(notes.table_id(), notes.schema_revision_id()),
-                module_name(tasks.table_id(), tasks.schema_revision_id())
+                module_name(
+                    notes.table_id(),
+                    notes.schema_revision_id(),
+                    &catalog::column_names(&connection, &notes).unwrap(),
+                ),
+                module_name(
+                    tasks.table_id(),
+                    tasks.schema_revision_id(),
+                    &catalog::column_names(&connection, &tasks).unwrap(),
+                )
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -990,7 +1030,11 @@ mod tests {
             .plan(&second, "SELECT body FROM notes WHERE id = 1")
             .unwrap()
             .unwrap();
-        let stable = module_name(created.table_id(), created.schema_revision_id());
+        let stable = module_name(
+            created.table_id(),
+            created.schema_revision_id(),
+            &catalog::column_names(&first, &created).unwrap(),
+        );
         let first_names = first_registry.registered_names();
         let second_names = second_registry.registered_names();
         assert_eq!(first_names.len(), 1);

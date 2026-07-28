@@ -75,7 +75,7 @@ impl IndexOperation {
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
             Error::UnsupportedSql("CREATE INDEX target has no synchronized schema identity"),
         )?;
-        let index = before.prepare_named_index(sql, spec)?;
+        let index = before.prepare_named_index(connection, sql, spec)?;
         let backfill = if index.is_unique() {
             backfill_unique_index(connection, &before, &index)?
         } else {
