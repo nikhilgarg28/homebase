@@ -21,7 +21,7 @@ use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
-const SCHEMA_FRAME_VERSION: u8 = 2;
+const SCHEMA_FRAME_VERSION: u8 = 3;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -57,10 +57,13 @@ const TAG_FOREIGN_KEY_NAME: u8 = 2;
 const TAG_FOREIGN_KEY_COLUMN_ID: u8 = 3;
 const TAG_FOREIGN_KEY_PARENT_TABLE_ID: u8 = 4;
 const TAG_FOREIGN_KEY_PARENT_TABLE_NAME: u8 = 5;
-const TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE_ID: u8 = 6;
+const TAG_FOREIGN_KEY_PARENT_TARGET_KIND: u8 = 6;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_ID: u8 = 7;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_NAME: u8 = 8;
+const TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID: u8 = 9;
 const TAG_PRIMARY_COLUMN_ID: u8 = 1;
+const FOREIGN_KEY_TARGET_PRIMARY_KEY: u8 = 1;
+const FOREIGN_KEY_TARGET_UNIQUE: u8 = 2;
 const COLUMN_NOT_NULL: u8 = 1;
 const TABLE_MODE_ORDINARY: u8 = 0;
 const TABLE_MODE_STRICT: u8 = 1;
@@ -468,9 +471,16 @@ pub struct ForeignKeyDefinition {
     columns: Vec<ColumnId>,
     referenced_table: TableId,
     referenced_table_name: SqlName,
-    referenced_row_keyspace: RowKeyspaceId,
+    referenced_target: ForeignKeyTarget,
     referenced_columns: Vec<ColumnId>,
     referenced_column_names: Vec<SqlName>,
+}
+
+/// Stable parent keyspace used to establish one foreign-key relationship.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKeyTarget {
+    PrimaryKey { row_keyspace: RowKeyspaceId },
+    Unique { keyspace: UniqueKeyspaceId },
 }
 
 /// One SQLite CHECK declaration owned by a table schema.
@@ -651,8 +661,8 @@ impl ForeignKeyDefinition {
         &self.referenced_table_name
     }
 
-    pub fn referenced_row_keyspace(&self) -> RowKeyspaceId {
-        self.referenced_row_keyspace
+    pub fn referenced_target(&self) -> ForeignKeyTarget {
+        self.referenced_target
     }
 
     pub fn referenced_columns(&self) -> &[ColumnId] {
@@ -662,6 +672,22 @@ impl ForeignKeyDefinition {
     #[cfg(test)]
     pub fn referenced_column_names(&self) -> &[SqlName] {
         &self.referenced_column_names
+    }
+}
+
+impl ForeignKeyTarget {
+    fn kind(self) -> u8 {
+        match self {
+            Self::PrimaryKey { .. } => FOREIGN_KEY_TARGET_PRIMARY_KEY,
+            Self::Unique { .. } => FOREIGN_KEY_TARGET_UNIQUE,
+        }
+    }
+
+    pub fn keyspace_bytes(self) -> [u8; 16] {
+        match self {
+            Self::PrimaryKey { row_keyspace } => row_keyspace.as_bytes(),
+            Self::Unique { keyspace } => keyspace.as_bytes(),
+        }
     }
 }
 
@@ -750,7 +776,15 @@ impl CreateTable {
         footprint.add_write(write_revision.clone());
         let mut parent_write_revisions = BTreeSet::new();
         for foreign_key in &self.schema.foreign_keys {
-            footprint.add_constraint(active_row_keyspace_key(foreign_key.referenced_table));
+            match foreign_key.referenced_target {
+                ForeignKeyTarget::PrimaryKey { .. } => {
+                    footprint.add_constraint(active_row_keyspace_key(foreign_key.referenced_table));
+                }
+                ForeignKeyTarget::Unique { .. } => {
+                    footprint
+                        .add_constraint(active_schema_revision_key(foreign_key.referenced_table));
+                }
+            }
             let revision = write_revision_key(foreign_key.referenced_table);
             footprint.add_write(revision.clone());
             parent_write_revisions.insert(revision);
@@ -932,6 +966,85 @@ impl CreateTable {
         })
     }
 
+    pub fn foreign_key_target_columns(&self, target: ForeignKeyTarget) -> Option<Vec<&Column>> {
+        let columns = match target {
+            ForeignKeyTarget::PrimaryKey { row_keyspace }
+                if row_keyspace == self.row_keyspace_id =>
+            {
+                self.schema.primary_key.columns.as_slice()
+            }
+            ForeignKeyTarget::Unique { keyspace } => self
+                .schema
+                .unique_constraints
+                .iter()
+                .find(|unique| unique.keyspace_id == keyspace)
+                .map(|unique| unique.columns.as_slice())
+                .or_else(|| {
+                    self.schema
+                        .indexes
+                        .iter()
+                        .find(|index| index.active && index.unique && index.keyspace_id == keyspace)
+                        .map(|index| index.columns.as_slice())
+                })?,
+            _ => return None,
+        };
+        columns
+            .iter()
+            .map(|id| self.schema.columns.iter().find(|column| column.id == *id))
+            .collect()
+    }
+
+    fn resolve_foreign_key_target(
+        &self,
+        referenced: Option<&[SqlName]>,
+    ) -> Option<(ForeignKeyTarget, Vec<&Column>)> {
+        let primary = ForeignKeyTarget::PrimaryKey {
+            row_keyspace: self.row_keyspace_id,
+        };
+        if referenced.is_none() {
+            return Some((
+                primary,
+                self.foreign_key_target_columns(primary)
+                    .expect("validated primary key exists"),
+            ));
+        }
+        let referenced = referenced.expect("absence was handled above");
+        let matches = |columns: &[ColumnId]| {
+            columns.len() == referenced.len()
+                && columns.iter().zip(referenced).all(|(id, name)| {
+                    self.schema.columns.iter().any(|column| {
+                        column.id == *id && column.name.canonical() == name.canonical()
+                    })
+                })
+        };
+        if matches(&self.schema.primary_key.columns) {
+            return Some((
+                primary,
+                self.foreign_key_target_columns(primary)
+                    .expect("validated primary key exists"),
+            ));
+        }
+        let keyspace = self
+            .schema
+            .unique_constraints
+            .iter()
+            .find(|unique| matches(&unique.columns))
+            .map(|unique| unique.keyspace_id)
+            .or_else(|| {
+                self.schema
+                    .indexes
+                    .iter()
+                    .find(|index| index.active && index.unique && matches(&index.columns))
+                    .map(|index| index.keyspace_id)
+            })?;
+        let target = ForeignKeyTarget::Unique { keyspace };
+        Some((
+            target,
+            self.foreign_key_target_columns(target)
+                .expect("selected UNIQUE target exists"),
+        ))
+    }
+
     pub fn is_rowid_alias(&self, column: ColumnId) -> bool {
         self.schema.storage == TableStorage::Rowid
             && self.schema.primary_key.columns.as_slice() == [column]
@@ -1048,6 +1161,7 @@ impl CreateTable {
 struct ResolvedForeignKey {
     spec: CreateForeignKey,
     parent: CreateTable,
+    target: ForeignKeyTarget,
 }
 
 fn resolve_foreign_keys(
@@ -1067,29 +1181,20 @@ fn resolve_foreign_keys(
                 .ok_or(Error::UnsupportedSql(
                     "foreign-key parent must already be a synchronized table",
                 ))?;
-            let parent_names = parent
-                .primary_key_columns()
-                .map(|column| column.name().clone())
-                .collect::<Vec<_>>();
-            let referenced = foreign_key
-                .referenced_columns
-                .as_ref()
-                .unwrap_or(&parent_names);
-            if referenced.len() != parent_names.len()
-                || referenced
-                    .iter()
-                    .zip(&parent_names)
-                    .any(|(referenced, parent)| referenced.canonical() != parent.canonical())
-                || foreign_key.columns.len() != parent_names.len()
-            {
+            let (target, parent_columns) = parent
+                .resolve_foreign_key_target(foreign_key.referenced_columns.as_deref())
+                .ok_or(Error::UnsupportedSql(
+                    "foreign keys must reference a complete primary or UNIQUE key in order",
+                ))?;
+            if foreign_key.columns.len() != parent_columns.len() {
                 return Err(Error::UnsupportedSql(
-                    "foreign keys must reference the parent's complete primary key in order",
+                    "foreign keys must reference a complete primary or UNIQUE key in order",
                 ));
             }
             if foreign_key
                 .columns
                 .iter()
-                .zip(parent.primary_key_columns())
+                .zip(&parent_columns)
                 .any(|(child_name, parent_column)| {
                     spec.columns
                         .iter()
@@ -1107,6 +1212,7 @@ fn resolve_foreign_keys(
             Ok(ResolvedForeignKey {
                 spec: foreign_key,
                 parent,
+                target,
             })
         })
         .collect()
@@ -1122,7 +1228,11 @@ fn validate_foreign_reference_key_shapes(
         .filter(|column| column.primary_key.is_some())
         .count();
     for foreign_key in resolved {
-        let parent_key_parts = foreign_key.parent.primary_key_columns().count();
+        let parent_key_parts = foreign_key
+            .parent
+            .foreign_key_target_columns(foreign_key.target)
+            .expect("resolved foreign-key target exists")
+            .len();
         if !foreign_reference_key_fits(parent_key_parts, child_key_parts) {
             return Err(Error::UnsupportedSql(
                 "foreign-key reference key exceeds the Homebase component limit",
@@ -1137,22 +1247,25 @@ fn validate_foreign_key_link(
     foreign_key: &ForeignKeyDefinition,
     parent: &CreateTable,
 ) -> Result<()> {
-    if !foreign_reference_key_fits(
-        parent.primary_key_columns().count(),
-        child.primary_key_columns().count(),
-    ) {
+    let parent_columns = parent
+        .foreign_key_target_columns(foreign_key.referenced_target)
+        .ok_or(Error::InvalidDatabase(
+            "foreign key target is no longer active in the parent schema",
+        ))?;
+    if !foreign_reference_key_fits(parent_columns.len(), child.primary_key_columns().count()) {
         return Err(Error::InvalidDatabase(
             "foreign-key reference key exceeds the Homebase component limit",
         ));
     }
     if parent.table_name_identity() != foreign_key.referenced_table_name()
-        || parent.row_keyspace_id() != foreign_key.referenced_row_keyspace()
-        || parent
-            .primary_key_columns()
+        || parent_columns
+            .iter()
+            .copied()
             .map(Column::id)
             .ne(foreign_key.referenced_columns.iter().copied())
-        || parent
-            .primary_key_columns()
+        || parent_columns
+            .iter()
+            .copied()
             .map(Column::name)
             .ne(foreign_key.referenced_column_names.iter())
     {
@@ -1165,7 +1278,7 @@ fn validate_foreign_key_link(
         .iter()
         .map(|id| child.columns().iter().find(|column| column.id() == *id));
     if child_columns
-        .zip(parent.primary_key_columns())
+        .zip(parent_columns)
         .any(|(child_column, parent_column)| {
             child_column.is_none_or(|child_column| {
                 child_column.affinity(child.mode()) != parent_column.affinity(parent.mode())
@@ -1269,34 +1382,35 @@ fn build_create_table(
         .collect();
     let foreign_keys = resolved_foreign_keys
         .into_iter()
-        .map(|resolved| ForeignKeyDefinition {
-            id: ForeignKeyId(mint()),
-            name: resolved.spec.name,
-            columns: resolved
-                .spec
-                .columns
-                .into_iter()
-                .map(|name| {
-                    columns
-                        .iter()
-                        .find(|column| column.name.canonical() == name.canonical())
-                        .expect("validated FOREIGN KEY child column exists")
-                        .id
-                })
-                .collect(),
-            referenced_table: resolved.parent.table_id(),
-            referenced_table_name: resolved.parent.table_name_identity().clone(),
-            referenced_row_keyspace: resolved.parent.row_keyspace_id(),
-            referenced_columns: resolved
+        .map(|resolved| {
+            let parent_columns = resolved
                 .parent
-                .primary_key_columns()
-                .map(Column::id)
-                .collect(),
-            referenced_column_names: resolved
-                .parent
-                .primary_key_columns()
-                .map(|column| column.name().clone())
-                .collect(),
+                .foreign_key_target_columns(resolved.target)
+                .expect("resolved foreign-key target exists");
+            ForeignKeyDefinition {
+                id: ForeignKeyId(mint()),
+                name: resolved.spec.name,
+                columns: resolved
+                    .spec
+                    .columns
+                    .into_iter()
+                    .map(|name| {
+                        columns
+                            .iter()
+                            .find(|column| column.name.canonical() == name.canonical())
+                            .expect("validated FOREIGN KEY child column exists")
+                            .id
+                    })
+                    .collect(),
+                referenced_table: resolved.parent.table_id(),
+                referenced_table_name: resolved.parent.table_name_identity().clone(),
+                referenced_target: resolved.target,
+                referenced_columns: parent_columns.iter().map(|column| column.id()).collect(),
+                referenced_column_names: parent_columns
+                    .iter()
+                    .map(|column| column.name().clone())
+                    .collect(),
+            }
         })
         .collect();
     CreateTable {
@@ -1666,8 +1780,14 @@ fn encode_foreign_key_definition(foreign_key: &ForeignKeyDefinition) -> Vec<u8> 
         .expect("foreign-key field length must fit in u32");
     writer
         .field(
-            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE_ID,
-            &foreign_key.referenced_row_keyspace.0,
+            TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
+            &[foreign_key.referenced_target.kind()],
+        )
+        .expect("foreign-key field length must fit in u32");
+    writer
+        .field(
+            TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID,
+            &foreign_key.referenced_target.keyspace_bytes(),
         )
         .expect("foreign-key field length must fit in u32");
     for (column, name) in foreign_key
@@ -2030,7 +2150,8 @@ fn decode_foreign_key_definition(
     let mut columns = Vec::new();
     let mut referenced_table = None;
     let mut referenced_table_name = None;
-    let mut referenced_row_keyspace = None;
+    let mut referenced_target_kind = None;
+    let mut referenced_keyspace = None;
     let mut referenced_columns = Vec::new();
     let mut referenced_column_names = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
@@ -2044,10 +2165,15 @@ fn decode_foreign_key_definition(
             TAG_FOREIGN_KEY_PARENT_TABLE_NAME => {
                 set_once(&mut referenced_table_name, decode_name(value)?)?
             }
-            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE_ID => set_once(
-                &mut referenced_row_keyspace,
-                RowKeyspaceId(uuid_bytes(value)?),
-            )?,
+            TAG_FOREIGN_KEY_PARENT_TARGET_KIND => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                set_once(&mut referenced_target_kind, *value)?;
+            }
+            TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID => {
+                set_once(&mut referenced_keyspace, uuid_bytes(value)?)?
+            }
             TAG_FOREIGN_KEY_PARENT_COLUMN_ID => {
                 referenced_columns.push(ColumnId(uuid_bytes(value)?))
             }
@@ -2061,6 +2187,20 @@ fn decode_foreign_key_definition(
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
+    let referenced_keyspace = referenced_keyspace.ok_or(SchemaCodecError::MissingField(
+        TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID,
+    ))?;
+    let referenced_target = match referenced_target_kind.ok_or(SchemaCodecError::MissingField(
+        TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
+    ))? {
+        FOREIGN_KEY_TARGET_PRIMARY_KEY => ForeignKeyTarget::PrimaryKey {
+            row_keyspace: RowKeyspaceId(referenced_keyspace),
+        },
+        FOREIGN_KEY_TARGET_UNIQUE => ForeignKeyTarget::Unique {
+            keyspace: UniqueKeyspaceId(referenced_keyspace),
+        },
+        _ => return Err(SchemaCodecError::InvalidSchema),
+    };
     Ok(ForeignKeyDefinition {
         id: id.ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ID))?,
         name,
@@ -2071,9 +2211,7 @@ fn decode_foreign_key_definition(
         referenced_table_name: referenced_table_name.ok_or(SchemaCodecError::MissingField(
             TAG_FOREIGN_KEY_PARENT_TABLE_NAME,
         ))?,
-        referenced_row_keyspace: referenced_row_keyspace.ok_or(SchemaCodecError::MissingField(
-            TAG_FOREIGN_KEY_PARENT_ROW_KEYSPACE_ID,
-        ))?,
+        referenced_target,
         referenced_columns,
         referenced_column_names,
     })
@@ -2348,6 +2486,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::commit::footprint::assert_explicit_range_assertions;
 
     fn definition(name: &str) -> CreateTableSpec {
         CreateTableSpec {
@@ -2582,6 +2721,10 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 7);
         assert_eq!(lowered.footprint.constraints().len(), 1);
         assert_eq!(lowered.footprint.writes().len(), 1);
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[table_name_scope_key(&created.name)],
+        );
 
         let Mutation::Set { key: log, value } = &lowered.mutations[0] else {
             panic!("schema log entry was not a set")
@@ -2774,8 +2917,10 @@ mod tests {
         assert_eq!(foreign_key.name().map(SqlName::value), Some("parent_fk"));
         assert_eq!(foreign_key.referenced_table(), parent.table_id());
         assert_eq!(
-            foreign_key.referenced_row_keyspace(),
-            parent.row_keyspace_id()
+            foreign_key.referenced_target(),
+            ForeignKeyTarget::PrimaryKey {
+                row_keyspace: parent.row_keyspace_id()
+            }
         );
         assert_eq!(
             foreign_key
@@ -2788,11 +2933,12 @@ mod tests {
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
 
         let lowered = child.to_homebase();
-        assert!(
-            lowered
-                .footprint
-                .constraints()
-                .contains(&active_row_keyspace_key(parent.table_id()))
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                table_name_scope_key(&child.name),
+                active_row_keyspace_key(parent.table_id()),
+            ],
         );
         assert!(
             lowered
@@ -2816,6 +2962,86 @@ mod tests {
             CreateTable::decode(&malformed.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
+    }
+
+    #[test]
+    fn foreign_keys_resolve_composite_unique_targets_with_stable_keyspaces() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent_sql = "CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            email TEXT NOT NULL,
+            UNIQUE (tenant, email)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
+            super::super::sql::validate_execute(parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::new(parent_sql, parent_spec);
+        catalog::insert(&connection, &parent).unwrap();
+        let child_sql = "CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            recipient TEXT,
+            FOREIGN KEY (tenant, recipient) REFERENCES accounts (tenant, email)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
+            super::super::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
+        let foreign_key = &child.foreign_keys()[0];
+        let target = ForeignKeyTarget::Unique {
+            keyspace: parent.unique_constraints()[0].keyspace_id(),
+        };
+
+        assert_eq!(foreign_key.referenced_target(), target);
+        assert_eq!(
+            parent
+                .foreign_key_target_columns(target)
+                .unwrap()
+                .into_iter()
+                .map(|column| column.name().value())
+                .collect::<Vec<_>>(),
+            ["tenant", "email"]
+        );
+        assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
+        child.validate_foreign_key_parents(&connection).unwrap();
+
+        let lowered = child.to_homebase();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                table_name_scope_key(&child.name),
+                active_schema_revision_key(parent.table_id()),
+            ],
+        );
+        assert!(
+            !lowered
+                .footprint
+                .constraints()
+                .contains(&active_row_keyspace_key(parent.table_id()))
+        );
+        assert!(
+            lowered
+                .footprint
+                .writes()
+                .contains(&write_revision_key(parent.table_id()))
+        );
+
+        let mut missing_target = child.clone();
+        missing_target.schema.foreign_keys[0].referenced_target = ForeignKeyTarget::Unique {
+            keyspace: UniqueKeyspaceId(test_uuid(99)),
+        };
+        assert!(matches!(
+            validate_foreign_key_graph(&[parent, missing_target]),
+            Err(Error::InvalidDatabase(
+                "foreign key target is no longer active in the parent schema"
+            ))
+        ));
     }
 
     #[test]

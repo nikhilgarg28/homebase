@@ -399,6 +399,372 @@ fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
 }
 
 #[test]
+fn unique_parent_relationships_conflict_symmetrically_and_allow_sibling_inserts() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("unique-foreign-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("unique-foreign-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                email TEXT NOT NULL,
+                UNIQUE (tenant, email)
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                recipient TEXT,
+                FOREIGN KEY (tenant, recipient)
+                    REFERENCES accounts (tenant, email)
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "INSERT INTO accounts VALUES
+                (1, 'acme', 'one@example.com'),
+                (2, 'acme', 'two@example.com'),
+                (3, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("DELETE FROM accounts WHERE id = 1", ())
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO messages VALUES (10, 'acme', 'one@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("UNIQUE-backed child insert did not conflict with parent deletion")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute(
+            "INSERT INTO messages VALUES (20, 'acme', 'two@example.com')",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("DELETE FROM accounts WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+        panic!("UNIQUE-backed parent deletion did not conflict with child insert")
+    };
+    first.rollback(&rejection).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "INSERT INTO messages VALUES (30, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO messages VALUES (31, 'acme', 'shared@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id FROM accounts ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [2, 3]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id FROM messages ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [20, 30, 31]
+        );
+    }
+}
+
+#[test]
+fn foreign_key_creation_and_unique_index_drop_conflict_in_either_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("foreign-index-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("foreign-index-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE first_parents (
+                    id INTEGER PRIMARY KEY,
+                    tenant TEXT NOT NULL,
+                    code TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE UNIQUE INDEX first_parent_key
+                 ON first_parents (tenant, code)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE second_parents (
+                    id INTEGER PRIMARY KEY,
+                    tenant TEXT NOT NULL,
+                    code TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE UNIQUE INDEX second_parent_key
+                 ON second_parents (tenant, code)",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE first_children (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                code TEXT,
+                FOREIGN KEY (tenant, code)
+                    REFERENCES first_parents (tenant, code)
+            )",
+            (),
+        )
+        .unwrap();
+    second.execute("DROP INDEX first_parent_key", ()).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("index drop did not conflict with admitted foreign-key creation")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first.execute("DROP INDEX second_parent_key", ()).unwrap();
+    second
+        .execute(
+            "CREATE TABLE second_children (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                code TEXT,
+                FOREIGN KEY (tenant, code)
+                    REFERENCES second_parents (tenant, code)
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("foreign-key creation did not conflict with admitted index drop")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT name FROM sqlite_schema
+                     WHERE name IN (
+                        'first_parent_key',
+                        'first_children',
+                        'second_parent_key',
+                        'second_children'
+                     )
+                     ORDER BY name",
+                    (),
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            ["first_children", "first_parent_key"]
+        );
+    }
+}
+
+#[test]
+fn unique_parent_key_updates_conflict_with_child_inserts_in_either_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("unique-update-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("unique-update-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                email TEXT UNIQUE
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                recipient TEXT REFERENCES accounts (email)
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "INSERT INTO accounts VALUES
+                (1, 'one@example.com'),
+                (2, 'two@example.com')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "UPDATE accounts SET email = 'moved@example.com' WHERE id = 1",
+            (),
+        )
+        .unwrap();
+    second
+        .execute("INSERT INTO messages VALUES (10, 'one@example.com')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("child insert did not conflict with an admitted UNIQUE-key update")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute("INSERT INTO messages VALUES (20, 'two@example.com')", ())
+        .unwrap();
+    first
+        .execute(
+            "UPDATE accounts SET email = 'other@example.com' WHERE id = 2",
+            (),
+        )
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+        panic!("UNIQUE-key update did not conflict with an admitted child insert")
+    };
+    first.rollback(&rejection).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, email FROM accounts ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [
+                (1, "moved@example.com".into()),
+                (2, "two@example.com".into()),
+            ]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, recipient FROM messages", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(20, "two@example.com".into())]
+        );
+    }
+}
+
+#[test]
 fn composite_foreign_reference_conflicts_with_the_exact_parent_delete() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -625,6 +991,144 @@ fn foreign_references_do_not_conflict_across_disjoint_parent_rows() {
                 })
                 .unwrap(),
             [(20, 2)]
+        );
+    }
+}
+
+#[test]
+fn unrelated_parent_updates_and_child_inserts_admit_for_both_target_kinds() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-body-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("foreign-key-body-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT UNIQUE,
+                    body TEXT
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE primary_children (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES parents(id)
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE unique_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_email TEXT REFERENCES parents(email)
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "INSERT INTO parents VALUES
+                    (1, 'one@example.com', 'one'),
+                    (2, 'two@example.com', 'two')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("UPDATE parents SET body = 'one-updated' WHERE id = 1", ())
+        .unwrap();
+    second
+        .update(|transaction| {
+            transaction.execute("INSERT INTO primary_children VALUES (10, 1)", ())?;
+            transaction.execute(
+                "INSERT INTO unique_children VALUES (10, 'one@example.com')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "an unrelated parent update must not invalidate child references"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute("INSERT INTO primary_children VALUES (20, 2)", ())?;
+            transaction.execute(
+                "INSERT INTO unique_children VALUES (20, 'two@example.com')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    second
+        .execute("UPDATE parents SET body = 'two-updated' WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "a child reference must not invalidate an unrelated parent update"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, body FROM parents ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(1, "one-updated".into()), (2, "two-updated".into())]
+        );
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, parent FROM primary_children ORDER BY id",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            [(10, 1), (20, 2)]
+        );
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, parent_email FROM unique_children ORDER BY id",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [
+                (10, "one@example.com".into()),
+                (20, "two@example.com".into()),
+            ]
         );
     }
 }

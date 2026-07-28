@@ -20,14 +20,16 @@ multilite
   agreement between materialized rows and reverse-reference cells. Generalize
   the resulting checker into a broader explicit database integrity audit.
 
-- Reverse foreign-reference cells and exact parent-image assertions have
-  landed. Before widening the grammar, define retirement and GC for dropped
-  relationships, then support targets backed by UNIQUE keyspaces,
-  affinity/collation coercion, self-references and cycles, deferred
-  constraints, mutating actions, and add/drop relationship evolution.
+- Exact reverse-reference assertions, parent prefix range fences, and parent
+  targets backed by table or explicit UNIQUE keyspaces have landed. A
+  referenced explicit index currently cannot be dropped. Before widening the
+  grammar, define retirement and GC for dropped relationships, then support
+  durable retargeting/removal, affinity/collation coercion, self-references and
+  cycles, deferred constraints, mutating actions, and add/drop relationship
+  evolution.
   Existence remains established by SQLite against the branch snapshot;
-  Homebase assertions certify freshness of exact parent/reference keys, not an
-  independent boolean witness.
+  Homebase assertions certify the child/reference handshake, not an independent
+  boolean witness.
 
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
   remains one cooperating Multilite committer per file. The WAL-derived map,

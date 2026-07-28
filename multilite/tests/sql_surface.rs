@@ -367,7 +367,7 @@ fn immediate_composite_foreign_keys_follow_sqlite_match_simple_semantics() {
 }
 
 #[test]
-fn foreign_keys_require_an_existing_matching_primary_key_contract() {
+fn foreign_keys_require_an_existing_matching_parent_key_contract() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("foreign-key-shape.sqlite")).unwrap();
 
@@ -401,9 +401,9 @@ fn foreign_keys_require_an_existing_matching_primary_key_contract() {
             parent INTEGER NOT NULL,
             FOREIGN KEY (parent, tenant) REFERENCES parents (id, tenant)
         )",
-        "CREATE TABLE unique_parent (
+        "CREATE TABLE non_unique_parent (
             id INTEGER PRIMARY KEY,
-            slug TEXT REFERENCES parents (slug)
+            tenant TEXT REFERENCES parents (tenant)
         )",
         "CREATE TABLE affinity_mismatch (
             id INTEGER PRIMARY KEY,
@@ -418,6 +418,126 @@ fn foreign_keys_require_an_existing_matching_primary_key_contract() {
     ] {
         assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
     }
+}
+
+#[test]
+fn composite_unique_foreign_keys_cover_constraints_and_explicit_indexes() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("unique-foreign-key.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            email TEXT,
+            UNIQUE (tenant, email)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            recipient TEXT,
+            FOREIGN KEY (tenant, recipient) REFERENCES accounts (tenant, email)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO accounts VALUES
+            (1, 'north', 'one@example.com'),
+            (2, NULL, 'nullable@example.com')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO messages VALUES
+            (10, 'north', 'one@example.com'),
+            (11, NULL, 'missing@example.com')",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute("DELETE FROM accounts WHERE id = 2", ()).unwrap(),
+        1
+    );
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO messages VALUES (12, 'north', 'missing@example.com')",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(matches!(
+        db.execute(
+            "UPDATE accounts SET email = 'moved@example.com' WHERE id = 1",
+            ()
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(matches!(
+        db.execute("DELETE FROM accounts WHERE id = 1", ()),
+        Err(Error::Sqlite(_))
+    ));
+    db.execute("DELETE FROM messages WHERE id = 10", ())
+        .unwrap();
+    db.execute(
+        "UPDATE accounts SET email = 'moved@example.com' WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO messages VALUES (13, 'north', 'moved@example.com')",
+        (),
+    )
+    .unwrap();
+
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE handles (
+                id INTEGER PRIMARY KEY,
+                region TEXT NOT NULL,
+                handle TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE UNIQUE INDEX handles_identity ON handles (region, handle)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE mentions (
+                id INTEGER PRIMARY KEY,
+                region TEXT,
+                handle TEXT,
+                FOREIGN KEY (region, handle) REFERENCES handles (region, handle)
+            )",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.execute("INSERT INTO handles VALUES (1, 'west', 'nikhil')", ())
+        .unwrap();
+    db.execute("INSERT INTO mentions VALUES (1, 'west', 'nikhil')", ())
+        .unwrap();
+    assert!(matches!(
+        db.execute("DROP INDEX handles_identity", ()),
+        Err(Error::UnsupportedSql(
+            "cannot drop a UNIQUE index referenced by a foreign key"
+        ))
+    ));
+    assert_eq!(
+        db.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'handles_identity'",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        [1]
+    );
 }
 
 #[test]

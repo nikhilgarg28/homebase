@@ -248,6 +248,70 @@ fn foreign_key_catalog_reopens_and_remains_usable() {
 }
 
 #[test]
+fn unique_foreign_key_targets_survive_reopen_with_their_keyspace_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unique-foreign-keys.sqlite");
+    {
+        let database = MultiliteConnection::open(&path).unwrap();
+        database
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY,
+                        tenant TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        UNIQUE (tenant, email)
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE messages (
+                        id INTEGER PRIMARY KEY,
+                        tenant TEXT,
+                        recipient TEXT,
+                        FOREIGN KEY (tenant, recipient)
+                            REFERENCES accounts (tenant, email)
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO accounts VALUES (1, 'acme', 'one@example.com')",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO messages VALUES (10, 'acme', 'one@example.com')",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let database = MultiliteConnection::open(&path).unwrap();
+    database
+        .execute(
+            "INSERT INTO messages VALUES (11, 'acme', 'one@example.com')",
+            (),
+        )
+        .unwrap();
+    assert!(matches!(
+        database.execute(
+            "DELETE FROM accounts WHERE tenant = 'acme' AND email = 'one@example.com'",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        database
+            .query("SELECT id FROM messages ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        [10, 11]
+    );
+}
+
+#[test]
 fn lifecycle_accepts_an_explicit_server_handle() {
     let directory = tempfile::tempdir().unwrap();
     let server = |_: &SpaceId| None::<UnreachableSpace>;

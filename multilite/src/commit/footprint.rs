@@ -13,8 +13,9 @@ use crate::database::isolation::IsolationLevel;
 
 /// Logical conflicts accumulated by one Multilite transaction.
 ///
-/// Writes and constraints are mandatory at every isolation level. Ordinary
-/// reads become assertions only under serializable isolation.
+/// Constraints are invariant guards independent of isolation policy. The
+/// current isolation levels also validate every write, while ordinary reads
+/// become assertions only under serializable isolation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConflictFootprint {
     writes: PrefixAntichain,
@@ -152,6 +153,28 @@ impl ConflictFootprint {
             .into_iter()
             .map(|prefix| RangeAssert { prefix, upto })
             .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_explicit_range_assertions(footprint: &ConflictFootprint, expected: &[Key]) {
+    let upto = AdmissionSeq(37);
+    for prefix in expected {
+        assert!(
+            footprint.constraints().contains(prefix),
+            "missing explicit constraint for {prefix:?}"
+        );
+    }
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let planned = footprint.clone().plan(isolation, upto);
+        for prefix in expected {
+            assert!(
+                planned
+                    .iter()
+                    .any(|assertion| assertion.prefix == *prefix && assertion.upto == upto),
+                "{isolation:?} did not plan explicit constraint {prefix:?}"
+            );
+        }
     }
 }
 

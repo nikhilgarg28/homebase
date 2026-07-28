@@ -356,7 +356,7 @@ mod tests {
         let lowered = transaction.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 9);
         assert_eq!(lowered.footprint.writes().len(), 2);
-        assert_eq!(lowered.footprint.constraints().len(), 3);
+        assert_eq!(lowered.footprint.constraints().len(), 4);
         assert!(lowered.footprint.reads().is_empty());
         let Mutation::Set { key, value } = &lowered.mutations[0] else {
             panic!("manifest was not a set")

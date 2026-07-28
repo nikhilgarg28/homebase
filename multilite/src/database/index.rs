@@ -13,9 +13,9 @@ use super::catalog;
 use super::codes;
 use super::row::{UniqueBackfillEntry, backfill_unique_index};
 use super::schema::{
-    CreateTable, IndexDefinition, MutationId, SchemaRevisionId, active_schema_revision_key,
-    index_name_scope_key, schema_log_key, table_schema_key, unique_keyspace_key,
-    write_revision_key,
+    CreateTable, ForeignKeyTarget, IndexDefinition, MutationId, SchemaRevisionId,
+    active_schema_revision_key, index_name_scope_key, schema_log_key, table_schema_key,
+    unique_keyspace_key, write_revision_key,
 };
 use super::sql::{CreateUniqueIndexSpec, DropIndexSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
@@ -108,6 +108,7 @@ impl IndexOperation {
         let (before, index) = catalog::index_by_name(connection, &spec.name)?.ok_or(
             Error::UnsupportedSql("DROP INDEX target has no synchronized schema identity"),
         )?;
+        ensure_not_referenced(connection, &before, &index)?;
         let after = before
             .with_retired_index(
                 SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -133,6 +134,7 @@ impl IndexOperation {
         let schema_head = active_schema_revision_key(self.after.table_id());
         let mut footprint = ConflictFootprint::new();
         footprint.add_constraint(name.clone());
+        footprint.add_constraint(schema_head.clone());
         footprint.add_write(schema_head.clone());
         let mut mutations = vec![Mutation::Set {
             key: schema_log_key(self.mutation_id),
@@ -172,6 +174,8 @@ impl IndexOperation {
                 key: write_revision,
                 value: self.mutation_id.as_bytes().to_vec(),
             });
+        } else {
+            footprint.add_constraint(write_revision_key(self.after.table_id()));
         }
         Ok(IndexHomebaseOp {
             mutations,
@@ -185,6 +189,9 @@ impl IndexOperation {
             return Err(Error::InvalidDatabase(
                 "index operation no longer matches the schema catalog",
             ));
+        }
+        if self.action == IndexAction::Drop {
+            ensure_not_referenced(connection, &self.before, &self.index)?;
         }
         connection.execute(&self.sql, ())?;
         catalog::replace(connection, &self.after)
@@ -391,6 +398,27 @@ impl IndexOperation {
     }
 }
 
+fn ensure_not_referenced(
+    connection: &Connection,
+    table: &CreateTable,
+    index: &IndexDefinition,
+) -> Result<()> {
+    if catalog::incoming_foreign_keys(connection, table.table_id())?
+        .iter()
+        .any(|(_, foreign_key)| {
+            foreign_key.referenced_target()
+                == (ForeignKeyTarget::Unique {
+                    keyspace: index.keyspace_id(),
+                })
+        })
+    {
+        return Err(Error::UnsupportedSql(
+            "cannot drop a UNIQUE index referenced by a foreign key",
+        ));
+    }
+    Ok(())
+}
+
 fn row_keyspace_prefix(table: &CreateTable) -> Key {
     Key::from_bytes([
         codes::ROOT,
@@ -510,6 +538,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::commit::footprint::assert_explicit_range_assertions;
     use crate::database::schema::{CreateColumn, CreateTableSpec, TableStorage, TypeDeclaration};
 
     fn table() -> CreateTable {
@@ -593,6 +622,14 @@ mod tests {
             operation
         );
         let lowered = operation.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                index_name_scope_key(operation.index.name()),
+                active_schema_revision_key(before.table_id()),
+                row_keyspace_prefix(&before),
+            ],
+        );
         assert!(
             lowered
                 .footprint
@@ -602,10 +639,16 @@ mod tests {
         assert!(
             lowered
                 .footprint
+                .constraints()
+                .contains(&active_schema_revision_key(before.table_id()))
+        );
+        assert!(
+            lowered
+                .footprint
                 .writes()
                 .contains(&write_revision_key(before.table_id()))
         );
-        assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 3);
 
         operation.record_catalog(&connection).unwrap();
         assert_eq!(
@@ -658,6 +701,14 @@ mod tests {
 
         assert_eq!(IndexOperation::decode(&drop.encode()).unwrap(), drop);
         let lowered = drop.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                index_name_scope_key(drop.index.name()),
+                active_schema_revision_key(drop.after.table_id()),
+                write_revision_key(drop.after.table_id()),
+            ],
+        );
         assert_eq!(lowered.footprint.writes().len(), 1);
         assert!(
             lowered
