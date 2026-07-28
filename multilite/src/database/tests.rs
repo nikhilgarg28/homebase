@@ -2871,7 +2871,7 @@ fn long_primary_key_succeeds_and_oversized_key_rolls_back_before_submission() {
     database
         .execute(
             &runtime,
-            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID",
             (),
         )
         .unwrap();

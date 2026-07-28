@@ -1113,6 +1113,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
     let wal_path = wal_path_for(&path);
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
+            validate_user_table_shapes(connection)?;
             match classify(connection)? {
                 DatabaseState::Fresh => {
                     initialize(&owner, invitation, server, lineage, canonical.clone())
@@ -1296,6 +1297,67 @@ fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
             "general metadata tables are only partially initialized",
         )),
     }
+}
+
+fn validate_user_table_shapes(connection: &SqliteConnection) -> Result<()> {
+    let mut tables = connection.prepare(
+        "SELECT name, type, wr
+         FROM pragma_table_list
+         WHERE schema = 'main'
+           AND type IN ('table', 'virtual', 'shadow')
+         ORDER BY name",
+    )?;
+    let tables = tables
+        .query_map((), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (table, kind, without_rowid) in tables {
+        if table.starts_with("sqlite_") || has_multilite_prefix(&table) {
+            continue;
+        }
+        if kind != "table" {
+            return Err(Error::InvalidDatabase(
+                "user virtual and shadow tables are not supported",
+            ));
+        }
+        let mut columns = connection.prepare(
+            "SELECT type, pk
+             FROM pragma_table_xinfo(?1)
+             WHERE pk > 0
+             ORDER BY pk",
+        )?;
+        let primary = columns
+            .query_map([&table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if primary.is_empty() {
+            return Err(Error::InvalidDatabase(
+                "every user table must declare a primary key",
+            ));
+        }
+        if without_rowid {
+            continue;
+        }
+        let primary_index: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk'
+             )",
+            [&table],
+            |row| row.get(0),
+        )?;
+        if primary.len() != 1 || !primary[0].0.eq_ignore_ascii_case("INTEGER") || primary_index {
+            return Err(Error::InvalidDatabase(
+                "rowid tables require a single INTEGER PRIMARY KEY alias",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mint_id() -> Result<[u8; 16]> {

@@ -202,7 +202,6 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 let (changed, _) = self.hooks.run(
                     || Ok(self.connection.execute(sql, params)?),
                     |events| {
-                        super::row::normalize_insert_rowids(self.connection, events)?;
                         let had_events = !events.is_empty();
                         let captured = std::mem::take(events)
                             .into_iter()

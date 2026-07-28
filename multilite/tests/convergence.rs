@@ -98,7 +98,10 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
         .unwrap();
     first
         .execute(
-            "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+            "CREATE TABLE documents (
+                id TEXT NOT NULL PRIMARY KEY,
+                body TEXT NOT NULL
+            ) WITHOUT ROWID",
             (),
         )
         .unwrap();
@@ -3004,7 +3007,10 @@ fn disjoint_mixed_schema_and_row_transactions_converge_in_manifest_order() {
     second
         .update(|transaction| {
             transaction.execute(
-                "CREATE TABLE tasks (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+                "CREATE TABLE tasks (
+                    id TEXT NOT NULL PRIMARY KEY,
+                    body TEXT NOT NULL
+                ) WITHOUT ROWID",
                 (),
             )?;
             transaction.execute("INSERT INTO tasks VALUES ('a', 'second')", ())?;
@@ -3411,7 +3417,7 @@ fn queued_insert_then_key_move_admit_in_same_device_order() {
 }
 
 #[test]
-fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
+fn rejected_text_primary_key_delete_restores_the_complete_without_rowid_row() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let first = MultiliteConnection::open_with(
@@ -3434,7 +3440,7 @@ fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
                 "CREATE TABLE documents (
                     id TEXT NOT NULL PRIMARY KEY,
                     body TEXT NOT NULL
-                )",
+                ) WITHOUT ROWID",
                 (),
             )?;
             transaction.execute("INSERT INTO documents VALUES ('a', 'original')", ())?;
@@ -3477,7 +3483,7 @@ fn rejected_text_primary_key_delete_restores_values_and_hidden_rowid() {
 }
 
 #[test]
-fn rejected_text_primary_key_move_restores_rowid_then_applies_the_winner() {
+fn rejected_text_primary_key_move_restores_then_applies_the_winner() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let first = MultiliteConnection::open_with(
@@ -3500,7 +3506,7 @@ fn rejected_text_primary_key_move_restores_rowid_then_applies_the_winner() {
                 "CREATE TABLE documents (
                     id TEXT NOT NULL PRIMARY KEY,
                     body TEXT NOT NULL
-                )",
+                ) WITHOUT ROWID",
                 (),
             )?;
             transaction.execute("INSERT INTO documents VALUES ('a', 'original')", ())?;
@@ -3538,25 +3544,20 @@ fn rejected_text_primary_key_move_restores_rowid_then_applies_the_winner() {
     second.rebase().unwrap();
     for database in [&first, &second] {
         let updated = document(database);
-        assert_eq!(updated.0, original.0);
         assert_eq!(
-            (updated.1.as_str(), updated.2.as_str()),
+            (updated.0.as_str(), updated.1.as_str()),
             ("winner", "first")
         );
     }
 }
 
-fn document<H>(database: &MultiliteConnection<H>) -> (i64, String, String)
+fn document<H>(database: &MultiliteConnection<H>) -> (String, String)
 where
     H: ServerHandle + Send + Sync + 'static,
 {
     database
-        .query("SELECT _rowid_, id, body FROM documents", (), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+        .query("SELECT id, body FROM documents", (), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .unwrap()
         .into_iter()

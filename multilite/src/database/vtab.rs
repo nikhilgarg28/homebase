@@ -765,7 +765,7 @@ mod tests {
         let sql = "CREATE TABLE strict_values (
             id ANY PRIMARY KEY,
             body TEXT
-        ) STRICT";
+        ) WITHOUT ROWID, STRICT";
         let super::super::sql::ValidatedExecute::CreateTable(spec) =
             super::super::sql::validate_execute(sql).unwrap()
         else {

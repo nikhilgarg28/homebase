@@ -2426,68 +2426,6 @@ fn decode_row(frame: &[u8]) -> std::result::Result<DecodedRow, RowCodecError> {
     ))
 }
 
-/// Replace branch-local sequential hidden rowids with collision-resistant ids.
-///
-/// INTEGER PRIMARY KEY already supplies stable row identity and is left alone.
-pub(super) fn normalize_insert_rowids(
-    connection: &Connection,
-    captured: &mut [CapturedChange],
-) -> Result<()> {
-    let Some(first) = captured.first().map(|change| match change {
-        CapturedChange::Insert(row) => Ok(row),
-        CapturedChange::Delete(_) | CapturedChange::Update { .. } => Err(Error::CaptureInvariant(
-            "INSERT captured a deleted application row",
-        )),
-    }) else {
-        return Ok(());
-    };
-    let first = first?;
-    if captured.iter().any(|change| match change {
-        CapturedChange::Insert(row) => row.table != first.table,
-        CapturedChange::Delete(_) | CapturedChange::Update { .. } => true,
-    }) {
-        return Err(Error::CaptureInvariant(
-            "INSERT captured an unexpected row change",
-        ));
-    }
-    let Some(created) = catalog::by_name(connection, &first.table)? else {
-        return Ok(());
-    };
-    let Some(alias) = hidden_rowid_alias(connection, &created)? else {
-        return Ok(());
-    };
-    let table = quote_identifier(&first.table);
-    let alias = quote_identifier(alias);
-    let exists_sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {alias} = ?1)");
-    let update_sql = format!("UPDATE {table} SET {alias} = ?1 WHERE {alias} = ?2");
-    for change in captured {
-        let CapturedChange::Insert(row) = change else {
-            unreachable!("all captured changes were checked above")
-        };
-        let rowid = loop {
-            let bytes = Uuid::new_v4().into_bytes();
-            let candidate =
-                i64::from_be_bytes(bytes[..8].try_into().expect("UUID has 16 bytes")) & i64::MAX;
-            if candidate == 0 {
-                continue;
-            }
-            let exists: bool =
-                connection.query_row(&exists_sql, [candidate], |result| result.get(0))?;
-            if !exists {
-                break candidate;
-            }
-        };
-        let changed = connection.execute(&update_sql, [rowid, row.rowid])?;
-        if changed != 1 {
-            return Err(Error::CaptureInvariant(
-                "captured INSERT rowid no longer identifies exactly one row",
-            ));
-        }
-        row.rowid = rowid;
-    }
-    Ok(())
-}
-
 fn hidden_rowid_alias(
     connection: &Connection,
     created: &CreateTable,
@@ -3855,29 +3793,26 @@ mod tests {
 
     #[test]
     fn integer_affinity_does_not_imply_a_rowid_alias() {
-        for (declaration, expected_hidden) in [("INTEGER", false), ("INT NOT NULL", true)] {
-            let sql = format!("CREATE TABLE aliases (id {declaration} PRIMARY KEY, body TEXT)");
-            let super::super::sql::ValidatedExecute::CreateTable(spec) =
-                super::super::sql::validate_execute(&sql).unwrap()
-            else {
-                unreachable!()
-            };
-            let created = CreateTable::new(&sql, spec);
-            let connection = connection(&created);
-            assert_eq!(
-                hidden_rowid_alias(&connection, &created).unwrap().is_some(),
-                expected_hidden,
-                "{declaration}"
-            );
-            assert_eq!(
-                created
-                    .primary_key_columns()
-                    .next()
-                    .unwrap()
-                    .affinity(created.mode()),
-                Affinity::Integer
-            );
-        }
+        let sql = "CREATE TABLE aliases (id INTEGER PRIMARY KEY, body TEXT)";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let connection = connection(&created);
+        assert!(hidden_rowid_alias(&connection, &created).unwrap().is_none());
+
+        assert!(matches!(
+            super::super::sql::validate_execute(
+                "CREATE TABLE aliases (id INT NOT NULL PRIMARY KEY, body TEXT)"
+            ),
+            Err(Error::UnsupportedSql(_))
+        ));
+        super::super::sql::validate_execute(
+            "CREATE TABLE aliases (id INT NOT NULL PRIMARY KEY, body TEXT) WITHOUT ROWID",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4217,7 +4152,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_update_moves_the_row_and_hidden_rowid_changes_stay_rejected() {
+    fn primary_key_update_moves_the_row_and_restores_the_before_image() {
         let created = definition();
         let notes_connection = connection(&created);
         let moved = UpdateRows::from_captured(
@@ -4306,64 +4241,6 @@ mod tests {
                 )],
             ),
             Err(Error::InvalidMultiliteOp(_))
-        ));
-
-        let documents = CreateTable::new(
-            "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
-            CreateTableSpec {
-                name: SqlName::new("documents".into()),
-                mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
-                columns: vec![
-                    CreateColumn {
-                        name: SqlName::new("id".into()),
-                        declared_type: TypeDeclaration::text(),
-                        not_null: true,
-                        not_null_name: None,
-                        default: None,
-                        primary_key: Some(0),
-                    },
-                    CreateColumn {
-                        name: SqlName::new("body".into()),
-                        declared_type: TypeDeclaration::text(),
-                        not_null: false,
-                        not_null_name: None,
-                        default: None,
-                        primary_key: None,
-                    },
-                ],
-                unique_constraints: Vec::new(),
-                foreign_keys: Vec::new(),
-                primary_key_name: None,
-                checks: Vec::new(),
-            },
-        );
-        let documents_connection = connection(&documents);
-        assert!(matches!(
-            UpdateRows::from_captured(
-                &documents_connection,
-                &[(
-                    CapturedRow {
-                        table: "documents".into(),
-                        rowid: 11,
-                        values: vec![
-                            StoredValue::Text(b"a".to_vec()),
-                            StoredValue::Text(b"before".to_vec()),
-                        ],
-                    },
-                    CapturedRow {
-                        table: "documents".into(),
-                        rowid: 12,
-                        values: vec![
-                            StoredValue::Text(b"a".to_vec()),
-                            StoredValue::Text(b"after".to_vec()),
-                        ],
-                    },
-                )],
-            ),
-            Err(Error::UnsupportedSql(
-                "UPDATE of SQLite rowid is not supported"
-            ))
         ));
     }
 
@@ -4820,103 +4697,6 @@ mod tests {
             Err(Error::InvalidMultiliteOp(message))
                 if message == "row value has an invalid STRICT storage class"
         ));
-    }
-
-    #[test]
-    fn non_integer_primary_keys_keep_collision_resistant_hidden_rowids() {
-        let created = CreateTable::new(
-            "CREATE TABLE documents (id TEXT NOT NULL PRIMARY KEY, body TEXT)",
-            CreateTableSpec {
-                name: SqlName::new("documents".into()),
-                mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
-                columns: vec![
-                    CreateColumn {
-                        name: SqlName::new("id".into()),
-                        declared_type: TypeDeclaration::text(),
-                        not_null: true,
-                        not_null_name: None,
-                        default: None,
-                        primary_key: Some(0),
-                    },
-                    CreateColumn {
-                        name: SqlName::new("body".into()),
-                        declared_type: TypeDeclaration::text(),
-                        not_null: false,
-                        not_null_name: None,
-                        default: None,
-                        primary_key: None,
-                    },
-                ],
-                unique_constraints: Vec::new(),
-                foreign_keys: Vec::new(),
-                primary_key_name: None,
-                checks: Vec::new(),
-            },
-        );
-        let source = connection(&created);
-        source
-            .execute("INSERT INTO documents VALUES ('a', 'one')", ())
-            .unwrap();
-        let mut changes = vec![CapturedChange::Insert(CapturedRow {
-            table: "documents".into(),
-            rowid: 1,
-            values: vec![
-                StoredValue::Text(b"a".to_vec()),
-                StoredValue::Text(b"one".to_vec()),
-            ],
-        })];
-        normalize_insert_rowids(&source, &mut changes).unwrap();
-        let [CapturedChange::Insert(captured)] = changes.as_slice() else {
-            unreachable!()
-        };
-        let captured = vec![captured.clone()];
-        assert_ne!(captured[0].rowid, 1);
-
-        let inserted = InsertRows::from_captured(&source, &captured)
-            .unwrap()
-            .unwrap();
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
-
-        let target = connection(&created);
-        inserted.apply(&target).unwrap();
-        assert_eq!(
-            target
-                .query_row("SELECT _rowid_, id, body FROM documents", (), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },)
-                .unwrap(),
-            (captured[0].rowid, "a".into(), "one".into())
-        );
-
-        let replacement_rowid = if captured[0].rowid == i64::MAX {
-            captured[0].rowid - 1
-        } else {
-            captured[0].rowid + 1
-        };
-        target
-            .execute(
-                "UPDATE documents SET _rowid_ = ?1 WHERE id = 'a'",
-                [replacement_rowid],
-            )
-            .unwrap();
-        assert!(matches!(
-            inserted.delete_materialized(&target),
-            Err(Error::InvalidDatabase(
-                "pending INSERT row no longer matches SQLite state"
-            ))
-        ));
-        assert_eq!(
-            target
-                .query_row("SELECT count(*) FROM documents", (), |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
     }
 
     #[test]

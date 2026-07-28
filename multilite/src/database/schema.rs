@@ -2570,13 +2570,7 @@ fn decode_create_table(
                     .find(|column| column.id == *id)
                     .is_none_or(|column| !column.not_null)
             }))
-        || (!rowid_alias
-            && primary_key.columns().iter().any(|id| {
-                columns
-                    .iter()
-                    .find(|column| column.id == *id)
-                    .is_none_or(|column| !column.not_null)
-            }))
+        || (storage == TableStorage::Rowid && !rowid_alias)
         || unique_constraints
             .iter()
             .enumerate()
@@ -2638,9 +2632,6 @@ fn decode_create_table(
                 .column
                 .is_some_and(|id| !columns.iter().any(|column| column.id == id))
         })
-        || (storage == TableStorage::Rowid
-            && !rowid_alias
-            && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none())
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
