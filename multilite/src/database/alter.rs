@@ -10,9 +10,9 @@ use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
 use super::schema::{
-    ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId, TableStorage,
-    active_schema_revision_key, available_hidden_rowid_alias, column_name_scope_key,
-    schema_log_key, table_name_scope_key, table_schema_key, write_revision_key,
+    ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
+    active_schema_revision_key, column_name_scope_key, schema_log_key, table_name_scope_key,
+    table_schema_key, write_revision_key,
 };
 use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
@@ -38,7 +38,6 @@ const RENAME_COLUMN: u8 = 2;
 const ADD_COLUMN: u8 = 3;
 const DROP_COLUMN: u8 = 4;
 const TAG_DROPPED_PRIMARY: u8 = 1;
-const TAG_DROPPED_ROWID: u8 = 2;
 const TAG_DROPPED_COLUMN: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +51,6 @@ enum AlterAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DroppedValue {
     primary: Vec<StoredValue>,
-    rowid: Option<StoredValue>,
     value: StoredValue,
 }
 
@@ -130,23 +128,6 @@ impl AlterTableOperation {
                 "ALTER TABLE target column name is already bound",
             ));
         }
-        if created.storage() == TableStorage::Rowid
-            && !created
-                .primary_key_columns()
-                .any(|column| created.is_rowid_alias(column.id()))
-        {
-            let mut names = catalog::column_names(connection, &created)?;
-            let renamed = names
-                .iter_mut()
-                .find(|name| name.canonical() == spec.old_name.canonical())
-                .expect("resolved column name has a catalog binding");
-            *renamed = spec.new_name.clone();
-            if available_hidden_rowid_alias(names.iter()).is_none() {
-                return Err(Error::UnsupportedSql(
-                    "RENAME COLUMN must leave one SQLite rowid alias unshadowed",
-                ));
-            }
-        }
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
@@ -177,19 +158,6 @@ impl AlterTableOperation {
             return Err(Error::UnsupportedSql(
                 "ALTER TABLE target column name is already bound",
             ));
-        }
-        if before.storage() == TableStorage::Rowid
-            && !before
-                .primary_key_columns()
-                .any(|column| before.is_rowid_alias(column.id()))
-        {
-            let mut names = catalog::column_names(connection, &before)?;
-            names.push(spec.column.name.clone());
-            if available_hidden_rowid_alias(names.iter()).is_none() {
-                return Err(Error::UnsupportedSql(
-                    "ADD COLUMN must leave one SQLite rowid alias unshadowed",
-                ));
-            }
         }
         let (after, column) = before.with_added_column(
             SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -868,14 +836,10 @@ fn capture_dropped_values(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let rowid = current_hidden_rowid_alias(connection, table)?;
     let mut selected = primary
         .iter()
         .map(|name| quote_identifier(name.value()))
         .collect::<Vec<_>>();
-    if let Some(rowid) = rowid {
-        selected.push(quote_identifier(rowid));
-    }
     selected.push(quote_identifier(column_name.value()));
     let sql = format!(
         "SELECT {} FROM {}",
@@ -888,18 +852,9 @@ fn capture_dropped_values(
         let primary = (0..primary_width)
             .map(|index| row.get_ref(index).map(StoredValue::capture))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut next = primary_width;
-        let rowid = if rowid.is_some() {
-            let value = StoredValue::capture(row.get_ref(next)?);
-            next += 1;
-            Some(value)
-        } else {
-            None
-        };
         Ok(DroppedValue {
             primary,
-            rowid,
-            value: StoredValue::capture(row.get_ref(next)?),
+            value: StoredValue::capture(row.get_ref(primary_width)?),
         })
     })?;
     // TODO: enforce deterministic row/byte limits and spill large DDL repair
@@ -931,14 +886,10 @@ fn restore_dropped_values(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let rowid = current_hidden_rowid_alias(connection, table)?;
-    let mut predicates = primary
+    let predicates = primary
         .iter()
         .map(|name| format!("{} IS ?", quote_identifier(name.value())))
         .collect::<Vec<_>>();
-    if let Some(rowid) = rowid {
-        predicates.push(format!("{} IS ?", quote_identifier(rowid)));
-    }
     let sql = format!(
         "UPDATE {} SET {} = ? WHERE {}",
         quote_identifier(table_name.value()),
@@ -947,14 +898,9 @@ fn restore_dropped_values(
     );
     let mut statement = connection.prepare(&sql)?;
     for value in values {
-        let mut parameters = Vec::<&dyn ToSql>::with_capacity(
-            1 + value.primary.len() + usize::from(value.rowid.is_some()),
-        );
+        let mut parameters = Vec::<&dyn ToSql>::with_capacity(1 + value.primary.len());
         parameters.push(&value.value);
         parameters.extend(value.primary.iter().map(|value| value as &dyn ToSql));
-        if let Some(rowid) = &value.rowid {
-            parameters.push(rowid);
-        }
         if statement.execute(params_from_iter(parameters))? != 1 {
             return Err(Error::InvalidDatabase(
                 "pending DROP COLUMN row no longer matches SQLite state",
@@ -964,35 +910,11 @@ fn restore_dropped_values(
     Ok(())
 }
 
-fn current_hidden_rowid_alias(
-    connection: &Connection,
-    table: &CreateTable,
-) -> Result<Option<&'static str>> {
-    if table.storage() == TableStorage::WithoutRowid
-        || table
-            .primary_key_columns()
-            .any(|column| table.is_rowid_alias(column.id()))
-    {
-        return Ok(None);
-    }
-    let names = catalog::column_names(connection, table)?;
-    available_hidden_rowid_alias(names.iter())
-        .map(Some)
-        .ok_or(Error::InvalidDatabase(
-            "rowid table has no unshadowed hidden rowid alias",
-        ))
-}
-
 fn encode_dropped_value(value: &DroppedValue) -> Vec<u8> {
     let mut writer = Writer::new();
     for primary in &value.primary {
         writer
             .field(TAG_DROPPED_PRIMARY, &encode_stored_value(primary))
-            .expect("dropped value field fits in u32");
-    }
-    if let Some(rowid) = &value.rowid {
-        writer
-            .field(TAG_DROPPED_ROWID, &encode_stored_value(rowid))
             .expect("dropped value field fits in u32");
     }
     writer
@@ -1004,7 +926,6 @@ fn encode_dropped_value(value: &DroppedValue) -> Vec<u8> {
 fn decode_dropped_value(frame: &[u8]) -> std::result::Result<DroppedValue, AlterTableCodecError> {
     let mut reader = Reader::new(frame);
     let mut primary = Vec::new();
-    let mut rowid = None;
     let mut value = None;
     while let Some((tag, bytes)) = reader
         .field()
@@ -1012,14 +933,12 @@ fn decode_dropped_value(frame: &[u8]) -> std::result::Result<DroppedValue, Alter
     {
         match tag {
             TAG_DROPPED_PRIMARY => primary.push(decode_stored_value(bytes)?),
-            TAG_DROPPED_ROWID => set_once(&mut rowid, decode_stored_value(bytes)?)?,
             TAG_DROPPED_COLUMN => set_once(&mut value, decode_stored_value(bytes)?)?,
             _ => {}
         }
     }
     Ok(DroppedValue {
         primary,
-        rowid,
         value: value.ok_or(AlterTableCodecError::MissingField(TAG_DROPPED_COLUMN))?,
     })
 }

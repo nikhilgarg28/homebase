@@ -90,7 +90,6 @@ const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
 
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
-const SQLITE_ROWID_ALIASES: [&str; 3] = ["_rowid_", "rowid", "oid"];
 
 /// Maximum number of columns in a single logical index definition.
 pub const MAX_INDEX_COLUMNS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
@@ -116,18 +115,6 @@ impl SqlName {
     pub fn canonical(&self) -> &[u8] {
         &self.canonical
     }
-}
-
-pub fn available_hidden_rowid_alias<'a>(
-    columns: impl IntoIterator<Item = &'a SqlName>,
-) -> Option<&'static str> {
-    let columns = columns
-        .into_iter()
-        .map(SqlName::canonical)
-        .collect::<Vec<_>>();
-    SQLITE_ROWID_ALIASES
-        .into_iter()
-        .find(|candidate| !columns.contains(&candidate.as_bytes()))
 }
 
 /// SQLite's five ordinary-table type affinities.
@@ -4131,7 +4118,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_rowid_tables_without_a_stable_hidden_alias() {
+    fn decoder_rejects_rowid_tables_without_an_integer_primary_key_alias() {
         let mut spec = definition("shadowed");
         spec.columns[0] = CreateColumn {
             name: SqlName::new("key".into()),
