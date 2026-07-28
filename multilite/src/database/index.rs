@@ -191,7 +191,17 @@ impl IndexOperation {
         if self.action == IndexAction::Drop {
             ensure_not_referenced(connection, &self.before, &self.index)?;
         }
-        connection.execute(&self.sql, ())?;
+        match self.action {
+            IndexAction::Create => {
+                let table = catalog::name_by_id(connection, self.before.table_id())?.ok_or(
+                    Error::InvalidDatabase("index operation references an unknown table identity"),
+                )?;
+                connection.execute(&self.index.materialization_sql(&table)?, ())?;
+            }
+            IndexAction::Drop => {
+                connection.execute(&self.sql, ())?;
+            }
+        }
         catalog::replace(connection, &self.after)
     }
 
@@ -214,7 +224,12 @@ impl IndexOperation {
                 ))?;
             }
             IndexAction::Drop => {
-                connection.execute(self.index.sql(), ())?;
+                let table = catalog::name_by_id(connection, self.after.table_id())?.ok_or(
+                    Error::InvalidDatabase(
+                        "pending index operation references an unknown table identity",
+                    ),
+                )?;
+                connection.execute(&self.index.materialization_sql(&table)?, ())?;
             }
         }
         catalog::replace(connection, &self.before)
@@ -744,6 +759,75 @@ mod tests {
         operation.record_catalog(&connection).unwrap();
         operation.rollback(&connection).unwrap();
         operation.apply(&connection).unwrap();
+    }
+
+    #[test]
+    fn index_apply_and_restore_render_the_owners_current_name() {
+        let (source, before) = connection();
+        let sql = "CREATE INDEX notes_tenant_slug_lookup ON notes (tenant, slug)";
+        source.execute(sql, ()).unwrap();
+        let create = IndexOperation::prepare_create(&source, sql, &secondary_spec()).unwrap();
+
+        let target = Connection::open_in_memory().unwrap();
+        catalog::initialize(&target).unwrap();
+        target.execute(before.sql(), ()).unwrap();
+        catalog::insert(&target, &before).unwrap();
+        target
+            .execute("ALTER TABLE notes RENAME TO archived_notes", ())
+            .unwrap();
+        catalog::rename_binding(
+            &target,
+            before.table_id(),
+            before.table_name_identity(),
+            &super::super::schema::SqlName::new("archived_notes".into()),
+        )
+        .unwrap();
+
+        create.apply(&target).unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT tbl_name FROM sqlite_schema
+                     WHERE type = 'index' AND name = 'notes_tenant_slug_lookup'",
+                    (),
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "archived_notes"
+        );
+        assert_eq!(
+            catalog::by_id(&target, before.table_id())
+                .unwrap()
+                .unwrap()
+                .indexes()[0]
+                .sql(),
+            sql
+        );
+
+        let drop_sql = "DROP INDEX notes_tenant_slug_lookup";
+        let drop = IndexOperation::prepare_drop(
+            &target,
+            drop_sql,
+            &DropIndexSpec {
+                name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
+            },
+        )
+        .unwrap();
+        target.execute(drop_sql, ()).unwrap();
+        drop.record_catalog(&target).unwrap();
+        drop.rollback(&target).unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT tbl_name FROM sqlite_schema
+                     WHERE type = 'index' AND name = 'notes_tenant_slug_lookup'",
+                    (),
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "archived_notes"
+        );
+        catalog::validate(&target).unwrap();
     }
 
     #[test]

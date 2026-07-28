@@ -565,6 +565,83 @@ fn select_table_reads_reserved(table: &SelectTable) -> bool {
     }
 }
 
+/// Render an immutable CREATE INDEX definition for its owner's current name.
+pub(super) fn render_create_index(sql: &str, table: &SqlName) -> Result<String> {
+    let mut statement = parse_one(sql)?;
+    let Stmt::CreateIndex { tbl_name, .. } = &mut statement else {
+        return Err(Error::InvalidMultiliteOp(
+            "index definition is not CREATE INDEX".into(),
+        ));
+    };
+    if identifier(tbl_name)?.canonical() == table.canonical() {
+        return Ok(sql.to_owned());
+    }
+    *tbl_name = quoted_name(table);
+    Ok(Cmd::Stmt(statement).to_string())
+}
+
+/// Render immutable CREATE TABLE provenance with current foreign-parent names.
+pub(super) fn render_create_table(sql: &str, parents: &[(SqlName, SqlName)]) -> Result<String> {
+    if parents
+        .iter()
+        .all(|(source, current)| source.canonical() == current.canonical())
+    {
+        return Ok(sql.to_owned());
+    }
+    let mut statement = parse_one(sql)?;
+    let Stmt::CreateTable { body, .. } = &mut statement else {
+        return Err(Error::InvalidMultiliteOp(
+            "table definition is not CREATE TABLE".into(),
+        ));
+    };
+    let CreateTableBody::ColumnsAndConstraints {
+        columns,
+        constraints,
+        ..
+    } = body
+    else {
+        return Err(Error::InvalidMultiliteOp(
+            "foreign-key table has no structural definition".into(),
+        ));
+    };
+
+    for column in columns.values_mut() {
+        for constraint in &mut column.constraints {
+            if let ColumnConstraint::ForeignKey { clause, .. } = &mut constraint.constraint {
+                rewrite_parent_clause(clause, parents)?;
+            }
+        }
+    }
+    for constraint in constraints.iter_mut().flatten() {
+        if let TableConstraint::ForeignKey { clause, .. } = &mut constraint.constraint {
+            rewrite_parent_clause(clause, parents)?;
+        }
+    }
+    Ok(Cmd::Stmt(statement).to_string())
+}
+
+fn rewrite_parent_clause(
+    clause: &mut ForeignKeyClause,
+    parents: &[(SqlName, SqlName)],
+) -> Result<()> {
+    let original = identifier(&clause.tbl_name)?;
+    let replacement = parents
+        .iter()
+        .find(|(source, _)| source.canonical() == original.canonical())
+        .map(|(_, replacement)| replacement)
+        .ok_or_else(|| {
+            Error::InvalidMultiliteOp(
+                "foreign-key SQL has no matching stable parent identity".into(),
+            )
+        })?;
+    clause.tbl_name = quoted_name(replacement);
+    Ok(())
+}
+
+fn quoted_name(name: &SqlName) -> Name {
+    Name(format!("\"{}\"", name.value().replace('"', "\"\"")).into())
+}
+
 fn parse_one(sql: &str) -> Result<Stmt> {
     match parse_one_command(sql)? {
         Cmd::Stmt(statement) => Ok(statement),
@@ -1324,6 +1401,42 @@ mod tests {
         ] {
             validate_execute(sql).unwrap();
         }
+    }
+
+    #[test]
+    fn materialization_renderers_change_only_uuid_resolved_table_names() {
+        let rendered = render_create_index(
+            "CREATE INDEX notes_body ON notes (body COLLATE NOCASE DESC)",
+            &SqlName::new("Archived Notes".into()),
+        )
+        .unwrap();
+        let ValidatedExecute::CreateIndex(spec) = validate_execute(&rendered).unwrap() else {
+            panic!("rendered index parsed as another statement kind")
+        };
+        assert_eq!(spec.table, SqlName::new("Archived Notes".into()));
+
+        let rendered = render_create_table(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                first INTEGER REFERENCES parents(id),
+                second INTEGER,
+                FOREIGN KEY (second) REFERENCES parents(id)
+            )",
+            &[(
+                SqlName::new("parents".into()),
+                SqlName::new("Archived Parents".into()),
+            )],
+        )
+        .unwrap();
+        let ValidatedExecute::CreateTable(spec) = validate_execute(&rendered).unwrap() else {
+            panic!("rendered table parsed as another statement kind")
+        };
+        assert!(
+            spec.foreign_keys
+                .iter()
+                .all(|foreign_key| foreign_key.referenced_table
+                    == SqlName::new("Archived Parents".into()))
+        );
     }
 
     #[test]

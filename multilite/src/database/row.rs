@@ -522,6 +522,7 @@ impl InsertRows {
 
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.table)?;
         let columns = created.columns();
         let hidden_rowid = hidden_rowid_alias(&created)?;
         let mut names = columns
@@ -538,7 +539,7 @@ impl InsertRows {
                 .join(", ");
         let sql = format!(
             "INSERT INTO {} ({names}) VALUES ({placeholders})",
-            quote_identifier(created.table_name())
+            quote_identifier(&table_name)
         );
         let mut statement = connection.prepare(&sql)?;
         for row in &self.rows {
@@ -581,6 +582,7 @@ impl InsertRows {
         mismatch: &'static str,
     ) -> Result<()> {
         let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.table)?;
         self.validate_materialized_against(connection, &created, mismatch)?;
         let primary = created.primary_key_columns().collect::<Vec<_>>();
         let mut predicates = primary
@@ -593,7 +595,7 @@ impl InsertRows {
         }
         let sql = format!(
             "DELETE FROM {} WHERE {}",
-            quote_identifier(created.table_name()),
+            quote_identifier(&table_name),
             predicates.join(" AND ")
         );
         let mut delete = connection.prepare(&sql)?;
@@ -621,6 +623,7 @@ impl InsertRows {
         created: &CreateTable,
         mismatch: &'static str,
     ) -> Result<()> {
+        let table_name = materialized_table_name(connection, self.table)?;
         let columns = created.columns();
         let primary = created.primary_key_columns().collect::<Vec<_>>();
         let mut predicates = primary
@@ -642,7 +645,7 @@ impl InsertRows {
         let select_sql = format!(
             "SELECT {} FROM {} WHERE {predicate}",
             selected.join(", "),
-            quote_identifier(created.table_name())
+            quote_identifier(&table_name)
         );
         let mut select = connection.prepare(&select_sql)?;
         for row in self.rows.iter().rev() {
@@ -1674,7 +1677,7 @@ impl UpdateRows {
         }
         let sql = format!(
             "UPDATE {} SET {assignments} WHERE {}",
-            quote_identifier(created.table_name()),
+            quote_identifier(&materialized_table_name(connection, self.after.table)?),
             predicates.join(" AND ")
         );
         let mut statement = connection.prepare(&sql)?;
@@ -1878,12 +1881,11 @@ fn foreign_key_rule(
         .ok_or(Error::InvalidDatabase(
             "foreign key target is no longer active in the parent schema",
         ))?;
-    if parent.table_name_identity() != foreign_key.referenced_table_name()
-        || parent_columns
-            .iter()
-            .copied()
-            .map(Column::id)
-            .ne(foreign_key.referenced_columns().iter().copied())
+    if parent_columns
+        .iter()
+        .copied()
+        .map(Column::id)
+        .ne(foreign_key.referenced_columns().iter().copied())
     {
         return Err(Error::InvalidDatabase(
             "foreign key parent identity contradicts the schema catalog",
@@ -2019,6 +2021,7 @@ pub fn backfill_unique_index(
 }
 
 fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<CapturedRow>> {
+    let table_name = materialized_table_name(connection, created.table_id())?;
     let hidden_rowid = hidden_rowid_alias(created)?;
     let mut selected = created
         .columns()
@@ -2031,7 +2034,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
     let sql = format!(
         "SELECT {} FROM {}",
         selected.join(", "),
-        quote_identifier(created.table_name())
+        quote_identifier(&table_name)
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map((), |row| {
@@ -2059,7 +2062,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
             0
         };
         Ok(CapturedRow {
-            table: created.table_name().to_owned(),
+            table: table_name.clone(),
             rowid,
             values,
         })
@@ -2447,7 +2450,7 @@ pub(super) fn normalize_insert_rowids(
     let Some(alias) = hidden_rowid_alias(&created)? else {
         return Ok(());
     };
-    let table = quote_identifier(created.table_name());
+    let table = quote_identifier(&first.table);
     let alias = quote_identifier(alias);
     let exists_sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {alias} = ?1)");
     let update_sql = format!("UPDATE {table} SET {alias} = ?1 WHERE {alias} = ?2");
@@ -2492,6 +2495,14 @@ fn hidden_rowid_alias(created: &CreateTable) -> Result<Option<&'static str>> {
         })
         .ok_or(Error::InvalidDatabase(
             "tables with a non-integer primary key must leave one SQLite rowid alias unshadowed",
+        ))
+}
+
+fn materialized_table_name(connection: &Connection, table: TableId) -> Result<String> {
+    catalog::name_by_id(connection, table)?
+        .map(|name| name.value().to_owned())
+        .ok_or(Error::InvalidDatabase(
+            "row operation references a table without a current name binding",
         ))
 }
 
@@ -4550,6 +4561,53 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn stale_rows_follow_table_identity_after_rename_and_name_reuse() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        connection
+            .execute("ALTER TABLE notes RENAME TO archived_notes", ())
+            .unwrap();
+        catalog::rename_binding(
+            &connection,
+            created.table_id(),
+            created.table_name_identity(),
+            &super::super::schema::SqlName::new("archived_notes".into()),
+        )
+        .unwrap();
+
+        let replacement = definition();
+        connection.execute(replacement.sql(), ()).unwrap();
+        catalog::insert(&connection, &replacement).unwrap();
+        inserted.apply(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM archived_notes", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        inserted.delete_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM archived_notes", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        catalog::validate(&connection).unwrap();
     }
 
     #[test]

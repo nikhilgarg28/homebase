@@ -458,16 +458,17 @@ fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
     for effect in effects {
         match effect {
             Effect::DropTable { created } => {
-                if catalog::by_name(connection, created.table_name())?.as_ref() != Some(created) {
+                if catalog::by_id(connection, created.table_id())?.as_ref() != Some(created) {
                     return Err(Error::InvalidDatabase(
                         "pending CREATE TABLE no longer matches SQLite state",
                     ));
                 }
-                connection.execute_batch(&format!(
-                    "DROP TABLE {}",
-                    quote_identifier(created.table_name())
-                ))?;
-                catalog::remove_by_name(connection, created.table_name())?;
+                let name = catalog::name_by_id(connection, created.table_id())?.ok_or(
+                    Error::InvalidDatabase("pending CREATE TABLE has no current name binding"),
+                )?;
+                connection
+                    .execute_batch(&format!("DROP TABLE {}", quote_identifier(name.value())))?;
+                catalog::remove_by_id(connection, created.table_id())?;
             }
             Effect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
             Effect::RestoreRows { deleted } => deleted.restore_materialized(connection)?,
@@ -879,6 +880,61 @@ mod tests {
         assert_eq!(
             catalog::by_name(&connection, "notes").unwrap(),
             Some(replacement)
+        );
+    }
+
+    #[test]
+    fn drop_effect_follows_the_created_identity_after_rename_and_name_reuse() {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let MultiliteOp::CreateTable(original) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(original.sql(), ()).unwrap();
+        catalog::insert(&connection, &original).unwrap();
+        connection
+            .execute("ALTER TABLE notes RENAME TO archived_notes", ())
+            .unwrap();
+        catalog::rename_binding(
+            &connection,
+            original.table_id(),
+            original.table_name_identity(),
+            &super::super::schema::SqlName::new("archived_notes".into()),
+        )
+        .unwrap();
+        let MultiliteOp::CreateTable(replacement) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(replacement.sql(), ()).unwrap();
+        catalog::insert(&connection, &replacement).unwrap();
+
+        apply_effects(
+            &connection,
+            &[Effect::DropTable {
+                created: original.clone(),
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            catalog::by_id(&connection, original.table_id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog::by_name(&connection, "notes").unwrap(),
+            Some(replacement)
+        );
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_schema WHERE name = 'archived_notes'
+                    )",
+                    (),
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
         );
     }
 

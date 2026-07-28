@@ -80,19 +80,29 @@ pub fn validate(connection: &Connection) -> Result<()> {
     }
 
     let mut statement = connection.prepare(&format!(
-        "SELECT table_id, definition FROM {TABLE} ORDER BY schema_name, table_name"
+        "SELECT schema_name, table_name, table_id, definition
+         FROM {TABLE} ORDER BY schema_name, table_name"
     ))?;
     let rows = statement.query_map((), |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
     })?;
     let mut active_indexes = BTreeSet::new();
     let mut tables = Vec::new();
     for row in rows {
-        let (table_id, definition) = row?;
+        let (schema_name, table_name, table_id, definition) = row?;
+        let binding = decode_binding(&table_name)?;
         let created = decode_definition(&definition)?;
-        if table_id != created.table_id().as_bytes() {
+        if schema_name != MAIN_SCHEMA
+            || binding.canonical() != table_name
+            || table_id != created.table_id().as_bytes()
+        {
             return Err(Error::InvalidDatabase(
-                "schema catalog table id contradicts its definition",
+                "schema catalog binding contradicts its definition",
             ));
         }
         if created
@@ -131,12 +141,11 @@ pub fn replace(connection: &Connection, definition: &CreateTable) -> Result<()> 
     let changed = connection.execute(
         &format!(
             "UPDATE {TABLE} SET definition = ?1
-             WHERE schema_name = ?2 AND table_name = ?3 AND table_id = ?4"
+             WHERE schema_name = ?2 AND table_id = ?3"
         ),
         params![
             definition.encode(),
             MAIN_SCHEMA,
-            definition.table_name_identity().canonical(),
             definition.table_id().as_bytes().as_slice(),
         ],
     )?;
@@ -148,12 +157,69 @@ pub fn replace(connection: &Connection, definition: &CreateTable) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 pub fn remove_by_name(connection: &Connection, name: &str) -> Result<()> {
     let name = SqlName::new(name.to_owned());
     connection.execute(
         &format!("DELETE FROM {TABLE} WHERE schema_name = ?1 AND table_name = ?2"),
         params![MAIN_SCHEMA, name.canonical()],
     )?;
+    Ok(())
+}
+
+pub fn remove_by_id(connection: &Connection, table: TableId) -> Result<()> {
+    let changed = connection.execute(
+        &format!("DELETE FROM {TABLE} WHERE schema_name = ?1 AND table_id = ?2"),
+        params![MAIN_SCHEMA, table.as_bytes().as_slice()],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidDatabase(
+            "schema catalog table changed during removal",
+        ));
+    }
+    Ok(())
+}
+
+/// Return the current SQLite spelling bound to a stable table identity.
+pub fn name_by_id(connection: &Connection, table: TableId) -> Result<Option<SqlName>> {
+    let name = connection
+        .query_row(
+            &format!(
+                "SELECT table_name FROM {TABLE}
+                 WHERE schema_name = ?1 AND table_id = ?2"
+            ),
+            params![MAIN_SCHEMA, table.as_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    name.map(|name| decode_binding(&name)).transpose()
+}
+
+/// Move only the mutable name binding for one stable table identity.
+#[allow(dead_code, reason = "used by the table-rename operation")]
+pub fn rename_binding(
+    connection: &Connection,
+    table: TableId,
+    expected: &SqlName,
+    replacement: &SqlName,
+) -> Result<()> {
+    let changed = connection.execute(
+        &format!(
+            "UPDATE {TABLE} SET table_name = ?1
+             WHERE schema_name = ?2 AND table_name = ?3 AND table_id = ?4"
+        ),
+        params![
+            replacement.canonical(),
+            MAIN_SCHEMA,
+            expected.canonical(),
+            table.as_bytes().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidDatabase(
+            "schema catalog table changed during rename",
+        ));
+    }
     Ok(())
 }
 
@@ -244,6 +310,12 @@ fn decode_definition(frame: &[u8]) -> Result<CreateTable> {
     CreateTable::decode(frame).map_err(|_| Error::InvalidDatabase("schema catalog is malformed"))
 }
 
+fn decode_binding(bytes: &[u8]) -> Result<SqlName> {
+    let value = String::from_utf8(bytes.to_vec())
+        .map_err(|_| Error::InvalidDatabase("schema catalog table name is not UTF-8"))?;
+    Ok(SqlName::new(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +368,42 @@ mod tests {
         assert_eq!(
             by_id(&connection, created.table_id()).unwrap(),
             Some(created)
+        );
+        validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn mutable_name_bindings_do_not_rewrite_immutable_definitions() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let created = created();
+        let encoded = created.encode();
+        insert(&connection, &created).unwrap();
+        let replacement = SqlName::new("Archived Notes".into());
+
+        rename_binding(
+            &connection,
+            created.table_id(),
+            created.table_name_identity(),
+            &replacement,
+        )
+        .unwrap();
+
+        assert!(by_name(&connection, "notes").unwrap().is_none());
+        assert_eq!(
+            by_name(&connection, "ARCHIVED NOTES").unwrap(),
+            Some(created.clone())
+        );
+        assert_eq!(
+            name_by_id(&connection, created.table_id()).unwrap(),
+            Some(SqlName::new("archived notes".into()))
+        );
+        assert_eq!(
+            by_id(&connection, created.table_id())
+                .unwrap()
+                .unwrap()
+                .encode(),
+            encoded
         );
         validate(&connection).unwrap();
     }

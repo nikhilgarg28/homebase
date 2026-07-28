@@ -831,6 +831,11 @@ impl NamedIndex {
         &self.sql
     }
 
+    /// Render this immutable definition for its owner's current SQLite name.
+    pub fn materialization_sql(&self, table: &SqlName) -> Result<String> {
+        super::sql::render_create_index(&self.sql, table)
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -973,13 +978,39 @@ impl CreateTable {
     }
 
     /// Return the exact SQLite spelling of the created table name.
+    #[cfg(test)]
     pub fn table_name(&self) -> &str {
         self.name.value()
     }
 
-    /// Return the validated SQL used to materialize this table.
+    /// Return the immutable SQL provenance for this table creation.
+    #[cfg(test)]
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// Render immutable CREATE TABLE provenance against current parent bindings.
+    pub fn materialization_sql(&self, connection: &Connection) -> Result<String> {
+        let mut parents = Vec::<(SqlName, SqlName)>::new();
+        for foreign_key in self.foreign_keys() {
+            let current = catalog::name_by_id(connection, foreign_key.referenced_table())?.ok_or(
+                Error::InvalidDatabase("foreign key references an unknown parent table"),
+            )?;
+            let source = foreign_key.referenced_table_name().clone();
+            if let Some((_, existing)) = parents
+                .iter()
+                .find(|(candidate, _)| candidate.canonical() == source.canonical())
+            {
+                if existing != &current {
+                    return Err(Error::InvalidDatabase(
+                        "foreign-key SQL name resolves to multiple parent identities",
+                    ));
+                }
+            } else {
+                parents.push((source, current));
+            }
+        }
+        super::sql::render_create_table(&self.sql, &parents)
     }
 
     pub fn table_id(&self) -> TableId {
@@ -1457,12 +1488,11 @@ fn validate_foreign_key_link(
             "foreign-key reference key exceeds the Homebase component limit",
         ));
     }
-    if parent.table_name_identity() != foreign_key.referenced_table_name()
-        || parent_columns
-            .iter()
-            .copied()
-            .map(Column::id)
-            .ne(foreign_key.referenced_columns.iter().copied())
+    if parent_columns
+        .iter()
+        .copied()
+        .map(Column::id)
+        .ne(foreign_key.referenced_columns.iter().copied())
         || parent_columns
             .iter()
             .copied()

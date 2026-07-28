@@ -163,7 +163,7 @@ impl MultiliteOp {
         match self {
             Self::CreateTable(created) => {
                 created.validate_foreign_key_parents(connection)?;
-                connection.execute(created.sql(), ())?;
+                connection.execute(&created.materialization_sql(connection)?, ())?;
                 catalog::insert(connection, created)
             }
             Self::InsertRows(inserted) => inserted.apply(connection),
@@ -347,5 +347,74 @@ mod tests {
         let (mutations, footprint) = updated.to_homebase().unwrap().into_parts();
         assert!(matches!(mutations.as_slice(), [Mutation::Set { .. }]));
         assert_eq!(footprint.writes().len(), 1);
+    }
+
+    #[test]
+    fn create_table_apply_renders_current_foreign_parent_names() {
+        let source = Connection::open_in_memory().unwrap();
+        catalog::initialize(&source).unwrap();
+        let parent_sql = "CREATE TABLE parents (id INTEGER PRIMARY KEY)";
+        let crate::database::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::database::sql::validate_execute(parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::new(parent_sql, parent_spec);
+        source.execute(parent.sql(), ()).unwrap();
+        catalog::insert(&source, &parent).unwrap();
+        let child_sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES parents(id)
+        )";
+        let crate::database::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::database::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&source, child_sql, child_spec).unwrap();
+        let encoded_child = child.encode();
+
+        let target = Connection::open_in_memory().unwrap();
+        target.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        catalog::initialize(&target).unwrap();
+        target.execute(parent.sql(), ()).unwrap();
+        catalog::insert(&target, &parent).unwrap();
+        target
+            .execute("ALTER TABLE parents RENAME TO accounts", ())
+            .unwrap();
+        catalog::rename_binding(
+            &target,
+            parent.table_id(),
+            parent.table_name_identity(),
+            &SqlName::new("accounts".into()),
+        )
+        .unwrap();
+
+        MultiliteOp::CreateTable(child.clone())
+            .apply(&target)
+            .unwrap();
+
+        assert_eq!(
+            target
+                .query_row("PRAGMA foreign_key_list(children)", (), |row| {
+                    row.get::<_, String>(2)
+                })
+                .unwrap(),
+            "accounts"
+        );
+        assert_eq!(
+            catalog::by_id(&target, child.table_id())
+                .unwrap()
+                .unwrap()
+                .encode(),
+            encoded_child
+        );
+        target
+            .execute("INSERT INTO accounts VALUES (1)", ())
+            .unwrap();
+        target
+            .execute("INSERT INTO children VALUES (1, 1)", ())
+            .unwrap();
+        catalog::validate(&target).unwrap();
     }
 }

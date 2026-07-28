@@ -237,6 +237,9 @@ struct EagerSource {
 
 impl EagerSource {
     fn load(connection: &Connection, definition: CreateTable, trace: ReadTrace) -> Result<Self> {
+        let table = catalog::name_by_id(connection, definition.table_id())?.ok_or(
+            Error::InvalidDatabase("vtable source has no current table-name binding"),
+        )?;
         let columns = definition
             .columns()
             .iter()
@@ -245,7 +248,7 @@ impl EagerSource {
             .join(", ");
         let sql = format!(
             "SELECT {columns} FROM main.{}",
-            quote_identifier(definition.table_name())
+            quote_identifier(table.value())
         );
         let mut statement = connection.prepare(&sql)?;
         let width = definition.columns().len();
