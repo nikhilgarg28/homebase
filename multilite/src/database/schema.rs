@@ -48,6 +48,15 @@ const TAG_NAMED_INDEX_DEFINITION: u8 = 1;
 const TAG_INDEX_NAME: u8 = 2;
 const TAG_INDEX_SQL: u8 = 5;
 const TAG_INDEX_ACTIVE: u8 = 6;
+const TAG_INDEX_TERM: u8 = 7;
+const TAG_INDEX_PREDICATE: u8 = 8;
+const INDEX_TERM_FRAME_VERSION: u8 = 1;
+const TAG_INDEX_TERM_COLUMN: u8 = 1;
+const TAG_INDEX_TERM_COLLATION: u8 = 2;
+const TAG_INDEX_TERM_EXPRESSION: u8 = 3;
+const TAG_INDEX_TERM_ORDER: u8 = 4;
+const INDEX_ORDER_ASC: u8 = 1;
+const INDEX_ORDER_DESC: u8 = 2;
 const TAG_FOREIGN_KEY_ID: u8 = 1;
 const TAG_FOREIGN_KEY_NAME: u8 = 2;
 const TAG_FOREIGN_KEY_COLUMN_ID: u8 = 3;
@@ -452,7 +461,31 @@ pub enum IndexKind {
     Secondary,
 }
 
-/// Stable identity and ordered columns for one logical table index.
+/// Explicit ordering attached to one ordinary secondary-index term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexOrder {
+    Asc,
+    Desc,
+}
+
+/// One durable term in an ordinary secondary-index definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexTerm {
+    Column {
+        column: ColumnId,
+        collation: Option<SqlName>,
+        order: Option<IndexOrder>,
+    },
+    Expression {
+        expression: SqlExpression,
+        order: Option<IndexOrder>,
+    },
+}
+
+/// Stable identity and comparison columns for one logical table index.
+///
+/// Primary and UNIQUE indexes carry ordered comparison columns here. Ordinary
+/// secondary indexes carry their physical terms on [`NamedIndex`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDefinition {
     id: IndexId,
@@ -461,15 +494,14 @@ pub struct IndexDefinition {
 }
 
 /// An explicit index attached to a table schema.
-///
-/// CREATE INDEX is not admitted yet, but indexes live here rather than in a
-/// parallel database-level registry when that grammar is added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedIndex {
     name: SqlName,
     index: IndexDefinition,
     sql: String,
     active: bool,
+    terms: Vec<IndexTerm>,
+    predicate: Option<SqlExpression>,
 }
 
 /// One stable immediate `NO ACTION` relationship owned by the child table.
@@ -709,7 +741,7 @@ fn index_columns_supported(kind: IndexKind, index_columns: usize) -> bool {
         IndexKind::Primary | IndexKind::Unique => codes::VALUE_KEY_PREFIX_COMPONENTS
             .checked_add(index_columns)
             .is_some_and(|components| components <= MAX_COMPONENTS),
-        IndexKind::Secondary => index_columns <= MAX_INDEX_COLUMNS,
+        IndexKind::Secondary => index_columns == 0,
     }
 }
 
@@ -732,20 +764,38 @@ impl IndexDefinition {
 }
 
 impl NamedIndex {
-    pub fn new(sql: String, name: SqlName, unique: bool, columns: Vec<ColumnId>) -> Self {
+    pub fn new_unique(sql: String, name: SqlName, columns: Vec<ColumnId>) -> Self {
         Self {
             name,
             index: IndexDefinition {
                 id: IndexId(Uuid::new_v4().into_bytes()),
-                kind: if unique {
-                    IndexKind::Unique
-                } else {
-                    IndexKind::Secondary
-                },
+                kind: IndexKind::Unique,
                 columns,
             },
             sql,
             active: true,
+            terms: Vec::new(),
+            predicate: None,
+        }
+    }
+
+    pub fn new_secondary(
+        sql: String,
+        name: SqlName,
+        terms: Vec<IndexTerm>,
+        predicate: Option<SqlExpression>,
+    ) -> Self {
+        Self {
+            name,
+            index: IndexDefinition {
+                id: IndexId(Uuid::new_v4().into_bytes()),
+                kind: IndexKind::Secondary,
+                columns: Vec::new(),
+            },
+            sql,
+            active: true,
+            terms,
+            predicate,
         }
     }
 
@@ -763,6 +813,14 @@ impl NamedIndex {
 
     pub fn columns(&self) -> &[ColumnId] {
         self.index.columns()
+    }
+
+    pub fn terms(&self) -> &[IndexTerm] {
+        &self.terms
+    }
+
+    pub fn predicate(&self) -> Option<&SqlExpression> {
+        self.predicate.as_ref()
     }
 
     pub fn index(&self) -> &IndexDefinition {
@@ -973,6 +1031,104 @@ impl CreateTable {
         self.columns()
             .iter()
             .find(|column| column.name.canonical() == name.canonical())
+    }
+
+    pub fn prepare_named_index(
+        &self,
+        sql: &str,
+        spec: &super::sql::CreateIndexSpec,
+    ) -> Result<NamedIndex> {
+        if spec.table != self.name {
+            return Err(Error::UnsupportedSql(
+                "CREATE INDEX target does not match its synchronized table",
+            ));
+        }
+        let (columns, terms) = self.resolve_index_terms(spec)?;
+        if spec.unique {
+            Ok(NamedIndex::new_unique(
+                sql.to_owned(),
+                spec.name.clone(),
+                columns,
+            ))
+        } else {
+            Ok(NamedIndex::new_secondary(
+                sql.to_owned(),
+                spec.name.clone(),
+                terms,
+                spec.predicate.clone(),
+            ))
+        }
+    }
+
+    pub fn named_index_matches_spec(
+        &self,
+        index: &NamedIndex,
+        spec: &super::sql::CreateIndexSpec,
+    ) -> bool {
+        if spec.name != *index.name() || spec.table != self.name || spec.unique != index.is_unique()
+        {
+            return false;
+        }
+        let Ok((columns, terms)) = self.resolve_index_terms(spec) else {
+            return false;
+        };
+        if spec.unique {
+            index.columns() == columns
+                && index.terms().is_empty()
+                && index.predicate().is_none()
+                && spec.predicate.is_none()
+        } else {
+            index.columns().is_empty()
+                && index.terms() == terms
+                && index.predicate() == spec.predicate.as_ref()
+        }
+    }
+
+    fn resolve_index_terms(
+        &self,
+        spec: &super::sql::CreateIndexSpec,
+    ) -> Result<(Vec<ColumnId>, Vec<IndexTerm>)> {
+        let mut columns = Vec::new();
+        let mut terms = Vec::new();
+        for term in &spec.terms {
+            match term {
+                super::sql::CreateIndexTerm::Column {
+                    name,
+                    collation,
+                    order,
+                } => {
+                    let column = self.column_named(name).ok_or(Error::UnsupportedSql(
+                        "CREATE INDEX references an unknown column",
+                    ))?;
+                    if spec.unique {
+                        if collation.is_some() || order.is_some() {
+                            return Err(Error::UnsupportedSql(
+                                "UNIQUE index collations and ordering are not supported",
+                            ));
+                        }
+                        columns.push(column.id());
+                    } else {
+                        terms.push(IndexTerm::Column {
+                            column: column.id(),
+                            collation: collation.clone(),
+                            order: *order,
+                        });
+                    }
+                }
+                super::sql::CreateIndexTerm::Expression { expression, order } => {
+                    if spec.unique {
+                        return Err(Error::UnsupportedSql(
+                            "UNIQUE index expressions are not supported",
+                        ));
+                    }
+                    terms.push(IndexTerm::Expression {
+                        expression: expression.clone(),
+                        order: *order,
+                    });
+                }
+            }
+        }
+        Ok((columns, terms))
     }
 
     pub fn index_named(&self, name: &SqlName) -> Option<&NamedIndex> {
@@ -1770,6 +1926,59 @@ fn encode_named_index(index: &NamedIndex) -> Vec<u8> {
     writer
         .field(TAG_INDEX_ACTIVE, &[u8::from(index.active)])
         .expect("index field length must fit in u32");
+    for term in &index.terms {
+        writer
+            .field(TAG_INDEX_TERM, &encode_index_term(term))
+            .expect("index term field length must fit in u32");
+    }
+    if let Some(predicate) = &index.predicate {
+        writer
+            .field(TAG_INDEX_PREDICATE, predicate.to_string().as_bytes())
+            .expect("index predicate field length must fit in u32");
+    }
+    writer.finish()
+}
+
+fn encode_index_term(term: &IndexTerm) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.u8(INDEX_TERM_FRAME_VERSION);
+    let order = match term {
+        IndexTerm::Column { column, .. } => {
+            writer
+                .field(TAG_INDEX_TERM_COLUMN, &column.0)
+                .expect("index column field length must fit in u32");
+            if let IndexTerm::Column {
+                collation: Some(collation),
+                ..
+            } = term
+            {
+                writer
+                    .field(TAG_INDEX_TERM_COLLATION, collation.value().as_bytes())
+                    .expect("index collation field length must fit in u32");
+            }
+            match term {
+                IndexTerm::Column { order, .. } => *order,
+                IndexTerm::Expression { .. } => unreachable!(),
+            }
+        }
+        IndexTerm::Expression { expression, order } => {
+            writer
+                .field(TAG_INDEX_TERM_EXPRESSION, expression.to_string().as_bytes())
+                .expect("index expression field length must fit in u32");
+            *order
+        }
+    };
+    if let Some(order) = order {
+        writer
+            .field(
+                TAG_INDEX_TERM_ORDER,
+                &[match order {
+                    IndexOrder::Asc => INDEX_ORDER_ASC,
+                    IndexOrder::Desc => INDEX_ORDER_DESC,
+                }],
+            )
+            .expect("index order field length must fit in u32");
+    }
     writer.finish()
 }
 
@@ -1925,6 +2134,37 @@ fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], SchemaCodecError> {
     Ok(bytes)
 }
 
+fn named_index_definition_is_valid(index: &NamedIndex, columns: &[Column]) -> bool {
+    match index.index.kind {
+        IndexKind::Unique => {
+            !index.columns().is_empty()
+                && index_columns_supported(IndexKind::Unique, index.columns().len())
+                && index.terms().is_empty()
+                && index.predicate().is_none()
+                && !index
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .any(|(position, column)| {
+                        index.columns()[..position].contains(column)
+                            || !columns.iter().any(|candidate| candidate.id == *column)
+                    })
+        }
+        IndexKind::Secondary => {
+            index.columns().is_empty()
+                && !index.terms().is_empty()
+                && index.terms().len() <= MAX_INDEX_COLUMNS
+                && index.terms().iter().all(|term| match term {
+                    IndexTerm::Column { column, .. } => {
+                        columns.iter().any(|candidate| candidate.id == *column)
+                    }
+                    IndexTerm::Expression { .. } => true,
+                })
+        }
+        IndexKind::Primary => false,
+    }
+}
+
 fn decode_create_table(
     frame: &[u8],
 ) -> std::result::Result<(TableId, SchemaRevisionId, SqlName, TableSchema), SchemaCodecError> {
@@ -2046,8 +2286,7 @@ fn decode_create_table(
             !matches!(
                 definition.index.kind,
                 IndexKind::Unique | IndexKind::Secondary
-            ) || definition.columns().is_empty()
-                || !index_columns_supported(definition.index.kind, definition.columns().len())
+            ) || !named_index_definition_is_valid(definition, &columns)
                 || definition.sql.is_empty()
                 || indexes[..index]
                     .iter()
@@ -2056,14 +2295,6 @@ fn decode_create_table(
                     && indexes[..index].iter().any(|seen| {
                         seen.active && seen.name.canonical() == definition.name.canonical()
                     }))
-                || definition
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .any(|(column_index, column)| {
-                        definition.columns()[..column_index].contains(column)
-                            || !columns.iter().any(|candidate| candidate.id == *column)
-                    })
         })
         || foreign_keys.iter().enumerate().any(|(index, foreign_key)| {
             foreign_key.columns.is_empty()
@@ -2205,6 +2436,8 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
     let mut name = None;
     let mut sql = None;
     let mut active = None;
+    let mut terms = Vec::new();
+    let mut predicate = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_NAMED_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
@@ -2224,6 +2457,16 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
                 };
                 set_once(&mut active, value)?;
             }
+            TAG_INDEX_TERM => terms.push(decode_index_term(value)?),
+            TAG_INDEX_PREDICATE => {
+                let expression = std::str::from_utf8(value)
+                    .map_err(|_| SchemaCodecError::InvalidUtf8)
+                    .and_then(|expression| {
+                        super::sql::parse_schema_expression(expression)
+                            .map_err(|_| SchemaCodecError::InvalidSql)
+                    })?;
+                set_once(&mut predicate, expression)?;
+            }
             _ => {}
         }
     }
@@ -2232,7 +2475,60 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
         name: name.ok_or(SchemaCodecError::MissingField(TAG_INDEX_NAME))?,
         sql: sql.ok_or(SchemaCodecError::MissingField(TAG_INDEX_SQL))?,
         active: active.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ACTIVE))?,
+        terms,
+        predicate,
     })
+}
+
+fn decode_index_term(frame: &[u8]) -> std::result::Result<IndexTerm, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(INDEX_TERM_FRAME_VERSION) {
+        return Err(SchemaCodecError::UnknownVersion);
+    }
+    let mut column = None;
+    let mut collation = None;
+    let mut expression = None;
+    let mut order = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_INDEX_TERM_COLUMN => {
+                set_once(&mut column, ColumnId(uuid_bytes(value)?))?;
+            }
+            TAG_INDEX_TERM_COLLATION => set_once(&mut collation, decode_name(value)?)?,
+            TAG_INDEX_TERM_EXPRESSION => {
+                let encoded =
+                    std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
+                let parsed = super::sql::parse_schema_expression(encoded)
+                    .map_err(|_| SchemaCodecError::InvalidSql)?;
+                set_once(&mut expression, parsed)?;
+            }
+            TAG_INDEX_TERM_ORDER => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                let decoded = match *value {
+                    INDEX_ORDER_ASC => IndexOrder::Asc,
+                    INDEX_ORDER_DESC => IndexOrder::Desc,
+                    _ => return Err(SchemaCodecError::InvalidSchema),
+                };
+                set_once(&mut order, decoded)?;
+            }
+            _ => {}
+        }
+    }
+    match (column, expression) {
+        (Some(column), None) => Ok(IndexTerm::Column {
+            column,
+            collation,
+            order,
+        }),
+        (None, Some(expression)) if collation.is_none() => {
+            Ok(IndexTerm::Expression { expression, order })
+        }
+        _ => Err(SchemaCodecError::InvalidSchema),
+    }
 }
 
 fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
@@ -2362,17 +2658,20 @@ fn decode_logical_index(frame: &[u8]) -> std::result::Result<IndexDefinition, Sc
             _ => {}
         }
     }
-    if columns.is_empty()
-        || columns
-            .iter()
-            .enumerate()
-            .any(|(position, column)| columns[..position].contains(column))
+    let kind = kind.ok_or(SchemaCodecError::MissingField(TAG_INDEX_KIND))?;
+    if (kind == IndexKind::Secondary && !columns.is_empty())
+        || (kind != IndexKind::Secondary
+            && (columns.is_empty()
+                || columns
+                    .iter()
+                    .enumerate()
+                    .any(|(position, column)| columns[..position].contains(column))))
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
     Ok(IndexDefinition {
         id: id.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ID))?,
-        kind: kind.ok_or(SchemaCodecError::MissingField(TAG_INDEX_KIND))?,
+        kind,
         columns,
     })
 }
@@ -2432,16 +2731,7 @@ fn validate_index_sql(created: &CreateTable) -> std::result::Result<(), SchemaCo
         else {
             return Err(SchemaCodecError::InvalidSql);
         };
-        if spec.unique != index.is_unique()
-            || spec.name != *index.name()
-            || spec.table != *created.table_name_identity()
-            || spec.columns.len() != index.columns().len()
-            || spec.columns.iter().zip(index.columns()).any(|(name, id)| {
-                created
-                    .column_named(name)
-                    .is_none_or(|column| column.id() != *id)
-            })
-        {
+        if !created.named_index_matches_spec(index, &spec) {
             return Err(SchemaCodecError::SqlMismatch);
         }
     }
@@ -2763,14 +3053,8 @@ mod tests {
             IndexKind::Unique,
             MAX_INDEX_COLUMNS
         ));
-        assert!(index_columns_supported(
-            IndexKind::Secondary,
-            MAX_INDEX_COLUMNS
-        ));
-        assert!(!index_columns_supported(
-            IndexKind::Secondary,
-            MAX_INDEX_COLUMNS + 1
-        ));
+        assert!(index_columns_supported(IndexKind::Secondary, 0));
+        assert!(!index_columns_supported(IndexKind::Secondary, 1));
     }
 
     #[test]

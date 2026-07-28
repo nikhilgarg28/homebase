@@ -1350,7 +1350,10 @@ fn secondary_index_lifecycle_converges_without_conflicting_duplicate_values() {
         .unwrap();
     first
         .execute(
-            "CREATE INDEX notes_category_tenant ON notes (category, tenant)",
+            "CREATE INDEX notes_category_tenant ON notes (
+                category COLLATE NOCASE DESC,
+                lower(tenant) ASC
+            ) WHERE category IS NOT NULL",
             (),
         )
         .unwrap();
@@ -1372,7 +1375,14 @@ fn secondary_index_lifecycle_converges_without_conflicting_duplicate_values() {
         )
         .unwrap();
     second
-        .execute("CREATE INDEX notes_tenant ON notes (tenant)", ())
+        .execute(
+            "CREATE INDEX notes_tenant ON notes (
+                tenant COLLATE RTRIM,
+                length(body) DESC,
+                tenant
+            ) WHERE tenant IS NOT NULL",
+            (),
+        )
         .unwrap();
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
     assert_eq!(
@@ -1620,10 +1630,22 @@ fn conflicting_index_ddl_repairs_local_sqlite_before_converging() {
     second.rebase().unwrap();
 
     first
-        .execute("CREATE INDEX notes_identity ON notes (tenant, slug)", ())
+        .execute(
+            "CREATE INDEX notes_identity ON notes (
+                tenant COLLATE NOCASE DESC,
+                lower(slug)
+            ) WHERE tenant IS NOT NULL",
+            (),
+        )
         .unwrap();
     second
-        .execute("CREATE INDEX notes_identity ON notes (slug, body)", ())
+        .execute(
+            "CREATE INDEX notes_identity ON notes (
+                upper(slug) ASC,
+                body COLLATE RTRIM
+            ) WHERE body IS NOT NULL",
+            (),
+        )
         .unwrap();
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
     let PushOutcome::Rejected(rejection) = second.push().unwrap() else {

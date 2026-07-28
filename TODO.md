@@ -82,12 +82,13 @@ multilite
   admitted grammar only alongside exact key-image support for collations, sort rules,
   and partial/expression UNIQUE indexes.
 
-- Ordinary secondary-index DDL now converges without row-level Homebase index
-  cells or `write-revision` churn. Keep serializable read tracing coarse until
-  measurements justify an optional secondary-index conflict projection. If
-  that projection is added, define its activation and backfill lifecycle so
-  snapshot-isolated writes do not pay permanent mutation overhead merely
-  because a SQLite access-path index exists.
+- Ordinary secondary-index DDL, including ordered/collated columns, expressions,
+  repeated terms, and partial predicates, now converges without row-level
+  Homebase index cells or `write-revision` churn. Keep serializable read tracing
+  coarse until measurements justify an optional secondary-index conflict
+  projection. If that projection is added, define its activation and backfill
+  lifecycle so snapshot-isolated writes do not pay permanent mutation overhead
+  merely because a SQLite access-path index exists.
 
 - Continue reducing private-transaction startup overhead. The committer now
   incrementally streams appended WAL frames into its snapshot cache, native

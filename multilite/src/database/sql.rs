@@ -2,18 +2,18 @@
 
 use fallible_iterator::FallibleIterator as _;
 #[cfg(test)]
-use sqlite3_parser::ast::{As, Operator, ResultColumn};
+use sqlite3_parser::ast::{As, Operator};
 use sqlite3_parser::ast::{
     Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, IndexedColumn, InsertBody,
-    Literal, Name, OneSelect, RefAct, RefArg, Select, SelectTable, Stmt, TabFlags, TableConstraint,
-    Type, TypeSize, UnaryOperator,
+    Literal, Name, OneSelect, RefAct, RefArg, ResultColumn, Select, SelectTable, Stmt, TabFlags,
+    TableConstraint, Type, TypeSize, UnaryOperator,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
-    DefaultDefinition, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode, TableStorage,
-    TypeDeclaration, available_hidden_rowid_alias,
+    DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode,
+    TableStorage, TypeDeclaration, available_hidden_rowid_alias,
 };
 use crate::{Error, Result};
 
@@ -32,7 +32,21 @@ pub struct CreateIndexSpec {
     pub unique: bool,
     pub name: SqlName,
     pub table: SqlName,
-    pub columns: Vec<SqlName>,
+    pub terms: Vec<CreateIndexTerm>,
+    pub predicate: Option<SqlExpression>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateIndexTerm {
+    Column {
+        name: SqlName,
+        collation: Option<SqlName>,
+        order: Option<IndexOrder>,
+    },
+    Expression {
+        expression: SqlExpression,
+        order: Option<IndexOrder>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,12 +199,9 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "qualified CREATE INDEX names are not supported",
                 ));
             }
-            if where_clause.is_some() {
-                return Err(Error::UnsupportedSql("partial indexes are not supported"));
-            }
             if columns.is_empty() || columns.len() > MAX_INDEX_COLUMNS {
                 return Err(Error::UnsupportedSql(
-                    "index has an unsupported number of key columns",
+                    "index has an unsupported number of terms",
                 ));
             }
             let name = identifier(&idx_name.name)?;
@@ -204,35 +215,61 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "reserved SQLite and Multilite names are not supported",
                 ));
             }
-            let mut key_columns = Vec::with_capacity(columns.len());
+            let mut terms = Vec::with_capacity(columns.len());
             for column in columns {
-                if column.order.is_some() || column.nulls.is_some() {
+                if column.nulls.is_some() {
                     return Err(Error::UnsupportedSql(
-                        "index sort and NULLS clauses are not supported",
+                        "index NULLS FIRST and NULLS LAST clauses are not supported",
                     ));
                 }
-                let column = match column.expr {
-                    Expr::Id(id) => identifier(&Name(id.0))?,
-                    Expr::Name(name) => identifier(&name)?,
-                    _ => {
-                        return Err(Error::UnsupportedSql(
-                            "index expressions and collations are not supported",
-                        ));
-                    }
-                };
-                if key_columns
-                    .iter()
-                    .any(|seen: &SqlName| seen.canonical() == column.canonical())
+                terms.push(create_index_term(column.expr, column.order)?);
+            }
+            let predicate = where_clause
+                .map(|expression| {
+                    validate_index_expression(&expression)?;
+                    Ok::<_, Error>(schema_expression(expression))
+                })
+                .transpose()?;
+            if unique {
+                if predicate.is_some()
+                    || terms.iter().any(|term| {
+                        !matches!(
+                            term,
+                            CreateIndexTerm::Column {
+                                collation: None,
+                                order: None,
+                                ..
+                            }
+                        )
+                    })
                 {
-                    return Err(Error::UnsupportedSql("index columns must be distinct"));
+                    return Err(Error::UnsupportedSql(
+                        "UNIQUE index expressions, collations, ordering, and predicates are not supported",
+                    ));
                 }
-                key_columns.push(column);
+                let columns = terms
+                    .iter()
+                    .map(|term| match term {
+                        CreateIndexTerm::Column { name, .. } => name,
+                        CreateIndexTerm::Expression { .. } => unreachable!(),
+                    })
+                    .collect::<Vec<_>>();
+                if columns.iter().enumerate().any(|(index, column)| {
+                    columns[..index]
+                        .iter()
+                        .any(|seen| seen.canonical() == column.canonical())
+                }) {
+                    return Err(Error::UnsupportedSql(
+                        "UNIQUE index columns must be distinct",
+                    ));
+                }
             }
             Ok(ValidatedExecute::CreateIndex(CreateIndexSpec {
                 unique,
                 name,
                 table,
-                columns: key_columns,
+                terms,
+                predicate,
             }))
         }
         Stmt::CreateTable {
@@ -845,6 +882,186 @@ fn schema_expression(expression: Expr) -> SqlExpression {
     SqlExpression::new(expression)
 }
 
+fn create_index_term(
+    expression: Expr,
+    order: Option<sqlite3_parser::ast::SortOrder>,
+) -> Result<CreateIndexTerm> {
+    let order = order.map(|order| match order {
+        sqlite3_parser::ast::SortOrder::Asc => IndexOrder::Asc,
+        sqlite3_parser::ast::SortOrder::Desc => IndexOrder::Desc,
+    });
+    match expression {
+        Expr::Id(id) => Ok(CreateIndexTerm::Column {
+            name: identifier(&Name(id.0))?,
+            collation: None,
+            order,
+        }),
+        Expr::Name(name) => Ok(CreateIndexTerm::Column {
+            name: identifier(&name)?,
+            collation: None,
+            order,
+        }),
+        Expr::Collate(expression, collation) => match *expression {
+            Expr::Id(id) => Ok(CreateIndexTerm::Column {
+                name: identifier(&Name(id.0))?,
+                collation: Some(identifier(&Name(collation))?),
+                order,
+            }),
+            Expr::Name(name) => Ok(CreateIndexTerm::Column {
+                name: identifier(&name)?,
+                collation: Some(identifier(&Name(collation))?),
+                order,
+            }),
+            expression => {
+                let expression = Expr::Collate(Box::new(expression), collation);
+                validate_index_expression(&expression)?;
+                Ok(CreateIndexTerm::Expression {
+                    expression: schema_expression(expression),
+                    order,
+                })
+            }
+        },
+        expression => {
+            validate_index_expression(&expression)?;
+            Ok(CreateIndexTerm::Expression {
+                expression: schema_expression(expression),
+                order,
+            })
+        }
+    }
+}
+
+fn validate_index_expression(expression: &Expr) -> Result<()> {
+    match expression {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            validate_index_expression(lhs)?;
+            validate_index_expression(start)?;
+            validate_index_expression(end)
+        }
+        Expr::Binary(left, _, right) => {
+            validate_index_expression(left)?;
+            validate_index_expression(right)
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                validate_index_expression(base)?;
+            }
+            for (when, then) in when_then_pairs {
+                validate_index_expression(when)?;
+                validate_index_expression(then)?;
+            }
+            if let Some(expression) = else_expr {
+                validate_index_expression(expression)?;
+            }
+            Ok(())
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => validate_index_expression(expr),
+        Expr::FunctionCall {
+            distinctness,
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            if distinctness.is_some() || order_by.is_some() || filter_over.is_some() {
+                return Err(unsupported_index_expression());
+            }
+            for argument in args.iter().flatten() {
+                validate_index_expression(argument)?;
+            }
+            Ok(())
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            validate_index_expression(lhs)?;
+            for value in rhs.iter().flatten() {
+                validate_index_expression(value)?;
+            }
+            Ok(())
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            validate_index_expression(lhs)?;
+            validate_index_expression(rhs)?;
+            if let Some(escape) = escape {
+                validate_index_expression(escape)?;
+            }
+            Ok(())
+        }
+        Expr::Parenthesized(expressions) => {
+            for expression in expressions {
+                validate_index_expression(expression)?;
+            }
+            Ok(())
+        }
+        Expr::Id(_) | Expr::Literal(_) | Expr::Name(_) => Ok(()),
+        Expr::DoublyQualified(_, _, _)
+        | Expr::Exists(_)
+        | Expr::FunctionCallStar { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::Qualified(_, _)
+        | Expr::Raise(_, _)
+        | Expr::Subquery(_)
+        | Expr::Variable(_) => Err(unsupported_index_expression()),
+    }
+}
+
+fn unsupported_index_expression() -> Error {
+    Error::UnsupportedSql(
+        "index expressions cannot contain parameters, subqueries, qualified columns, aggregates, or window clauses",
+    )
+}
+
+pub(super) fn parse_schema_expression(sql: &str) -> Result<SqlExpression> {
+    let statement = parse_one(&format!("SELECT {sql}"))?;
+    let Stmt::Select(select) = statement else {
+        return Err(Error::UnsupportedSql(
+            "stored schema expression is not valid SQLite SQL",
+        ));
+    };
+    if select.with.is_some()
+        || select.body.compounds.is_some()
+        || select.order_by.is_some()
+        || select.limit.is_some()
+    {
+        return Err(Error::UnsupportedSql(
+            "stored schema expression is not valid SQLite SQL",
+        ));
+    }
+    let OneSelect::Select {
+        distinctness: None,
+        mut columns,
+        from: None,
+        where_clause: None,
+        group_by: None,
+        having: None,
+        window_clause: None,
+    } = select.body.select
+    else {
+        return Err(Error::UnsupportedSql(
+            "stored schema expression is not valid SQLite SQL",
+        ));
+    };
+    let [ResultColumn::Expr(expression, None)] = columns.as_mut_slice() else {
+        return Err(Error::UnsupportedSql(
+            "stored schema expression is not valid SQLite SQL",
+        ));
+    };
+    validate_index_expression(expression)?;
+    Ok(schema_expression(expression.clone()))
+}
+
 fn validate_foreign_key(
     name: Option<SqlName>,
     columns: Vec<SqlName>,
@@ -1132,10 +1349,60 @@ mod tests {
             );
             assert_eq!(spec.table.value(), "notes");
             assert_eq!(
-                spec.columns.iter().map(SqlName::value).collect::<Vec<_>>(),
+                spec.terms
+                    .iter()
+                    .map(|term| match term {
+                        CreateIndexTerm::Column { name, .. } => name.value(),
+                        CreateIndexTerm::Expression { .. } => panic!("unexpected expression"),
+                    })
+                    .collect::<Vec<_>>(),
                 ["tenant", "body"]
             );
+            assert!(spec.predicate.is_none());
         }
+    }
+
+    #[test]
+    fn ordinary_indexes_preserve_order_collation_expressions_and_predicates() {
+        let sql = "CREATE INDEX notes_search ON notes (
+            tenant COLLATE NOCASE DESC,
+            lower(trim(body)) ASC,
+            tenant
+        ) WHERE tenant IS NOT NULL AND length(body) > 0";
+        let ValidatedExecute::CreateIndex(spec) = validate_execute(sql).unwrap() else {
+            unreachable!()
+        };
+        assert!(!spec.unique);
+        assert_eq!(spec.terms.len(), 3);
+        assert_eq!(
+            spec.terms[0],
+            CreateIndexTerm::Column {
+                name: SqlName::new("tenant".into()),
+                collation: Some(SqlName::new("NOCASE".into())),
+                order: Some(IndexOrder::Desc),
+            }
+        );
+        let CreateIndexTerm::Expression { expression, order } = &spec.terms[1] else {
+            panic!("function term was not retained as an expression")
+        };
+        assert_eq!(*order, Some(IndexOrder::Asc));
+        assert_eq!(
+            parse_schema_expression(&expression.to_string()).unwrap(),
+            *expression
+        );
+        assert_eq!(
+            spec.terms[2],
+            CreateIndexTerm::Column {
+                name: SqlName::new("tenant".into()),
+                collation: None,
+                order: None,
+            }
+        );
+        let predicate = spec.predicate.unwrap();
+        assert_eq!(
+            parse_schema_expression(&predicate.to_string()).unwrap(),
+            predicate
+        );
     }
 
     #[test]
@@ -1667,22 +1934,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_index_extensions_outside_the_initial_slice() {
+    fn rejects_unsafe_or_semantically_unimplemented_index_extensions() {
         for sql in [
             "CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes (body)",
             "CREATE INDEX IF NOT EXISTS notes_body ON notes (body)",
             "CREATE UNIQUE INDEX main.notes_body ON notes (body)",
             "CREATE INDEX main.notes_body ON notes (body)",
             "CREATE UNIQUE INDEX notes_body ON notes (body DESC)",
-            "CREATE INDEX notes_body ON notes (body DESC)",
             "CREATE UNIQUE INDEX notes_body ON notes (body COLLATE NOCASE)",
-            "CREATE INDEX notes_body ON notes (body COLLATE NOCASE)",
             "CREATE UNIQUE INDEX notes_body ON notes (lower(body))",
-            "CREATE INDEX notes_body ON notes (lower(body))",
             "CREATE UNIQUE INDEX notes_body ON notes (body) WHERE body IS NOT NULL",
-            "CREATE INDEX notes_body ON notes (body) WHERE body IS NOT NULL",
             "CREATE UNIQUE INDEX notes_body ON notes (body, body)",
-            "CREATE INDEX notes_body ON notes (body, body)",
+            "CREATE INDEX notes_body ON notes (body NULLS FIRST)",
+            "CREATE INDEX notes_body ON notes ((SELECT body FROM notes))",
+            "CREATE INDEX notes_body ON notes (?1)",
             "DROP INDEX IF EXISTS notes_body",
             "DROP INDEX main.notes_body",
         ] {

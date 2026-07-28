@@ -75,16 +75,7 @@ impl IndexOperation {
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
             Error::UnsupportedSql("CREATE INDEX target has no synchronized schema identity"),
         )?;
-        let columns =
-            spec.columns
-                .iter()
-                .map(|name| {
-                    before.column_named(name).map(|column| column.id()).ok_or(
-                        Error::UnsupportedSql("CREATE INDEX references an unknown column"),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-        let index = NamedIndex::new(sql.to_owned(), spec.name.clone(), spec.unique, columns);
+        let index = before.prepare_named_index(sql, spec)?;
         let backfill = if index.is_unique() {
             backfill_unique_index(connection, &before, &index)?
         } else {
@@ -163,7 +154,7 @@ impl IndexOperation {
         if self.action == IndexAction::Create {
             mutations.push(Mutation::Set {
                 key: index_definition_key(self.after.table_id(), self.index.index_id()),
-                value: self.index.index().encode(),
+                value: self.index.encode(),
             });
         }
 
@@ -348,19 +339,7 @@ impl IndexOperation {
                     .with_added_index(self.after.schema_revision_id(), self.index.clone());
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
                     || expected_after != self.after
-                    || spec.unique != self.index.is_unique()
-                    || spec.name != *self.index.name()
-                    || spec.table != *self.before.table_name_identity()
-                    || spec.columns.len() != self.index.columns().len()
-                    || spec
-                        .columns
-                        .iter()
-                        .zip(self.index.columns())
-                        .any(|(name, id)| {
-                            self.before
-                                .column_named(name)
-                                .is_none_or(|column| column.id() != *id)
-                        })
+                    || !self.before.named_index_matches_spec(&self.index, &spec)
                     || self.before.index_named(self.index.name()).is_some()
                     || self.after.index_named(self.index.name()) != Some(&self.index)
                     || (!self.index.is_unique() && !self.backfill.is_empty())
@@ -546,7 +525,10 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, TableStorage, TypeDeclaration};
+    use crate::database::schema::{
+        CreateColumn, CreateTableSpec, IndexOrder, IndexTerm, TableStorage, TypeDeclaration,
+    };
+    use crate::database::sql::CreateIndexTerm;
 
     fn table() -> CreateTable {
         CreateTable::new(
@@ -610,10 +592,19 @@ mod tests {
             unique: true,
             name: super::super::schema::SqlName::new("notes_tenant_slug".into()),
             table: super::super::schema::SqlName::new("notes".into()),
-            columns: vec![
-                super::super::schema::SqlName::new("tenant".into()),
-                super::super::schema::SqlName::new("slug".into()),
+            terms: vec![
+                CreateIndexTerm::Column {
+                    name: super::super::schema::SqlName::new("tenant".into()),
+                    collation: None,
+                    order: None,
+                },
+                CreateIndexTerm::Column {
+                    name: super::super::schema::SqlName::new("slug".into()),
+                    collation: None,
+                    order: None,
+                },
             ],
+            predicate: None,
         }
     }
 
@@ -622,10 +613,19 @@ mod tests {
             unique: false,
             name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
             table: super::super::schema::SqlName::new("notes".into()),
-            columns: vec![
-                super::super::schema::SqlName::new("tenant".into()),
-                super::super::schema::SqlName::new("slug".into()),
+            terms: vec![
+                CreateIndexTerm::Column {
+                    name: super::super::schema::SqlName::new("tenant".into()),
+                    collation: None,
+                    order: None,
+                },
+                CreateIndexTerm::Column {
+                    name: super::super::schema::SqlName::new("slug".into()),
+                    collation: None,
+                    order: None,
+                },
             ],
+            predicate: None,
         }
     }
 
@@ -742,6 +742,96 @@ mod tests {
         );
 
         operation.record_catalog(&connection).unwrap();
+        operation.rollback(&connection).unwrap();
+        operation.apply(&connection).unwrap();
+    }
+
+    #[test]
+    fn rich_secondary_index_definition_roundtrips_replays_and_rejects_sql_mismatch() {
+        let (connection, before) = connection();
+        let sql = "CREATE INDEX notes_search ON notes (
+            tenant COLLATE NOCASE DESC,
+            lower(slug) ASC,
+            tenant
+        ) WHERE tenant IS NOT NULL AND length(slug) > 0";
+        let ValidatedExecute::CreateIndex(spec) = super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        connection.execute(sql, ()).unwrap();
+        let operation = IndexOperation::prepare_create(&connection, sql, &spec).unwrap();
+
+        assert!(!operation.index.is_unique());
+        assert!(operation.index.columns().is_empty());
+        assert_eq!(operation.index.terms().len(), 3);
+        assert_eq!(
+            operation.index.terms()[0],
+            IndexTerm::Column {
+                column: before
+                    .column_named(&super::super::schema::SqlName::new("tenant".into()))
+                    .unwrap()
+                    .id(),
+                collation: Some(super::super::schema::SqlName::new("NOCASE".into())),
+                order: Some(IndexOrder::Desc),
+            }
+        );
+        assert!(matches!(
+            operation.index.terms()[1],
+            IndexTerm::Expression {
+                order: Some(IndexOrder::Asc),
+                ..
+            }
+        ));
+        assert!(operation.index.predicate().is_some());
+        assert_eq!(
+            IndexOperation::decode(&operation.encode()).unwrap(),
+            operation
+        );
+        let lowered = operation.to_homebase().unwrap();
+        let definition = lowered
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Set { key, value }
+                    if key
+                        == &index_definition_key(
+                            operation.after.table_id(),
+                            operation.index.index_id(),
+                        ) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("secondary index definition mutation is present");
+        assert_eq!(
+            NamedIndex::decode(definition).unwrap(),
+            operation.index,
+            "the independently fetched definition retains every physical term"
+        );
+        assert!(
+            !lowered
+                .mutations
+                .iter()
+                .any(|mutation| mutation.key() == &write_revision_key(operation.after.table_id()))
+        );
+
+        let mut mismatched = operation.clone();
+        mismatched.sql =
+            "CREATE INDEX notes_search ON notes (tenant, lower(tenant), tenant)".into();
+        assert_eq!(
+            mismatched.validate(),
+            Err(IndexCodecError::InvalidEvolution)
+        );
+
+        operation.record_catalog(&connection).unwrap();
+        let catalog_index = catalog::by_name(&connection, "notes")
+            .unwrap()
+            .unwrap()
+            .index_named(&super::super::schema::SqlName::new("notes_search".into()))
+            .unwrap()
+            .clone();
+        assert_eq!(catalog_index, operation.index);
         operation.rollback(&connection).unwrap();
         operation.apply(&connection).unwrap();
     }

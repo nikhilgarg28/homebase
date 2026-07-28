@@ -70,7 +70,11 @@ paths only. Their names and definitions converge across replicas, but row
 operations emit no secondary-index Homebase cells and creating or dropping one
 does not advance `write-revision`. Serializable read tracking therefore remains
 coarse rather than charging snapshot-isolated writes for speculative future
-index precision.
+index precision. Ordinary definitions may contain repeated column terms,
+`ASC`/`DESC`, explicit collations, scalar expression terms, and a partial-index
+predicate. These richer forms remain rejected for `UNIQUE` indexes until
+Multilite can reproduce their exact comparison semantics in Homebase key
+images.
 
 Foreign-key declarations retain stable parent table, target index, and
 ordered parent-column identities. Non-NULL child tuples write and assert an

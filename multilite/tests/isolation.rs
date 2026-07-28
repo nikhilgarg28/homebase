@@ -211,6 +211,72 @@ fn composite_unique_collisions_are_mandatory_at_both_isolation_levels() {
 }
 
 #[test]
+fn secondary_index_ddl_does_not_invalidate_unsynced_row_writes_at_either_isolation() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation) in [
+        ("snapshot", IsolationLevel::Snapshot),
+        ("serializable", IsolationLevel::Serializable),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-secondary-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-secondary-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        synchronize_schema(&first, &second);
+
+        first
+            .execute(
+                "CREATE INDEX bookings_day_search ON bookings (
+                    day COLLATE NOCASE DESC,
+                    lower(trim(day)) ASC,
+                    day
+                ) WHERE day IS NOT NULL",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained, "{label}");
+
+        // The second replica deliberately does not pull the admitted index.
+        insert_without_read(&second, isolation, 7, "MiXeD ");
+        assert_eq!(
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "{label}: access-path DDL invalidated a stale row write"
+        );
+        converge(&first, &second);
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT name FROM sqlite_schema
+                         WHERE type = 'index' AND name = 'bookings_day_search'",
+                        (),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                ["bookings_day_search"],
+                "{label}"
+            );
+            assert_eq!(bookings(database), [(7, String::from("MiXeD "))], "{label}");
+        }
+    }
+}
+
+#[test]
 fn coarse_serializable_reads_ignore_secondary_indexes_and_conflict_across_disjoint_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let authority = server();

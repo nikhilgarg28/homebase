@@ -290,8 +290,8 @@ fn unique_index_ddl_is_atomic_and_names_can_be_reused_after_drop() {
 #[test]
 fn secondary_indexes_cover_duplicate_null_and_row_lifecycle_sql() {
     let directory = tempfile::tempdir().unwrap();
-    let db =
-        MultiliteConnection::open(directory.path().join("secondary-index-ddl.sqlite")).unwrap();
+    let path = directory.path().join("secondary-index-ddl.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
 
     db.execute(
         "CREATE TABLE notes (
@@ -314,7 +314,11 @@ fn secondary_indexes_cover_duplicate_null_and_row_lifecycle_sql() {
     db.execute("CREATE INDEX notes_category ON notes (category)", ())
         .unwrap();
     db.execute(
-        "CREATE INDEX notes_tenant_category ON notes (tenant, category)",
+        "CREATE INDEX notes_tenant_category ON notes (
+            tenant COLLATE NOCASE DESC,
+            lower(category) ASC,
+            tenant
+        ) WHERE tenant IS NOT NULL",
         (),
     )
     .unwrap();
@@ -358,8 +362,69 @@ fn secondary_indexes_cover_duplicate_null_and_row_lifecycle_sql() {
     );
 
     db.execute("DROP INDEX notes_category", ()).unwrap();
-    db.execute("CREATE INDEX notes_category ON notes (body, category)", ())
+    db.execute(
+        "CREATE INDEX notes_category ON notes (
+            substr(body, 1, 2) DESC,
+            category COLLATE RTRIM
+        ) WHERE category IS NOT NULL",
+        (),
+    )
+    .unwrap();
+
+    drop(db);
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND name LIKE 'notes_%' ORDER BY name",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        ["notes_category", "notes_tenant_category"]
+    );
+    reopened
+        .execute(
+            "INSERT INTO notes VALUES (5, 'west', 'open', 'reopened')",
+            (),
+        )
         .unwrap();
+}
+
+#[test]
+fn invalid_secondary_index_expressions_leave_no_schema_or_catalog_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let db =
+        MultiliteConnection::open(directory.path().join("invalid-secondary-index.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'one')", ())
+        .unwrap();
+
+    for sql in [
+        "CREATE INDEX notes_random_term ON notes (random())",
+        "CREATE INDEX notes_random_predicate ON notes (body) WHERE random() > 0",
+        "CREATE INDEX notes_missing_column ON notes (missing)",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::Sqlite(_))));
+    }
+    assert!(
+        db.query(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name LIKE 'notes_%'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    db.execute(
+        "CREATE INDEX notes_valid ON notes (lower(body)) WHERE body IS NOT NULL",
+        (),
+    )
+    .unwrap();
 }
 
 #[test]
