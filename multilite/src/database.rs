@@ -51,6 +51,7 @@ use crate::commit::proposal::{
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
 use crate::metastore::{SqliteOrderedStore, SqliteSnapshotStore};
+use crate::rowid;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
@@ -879,6 +880,11 @@ impl<H: ServerHandle + Send + Sync + 'static> CommitBackend for DatabaseCommitBa
         reader.with_reader(|connection| connection.authorizer(Some(authorize_public)))?;
         Ok(reader)
     }
+
+    fn lease_rowids(&self) -> Result<rowid::RowidLease> {
+        self.owner
+            .with_savepoint("__multilite__rowid_lease", rowid::lease)
+    }
 }
 
 fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authorization {
@@ -1208,6 +1214,7 @@ fn initialize<H: ServerHandle>(
         DeviceId(mint_id()?),
         SystemNonceSource,
     ))?;
+    owner.with_connection(|connection| rowid::initialize(connection, client.device()))?;
     block_on(client.attach(&SpaceEnvelope::plaintext(database_id.space_id())))?;
     Ok((database_id, client))
 }
@@ -1258,6 +1265,7 @@ fn reopen<H: ServerHandle>(
     owner.with_connection(|connection| {
         catalog::validate(connection)?;
         history::validate(connection)?;
+        rowid::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)?;
         commit_history.prune(connection)?;
         Ok::<_, Error>(())
@@ -1270,6 +1278,7 @@ fn reopen<H: ServerHandle>(
         DeviceId(mint_id()?),
         SystemNonceSource,
     ))?;
+    owner.with_connection(|connection| rowid::validate_device(connection, client.device()))?;
     block_on(client.attach(&envelope))?;
     Ok((database_id, client))
 }
@@ -1285,12 +1294,14 @@ fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let pending = pending::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
     let history = history::is_initialized(connection)?;
-    match (metadata, pending, catalog, history) {
-        (false, false, false, false) => Ok(DatabaseState::Fresh),
-        (true, true, true, true) => {
+    let rowids = rowid::is_initialized(connection)?;
+    match (metadata, pending, catalog, history, rowids) {
+        (false, false, false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
             catalog::validate(connection)?;
+            rowid::validate(connection)?;
             Ok(DatabaseState::Initialized)
         }
         _ => Err(Error::InvalidDatabase(

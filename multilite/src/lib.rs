@@ -9,6 +9,7 @@ mod connection;
 mod database;
 mod error;
 mod metastore;
+mod rowid;
 mod runtime;
 mod value;
 
