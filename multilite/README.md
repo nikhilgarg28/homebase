@@ -11,7 +11,7 @@ against non-reserved tables. A table must use the initial four declared types
 and exactly one inline primary key. Inline and table-level `UNIQUE`
 declarations, including ordered multi-column constraints, are supported with
 SQLite's default comparison rules, as are explicit composite
-`CREATE UNIQUE INDEX`/`DROP INDEX` operations. Immediate `NO ACTION` foreign
+`CREATE [UNIQUE] INDEX`/`DROP INDEX` operations. Immediate `NO ACTION` foreign
 keys may target the complete primary key, table-declared UNIQUE key, or active
 explicit UNIQUE index of an existing synchronized table when child and parent
 affinities match. Other actions, deferral, self-references, and richer schema
@@ -43,30 +43,36 @@ The general database owns this SQL gate, reserved namespace, schema catalog,
 and row capture. Multilite does not create or require a built-in user table.
 
 Each translated table creation contains immutable UUID identities for its
-table, schema revision, row keyspace, columns, and unique keyspaces, plus the
+table, schema revision, primary index, columns, and logical indexes, plus the
 exact SQL. Its
 Homebase form records the immutable schema operation, canonical name lookup,
-schema revision, row-keyspace and unique-keyspace definitions, active row
-keyspace, and one mutable `write-revision` cell whose value is the UUID of the
-latest DDL operation that changed valid row lowering. The inverse translation
-verifies the complete envelope and checks that stored SQL projects to the same
-structured operation.
+schema revision, index definitions, active primary index, and one mutable
+`write-revision` cell whose value is the UUID of the latest DDL operation that
+changed valid row lowering. The inverse translation verifies the complete
+envelope and checks that stored SQL projects to the same structured operation.
 
 SQLite's preupdate hook captures final inserted values after affinity has run.
 One SQL statement becomes one `InsertRows` operation even when it inserts many
 rows. Row frames identify their schema revision and carry column-UUID/value
 pairs using lossless SQLite storage classes. Primary-key values become separate
-Homebase key components under the table and row-keyspace UUID. Submissions
+Homebase key components under the table and primary-index UUID. Submissions
 assert every exact row key, every non-NULL unique tuple, and the table's
-active-row-keyspace and write-revision cells. Composite unique values occupy
-one Homebase component per key part under their immutable unique-keyspace UUID;
+active-primary-index and write-revision cells. Composite unique values occupy
+one Homebase component per key part under their immutable index UUID;
 their value identifies the owning row. Tuples containing NULL emit no ownership
 cell, matching SQLite's distinct-NULL behavior. Accepted foreign rows replay by
 stable IDs through the local schema catalog; rejected local rows are deleted by
 the pending journal in the same transaction that rolls back the Homebase submit
 window.
 
-Foreign-key declarations retain stable parent table, target-keyspace, and
+Ordinary secondary indexes are synchronized schema and physical SQLite access
+paths only. Their names and definitions converge across replicas, but row
+operations emit no secondary-index Homebase cells and creating or dropping one
+does not advance `write-revision`. Serializable read tracking therefore remains
+coarse rather than charging snapshot-isolated writes for speculative future
+index precision.
+
+Foreign-key declarations retain stable parent table, target index, and
 ordered parent-column identities. Non-NULL child tuples write and assert an
 exact reverse-reference cell keyed by the relationship UUID, parent target
 image, and child row identity. Child deletes remove that cell; foreign-key or
@@ -85,7 +91,7 @@ snapshot.
 optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and
 `LIMIT` remain rejected. SQLite evaluates the predicate and the preupdate hook
 captures every complete old row image. `DeleteRows` lowers those rows to exact
-Homebase point deletes with the same row-keyspace and write-revision guards as
+Homebase point deletes with the same primary-index and write-revision guards as
 inserts. Remote apply verifies the complete current row before deleting it, and
 rejection restores values plus the hidden SQLite rowid when one exists.
 Zero-row deletes create no logical transaction.
@@ -139,7 +145,7 @@ and mandatory constraints and executes reads directly against SQLite.
 Serializable isolation also includes traced application reads. Its currently
 supported single-table reads run through a transaction-local virtual-table
 facade: full scans and non-primary predicates conservatively trace the table's
-active row keyspace, while primary-key equality traces one exact row key. The
+active primary index, while primary-key equality traces one exact row key. The
 facade is refreshed before each execution, so a reusable prepared statement
 sees earlier writes in the same managed update without querying SQLite
 recursively from a vtable callback. Broader joins, subqueries, and index-prefix

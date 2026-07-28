@@ -14,7 +14,7 @@ use rusqlite::vtab::{
 
 use super::catalog;
 use super::row::{
-    StoredValue, primary_key_equality_prefix, primary_key_prefix, row_keyspace_prefix,
+    StoredValue, primary_index_prefix, primary_key_equality_prefix, primary_key_prefix,
 };
 use super::schema::{CreateTable, SchemaRevisionId, StrictType, TableId, TableMode};
 use crate::commit::footprint::ReadTrace;
@@ -268,7 +268,7 @@ impl EagerSource {
     }
 
     fn trace_filter(&self, values: &[ValueRef<'_>]) {
-        let full = row_keyspace_prefix(&self.definition);
+        let full = primary_index_prefix(&self.definition);
         let values = values
             .iter()
             .copied()
@@ -312,7 +312,7 @@ unsafe impl<'vtab> VTab<'vtab> for MultiliteVTab {
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        // Later index SQL slices add catalog-backed keyspace candidates here;
+        // Later index SQL slices add catalog-backed index candidates here;
         // SQLite's materialized index list is not durable replication meaning.
         let constraints = info
             .constraints()
@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn full_scan_matches_sqlite_and_records_the_row_keyspace() {
+    fn full_scan_matches_sqlite_and_records_the_primary_index() {
         let (connection, created) = connection();
         let registry = Registry::default();
         let plan = registry
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(rows, [1]);
         assert_eq!(
             trace.footprint().reads(),
-            &BTreeSet::from([row_keyspace_prefix(&created)])
+            &BTreeSet::from([primary_index_prefix(&created)])
         );
     }
 
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(rows, ["one", "three"]);
         assert_eq!(
             nonleading_trace.footprint().reads(),
-            &BTreeSet::from([row_keyspace_prefix(&created)])
+            &BTreeSet::from([primary_index_prefix(&created)])
         );
     }
 
@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(rows, ["tue"]);
         assert_eq!(
             trace.footprint().reads(),
-            &BTreeSet::from([row_keyspace_prefix(&created)])
+            &BTreeSet::from([primary_index_prefix(&created)])
         );
     }
 

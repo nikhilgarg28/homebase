@@ -21,7 +21,7 @@ use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
-const SCHEMA_FRAME_VERSION: u8 = 3;
+const SCHEMA_FRAME_VERSION: u8 = 4;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -29,7 +29,6 @@ const TAG_TABLE_ID: u8 = 1;
 const TAG_TABLE_NAME: u8 = 2;
 const TAG_COLUMN: u8 = 3;
 const TAG_SCHEMA_REVISION_ID: u8 = 4;
-const TAG_ROW_KEYSPACE_ID: u8 = 5;
 const TAG_UNIQUE_CONSTRAINT: u8 = 6;
 const TAG_TABLE_MODE: u8 = 7;
 const TAG_PRIMARY_KEY: u8 = 8;
@@ -43,13 +42,10 @@ const TAG_COLUMN_FLAGS: u8 = 4;
 const TYPE_DECLARATION_FRAME_VERSION: u8 = 1;
 const TAG_TYPE_NAME: u8 = 1;
 const TAG_TYPE_ARGUMENT: u8 = 2;
-const TAG_UNIQUE_KEYSPACE_ID: u8 = 1;
+const TAG_UNIQUE_INDEX_DEFINITION: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
-const TAG_UNIQUE_COLUMN_ID: u8 = 3;
-const TAG_INDEX_KEYSPACE_ID: u8 = 1;
+const TAG_NAMED_INDEX_DEFINITION: u8 = 1;
 const TAG_INDEX_NAME: u8 = 2;
-const TAG_INDEX_UNIQUE: u8 = 3;
-const TAG_INDEX_COLUMN_ID: u8 = 4;
 const TAG_INDEX_SQL: u8 = 5;
 const TAG_INDEX_ACTIVE: u8 = 6;
 const TAG_FOREIGN_KEY_ID: u8 = 1;
@@ -57,13 +53,16 @@ const TAG_FOREIGN_KEY_NAME: u8 = 2;
 const TAG_FOREIGN_KEY_COLUMN_ID: u8 = 3;
 const TAG_FOREIGN_KEY_PARENT_TABLE_ID: u8 = 4;
 const TAG_FOREIGN_KEY_PARENT_TABLE_NAME: u8 = 5;
-const TAG_FOREIGN_KEY_PARENT_TARGET_KIND: u8 = 6;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_ID: u8 = 7;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_NAME: u8 = 8;
-const TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID: u8 = 9;
-const TAG_PRIMARY_COLUMN_ID: u8 = 1;
-const FOREIGN_KEY_TARGET_PRIMARY_KEY: u8 = 1;
-const FOREIGN_KEY_TARGET_UNIQUE: u8 = 2;
+const TAG_FOREIGN_KEY_PARENT_INDEX_ID: u8 = 9;
+const INDEX_DEFINITION_FRAME_VERSION: u8 = 1;
+const TAG_INDEX_ID: u8 = 1;
+const TAG_INDEX_KIND: u8 = 2;
+const TAG_INDEX_COLUMN_ID: u8 = 3;
+const INDEX_KIND_PRIMARY: u8 = 1;
+const INDEX_KIND_UNIQUE: u8 = 2;
+const INDEX_KIND_SECONDARY: u8 = 3;
 const COLUMN_NOT_NULL: u8 = 1;
 const TABLE_MODE_ORDINARY: u8 = 0;
 const TABLE_MODE_STRICT: u8 = 1;
@@ -74,8 +73,8 @@ const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
 const SQLITE_ROWID_ALIASES: [&str; 3] = ["_rowid_", "rowid", "oid"];
 
-/// Maximum number of value components in a row or UNIQUE Homebase key.
-pub const MAX_KEY_PARTS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
+/// Maximum number of columns in a single logical index definition.
+pub const MAX_INDEX_COLUMNS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
 
 /// SQLite identifier spelling plus its case-insensitive identity form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,10 +412,7 @@ pub struct TableId([u8; 16]);
 pub struct SchemaRevisionId([u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RowKeyspaceId([u8; 16]);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UniqueKeyspaceId([u8; 16]);
+pub struct IndexId([u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForeignKeyId([u8; 16]);
@@ -438,14 +434,29 @@ pub struct Column {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimaryKey {
     name: Option<SqlName>,
-    columns: Vec<ColumnId>,
+    index: IndexDefinition,
 }
 
 /// One durable UNIQUE key definition owned by a table schema revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UniqueConstraint {
-    keyspace_id: UniqueKeyspaceId,
     name: Option<SqlName>,
+    index: IndexDefinition,
+}
+
+/// Semantic kind of one table-owned logical index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    Primary,
+    Unique,
+    Secondary,
+}
+
+/// Stable identity and ordered columns for one logical table index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDefinition {
+    id: IndexId,
+    kind: IndexKind,
     columns: Vec<ColumnId>,
 }
 
@@ -454,11 +465,9 @@ pub struct UniqueConstraint {
 /// CREATE INDEX is not admitted yet, but indexes live here rather than in a
 /// parallel database-level registry when that grammar is added.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexDefinition {
-    keyspace_id: UniqueKeyspaceId,
+pub struct NamedIndex {
     name: SqlName,
-    unique: bool,
-    columns: Vec<ColumnId>,
+    index: IndexDefinition,
     sql: String,
     active: bool,
 }
@@ -471,16 +480,9 @@ pub struct ForeignKeyDefinition {
     columns: Vec<ColumnId>,
     referenced_table: TableId,
     referenced_table_name: SqlName,
-    referenced_target: ForeignKeyTarget,
+    referenced_index: IndexId,
     referenced_columns: Vec<ColumnId>,
     referenced_column_names: Vec<SqlName>,
-}
-
-/// Stable parent keyspace used to establish one foreign-key relationship.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ForeignKeyTarget {
-    PrimaryKey { row_keyspace: RowKeyspaceId },
-    Unique { keyspace: UniqueKeyspaceId },
 }
 
 /// One SQLite CHECK declaration owned by a table schema.
@@ -499,7 +501,7 @@ pub struct TableSchema {
     columns: Vec<Column>,
     primary_key: PrimaryKey,
     unique_constraints: Vec<UniqueConstraint>,
-    indexes: Vec<IndexDefinition>,
+    indexes: Vec<NamedIndex>,
     foreign_keys: Vec<ForeignKeyDefinition>,
     checks: Vec<CheckConstraint>,
 }
@@ -511,7 +513,6 @@ pub struct CreateTable {
     sql: String,
     table_id: TableId,
     schema_revision_id: SchemaRevisionId,
-    row_keyspace_id: RowKeyspaceId,
     name: SqlName,
     schema: TableSchema,
 }
@@ -540,8 +541,7 @@ macro_rules! id_accessors {
 id_accessors!(TableId);
 id_accessors!(MutationId);
 id_accessors!(SchemaRevisionId);
-id_accessors!(RowKeyspaceId);
-id_accessors!(UniqueKeyspaceId);
+id_accessors!(IndexId);
 id_accessors!(ForeignKeyId);
 id_accessors!(ColumnId);
 
@@ -589,7 +589,11 @@ impl PrimaryKey {
     }
 
     pub fn columns(&self) -> &[ColumnId] {
-        &self.columns
+        self.index.columns()
+    }
+
+    pub fn index(&self) -> &IndexDefinition {
+        &self.index
     }
 }
 
@@ -614,7 +618,7 @@ impl TableSchema {
         &self.unique_constraints
     }
 
-    pub fn indexes(&self) -> &[IndexDefinition] {
+    pub fn indexes(&self) -> &[NamedIndex] {
         &self.indexes
     }
 
@@ -630,12 +634,16 @@ impl TableSchema {
 }
 
 impl UniqueConstraint {
-    pub fn keyspace_id(&self) -> UniqueKeyspaceId {
-        self.keyspace_id
+    pub fn index_id(&self) -> IndexId {
+        self.index.id()
     }
 
     pub fn columns(&self) -> &[ColumnId] {
-        &self.columns
+        self.index.columns()
+    }
+
+    pub fn index(&self) -> &IndexDefinition {
+        &self.index
     }
 }
 
@@ -661,8 +669,8 @@ impl ForeignKeyDefinition {
         &self.referenced_table_name
     }
 
-    pub fn referenced_target(&self) -> ForeignKeyTarget {
-        self.referenced_target
+    pub fn referenced_index(&self) -> IndexId {
+        self.referenced_index
     }
 
     pub fn referenced_columns(&self) -> &[ColumnId] {
@@ -675,36 +683,74 @@ impl ForeignKeyDefinition {
     }
 }
 
-impl ForeignKeyTarget {
-    fn kind(self) -> u8 {
+impl IndexKind {
+    fn to_u8(self) -> u8 {
         match self {
-            Self::PrimaryKey { .. } => FOREIGN_KEY_TARGET_PRIMARY_KEY,
-            Self::Unique { .. } => FOREIGN_KEY_TARGET_UNIQUE,
+            Self::Primary => INDEX_KIND_PRIMARY,
+            Self::Unique => INDEX_KIND_UNIQUE,
+            Self::Secondary => INDEX_KIND_SECONDARY,
         }
     }
 
-    pub fn keyspace_bytes(self) -> [u8; 16] {
-        match self {
-            Self::PrimaryKey { row_keyspace } => row_keyspace.as_bytes(),
-            Self::Unique { keyspace } => keyspace.as_bytes(),
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            INDEX_KIND_PRIMARY => Some(Self::Primary),
+            INDEX_KIND_UNIQUE => Some(Self::Unique),
+            INDEX_KIND_SECONDARY => Some(Self::Secondary),
+            _ => None,
         }
     }
 }
 
+/// Whether an index definition fits the currently supported SQL and durable
+/// representation. Ordinary secondary indexes have no per-row Homebase key.
+fn index_columns_supported(kind: IndexKind, index_columns: usize) -> bool {
+    match kind {
+        IndexKind::Primary | IndexKind::Unique => codes::VALUE_KEY_PREFIX_COMPONENTS
+            .checked_add(index_columns)
+            .is_some_and(|components| components <= MAX_COMPONENTS),
+        IndexKind::Secondary => index_columns <= MAX_INDEX_COLUMNS,
+    }
+}
+
 impl IndexDefinition {
-    pub fn new_unique(sql: String, name: SqlName, columns: Vec<ColumnId>) -> Self {
+    pub fn id(&self) -> IndexId {
+        self.id
+    }
+
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    pub fn columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_logical_index(self)
+    }
+}
+
+impl NamedIndex {
+    pub fn new(sql: String, name: SqlName, unique: bool, columns: Vec<ColumnId>) -> Self {
         Self {
-            keyspace_id: UniqueKeyspaceId(Uuid::new_v4().into_bytes()),
             name,
-            unique: true,
-            columns,
+            index: IndexDefinition {
+                id: IndexId(Uuid::new_v4().into_bytes()),
+                kind: if unique {
+                    IndexKind::Unique
+                } else {
+                    IndexKind::Secondary
+                },
+                columns,
+            },
             sql,
             active: true,
         }
     }
 
-    pub fn keyspace_id(&self) -> UniqueKeyspaceId {
-        self.keyspace_id
+    pub fn index_id(&self) -> IndexId {
+        self.index.id()
     }
 
     pub fn name(&self) -> &SqlName {
@@ -712,11 +758,15 @@ impl IndexDefinition {
     }
 
     pub fn is_unique(&self) -> bool {
-        self.unique
+        self.index.kind() == IndexKind::Unique
     }
 
     pub fn columns(&self) -> &[ColumnId] {
-        &self.columns
+        self.index.columns()
+    }
+
+    pub fn index(&self) -> &IndexDefinition {
+        &self.index
     }
 
     pub fn sql(&self) -> &str {
@@ -734,11 +784,11 @@ impl IndexDefinition {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        encode_index_definition(self)
+        encode_named_index(self)
     }
 
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
-        decode_index_definition(frame)
+        decode_named_index(frame)
     }
 }
 
@@ -768,23 +818,17 @@ impl CreateTable {
         let name_scope = table_name_scope_key(&self.name);
         let schema = table_schema_key(self.table_id, self.schema_revision_id);
         let active_schema_revision = active_schema_revision_key(self.table_id);
-        let active_row_keyspace = active_row_keyspace_key(self.table_id);
-        let row_keyspace = row_keyspace_key(self.table_id, self.row_keyspace_id);
+        let active_primary_index = active_primary_index_key(self.table_id);
+        let primary_index = index_definition_key(self.table_id, self.primary_index_id());
         let write_revision = write_revision_key(self.table_id);
         let mut footprint = ConflictFootprint::new();
         footprint.add_constraint(name_scope.clone());
         footprint.add_write(write_revision.clone());
         let mut parent_write_revisions = BTreeSet::new();
         for foreign_key in &self.schema.foreign_keys {
-            match foreign_key.referenced_target {
-                ForeignKeyTarget::PrimaryKey { .. } => {
-                    footprint.add_constraint(active_row_keyspace_key(foreign_key.referenced_table));
-                }
-                ForeignKeyTarget::Unique { .. } => {
-                    footprint
-                        .add_constraint(active_schema_revision_key(foreign_key.referenced_table));
-                }
-            }
+            // The schema head guards the referenced logical index definition,
+            // whether it is the primary or a UNIQUE index.
+            footprint.add_constraint(active_schema_revision_key(foreign_key.referenced_table));
             let revision = write_revision_key(foreign_key.referenced_table);
             footprint.add_write(revision.clone());
             parent_write_revisions.insert(revision);
@@ -807,12 +851,12 @@ impl CreateTable {
                 value: self.schema_revision_id.0.to_vec(),
             },
             Mutation::Set {
-                key: active_row_keyspace,
-                value: self.row_keyspace_id.0.to_vec(),
+                key: active_primary_index,
+                value: self.primary_index_id().0.to_vec(),
             },
             Mutation::Set {
-                key: row_keyspace,
-                value: encode_row_keyspace(self),
+                key: primary_index,
+                value: self.schema.primary_key.index.encode(),
             },
         ];
         mutations.extend(
@@ -820,8 +864,8 @@ impl CreateTable {
                 .unique_constraints
                 .iter()
                 .map(|unique| Mutation::Set {
-                    key: unique_keyspace_key(self.table_id, unique.keyspace_id),
-                    value: encode_unique_constraint(unique),
+                    key: index_definition_key(self.table_id, unique.index.id),
+                    value: unique.index.encode(),
                 }),
         );
         mutations.push(Mutation::Set {
@@ -888,8 +932,8 @@ impl CreateTable {
         self.schema_revision_id
     }
 
-    pub fn row_keyspace_id(&self) -> RowKeyspaceId {
-        self.row_keyspace_id
+    pub fn primary_index_id(&self) -> IndexId {
+        self.schema.primary_key.index.id()
     }
 
     pub fn table_name_identity(&self) -> &SqlName {
@@ -917,7 +961,7 @@ impl CreateTable {
         self.schema.unique_constraints()
     }
 
-    pub fn indexes(&self) -> &[IndexDefinition] {
+    pub fn indexes(&self) -> &[NamedIndex] {
         self.schema.indexes()
     }
 
@@ -931,13 +975,13 @@ impl CreateTable {
             .find(|column| column.name.canonical() == name.canonical())
     }
 
-    pub fn index_named(&self, name: &SqlName) -> Option<&IndexDefinition> {
+    pub fn index_named(&self, name: &SqlName) -> Option<&NamedIndex> {
         self.indexes()
             .iter()
             .find(|index| index.active && index.name.canonical() == name.canonical())
     }
 
-    pub fn with_added_index(&self, revision: SchemaRevisionId, index: IndexDefinition) -> Self {
+    pub fn with_added_index(&self, revision: SchemaRevisionId, index: NamedIndex) -> Self {
         let mut evolved = self.clone();
         evolved.schema_revision_id = revision;
         evolved.schema.indexes.push(index);
@@ -966,28 +1010,31 @@ impl CreateTable {
         })
     }
 
-    pub fn foreign_key_target_columns(&self, target: ForeignKeyTarget) -> Option<Vec<&Column>> {
-        let columns = match target {
-            ForeignKeyTarget::PrimaryKey { row_keyspace }
-                if row_keyspace == self.row_keyspace_id =>
-            {
-                self.schema.primary_key.columns.as_slice()
-            }
-            ForeignKeyTarget::Unique { keyspace } => self
-                .schema
-                .unique_constraints
-                .iter()
-                .find(|unique| unique.keyspace_id == keyspace)
-                .map(|unique| unique.columns.as_slice())
-                .or_else(|| {
-                    self.schema
-                        .indexes
-                        .iter()
-                        .find(|index| index.active && index.unique && index.keyspace_id == keyspace)
-                        .map(|index| index.columns.as_slice())
-                })?,
-            _ => return None,
-        };
+    pub fn index_definition(&self, index: IndexId) -> Option<&IndexDefinition> {
+        std::iter::once(self.schema.primary_key.index())
+            .chain(
+                self.schema
+                    .unique_constraints
+                    .iter()
+                    .map(UniqueConstraint::index),
+            )
+            .chain(self.schema.indexes.iter().map(NamedIndex::index))
+            .find(|definition| definition.id() == index)
+    }
+
+    pub fn foreign_key_target_columns(&self, index: IndexId) -> Option<Vec<&Column>> {
+        let definition = self.index_definition(index)?;
+        if definition.kind() == IndexKind::Secondary
+            || (definition.kind() == IndexKind::Unique
+                && self
+                    .schema
+                    .indexes
+                    .iter()
+                    .any(|index| index.index().id() == definition.id() && !index.is_active()))
+        {
+            return None;
+        }
+        let columns = definition.columns();
         columns
             .iter()
             .map(|id| self.schema.columns.iter().find(|column| column.id == *id))
@@ -997,10 +1044,8 @@ impl CreateTable {
     fn resolve_foreign_key_target(
         &self,
         referenced: Option<&[SqlName]>,
-    ) -> Option<(ForeignKeyTarget, Vec<&Column>)> {
-        let primary = ForeignKeyTarget::PrimaryKey {
-            row_keyspace: self.row_keyspace_id,
-        };
+    ) -> Option<(IndexId, Vec<&Column>)> {
+        let primary = self.primary_index_id();
         if referenced.is_none() {
             return Some((
                 primary,
@@ -1017,37 +1062,36 @@ impl CreateTable {
                     })
                 })
         };
-        if matches(&self.schema.primary_key.columns) {
+        if matches(self.schema.primary_key.columns()) {
             return Some((
                 primary,
                 self.foreign_key_target_columns(primary)
                     .expect("validated primary key exists"),
             ));
         }
-        let keyspace = self
+        let index = self
             .schema
             .unique_constraints
             .iter()
-            .find(|unique| matches(&unique.columns))
-            .map(|unique| unique.keyspace_id)
+            .find(|unique| matches(unique.columns()))
+            .map(UniqueConstraint::index_id)
             .or_else(|| {
                 self.schema
                     .indexes
                     .iter()
-                    .find(|index| index.active && index.unique && matches(&index.columns))
-                    .map(|index| index.keyspace_id)
+                    .find(|index| index.active && index.is_unique() && matches(index.columns()))
+                    .map(NamedIndex::index_id)
             })?;
-        let target = ForeignKeyTarget::Unique { keyspace };
         Some((
-            target,
-            self.foreign_key_target_columns(target)
+            index,
+            self.foreign_key_target_columns(index)
                 .expect("selected UNIQUE target exists"),
         ))
     }
 
     pub fn is_rowid_alias(&self, column: ColumnId) -> bool {
         self.schema.storage == TableStorage::Rowid
-            && self.schema.primary_key.columns.as_slice() == [column]
+            && self.schema.primary_key.columns() == [column]
             && self
                 .schema
                 .columns
@@ -1094,7 +1138,7 @@ impl CreateTable {
                         && encoded.not_null == parsed.not_null
                 })
             && spec_primary_key_ids(spec, &self.schema.columns)
-                .is_some_and(|ids| ids == self.schema.primary_key.columns)
+                .is_some_and(|ids| ids == self.schema.primary_key.columns())
             && self.schema.unique_constraints.len() == spec.unique_constraints.len()
             && self
                 .schema
@@ -1103,8 +1147,8 @@ impl CreateTable {
                 .zip(&spec.unique_constraints)
                 .all(|(encoded, parsed)| {
                     encoded.name == parsed.name
-                        && encoded.columns.len() == parsed.columns.len()
-                        && encoded.columns.iter().zip(&parsed.columns).all(
+                        && encoded.columns().len() == parsed.columns.len()
+                        && encoded.columns().iter().zip(&parsed.columns).all(
                             |(encoded_column, parsed_column)| {
                                 self.schema.columns.iter().any(|column| {
                                     column.id == *encoded_column
@@ -1161,7 +1205,7 @@ impl CreateTable {
 struct ResolvedForeignKey {
     spec: CreateForeignKey,
     parent: CreateTable,
-    target: ForeignKeyTarget,
+    target: IndexId,
 }
 
 fn resolve_foreign_keys(
@@ -1248,7 +1292,7 @@ fn validate_foreign_key_link(
     parent: &CreateTable,
 ) -> Result<()> {
     let parent_columns = parent
-        .foreign_key_target_columns(foreign_key.referenced_target)
+        .foreign_key_target_columns(foreign_key.referenced_index)
         .ok_or(Error::InvalidDatabase(
             "foreign key target is no longer active in the parent schema",
         ))?;
@@ -1344,7 +1388,7 @@ fn build_create_table(
     let mutation_id = MutationId(mint());
     let table_id = TableId(mint());
     let schema_revision_id = SchemaRevisionId(mint());
-    let row_keyspace_id = RowKeyspaceId(mint());
+    let row_index_id = IndexId(mint());
     let columns = column_specs
         .iter()
         .map(|column| Column {
@@ -1358,26 +1402,33 @@ fn build_create_table(
         .collect::<Vec<_>>();
     let primary_key = PrimaryKey {
         name: primary_key_name,
-        columns: spec_primary_key_ids_from_columns(&column_specs, &columns)
-            .expect("validated PRIMARY KEY columns exist"),
+        index: IndexDefinition {
+            id: row_index_id,
+            kind: IndexKind::Primary,
+            columns: spec_primary_key_ids_from_columns(&column_specs, &columns)
+                .expect("validated PRIMARY KEY columns exist"),
+        },
     };
     let checks = lower_checks(check_specs, &columns);
     let unique_constraints = unique_specs
         .into_iter()
         .map(|unique| UniqueConstraint {
-            keyspace_id: UniqueKeyspaceId(mint()),
             name: unique.name,
-            columns: unique
-                .columns
-                .into_iter()
-                .map(|name| {
-                    columns
-                        .iter()
-                        .find(|column| column.name.canonical() == name.canonical())
-                        .expect("validated UNIQUE column exists")
-                        .id
-                })
-                .collect(),
+            index: IndexDefinition {
+                id: IndexId(mint()),
+                kind: IndexKind::Unique,
+                columns: unique
+                    .columns
+                    .into_iter()
+                    .map(|name| {
+                        columns
+                            .iter()
+                            .find(|column| column.name.canonical() == name.canonical())
+                            .expect("validated UNIQUE column exists")
+                            .id
+                    })
+                    .collect(),
+            },
         })
         .collect();
     let foreign_keys = resolved_foreign_keys
@@ -1404,7 +1455,7 @@ fn build_create_table(
                     .collect(),
                 referenced_table: resolved.parent.table_id(),
                 referenced_table_name: resolved.parent.table_name_identity().clone(),
-                referenced_target: resolved.target,
+                referenced_index: resolved.target,
                 referenced_columns: parent_columns.iter().map(|column| column.id()).collect(),
                 referenced_column_names: parent_columns
                     .iter()
@@ -1418,7 +1469,6 @@ fn build_create_table(
         sql: sql.to_owned(),
         table_id,
         schema_revision_id,
-        row_keyspace_id,
         name,
         schema: TableSchema {
             mode,
@@ -1514,14 +1564,14 @@ pub fn table_prefix(table: TableId) -> Key {
         .expect("table prefix is bounded")
 }
 
-pub fn active_row_keyspace_key(table: TableId) -> Key {
+pub fn active_primary_index_key(table: TableId) -> Key {
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
         table.0.as_slice(),
-        codes::ACTIVE_ROW_KEYSPACE,
+        codes::ACTIVE_PRIMARY_INDEX,
     ])
-    .expect("active row keyspace key is bounded")
+    .expect("active primary index key is bounded")
 }
 
 pub fn active_schema_revision_key(table: TableId) -> Key {
@@ -1547,26 +1597,15 @@ pub fn index_name_scope_key(name: &SqlName) -> Key {
     .expect("index-name scope components are bounded and non-empty")
 }
 
-fn row_keyspace_key(table: TableId, keyspace: RowKeyspaceId) -> Key {
+pub fn index_definition_key(table: TableId, index: IndexId) -> Key {
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
         table.0.as_slice(),
-        codes::ROW_KEYSPACES,
-        keyspace.0.as_slice(),
+        codes::INDEX_DEFINITIONS,
+        index.0.as_slice(),
     ])
-    .expect("row keyspace key is bounded")
-}
-
-pub fn unique_keyspace_key(table: TableId, keyspace: UniqueKeyspaceId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::UNIQUE_KEYSPACES,
-        keyspace.0.as_slice(),
-    ])
-    .expect("unique keyspace key is bounded")
+    .expect("index definition key is bounded")
 }
 
 pub fn write_revision_key(table: TableId) -> Key {
@@ -1608,9 +1647,6 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
         .field(TAG_SCHEMA_REVISION_ID, &table.schema_revision_id.0)
         .expect("schema field length must fit in u32");
     writer
-        .field(TAG_ROW_KEYSPACE_ID, &table.row_keyspace_id.0)
-        .expect("schema field length must fit in u32");
-    writer
         .field(TAG_TABLE_MODE, &[table.schema.mode.to_u8()])
         .expect("schema field length must fit in u32");
     writer
@@ -1634,7 +1670,7 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
     }
     for index in &table.schema.indexes {
         writer
-            .field(TAG_INDEX_DEFINITION, &encode_index_definition(index))
+            .field(TAG_INDEX_DEFINITION, &encode_named_index(index))
             .expect("schema field length must fit in u32");
     }
     for foreign_key in &table.schema.foreign_keys {
@@ -1644,18 +1680,6 @@ fn encode_create_table(table: &CreateTable) -> Vec<u8> {
                 &encode_foreign_key_definition(foreign_key),
             )
             .expect("schema field length must fit in u32");
-    }
-    writer.finish()
-}
-
-fn encode_row_keyspace(table: &CreateTable) -> Vec<u8> {
-    let primary = table.primary_key_columns().collect::<Vec<_>>();
-    let mut writer = Writer::with_capacity(2 + primary.len() * 17);
-    writer.u8(1);
-    writer.u8(u8::try_from(primary.len()).expect("supported primary key count fits in u8"));
-    for column in primary {
-        writer.bytes16(&column.id.0);
-        writer.u8(column.affinity(table.mode()).to_u8());
     }
     writer.finish()
 }
@@ -1699,43 +1723,46 @@ fn encode_column(column: &Column) -> Vec<u8> {
 }
 
 fn encode_primary_key(primary_key: &PrimaryKey) -> Vec<u8> {
-    let mut writer = Writer::new();
-    for column in &primary_key.columns {
-        writer
-            .field(TAG_PRIMARY_COLUMN_ID, &column.0)
-            .expect("schema field length must fit in u32");
-    }
-    writer.finish()
+    primary_key.index.encode()
 }
 
 fn encode_unique_constraint(unique: &UniqueConstraint) -> Vec<u8> {
     let mut writer = Writer::new();
     writer
-        .field(TAG_UNIQUE_KEYSPACE_ID, &unique.keyspace_id.0)
+        .field(TAG_UNIQUE_INDEX_DEFINITION, &unique.index.encode())
         .expect("schema field length must fit in u32");
     if let Some(name) = &unique.name {
         writer
             .field(TAG_UNIQUE_NAME, name.value().as_bytes())
             .expect("schema field length must fit in u32");
     }
-    for column in &unique.columns {
+    writer.finish()
+}
+
+fn encode_logical_index(index: &IndexDefinition) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.u8(INDEX_DEFINITION_FRAME_VERSION);
+    writer
+        .field(TAG_INDEX_ID, &index.id.0)
+        .expect("index definition field length must fit in u32");
+    writer
+        .field(TAG_INDEX_KIND, &[index.kind.to_u8()])
+        .expect("index definition field length must fit in u32");
+    for column in &index.columns {
         writer
-            .field(TAG_UNIQUE_COLUMN_ID, &column.0)
-            .expect("schema field length must fit in u32");
+            .field(TAG_INDEX_COLUMN_ID, &column.0)
+            .expect("index definition field length must fit in u32");
     }
     writer.finish()
 }
 
-fn encode_index_definition(index: &IndexDefinition) -> Vec<u8> {
+fn encode_named_index(index: &NamedIndex) -> Vec<u8> {
     let mut writer = Writer::new();
     writer
-        .field(TAG_INDEX_KEYSPACE_ID, &index.keyspace_id.0)
+        .field(TAG_NAMED_INDEX_DEFINITION, &index.index.encode())
         .expect("index field length must fit in u32");
     writer
         .field(TAG_INDEX_NAME, index.name.value().as_bytes())
-        .expect("index field length must fit in u32");
-    writer
-        .field(TAG_INDEX_UNIQUE, &[u8::from(index.unique)])
         .expect("index field length must fit in u32");
     writer
         .field(TAG_INDEX_SQL, index.sql.as_bytes())
@@ -1743,11 +1770,6 @@ fn encode_index_definition(index: &IndexDefinition) -> Vec<u8> {
     writer
         .field(TAG_INDEX_ACTIVE, &[u8::from(index.active)])
         .expect("index field length must fit in u32");
-    for column in &index.columns {
-        writer
-            .field(TAG_INDEX_COLUMN_ID, &column.0)
-            .expect("index field length must fit in u32");
-    }
     writer.finish()
 }
 
@@ -1780,14 +1802,8 @@ fn encode_foreign_key_definition(foreign_key: &ForeignKeyDefinition) -> Vec<u8> 
         .expect("foreign-key field length must fit in u32");
     writer
         .field(
-            TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
-            &[foreign_key.referenced_target.kind()],
-        )
-        .expect("foreign-key field length must fit in u32");
-    writer
-        .field(
-            TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID,
-            &foreign_key.referenced_target.keyspace_bytes(),
+            TAG_FOREIGN_KEY_PARENT_INDEX_ID,
+            &foreign_key.referenced_index.as_bytes(),
         )
         .expect("foreign-key field length must fit in u32");
     for (column, name) in foreign_key
@@ -1875,15 +1891,9 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     }
     let mutation_id = mutation_id.ok_or(SchemaCodecError::MissingField(TAG_MUTATION_ID))?;
     let sql = sql.ok_or(SchemaCodecError::MissingField(TAG_SQL))?;
-    let (table_id, schema_revision_id, row_keyspace_id, name, schema) =
+    let (table_id, schema_revision_id, name, schema) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
-    if !schema_identities_are_unique(
-        mutation_id,
-        table_id,
-        schema_revision_id,
-        row_keyspace_id,
-        &schema,
-    ) {
+    if !schema_identities_are_unique(mutation_id, table_id, schema_revision_id, &schema) {
         return Err(SchemaCodecError::InvalidSchema);
     }
     Ok(CreateTable {
@@ -1891,7 +1901,6 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
         sql,
         table_id,
         schema_revision_id,
-        row_keyspace_id,
         name,
         schema,
     })
@@ -1918,22 +1927,12 @@ fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], SchemaCodecError> {
 
 fn decode_create_table(
     frame: &[u8],
-) -> std::result::Result<
-    (
-        TableId,
-        SchemaRevisionId,
-        RowKeyspaceId,
-        SqlName,
-        TableSchema,
-    ),
-    SchemaCodecError,
-> {
+) -> std::result::Result<(TableId, SchemaRevisionId, SqlName, TableSchema), SchemaCodecError> {
     use homebase_core::reader::Reader;
 
     let mut reader = Reader::new(frame);
     let mut table_id = None;
     let mut schema_revision_id = None;
-    let mut row_keyspace_id = None;
     let mut name = None;
     let mut mode = None;
     let mut storage = None;
@@ -1950,9 +1949,6 @@ fn decode_create_table(
                 &mut schema_revision_id,
                 SchemaRevisionId(uuid_bytes(value)?),
             )?,
-            TAG_ROW_KEYSPACE_ID => {
-                set_once(&mut row_keyspace_id, RowKeyspaceId(uuid_bytes(value)?))?
-            }
             TAG_TABLE_MODE => {
                 let [value] = value else {
                     return Err(SchemaCodecError::InvalidLength);
@@ -1975,7 +1971,7 @@ fn decode_create_table(
             TAG_PRIMARY_KEY => set_once(&mut primary_key, decode_primary_key(value)?)?,
             TAG_COLUMN => columns.push(decode_column(value)?),
             TAG_UNIQUE_CONSTRAINT => unique_constraints.push(decode_unique_constraint(value)?),
-            TAG_INDEX_DEFINITION => indexes.push(decode_index_definition(value)?),
+            TAG_INDEX_DEFINITION => indexes.push(decode_named_index(value)?),
             TAG_FOREIGN_KEY_DEFINITION => foreign_keys.push(decode_foreign_key_definition(value)?),
             _ => {}
         }
@@ -1984,8 +1980,8 @@ fn decode_create_table(
     let storage = storage.ok_or(SchemaCodecError::MissingField(TAG_TABLE_STORAGE))?;
     let primary_key = primary_key.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_KEY))?;
     let rowid_alias = storage == TableStorage::Rowid
-        && primary_key.columns.len() == 1
-        && primary_key.columns.first().is_some_and(|id| {
+        && primary_key.columns().len() == 1
+        && primary_key.columns().first().is_some_and(|id| {
             columns
                 .iter()
                 .find(|column| column.id == *id)
@@ -1997,30 +1993,31 @@ fn decode_create_table(
                 .iter()
                 .any(|seen| seen.name.canonical() == column.name.canonical())
         })
-        || primary_key.columns.is_empty()
-        || primary_key.columns.len() > MAX_KEY_PARTS
+        || primary_key.index.kind != IndexKind::Primary
+        || primary_key.columns().is_empty()
+        || !index_columns_supported(IndexKind::Primary, primary_key.columns().len())
         || primary_key
-            .columns
+            .columns()
             .iter()
             .enumerate()
             .any(|(index, column)| {
-                primary_key.columns[..index].contains(column)
+                primary_key.columns()[..index].contains(column)
                     || !columns.iter().any(|candidate| candidate.id == *column)
             })
         || (mode == TableMode::Strict
             && columns.iter().any(|column| {
                 column.strict_type().is_none()
-                    || (primary_key.columns.contains(&column.id) && !column.not_null)
+                    || (primary_key.columns().contains(&column.id) && !column.not_null)
             }))
         || (storage == TableStorage::WithoutRowid
-            && primary_key.columns.iter().any(|id| {
+            && primary_key.columns().iter().any(|id| {
                 columns
                     .iter()
                     .find(|column| column.id == *id)
                     .is_none_or(|column| !column.not_null)
             }))
         || (!rowid_alias
-            && primary_key.columns.iter().any(|id| {
+            && primary_key.columns().iter().any(|id| {
                 columns
                     .iter()
                     .find(|column| column.id == *id)
@@ -2030,44 +2027,47 @@ fn decode_create_table(
             .iter()
             .enumerate()
             .any(|(index, unique)| {
-                unique.columns.is_empty()
-                    || unique.columns.len() > MAX_KEY_PARTS
+                unique.index.kind != IndexKind::Unique
+                    || unique.columns().is_empty()
+                    || !index_columns_supported(IndexKind::Unique, unique.columns().len())
                     || unique_constraints[..index]
                         .iter()
-                        .any(|seen| seen.keyspace_id == unique.keyspace_id)
+                        .any(|seen| seen.index.id == unique.index.id)
                     || unique
-                        .columns
+                        .columns()
                         .iter()
                         .enumerate()
                         .any(|(column_index, column)| {
-                            unique.columns[..column_index].contains(column)
+                            unique.columns()[..column_index].contains(column)
                                 || !columns.iter().any(|candidate| candidate.id == *column)
                         })
             })
         || indexes.iter().enumerate().any(|(index, definition)| {
-            !definition.unique
-                || definition.columns.is_empty()
-                || definition.columns.len() > MAX_KEY_PARTS
+            !matches!(
+                definition.index.kind,
+                IndexKind::Unique | IndexKind::Secondary
+            ) || definition.columns().is_empty()
+                || !index_columns_supported(definition.index.kind, definition.columns().len())
                 || definition.sql.is_empty()
                 || indexes[..index]
                     .iter()
-                    .any(|seen| seen.keyspace_id == definition.keyspace_id)
+                    .any(|seen| seen.index.id == definition.index.id)
                 || (definition.active
                     && indexes[..index].iter().any(|seen| {
                         seen.active && seen.name.canonical() == definition.name.canonical()
                     }))
                 || definition
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .any(|(column_index, column)| {
-                        definition.columns[..column_index].contains(column)
+                        definition.columns()[..column_index].contains(column)
                             || !columns.iter().any(|candidate| candidate.id == *column)
                     })
         })
         || foreign_keys.iter().enumerate().any(|(index, foreign_key)| {
             foreign_key.columns.is_empty()
-                || foreign_key.columns.len() > MAX_KEY_PARTS
+                || foreign_key.columns.len() > MAX_INDEX_COLUMNS
                 || foreign_key.columns.len() != foreign_key.referenced_columns.len()
                 || foreign_key.columns.len() != foreign_key.referenced_column_names.len()
                 || foreign_key.referenced_table == table_id.unwrap_or(TableId([0; 16]))
@@ -2097,7 +2097,6 @@ fn decode_create_table(
     Ok((
         table_id.ok_or(SchemaCodecError::MissingField(TAG_TABLE_ID))?,
         schema_revision_id.ok_or(SchemaCodecError::MissingField(TAG_SCHEMA_REVISION_ID))?,
-        row_keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_ROW_KEYSPACE_ID))?,
         name.ok_or(SchemaCodecError::MissingField(TAG_TABLE_NAME))?,
         TableSchema {
             mode,
@@ -2116,20 +2115,19 @@ fn schema_identities_are_unique(
     mutation: MutationId,
     table: TableId,
     schema_revision: SchemaRevisionId,
-    row_keyspace: RowKeyspaceId,
     schema: &TableSchema,
 ) -> bool {
     let mut identities = BTreeSet::new();
     std::iter::once(mutation.0)
-        .chain([table.0, schema_revision.0, row_keyspace.0])
+        .chain([table.0, schema_revision.0, schema.primary_key.index.id.0])
         .chain(schema.columns.iter().map(|column| column.id.0))
         .chain(
             schema
                 .unique_constraints
                 .iter()
-                .map(|unique| unique.keyspace_id.0),
+                .map(|unique| unique.index.id.0),
         )
-        .chain(schema.indexes.iter().map(|index| index.keyspace_id.0))
+        .chain(schema.indexes.iter().map(|index| index.index.id.0))
         .chain(
             schema
                 .foreign_keys
@@ -2150,8 +2148,7 @@ fn decode_foreign_key_definition(
     let mut columns = Vec::new();
     let mut referenced_table = None;
     let mut referenced_table_name = None;
-    let mut referenced_target_kind = None;
-    let mut referenced_keyspace = None;
+    let mut referenced_index = None;
     let mut referenced_columns = Vec::new();
     let mut referenced_column_names = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
@@ -2165,14 +2162,8 @@ fn decode_foreign_key_definition(
             TAG_FOREIGN_KEY_PARENT_TABLE_NAME => {
                 set_once(&mut referenced_table_name, decode_name(value)?)?
             }
-            TAG_FOREIGN_KEY_PARENT_TARGET_KIND => {
-                let [value] = value else {
-                    return Err(SchemaCodecError::InvalidLength);
-                };
-                set_once(&mut referenced_target_kind, *value)?;
-            }
-            TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID => {
-                set_once(&mut referenced_keyspace, uuid_bytes(value)?)?
+            TAG_FOREIGN_KEY_PARENT_INDEX_ID => {
+                set_once(&mut referenced_index, IndexId(uuid_bytes(value)?))?
             }
             TAG_FOREIGN_KEY_PARENT_COLUMN_ID => {
                 referenced_columns.push(ColumnId(uuid_bytes(value)?))
@@ -2187,20 +2178,9 @@ fn decode_foreign_key_definition(
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    let referenced_keyspace = referenced_keyspace.ok_or(SchemaCodecError::MissingField(
-        TAG_FOREIGN_KEY_PARENT_KEYSPACE_ID,
+    let referenced_index = referenced_index.ok_or(SchemaCodecError::MissingField(
+        TAG_FOREIGN_KEY_PARENT_INDEX_ID,
     ))?;
-    let referenced_target = match referenced_target_kind.ok_or(SchemaCodecError::MissingField(
-        TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
-    ))? {
-        FOREIGN_KEY_TARGET_PRIMARY_KEY => ForeignKeyTarget::PrimaryKey {
-            row_keyspace: RowKeyspaceId(referenced_keyspace),
-        },
-        FOREIGN_KEY_TARGET_UNIQUE => ForeignKeyTarget::Unique {
-            keyspace: UniqueKeyspaceId(referenced_keyspace),
-        },
-        _ => return Err(SchemaCodecError::InvalidSchema),
-    };
     Ok(ForeignKeyDefinition {
         id: id.ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ID))?,
         name,
@@ -2211,40 +2191,24 @@ fn decode_foreign_key_definition(
         referenced_table_name: referenced_table_name.ok_or(SchemaCodecError::MissingField(
             TAG_FOREIGN_KEY_PARENT_TABLE_NAME,
         ))?,
-        referenced_target,
+        referenced_index,
         referenced_columns,
         referenced_column_names,
     })
 }
 
-fn decode_index_definition(frame: &[u8]) -> std::result::Result<IndexDefinition, SchemaCodecError> {
+fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCodecError> {
     use homebase_core::reader::Reader;
 
     let mut reader = Reader::new(frame);
-    let mut keyspace_id = None;
+    let mut index = None;
     let mut name = None;
-    let mut unique = None;
     let mut sql = None;
     let mut active = None;
-    let mut columns = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
-            TAG_INDEX_KEYSPACE_ID => {
-                set_once(&mut keyspace_id, UniqueKeyspaceId(uuid_bytes(value)?))?
-            }
+            TAG_NAMED_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_INDEX_NAME => set_once(&mut name, decode_name(value)?)?,
-            TAG_INDEX_UNIQUE => {
-                let [value] = value else {
-                    return Err(SchemaCodecError::InvalidLength);
-                };
-                let value = match value {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(SchemaCodecError::InvalidSchema),
-                };
-                set_once(&mut unique, value)?;
-            }
-            TAG_INDEX_COLUMN_ID => columns.push(ColumnId(uuid_bytes(value)?)),
             TAG_INDEX_SQL => set_once(
                 &mut sql,
                 String::from_utf8(value.to_vec()).map_err(|_| SchemaCodecError::InvalidUtf8)?,
@@ -2263,33 +2227,20 @@ fn decode_index_definition(frame: &[u8]) -> std::result::Result<IndexDefinition,
             _ => {}
         }
     }
-    Ok(IndexDefinition {
-        keyspace_id: keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_INDEX_KEYSPACE_ID))?,
+    Ok(NamedIndex {
+        index: index.ok_or(SchemaCodecError::MissingField(TAG_NAMED_INDEX_DEFINITION))?,
         name: name.ok_or(SchemaCodecError::MissingField(TAG_INDEX_NAME))?,
-        unique: unique.ok_or(SchemaCodecError::MissingField(TAG_INDEX_UNIQUE))?,
-        columns,
         sql: sql.ok_or(SchemaCodecError::MissingField(TAG_INDEX_SQL))?,
         active: active.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ACTIVE))?,
     })
 }
 
 fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCodecError> {
-    use homebase_core::reader::Reader;
-
-    let mut reader = Reader::new(frame);
-    let mut columns = Vec::new();
-    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
-        if tag == TAG_PRIMARY_COLUMN_ID {
-            columns.push(ColumnId(uuid_bytes(value)?));
-        }
-    }
-    if columns.is_empty() {
+    let index = decode_logical_index(frame)?;
+    if index.kind != IndexKind::Primary {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(PrimaryKey {
-        name: None,
-        columns,
-    })
+    Ok(PrimaryKey { name: None, index })
 }
 
 fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> {
@@ -2369,16 +2320,45 @@ fn decode_unique_constraint(
     use homebase_core::reader::Reader;
 
     let mut reader = Reader::new(frame);
-    let mut keyspace_id = None;
+    let mut index = None;
     let mut name = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
+        match tag {
+            TAG_UNIQUE_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
+            TAG_UNIQUE_NAME => set_once(&mut name, decode_name(value)?)?,
+            _ => {}
+        }
+    }
+    let index = index.ok_or(SchemaCodecError::MissingField(TAG_UNIQUE_INDEX_DEFINITION))?;
+    if index.kind != IndexKind::Unique {
+        return Err(SchemaCodecError::InvalidSchema);
+    }
+    Ok(UniqueConstraint { name, index })
+}
+
+fn decode_logical_index(frame: &[u8]) -> std::result::Result<IndexDefinition, SchemaCodecError> {
+    use homebase_core::reader::Reader;
+
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(INDEX_DEFINITION_FRAME_VERSION) {
+        return Err(SchemaCodecError::UnknownVersion);
+    }
+    let mut id = None;
+    let mut kind = None;
     let mut columns = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
-            TAG_UNIQUE_KEYSPACE_ID => {
-                set_once(&mut keyspace_id, UniqueKeyspaceId(uuid_bytes(value)?))?
+            TAG_INDEX_ID => set_once(&mut id, IndexId(uuid_bytes(value)?))?,
+            TAG_INDEX_KIND => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut kind,
+                    IndexKind::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)?,
+                )?;
             }
-            TAG_UNIQUE_NAME => set_once(&mut name, decode_name(value)?)?,
-            TAG_UNIQUE_COLUMN_ID => columns.push(ColumnId(uuid_bytes(value)?)),
+            TAG_INDEX_COLUMN_ID => columns.push(ColumnId(uuid_bytes(value)?)),
             _ => {}
         }
     }
@@ -2386,13 +2366,13 @@ fn decode_unique_constraint(
         || columns
             .iter()
             .enumerate()
-            .any(|(index, column)| columns[..index].contains(column))
+            .any(|(position, column)| columns[..position].contains(column))
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(UniqueConstraint {
-        keyspace_id: keyspace_id.ok_or(SchemaCodecError::MissingField(TAG_UNIQUE_KEYSPACE_ID))?,
-        name,
+    Ok(IndexDefinition {
+        id: id.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ID))?,
+        kind: kind.ok_or(SchemaCodecError::MissingField(TAG_INDEX_KIND))?,
         columns,
     })
 }
@@ -2447,12 +2427,12 @@ fn hydrate_literal_sql(created: &mut CreateTable) -> std::result::Result<(), Sch
 
 fn validate_index_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
     for index in created.indexes() {
-        let super::sql::ValidatedExecute::CreateUniqueIndex(spec) =
+        let super::sql::ValidatedExecute::CreateIndex(spec) =
             super::sql::validate_execute(index.sql()).map_err(|_| SchemaCodecError::InvalidSql)?
         else {
             return Err(SchemaCodecError::InvalidSql);
         };
-        if !index.is_unique()
+        if spec.unique != index.is_unique()
             || spec.name != *index.name()
             || spec.table != *created.table_name_identity()
             || spec.columns.len() != index.columns().len()
@@ -2750,12 +2730,12 @@ mod tests {
     }
 
     #[test]
-    fn composite_unique_constraints_roundtrip_with_their_own_keyspace() {
+    fn composite_unique_constraints_roundtrip_with_their_own_index() {
         let created = deterministic_unique_create();
         let unique = &created.schema.unique_constraints[0];
-        assert_eq!(unique.keyspace_id.0, test_uuid(8));
+        assert_eq!(unique.index.id.0, test_uuid(8));
         assert_eq!(
-            unique.columns,
+            unique.columns(),
             vec![created.schema.columns[1].id, created.schema.columns[2].id]
         );
 
@@ -2765,12 +2745,32 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 8);
         assert_eq!(
             lowered.mutations[6].key(),
-            &unique_keyspace_key(created.table_id, unique.keyspace_id)
+            &index_definition_key(created.table_id, unique.index.id)
         );
         assert_eq!(
             CreateTable::from_homebase(&admit(lowered.mutations)).unwrap(),
             created
         );
+    }
+
+    #[test]
+    fn only_semantic_indexes_are_bounded_by_homebase_key_components() {
+        assert!(index_columns_supported(
+            IndexKind::Primary,
+            MAX_INDEX_COLUMNS
+        ));
+        assert!(index_columns_supported(
+            IndexKind::Unique,
+            MAX_INDEX_COLUMNS
+        ));
+        assert!(index_columns_supported(
+            IndexKind::Secondary,
+            MAX_INDEX_COLUMNS
+        ));
+        assert!(!index_columns_supported(
+            IndexKind::Secondary,
+            MAX_INDEX_COLUMNS + 1
+        ));
     }
 
     #[test]
@@ -2916,12 +2916,7 @@ mod tests {
 
         assert_eq!(foreign_key.name().map(SqlName::value), Some("parent_fk"));
         assert_eq!(foreign_key.referenced_table(), parent.table_id());
-        assert_eq!(
-            foreign_key.referenced_target(),
-            ForeignKeyTarget::PrimaryKey {
-                row_keyspace: parent.row_keyspace_id()
-            }
-        );
+        assert_eq!(foreign_key.referenced_index(), parent.primary_index_id());
         assert_eq!(
             foreign_key
                 .referenced_column_names()
@@ -2937,7 +2932,7 @@ mod tests {
             &lowered.footprint,
             &[
                 table_name_scope_key(&child.name),
-                active_row_keyspace_key(parent.table_id()),
+                active_schema_revision_key(parent.table_id()),
             ],
         );
         assert!(
@@ -2965,7 +2960,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_keys_resolve_composite_unique_targets_with_stable_keyspaces() {
+    fn foreign_keys_resolve_composite_unique_targets_with_stable_indexes() {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let parent_sql = "CREATE TABLE accounts (
@@ -2994,11 +2989,9 @@ mod tests {
         };
         let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
         let foreign_key = &child.foreign_keys()[0];
-        let target = ForeignKeyTarget::Unique {
-            keyspace: parent.unique_constraints()[0].keyspace_id(),
-        };
+        let target = parent.unique_constraints()[0].index_id();
 
-        assert_eq!(foreign_key.referenced_target(), target);
+        assert_eq!(foreign_key.referenced_index(), target);
         assert_eq!(
             parent
                 .foreign_key_target_columns(target)
@@ -3020,12 +3013,6 @@ mod tests {
             ],
         );
         assert!(
-            !lowered
-                .footprint
-                .constraints()
-                .contains(&active_row_keyspace_key(parent.table_id()))
-        );
-        assert!(
             lowered
                 .footprint
                 .writes()
@@ -3033,9 +3020,7 @@ mod tests {
         );
 
         let mut missing_target = child.clone();
-        missing_target.schema.foreign_keys[0].referenced_target = ForeignKeyTarget::Unique {
-            keyspace: UniqueKeyspaceId(test_uuid(99)),
-        };
+        missing_target.schema.foreign_keys[0].referenced_index = IndexId(test_uuid(99));
         assert!(matches!(
             validate_foreign_key_graph(&[parent, missing_target]),
             Err(Error::InvalidDatabase(
@@ -3167,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_unique_constraints_keep_distinct_ordered_keyspaces() {
+    fn overlapping_unique_constraints_keep_distinct_ordered_indexes() {
         let created = deterministic_overlapping_unique_create();
         assert_eq!(created.schema.unique_constraints.len(), 4);
         assert_eq!(
@@ -3175,7 +3160,7 @@ mod tests {
                 .schema
                 .unique_constraints
                 .iter()
-                .map(|unique| unique.keyspace_id.0)
+                .map(|unique| unique.index.id.0)
                 .collect::<Vec<_>>(),
             [test_uuid(9), test_uuid(10), test_uuid(11), test_uuid(12)]
         );
@@ -3184,7 +3169,7 @@ mod tests {
                 .schema
                 .unique_constraints
                 .iter()
-                .map(|unique| unique.columns.clone())
+                .map(|unique| unique.columns().to_vec())
                 .collect::<Vec<_>>(),
             [
                 vec![created.schema.columns[2].id],
@@ -3203,7 +3188,7 @@ mod tests {
         {
             assert_eq!(
                 mutation.key(),
-                &unique_keyspace_key(created.table_id, unique.keyspace_id)
+                &index_definition_key(created.table_id, unique.index.id)
             );
         }
         assert_eq!(
@@ -3216,6 +3201,7 @@ mod tests {
     fn decoder_rejects_malformed_unique_definitions() {
         let mut duplicate_column = deterministic_unique_create();
         duplicate_column.schema.unique_constraints[0]
+            .index
             .columns
             .push(duplicate_column.schema.columns[1].id);
         assert_eq!(
@@ -3224,17 +3210,17 @@ mod tests {
         );
 
         let mut unknown_column = deterministic_unique_create();
-        unknown_column.schema.unique_constraints[0].columns[0] = ColumnId(test_uuid(99));
+        unknown_column.schema.unique_constraints[0].index.columns[0] = ColumnId(test_uuid(99));
         assert_eq!(
             CreateTable::decode(&unknown_column.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
 
-        let mut duplicate_keyspace = deterministic_overlapping_unique_create();
-        duplicate_keyspace.schema.unique_constraints[1].keyspace_id =
-            duplicate_keyspace.schema.unique_constraints[0].keyspace_id;
+        let mut duplicate_index = deterministic_overlapping_unique_create();
+        duplicate_index.schema.unique_constraints[1].index.id =
+            duplicate_index.schema.unique_constraints[0].index.id;
         assert_eq!(
-            CreateTable::decode(&duplicate_keyspace.encode()),
+            CreateTable::decode(&duplicate_index.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
     }
@@ -3466,8 +3452,8 @@ mod tests {
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
 
         let mut duplicate_primary = created;
-        duplicate_primary.schema.primary_key.columns[1] =
-            duplicate_primary.schema.primary_key.columns[0];
+        duplicate_primary.schema.primary_key.index.columns[1] =
+            duplicate_primary.schema.primary_key.index.columns[0];
         assert_eq!(
             CreateTable::decode(&duplicate_primary.encode()),
             Err(SchemaCodecError::InvalidSchema)
@@ -3493,7 +3479,7 @@ mod tests {
         );
 
         let mut reused_identity = created;
-        reused_identity.row_keyspace_id = RowKeyspaceId(reused_identity.table_id.0);
+        reused_identity.schema.primary_key.index.id = IndexId(reused_identity.table_id.0);
         assert_eq!(
             CreateTable::decode(&reused_identity.encode()),
             Err(SchemaCodecError::InvalidSchema)
@@ -3547,7 +3533,7 @@ mod tests {
         for bytes in std::iter::once(created.mutation_id.0)
             .chain(std::iter::once(created.table_id.0))
             .chain(std::iter::once(created.schema_revision_id.0))
-            .chain(std::iter::once(created.row_keyspace_id.0))
+            .chain(std::iter::once(created.primary_index_id().0))
             .chain(created.schema.columns.iter().map(|column| column.id.0))
         {
             let uuid = Uuid::from_bytes(bytes);

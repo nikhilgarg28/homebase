@@ -248,7 +248,7 @@ fn foreign_key_catalog_reopens_and_remains_usable() {
 }
 
 #[test]
-fn unique_foreign_key_targets_survive_reopen_with_their_keyspace_identity() {
+fn unique_foreign_key_targets_survive_reopen_with_their_index_identity() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("unique-foreign-keys.sqlite");
     {

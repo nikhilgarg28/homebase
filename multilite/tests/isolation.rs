@@ -211,7 +211,7 @@ fn composite_unique_collisions_are_mandatory_at_both_isolation_levels() {
 }
 
 #[test]
-fn coarse_serializable_table_reads_conflict_across_disjoint_point_predicates() {
+fn coarse_serializable_reads_ignore_secondary_indexes_and_conflict_across_disjoint_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let authority = server();
     let first = MultiliteConnection::open_with(
@@ -228,6 +228,12 @@ fn coarse_serializable_table_reads_conflict_across_disjoint_point_predicates() {
     )
     .unwrap();
     synchronize_schema(&first, &second);
+    first
+        .execute("CREATE INDEX bookings_day ON bookings (day)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
 
     assert!(conditionally_book_after_point_read(
         &first,

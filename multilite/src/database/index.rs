@@ -1,4 +1,4 @@
-//! Explicit UNIQUE-index schema operations and ownership backfills.
+//! Explicit index schema operations and durable entry backfills.
 
 use std::fmt;
 
@@ -11,17 +11,17 @@ use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
 use super::codes;
-use super::row::{UniqueBackfillEntry, backfill_unique_index};
+use super::row::{IndexBackfillEntry, backfill_unique_index};
 use super::schema::{
-    CreateTable, ForeignKeyTarget, IndexDefinition, MutationId, SchemaRevisionId,
-    active_schema_revision_key, index_name_scope_key, schema_log_key, table_schema_key,
-    unique_keyspace_key, write_revision_key,
+    CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
+    index_definition_key, index_name_scope_key, schema_log_key, table_schema_key,
+    write_revision_key,
 };
-use super::sql::{CreateUniqueIndexSpec, DropIndexSpec, ValidatedExecute};
+use super::sql::{CreateIndexSpec, DropIndexSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
-const INDEX_OPERATION_VERSION: u8 = 1;
+const INDEX_OPERATION_VERSION: u8 = 2;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_BEFORE: u8 = 3;
@@ -29,7 +29,7 @@ const TAG_AFTER: u8 = 4;
 const TAG_ACTION: u8 = 5;
 const TAG_INDEX: u8 = 6;
 const TAG_BACKFILL: u8 = 7;
-const CREATE_UNIQUE: u8 = 1;
+const CREATE: u8 = 1;
 const DROP: u8 = 2;
 
 const BACKFILL_VERSION: u8 = 1;
@@ -38,7 +38,7 @@ const TAG_BACKFILL_OWNER: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IndexAction {
-    CreateUnique,
+    Create,
     Drop,
 }
 
@@ -50,8 +50,8 @@ pub struct IndexOperation {
     before: CreateTable,
     after: CreateTable,
     action: IndexAction,
-    index: IndexDefinition,
-    backfill: Vec<UniqueBackfillEntry>,
+    index: NamedIndex,
+    backfill: Vec<IndexBackfillEntry>,
 }
 
 /// Homebase mutations and conflict footprint for one explicit-index change.
@@ -61,11 +61,11 @@ pub struct IndexHomebaseOp {
 }
 
 impl IndexOperation {
-    /// Prepare a CREATE UNIQUE INDEX after SQLite has validated and built it.
+    /// Prepare a CREATE INDEX after SQLite has validated and built it.
     pub fn prepare_create(
         connection: &Connection,
         sql: &str,
-        spec: &CreateUniqueIndexSpec,
+        spec: &CreateIndexSpec,
     ) -> Result<Self> {
         if catalog::index_by_name(connection, &spec.name)?.is_some() {
             return Err(Error::InvalidDatabase(
@@ -73,29 +73,33 @@ impl IndexOperation {
             ));
         }
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
-            Error::UnsupportedSql("CREATE UNIQUE INDEX target has no synchronized schema identity"),
+            Error::UnsupportedSql("CREATE INDEX target has no synchronized schema identity"),
         )?;
         let columns =
             spec.columns
                 .iter()
                 .map(|name| {
                     before.column_named(name).map(|column| column.id()).ok_or(
-                        Error::UnsupportedSql("CREATE UNIQUE INDEX references an unknown column"),
+                        Error::UnsupportedSql("CREATE INDEX references an unknown column"),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-        let index = IndexDefinition::new_unique(sql.to_owned(), spec.name.clone(), columns);
+        let index = NamedIndex::new(sql.to_owned(), spec.name.clone(), spec.unique, columns);
+        let backfill = if index.is_unique() {
+            backfill_unique_index(connection, &before, &index)?
+        } else {
+            Vec::new()
+        };
         let after = before.with_added_index(
             SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
             index.clone(),
         );
-        let backfill = backfill_unique_index(connection, &before, &index)?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
             before,
             after,
-            action: IndexAction::CreateUnique,
+            action: IndexAction::Create,
             index,
             backfill,
         };
@@ -141,9 +145,9 @@ impl IndexOperation {
             value: self.encode(),
         }];
         match self.action {
-            IndexAction::CreateUnique => mutations.push(Mutation::Set {
+            IndexAction::Create => mutations.push(Mutation::Set {
                 key: name,
-                value: index_name_value(self.after.table_id().as_bytes(), self.index.keyspace_id()),
+                value: index_name_value(self.after.table_id().as_bytes(), self.index.index_id()),
             }),
             IndexAction::Drop => mutations.push(Mutation::Delete { key: name }),
         }
@@ -156,25 +160,28 @@ impl IndexOperation {
             value: self.after.schema_revision_id().as_bytes().to_vec(),
         });
 
-        if self.action == IndexAction::CreateUnique {
+        if self.action == IndexAction::Create {
             mutations.push(Mutation::Set {
-                key: unique_keyspace_key(self.after.table_id(), self.index.keyspace_id()),
-                value: self.index.encode(),
+                key: index_definition_key(self.after.table_id(), self.index.index_id()),
+                value: self.index.index().encode(),
             });
+        }
+
+        if self.action == IndexAction::Create && self.index.is_unique() {
             for entry in &self.backfill {
                 mutations.push(Mutation::Set {
                     key: entry.key.clone(),
-                    value: entry.owner.clone(),
+                    value: entry.value.clone(),
                 });
             }
             let write_revision = write_revision_key(self.after.table_id());
             footprint.add_write(write_revision.clone());
-            footprint.add_constraint(row_keyspace_prefix(&self.before));
+            footprint.add_constraint(primary_index_prefix(&self.before));
             mutations.push(Mutation::Set {
                 key: write_revision,
                 value: self.mutation_id.as_bytes().to_vec(),
             });
-        } else {
+        } else if self.action == IndexAction::Drop && self.index.is_unique() {
             footprint.add_constraint(write_revision_key(self.after.table_id()));
         }
         Ok(IndexHomebaseOp {
@@ -209,7 +216,7 @@ impl IndexOperation {
             ));
         }
         match self.action {
-            IndexAction::CreateUnique => {
+            IndexAction::Create => {
                 connection.execute_batch(&format!(
                     "DROP INDEX {}",
                     quote_identifier(self.index.name().value())
@@ -241,7 +248,7 @@ impl IndexOperation {
             .field(
                 TAG_ACTION,
                 &[match self.action {
-                    IndexAction::CreateUnique => CREATE_UNIQUE,
+                    IndexAction::Create => CREATE,
                     IndexAction::Drop => DROP,
                 }],
             )
@@ -293,7 +300,7 @@ impl IndexOperation {
                         return Err(IndexCodecError::InvalidLength);
                     };
                     let value = match *value {
-                        CREATE_UNIQUE => IndexAction::CreateUnique,
+                        CREATE => IndexAction::Create,
                         DROP => IndexAction::Drop,
                         _ => return Err(IndexCodecError::InvalidAction),
                     };
@@ -301,7 +308,7 @@ impl IndexOperation {
                 }
                 TAG_INDEX => set_once(
                     &mut index,
-                    IndexDefinition::decode(value)
+                    NamedIndex::decode(value)
                         .map_err(|_| IndexCodecError::InvalidIndexDefinition)?,
                 )?,
                 TAG_BACKFILL => backfill.push(decode_backfill(value)?),
@@ -324,13 +331,13 @@ impl IndexOperation {
     fn validate(&self) -> std::result::Result<(), IndexCodecError> {
         if self.before.table_id() != self.after.table_id()
             || self.before.table_name_identity() != self.after.table_name_identity()
-            || self.before.row_keyspace_id() != self.after.row_keyspace_id()
+            || self.before.primary_index_id() != self.after.primary_index_id()
         {
             return Err(IndexCodecError::InvalidEvolution);
         }
         match self.action {
-            IndexAction::CreateUnique => {
-                let ValidatedExecute::CreateUniqueIndex(spec) =
+            IndexAction::Create => {
+                let ValidatedExecute::CreateIndex(spec) =
                     super::sql::validate_execute(&self.sql)
                         .map_err(|_| IndexCodecError::InvalidSql)?
                 else {
@@ -341,6 +348,7 @@ impl IndexOperation {
                     .with_added_index(self.after.schema_revision_id(), self.index.clone());
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
                     || expected_after != self.after
+                    || spec.unique != self.index.is_unique()
                     || spec.name != *self.index.name()
                     || spec.table != *self.before.table_name_identity()
                     || spec.columns.len() != self.index.columns().len()
@@ -355,19 +363,20 @@ impl IndexOperation {
                         })
                     || self.before.index_named(self.index.name()).is_some()
                     || self.after.index_named(self.index.name()) != Some(&self.index)
-                    || self.backfill.iter().any(|entry| {
-                        let owner = Key::decode(&entry.owner);
-                        !entry
-                            .key
-                            .starts_with(&unique_prefix(&self.after, &self.index))
-                            || !owner.is_ok_and(|owner| {
-                                owner.starts_with(&row_keyspace_prefix(&self.after))
-                            })
-                    })
-                    || self
-                        .backfill
-                        .windows(2)
-                        .any(|entries| entries[0].key >= entries[1].key)
+                    || (!self.index.is_unique() && !self.backfill.is_empty())
+                    || (self.index.is_unique()
+                        && (self.backfill.iter().any(|entry| {
+                            let owner = Key::decode(&entry.value);
+                            !entry
+                                .key
+                                .starts_with(&unique_prefix(&self.after, &self.index))
+                                || !owner.is_ok_and(|owner| {
+                                    owner.starts_with(&primary_index_prefix(&self.after))
+                                })
+                        }) || self
+                            .backfill
+                            .windows(2)
+                            .any(|entries| entries[0].key >= entries[1].key)))
                 {
                     return Err(IndexCodecError::InvalidEvolution);
                 }
@@ -401,15 +410,12 @@ impl IndexOperation {
 fn ensure_not_referenced(
     connection: &Connection,
     table: &CreateTable,
-    index: &IndexDefinition,
+    index: &NamedIndex,
 ) -> Result<()> {
     if catalog::incoming_foreign_keys(connection, table.table_id())?
         .iter()
         .any(|(_, foreign_key)| {
-            foreign_key.referenced_target()
-                == (ForeignKeyTarget::Unique {
-                    keyspace: index.keyspace_id(),
-                })
+            index.is_unique() && foreign_key.referenced_index() == index.index_id()
         })
     {
         return Err(Error::UnsupportedSql(
@@ -419,48 +425,49 @@ fn ensure_not_referenced(
     Ok(())
 }
 
-fn row_keyspace_prefix(table: &CreateTable) -> Key {
+fn primary_index_prefix(table: &CreateTable) -> Key {
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
         table.table_id().as_bytes().as_slice(),
         codes::ROWS,
-        table.row_keyspace_id().as_bytes().as_slice(),
+        table.primary_index_id().as_bytes().as_slice(),
     ])
-    .expect("row keyspace prefix is bounded")
+    .expect("primary index prefix is bounded")
 }
 
-fn unique_prefix(table: &CreateTable, index: &IndexDefinition) -> Key {
+fn unique_prefix(table: &CreateTable, index: &NamedIndex) -> Key {
+    debug_assert!(index.is_unique());
     Key::from_bytes([
         codes::ROOT,
         codes::TABLES,
         table.table_id().as_bytes().as_slice(),
         codes::UNIQUE,
-        index.keyspace_id().as_bytes().as_slice(),
+        index.index_id().as_bytes().as_slice(),
     ])
-    .expect("unique keyspace prefix is bounded")
+    .expect("UNIQUE entry prefix is bounded")
 }
 
-fn index_name_value(table: [u8; 16], keyspace: super::schema::UniqueKeyspaceId) -> Vec<u8> {
+fn index_name_value(table: [u8; 16], index: IndexId) -> Vec<u8> {
     let mut value = Vec::with_capacity(32);
     value.extend_from_slice(&table);
-    value.extend_from_slice(&keyspace.as_bytes());
+    value.extend_from_slice(&index.as_bytes());
     value
 }
 
-fn encode_backfill(entry: &UniqueBackfillEntry) -> Vec<u8> {
+fn encode_backfill(entry: &IndexBackfillEntry) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.u8(BACKFILL_VERSION);
     writer
         .field(TAG_BACKFILL_KEY, &entry.key.encode())
         .expect("backfill field fits in u32");
     writer
-        .field(TAG_BACKFILL_OWNER, &entry.owner)
+        .field(TAG_BACKFILL_OWNER, &entry.value)
         .expect("backfill field fits in u32");
     writer.finish()
 }
 
-fn decode_backfill(frame: &[u8]) -> std::result::Result<UniqueBackfillEntry, IndexCodecError> {
+fn decode_backfill(frame: &[u8]) -> std::result::Result<IndexBackfillEntry, IndexCodecError> {
     let mut reader = Reader::new(frame);
     if reader.u8() != Some(BACKFILL_VERSION) {
         return Err(IndexCodecError::UnknownVersion);
@@ -477,9 +484,9 @@ fn decode_backfill(frame: &[u8]) -> std::result::Result<UniqueBackfillEntry, Ind
             _ => {}
         }
     }
-    Ok(UniqueBackfillEntry {
+    Ok(IndexBackfillEntry {
         key: key.ok_or(IndexCodecError::MissingField(TAG_BACKFILL_KEY))?,
-        owner: owner.ok_or(IndexCodecError::MissingField(TAG_BACKFILL_OWNER))?,
+        value: owner.ok_or(IndexCodecError::MissingField(TAG_BACKFILL_OWNER))?,
     })
 }
 
@@ -598,9 +605,22 @@ mod tests {
         (connection, table)
     }
 
-    fn create_spec() -> CreateUniqueIndexSpec {
-        CreateUniqueIndexSpec {
+    fn create_spec() -> CreateIndexSpec {
+        CreateIndexSpec {
+            unique: true,
             name: super::super::schema::SqlName::new("notes_tenant_slug".into()),
+            table: super::super::schema::SqlName::new("notes".into()),
+            columns: vec![
+                super::super::schema::SqlName::new("tenant".into()),
+                super::super::schema::SqlName::new("slug".into()),
+            ],
+        }
+    }
+
+    fn secondary_spec() -> CreateIndexSpec {
+        CreateIndexSpec {
+            unique: false,
+            name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
             table: super::super::schema::SqlName::new("notes".into()),
             columns: vec![
                 super::super::schema::SqlName::new("tenant".into()),
@@ -627,7 +647,7 @@ mod tests {
             &[
                 index_name_scope_key(operation.index.name()),
                 active_schema_revision_key(before.table_id()),
-                row_keyspace_prefix(&before),
+                primary_index_prefix(&before),
             ],
         );
         assert!(
@@ -676,6 +696,96 @@ mod tests {
             0
         );
         operation.apply(&connection).unwrap();
+    }
+
+    #[test]
+    fn create_secondary_index_tracks_ddl_without_row_projection() {
+        let (connection, before) = connection();
+        let sql = "CREATE INDEX notes_tenant_slug_lookup ON notes (tenant, slug)";
+        connection.execute(sql, ()).unwrap();
+        let operation =
+            IndexOperation::prepare_create(&connection, sql, &secondary_spec()).unwrap();
+
+        assert!(!operation.index.is_unique());
+        assert!(operation.backfill.is_empty());
+        assert_eq!(
+            IndexOperation::decode(&operation.encode()).unwrap(),
+            operation
+        );
+
+        let lowered = operation.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                index_name_scope_key(operation.index.name()),
+                active_schema_revision_key(before.table_id()),
+            ],
+        );
+        assert_eq!(lowered.mutations.len(), 5);
+        assert!(
+            !lowered
+                .footprint
+                .constraints()
+                .contains(&primary_index_prefix(&before))
+        );
+        assert!(
+            !lowered
+                .footprint
+                .writes()
+                .contains(&write_revision_key(before.table_id()))
+        );
+        assert!(
+            !lowered
+                .mutations
+                .iter()
+                .any(|mutation| mutation.key() == &write_revision_key(before.table_id()))
+        );
+
+        operation.record_catalog(&connection).unwrap();
+        operation.rollback(&connection).unwrap();
+        operation.apply(&connection).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_secondary_index_does_not_touch_the_write_contract() {
+        let (connection, before) = connection();
+        let create_sql = "CREATE INDEX notes_tenant_slug_lookup ON notes (tenant, slug)";
+        connection.execute(create_sql, ()).unwrap();
+        let created =
+            IndexOperation::prepare_create(&connection, create_sql, &secondary_spec()).unwrap();
+        created.record_catalog(&connection).unwrap();
+
+        let drop_sql = "DROP INDEX notes_tenant_slug_lookup";
+        let drop = IndexOperation::prepare_drop(
+            &connection,
+            drop_sql,
+            &DropIndexSpec {
+                name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
+            },
+        )
+        .unwrap();
+        connection.execute(drop_sql, ()).unwrap();
+
+        let lowered = drop.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                index_name_scope_key(drop.index.name()),
+                active_schema_revision_key(before.table_id()),
+            ],
+        );
+        assert!(
+            !lowered
+                .footprint
+                .constraints()
+                .contains(&write_revision_key(before.table_id()))
+        );
+        assert!(
+            !lowered
+                .mutations
+                .iter()
+                .any(|mutation| mutation.key() == &write_revision_key(before.table_id()))
+        );
     }
 
     #[test]

@@ -1304,6 +1304,188 @@ fn adding_unique_index_fences_rows_compiled_against_the_old_write_contract() {
 }
 
 #[test]
+fn secondary_index_lifecycle_converges_without_conflicting_duplicate_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("secondary-index-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("secondary-index-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                category TEXT,
+                body TEXT
+            )",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "INSERT INTO notes VALUES (1, 'seed', 'shared', 'initial')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute(
+            "INSERT INTO notes VALUES (2, 'stale', 'shared', 'queued')",
+            (),
+        )
+        .unwrap();
+    first
+        .execute(
+            "CREATE INDEX notes_category_tenant ON notes (category, tenant)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "ordinary index creation must not reject a stale row operation"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "INSERT INTO notes VALUES (6, 'before-ddl', 'shared', 'existing')",
+            (),
+        )
+        .unwrap();
+    second
+        .execute("CREATE INDEX notes_tenant ON notes (tenant)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "ordinary index creation must admit after a concurrent row operation"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO notes VALUES (3, 'first', 'shared', 'one')", ())
+        .unwrap();
+    second
+        .execute(
+            "INSERT INTO notes VALUES (4, 'second', 'shared', 'two')",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "duplicate secondary values must coexist through their primary suffixes"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute(
+            "UPDATE notes SET category = NULL, body = 'changed' WHERE id = 3",
+            (),
+        )
+        .unwrap();
+    second
+        .execute("DELETE FROM notes WHERE id = 4", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute(
+            "INSERT INTO notes VALUES (5, NULL, 'shared', 'after-drop')",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("DROP INDEX notes_category_tenant", ())
+        .unwrap();
+    first.execute("DROP INDEX notes_tenant", ()).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "ordinary index removal and stale rows must remain compatible"
+    );
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert!(index_names(database).is_empty());
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, tenant, category, body FROM notes ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            [
+                (
+                    1,
+                    Some("seed".into()),
+                    Some("shared".into()),
+                    "initial".into(),
+                ),
+                (
+                    2,
+                    Some("stale".into()),
+                    Some("shared".into()),
+                    "queued".into(),
+                ),
+                (3, Some("first".into()), None, "changed".into()),
+                (5, None, Some("shared".into()), "after-drop".into(),),
+                (
+                    6,
+                    Some("before-ddl".into()),
+                    Some("shared".into()),
+                    "existing".into(),
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
 fn dropping_unique_index_keeps_stale_superset_row_operations_compatible() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -1438,16 +1620,10 @@ fn conflicting_index_ddl_repairs_local_sqlite_before_converging() {
     second.rebase().unwrap();
 
     first
-        .execute(
-            "CREATE UNIQUE INDEX notes_identity ON notes (tenant, slug)",
-            (),
-        )
+        .execute("CREATE INDEX notes_identity ON notes (tenant, slug)", ())
         .unwrap();
     second
-        .execute(
-            "CREATE UNIQUE INDEX notes_identity ON notes (slug, body)",
-            (),
-        )
+        .execute("CREATE INDEX notes_identity ON notes (slug, body)", ())
         .unwrap();
     assert_eq!(first.push().unwrap(), PushOutcome::Drained);
     let PushOutcome::Rejected(rejection) = second.push().unwrap() else {

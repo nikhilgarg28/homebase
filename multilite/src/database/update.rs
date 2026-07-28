@@ -119,7 +119,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 self.record_operation(operation, footprint);
                 Ok(changed)
             }
-            ValidatedExecute::CreateUniqueIndex(spec) => {
+            ValidatedExecute::CreateIndex(spec) => {
                 let mut captured_operation = None;
                 let (changed, events) = self.hooks.run(
                     || {
@@ -136,7 +136,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 )?;
                 if !events.is_empty() {
                     return Err(Error::CaptureInvariant(
-                        "CREATE UNIQUE INDEX captured application rows",
+                        "CREATE INDEX captured application rows",
                     ));
                 }
                 let operation = MultiliteOp::Index(

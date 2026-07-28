@@ -5,8 +5,7 @@ use std::collections::BTreeSet;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::schema::{
-    CreateTable, ForeignKeyDefinition, IndexDefinition, SqlName, TableId,
-    validate_foreign_key_graph,
+    CreateTable, ForeignKeyDefinition, NamedIndex, SqlName, TableId, validate_foreign_key_graph,
 };
 use crate::{Error, Result};
 
@@ -219,7 +218,7 @@ pub fn incoming_foreign_keys(
 pub fn index_by_name(
     connection: &Connection,
     name: &SqlName,
-) -> Result<Option<(CreateTable, IndexDefinition)>> {
+) -> Result<Option<(CreateTable, NamedIndex)>> {
     let mut statement = connection.prepare(&format!(
         "SELECT definition FROM {TABLE} ORDER BY schema_name, table_name"
     ))?;

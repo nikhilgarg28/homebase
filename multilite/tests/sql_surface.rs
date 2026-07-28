@@ -288,6 +288,81 @@ fn unique_index_ddl_is_atomic_and_names_can_be_reused_after_drop() {
 }
 
 #[test]
+fn secondary_indexes_cover_duplicate_null_and_row_lifecycle_sql() {
+    let directory = tempfile::tempdir().unwrap();
+    let db =
+        MultiliteConnection::open(directory.path().join("secondary-index-ddl.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            category TEXT,
+            body TEXT
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO notes VALUES
+            (1, 'north', 'shared', 'first'),
+            (2, 'south', 'shared', 'second'),
+            (3, NULL, NULL, 'third')",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX notes_category ON notes (category)", ())
+        .unwrap();
+    db.execute(
+        "CREATE INDEX notes_tenant_category ON notes (tenant, category)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO notes VALUES (4, NULL, 'shared', 'fourth')", ())
+        .unwrap();
+    db.execute(
+        "UPDATE notes SET tenant = 'east', category = NULL WHERE id = 2",
+        (),
+    )
+    .unwrap();
+    db.execute("DELETE FROM notes WHERE id = 1", ()).unwrap();
+
+    assert_eq!(
+        db.query(
+            "SELECT id, tenant, category FROM notes ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            (2, Some("east".into()), None),
+            (3, None, None),
+            (4, None, Some("shared".into())),
+        ]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name LIKE 'notes_%' ORDER BY name",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        ["notes_category", "notes_tenant_category"]
+    );
+
+    db.execute("DROP INDEX notes_category", ()).unwrap();
+    db.execute("CREATE INDEX notes_category ON notes (body, category)", ())
+        .unwrap();
+}
+
+#[test]
 fn immediate_composite_foreign_keys_follow_sqlite_match_simple_semantics() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("foreign-key.sqlite")).unwrap();
@@ -892,7 +967,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
     for sql in [
         "ALTER TABLE notes ADD COLUMN extra TEXT",
         "DROP TABLE notes",
-        "CREATE INDEX notes_body ON notes(body)",
         "CREATE VIEW note_view AS SELECT * FROM notes",
         "PRAGMA user_version = 9",
         "ATTACH DATABASE ':memory:' AS attached",

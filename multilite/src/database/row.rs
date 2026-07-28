@@ -14,24 +14,24 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::schema::{
-    Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, ForeignKeyTarget,
-    IndexDefinition, RowKeyspaceId, SchemaRevisionId, StrictType, TableId, TableMode, TableStorage,
-    UniqueKeyspaceId, active_row_keyspace_key, write_revision_key,
+    Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
+    NamedIndex, SchemaRevisionId, StrictType, TableId, TableMode, TableStorage,
+    active_primary_index_key, write_revision_key,
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ROW_FRAME_VERSION: u8 = 4;
+const ROW_FRAME_VERSION: u8 = 5;
 const ROW_SET_FRAME_VERSION: u8 = 1;
 const UPDATE_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
-const TAG_ROW_KEYSPACE: u8 = 2;
+const TAG_PRIMARY_INDEX: u8 = 2;
 const TAG_KEY_PART: u8 = 3;
 const TAG_COLUMN_VALUE: u8 = 4;
 const TAG_ROWID: u8 = 5;
-const TAG_UNIQUE_KEY: u8 = 6;
+const TAG_INDEX_RULES: u8 = 6;
 const TAG_TABLE_STORAGE: u8 = 7;
 const TAG_FOREIGN_KEY: u8 = 8;
 const TAG_INCOMING_FOREIGN_KEY: u8 = 9;
@@ -43,23 +43,19 @@ const TAG_KEY_PART_FLAGS: u8 = 3;
 const TAG_VALUE: u8 = 2;
 const TAG_UPDATE_BEFORE: u8 = 1;
 const TAG_UPDATE_AFTER: u8 = 2;
-const TAG_UNIQUE_KEYSPACE: u8 = 1;
-const TAG_UNIQUE_KEY_PART: u8 = 2;
+const TAG_RULES_INDEX_ID: u8 = 1;
+const TAG_RULES_INDEX_PART: u8 = 2;
 const TAG_FOREIGN_KEY_ID: u8 = 1;
 const TAG_FOREIGN_KEY_PARENT_TABLE: u8 = 2;
-const TAG_FOREIGN_KEY_PARENT_TARGET_KIND: u8 = 3;
 const TAG_FOREIGN_KEY_PART: u8 = 4;
-const TAG_FOREIGN_KEY_PARENT_KEYSPACE: u8 = 5;
+const TAG_FOREIGN_KEY_PARENT_INDEX: u8 = 5;
 const TAG_FOREIGN_KEY_CHILD_COLUMN: u8 = 1;
 const TAG_FOREIGN_KEY_PARENT_PART: u8 = 2;
 const TAG_INCOMING_FOREIGN_KEY_ID: u8 = 1;
 const TAG_INCOMING_CHILD_TABLE: u8 = 2;
-const TAG_INCOMING_CHILD_ROW_KEYSPACE: u8 = 3;
-const TAG_INCOMING_PARENT_TARGET_KIND: u8 = 4;
-const TAG_INCOMING_PARENT_KEYSPACE: u8 = 5;
+const TAG_INCOMING_CHILD_PRIMARY_INDEX: u8 = 3;
+const TAG_INCOMING_PARENT_INDEX: u8 = 5;
 const TAG_INCOMING_PARENT_PART: u8 = 6;
-const FOREIGN_KEY_TARGET_PRIMARY_KEY: u8 = 1;
-const FOREIGN_KEY_TARGET_UNIQUE: u8 = 2;
 const KEY_PART_ROWID_ALIAS: u8 = 1;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
@@ -146,11 +142,11 @@ pub struct KeyPartRules {
     pub rowid_alias: bool,
 }
 
-/// Ordered comparison rules for one table-owned UNIQUE keyspace.
+/// Ordered comparison rules for one table-owned UNIQUE index.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UniqueKeyRules {
-    keyspace: UniqueKeyspaceId,
-    key_parts: Vec<KeyPartRules>,
+pub struct IndexRules {
+    index: IndexId,
+    parts: Vec<KeyPartRules>,
 }
 
 /// One child-to-parent key mapping used for reverse-reference assertions.
@@ -158,7 +154,7 @@ pub struct UniqueKeyRules {
 struct ForeignKeyRules {
     id: ForeignKeyId,
     parent_table: TableId,
-    parent_target: ForeignKeyTarget,
+    parent_index: IndexId,
     key_parts: Vec<ForeignKeyPartRules>,
 }
 
@@ -168,19 +164,24 @@ struct ForeignKeyPartRules {
     parent: KeyPartRules,
 }
 
-/// One child row keyspace that may prevent deletion of this table's rows.
+/// One child primary index that may prevent deletion of this table's rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IncomingForeignKeyRules {
     id: ForeignKeyId,
     child_table: TableId,
-    child_row_keyspace: RowKeyspaceId,
-    parent_target: ForeignKeyTarget,
+    child_primary_index: IndexId,
+    parent_index: IndexId,
     parent_key_parts: Vec<KeyPartRules>,
 }
 
 struct ForeignReference {
     key: Key,
     owner: Vec<u8>,
+}
+
+struct IndexEntry {
+    key: Key,
+    value: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,10 +195,10 @@ pub struct Row {
 pub struct InsertRows {
     table: TableId,
     schema_revision: SchemaRevisionId,
-    row_keyspace: RowKeyspaceId,
+    primary_index: IndexId,
     storage: TableStorage,
     key_parts: Vec<KeyPartRules>,
-    unique_keys: Vec<UniqueKeyRules>,
+    indexes: Vec<IndexRules>,
     foreign_keys: Vec<ForeignKeyRules>,
     incoming_foreign_keys: Vec<IncomingForeignKeyRules>,
     rows: Vec<Row>,
@@ -222,11 +223,11 @@ pub struct RowHomebaseOp {
     pub footprint: ConflictFootprint,
 }
 
-/// One ownership cell created while a new UNIQUE index scans existing rows.
+/// One durable entry created while a new index scans existing rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UniqueBackfillEntry {
+pub struct IndexBackfillEntry {
     pub key: Key,
-    pub owner: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 impl InsertRows {
@@ -259,7 +260,7 @@ impl InsertRows {
                 rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
-        let unique_keys = unique_key_rules(&created);
+        let indexes = index_rules(&created);
         let foreign_keys = foreign_key_rules(connection, &created)?;
         let incoming_foreign_keys = incoming_foreign_key_rules(connection, &created)?;
         let rows = captured
@@ -281,10 +282,10 @@ impl InsertRows {
         let inserted = Self {
             table: created.table_id(),
             schema_revision: created.schema_revision_id(),
-            row_keyspace: created.row_keyspace_id(),
+            primary_index: created.primary_index_id(),
             storage: created.storage(),
             key_parts,
-            unique_keys,
+            indexes,
             foreign_keys,
             incoming_foreign_keys,
             rows,
@@ -297,7 +298,7 @@ impl InsertRows {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let mut mutations = Vec::with_capacity(
-            self.rows.len() * (self.unique_keys.len() + self.foreign_keys.len() + 1),
+            self.rows.len() * (self.indexes.len() + self.foreign_keys.len() + 1),
         );
         let mut footprint = ConflictFootprint::new();
         for row in &self.rows {
@@ -312,13 +313,16 @@ impl InsertRows {
             });
         }
         for row in &self.rows {
-            for (key, owner) in self
-                .unique_entries(row)
+            for entry in self
+                .index_entries(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_constraint(key.clone());
-                footprint.add_write(key.clone());
-                mutations.push(Mutation::Set { key, value: owner });
+                footprint.add_constraint(entry.key.clone());
+                footprint.add_write(entry.key.clone());
+                mutations.push(Mutation::Set {
+                    key: entry.key,
+                    value: entry.value,
+                });
             }
             for reference in self
                 .foreign_references(row)
@@ -332,7 +336,7 @@ impl InsertRows {
                 });
             }
         }
-        footprint.add_constraint(active_row_keyspace_key(self.table));
+        footprint.add_constraint(active_primary_index_key(self.table));
         footprint.add_constraint(write_revision_key(self.table));
         Ok(RowHomebaseOp {
             mutations,
@@ -367,37 +371,37 @@ impl InsertRows {
                 return Err(RowCodecError::InvalidBatch);
             }
             let table = TableId::from_bytes(uuid_bytes(components[2].as_bytes())?);
-            let row_keyspace = RowKeyspaceId::from_bytes(uuid_bytes(components[4].as_bytes())?);
+            let primary_index = IndexId::from_bytes(uuid_bytes(components[4].as_bytes())?);
             let (
                 schema_revision,
-                encoded_keyspace,
+                encoded_primary_index,
                 storage,
                 key_parts,
-                unique_keys,
+                indexes,
                 foreign_keys,
                 incoming_foreign_keys,
                 row,
             ) = decode_row(value)?;
-            if encoded_keyspace != row_keyspace {
+            if encoded_primary_index != primary_index {
                 return Err(RowCodecError::InvalidBatch);
             }
             let candidate = operation.get_or_insert_with(|| Self {
                 table,
                 schema_revision,
-                row_keyspace,
+                primary_index,
                 storage,
                 key_parts: key_parts.clone(),
-                unique_keys: unique_keys.clone(),
+                indexes: indexes.clone(),
                 foreign_keys: foreign_keys.clone(),
                 incoming_foreign_keys: incoming_foreign_keys.clone(),
                 rows: Vec::new(),
             });
             if candidate.table != table
                 || candidate.schema_revision != schema_revision
-                || candidate.row_keyspace != row_keyspace
+                || candidate.primary_index != primary_index
                 || candidate.storage != storage
                 || candidate.key_parts != key_parts
-                || candidate.unique_keys != unique_keys
+                || candidate.indexes != indexes
                 || candidate.foreign_keys != foreign_keys
                 || candidate.incoming_foreign_keys != incoming_foreign_keys
             {
@@ -458,10 +462,10 @@ impl InsertRows {
                     let table = table.ok_or(RowCodecError::MissingField(TAG_TABLE))?;
                     let (
                         schema_revision,
-                        row_keyspace,
+                        primary_index,
                         storage,
                         key_parts,
-                        unique_keys,
+                        indexes,
                         foreign_keys,
                         incoming_foreign_keys,
                         row,
@@ -469,20 +473,20 @@ impl InsertRows {
                     let candidate = operation.get_or_insert_with(|| Self {
                         table,
                         schema_revision,
-                        row_keyspace,
+                        primary_index,
                         storage,
                         key_parts: key_parts.clone(),
-                        unique_keys: unique_keys.clone(),
+                        indexes: indexes.clone(),
                         foreign_keys: foreign_keys.clone(),
                         incoming_foreign_keys: incoming_foreign_keys.clone(),
                         rows: Vec::new(),
                     });
                     if candidate.table != table
                         || candidate.schema_revision != schema_revision
-                        || candidate.row_keyspace != row_keyspace
+                        || candidate.primary_index != primary_index
                         || candidate.storage != storage
                         || candidate.key_parts != key_parts
-                        || candidate.unique_keys != unique_keys
+                        || candidate.indexes != indexes
                         || candidate.foreign_keys != foreign_keys
                         || candidate.incoming_foreign_keys != incoming_foreign_keys
                     {
@@ -701,21 +705,21 @@ impl InsertRows {
                 rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
-        let expected_unique_keys = unique_key_rules(created);
-        let known_unique_keys = known_unique_key_rules(created);
+        let expected_indexes = index_rules(created);
+        let known_indexes = known_index_rules(created);
         let expected_foreign_keys = foreign_key_rules(connection, created)?;
         let expected_incoming_foreign_keys = incoming_foreign_key_rules(connection, created)?;
         if self.table != created.table_id()
-            || self.row_keyspace != created.row_keyspace_id()
+            || self.primary_index != created.primary_index_id()
             || self.storage != created.storage()
             || self.key_parts != expected_key_parts
-            || expected_unique_keys
+            || expected_indexes
                 .iter()
-                .any(|expected| !self.unique_keys.contains(expected))
+                .any(|expected| !self.indexes.contains(expected))
             || self
-                .unique_keys
+                .indexes
                 .iter()
-                .any(|actual| !known_unique_keys.contains(actual))
+                .any(|actual| !known_indexes.contains(actual))
             || self.foreign_keys != expected_foreign_keys
             || self.incoming_foreign_keys != expected_incoming_foreign_keys
         {
@@ -752,7 +756,7 @@ impl InsertRows {
             self.key_images(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
             })?;
-            self.unique_entries(row).map_err(|error| {
+            self.index_entries(row).map_err(|error| {
                 Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
             })?;
             self.foreign_references(row).map_err(|error| {
@@ -789,21 +793,17 @@ impl InsertRows {
         {
             return Err(RowCodecError::DuplicateField);
         }
-        if self.unique_keys.iter().enumerate().any(|(index, unique)| {
-            unique.key_parts.is_empty()
-                || unique.key_parts.iter().any(|part| part.rowid_alias)
-                || self.unique_keys[..index]
+        if self.indexes.iter().enumerate().any(|(position, index)| {
+            index.parts.is_empty()
+                || index.parts.iter().any(|part| part.rowid_alias)
+                || self.indexes[..position]
                     .iter()
-                    .any(|seen| seen.keyspace == unique.keyspace)
-                || unique
-                    .key_parts
-                    .iter()
-                    .enumerate()
-                    .any(|(part_index, part)| {
-                        unique.key_parts[..part_index]
-                            .iter()
-                            .any(|seen| seen.column == part.column)
-                    })
+                    .any(|seen| seen.index == index.index)
+                || index.parts.iter().enumerate().any(|(part_index, part)| {
+                    index.parts[..part_index]
+                        .iter()
+                        .any(|seen| seen.column == part.column)
+                })
         }) {
             return Err(RowCodecError::InvalidRow);
         }
@@ -816,11 +816,6 @@ impl InsertRows {
                     || self.foreign_keys[..index]
                         .iter()
                         .any(|seen| seen.id == foreign_key.id)
-                    || (matches!(foreign_key.parent_target, ForeignKeyTarget::Unique { .. })
-                        && foreign_key
-                            .key_parts
-                            .iter()
-                            .any(|part| part.parent.rowid_alias))
                     || foreign_key
                         .key_parts
                         .iter()
@@ -840,11 +835,6 @@ impl InsertRows {
                         .iter()
                         .any(|seen| seen.id == incoming.id)
                         || incoming.parent_key_parts.is_empty()
-                        || (matches!(incoming.parent_target, ForeignKeyTarget::Unique { .. })
-                            && incoming
-                                .parent_key_parts
-                                .iter()
-                                .any(|part| part.rowid_alias))
                         || incoming
                             .parent_key_parts
                             .iter()
@@ -859,7 +849,7 @@ impl InsertRows {
             return Err(RowCodecError::InvalidRow);
         }
         let mut keys = BTreeSet::new();
-        let mut unique_keys = BTreeSet::new();
+        let mut indexes = BTreeSet::new();
         for row in &self.rows {
             if let [
                 KeyPartRules {
@@ -882,8 +872,8 @@ impl InsertRows {
             if !keys.insert(self.row_key(row)?) {
                 return Err(RowCodecError::DuplicateRow);
             }
-            for (key, _) in self.unique_entries(row)? {
-                if !unique_keys.insert(key) {
+            for entry in self.index_entries(row)? {
+                if !indexes.insert(entry.key) {
                     return Err(RowCodecError::DuplicateUniqueKey);
                 }
             }
@@ -894,7 +884,7 @@ impl InsertRows {
 
     fn row_key(&self, row: &Row) -> std::result::Result<Key, RowCodecError> {
         let images = self.key_images(row)?;
-        row_prefix(self.table, self.row_keyspace, images)
+        row_prefix(self.table, self.primary_index, images)
     }
 
     fn key_images(&self, row: &Row) -> std::result::Result<Vec<Vec<u8>>, RowCodecError> {
@@ -912,12 +902,12 @@ impl InsertRows {
             .collect()
     }
 
-    fn unique_entries(&self, row: &Row) -> std::result::Result<Vec<(Key, Vec<u8>)>, RowCodecError> {
+    fn index_entries(&self, row: &Row) -> std::result::Result<Vec<IndexEntry>, RowCodecError> {
         let owner = self.row_key(row)?.encode();
-        let mut entries = Vec::with_capacity(self.unique_keys.len());
-        for unique in &self.unique_keys {
-            let values = unique
-                .key_parts
+        let mut entries = Vec::with_capacity(self.indexes.len());
+        for index in &self.indexes {
+            let values = index
+                .parts
                 .iter()
                 .map(|part| {
                     row.values
@@ -935,22 +925,22 @@ impl InsertRows {
             }
             let images = values
                 .into_iter()
-                .zip(&unique.key_parts)
-                .map(|(value, rules)| key_image(value, *rules))
+                .zip(&index.parts)
+                .map(|(value, rules)| index_image(value, *rules))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            entries.push((
-                unique_prefix(self.table, unique.keyspace, images)?,
-                owner.clone(),
-            ));
+            entries.push(IndexEntry {
+                key: unique_prefix(self.table, index.index, images)?,
+                value: owner.clone(),
+            });
         }
         Ok(entries)
     }
 
-    fn unique_entry_map(&self) -> std::result::Result<BTreeMap<Key, Vec<u8>>, RowCodecError> {
+    fn index_entry_map(&self) -> std::result::Result<BTreeMap<Key, Vec<u8>>, RowCodecError> {
         let mut entries = BTreeMap::new();
         for row in &self.rows {
-            for (key, owner) in self.unique_entries(row)? {
-                if entries.insert(key, owner).is_some() {
+            for entry in self.index_entries(row)? {
+                if entries.insert(entry.key, entry.value).is_some() {
                     return Err(RowCodecError::DuplicateUniqueKey);
                 }
             }
@@ -1003,9 +993,9 @@ impl InsertRows {
             let key = foreign_reference_key(
                 foreign_key.parent_table,
                 foreign_key.id,
-                foreign_key.parent_target,
+                foreign_key.parent_index,
                 images,
-                self.row_keyspace,
+                self.primary_index,
                 child_images.clone(),
             )?;
             references.push(ForeignReference {
@@ -1047,7 +1037,7 @@ impl InsertRows {
             prefixes.push(foreign_reference_prefix(
                 self.table,
                 incoming.id,
-                incoming.parent_target,
+                incoming.parent_index,
                 images,
             )?);
         }
@@ -1061,7 +1051,7 @@ impl InsertRows {
             .field(TAG_SCHEMA_REVISION, &self.schema_revision.as_bytes())
             .expect("row field length fits in u32");
         writer
-            .field(TAG_ROW_KEYSPACE, &self.row_keyspace.as_bytes())
+            .field(TAG_PRIMARY_INDEX, &self.primary_index.as_bytes())
             .expect("row field length fits in u32");
         writer
             .field(TAG_TABLE_STORAGE, &[self.storage.to_u8()])
@@ -1076,9 +1066,9 @@ impl InsertRows {
                 .field(TAG_KEY_PART, &encode_key_part(*part))
                 .expect("row field length fits in u32");
         }
-        for unique in &self.unique_keys {
+        for index in &self.indexes {
             writer
-                .field(TAG_UNIQUE_KEY, &encode_unique_key(unique))
+                .field(TAG_INDEX_RULES, &encode_index_rules(index))
                 .expect("row field length fits in u32");
         }
         for foreign_key in &self.foreign_keys {
@@ -1103,45 +1093,41 @@ impl InsertRows {
     }
 }
 
-fn encode_unique_key(unique: &UniqueKeyRules) -> Vec<u8> {
+fn encode_index_rules(index: &IndexRules) -> Vec<u8> {
     let mut writer = Writer::new();
     writer
-        .field(TAG_UNIQUE_KEYSPACE, &unique.keyspace.as_bytes())
+        .field(TAG_RULES_INDEX_ID, &index.index.as_bytes())
         .expect("row field length fits in u32");
-    for part in &unique.key_parts {
+    for part in &index.parts {
         writer
-            .field(TAG_UNIQUE_KEY_PART, &encode_key_part(*part))
+            .field(TAG_RULES_INDEX_PART, &encode_key_part(*part))
             .expect("row field length fits in u32");
     }
     writer.finish()
 }
 
-fn decode_unique_key(frame: &[u8]) -> std::result::Result<UniqueKeyRules, RowCodecError> {
+fn decode_index_rules(frame: &[u8]) -> std::result::Result<IndexRules, RowCodecError> {
     let mut reader = Reader::new(frame);
-    let mut keyspace = None;
-    let mut key_parts = Vec::new();
+    let mut index = None;
+    let mut parts = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
-            TAG_UNIQUE_KEYSPACE => set_once(
-                &mut keyspace,
-                UniqueKeyspaceId::from_bytes(uuid_bytes(value)?),
-            )?,
-            TAG_UNIQUE_KEY_PART => key_parts.push(decode_key_part(value)?),
+            TAG_RULES_INDEX_ID => set_once(&mut index, IndexId::from_bytes(uuid_bytes(value)?))?,
+            TAG_RULES_INDEX_PART => parts.push(decode_key_part(value)?),
             _ => {}
         }
     }
-    if key_parts.is_empty()
-        || key_parts.iter().enumerate().any(|(index, part)| {
-            key_parts[..index]
-                .iter()
-                .any(|seen| seen.column == part.column)
-        })
+    if parts.is_empty()
+        || parts
+            .iter()
+            .enumerate()
+            .any(|(index, part)| parts[..index].iter().any(|seen| seen.column == part.column))
     {
         return Err(RowCodecError::InvalidRow);
     }
-    Ok(UniqueKeyRules {
-        keyspace: keyspace.ok_or(RowCodecError::MissingField(TAG_UNIQUE_KEYSPACE))?,
-        key_parts,
+    Ok(IndexRules {
+        index: index.ok_or(RowCodecError::MissingField(TAG_RULES_INDEX_ID))?,
+        parts,
     })
 }
 
@@ -1158,14 +1144,8 @@ fn encode_foreign_key(foreign_key: &ForeignKeyRules) -> Vec<u8> {
         .expect("row field length fits in u32");
     writer
         .field(
-            TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
-            &[foreign_key_target_kind(foreign_key.parent_target)],
-        )
-        .expect("row field length fits in u32");
-    writer
-        .field(
-            TAG_FOREIGN_KEY_PARENT_KEYSPACE,
-            &foreign_key.parent_target.keyspace_bytes(),
+            TAG_FOREIGN_KEY_PARENT_INDEX,
+            &foreign_key.parent_index.as_bytes(),
         )
         .expect("row field length fits in u32");
     for part in &foreign_key.key_parts {
@@ -1187,8 +1167,7 @@ fn decode_foreign_key(frame: &[u8]) -> std::result::Result<ForeignKeyRules, RowC
     let mut reader = Reader::new(frame);
     let mut id = None;
     let mut parent_table = None;
-    let mut parent_target_kind = None;
-    let mut parent_keyspace = None;
+    let mut parent_index = None;
     let mut key_parts = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
@@ -1196,13 +1175,9 @@ fn decode_foreign_key(frame: &[u8]) -> std::result::Result<ForeignKeyRules, RowC
             TAG_FOREIGN_KEY_PARENT_TABLE => {
                 set_once(&mut parent_table, TableId::from_bytes(uuid_bytes(value)?))?
             }
-            TAG_FOREIGN_KEY_PARENT_TARGET_KIND => {
-                let [value] = value else {
-                    return Err(RowCodecError::InvalidLength);
-                };
-                set_once(&mut parent_target_kind, *value)?;
+            TAG_FOREIGN_KEY_PARENT_INDEX => {
+                set_once(&mut parent_index, IndexId::from_bytes(uuid_bytes(value)?))?
             }
-            TAG_FOREIGN_KEY_PARENT_KEYSPACE => set_once(&mut parent_keyspace, uuid_bytes(value)?)?,
             TAG_FOREIGN_KEY_PART => {
                 let mut part_reader = Reader::new(value);
                 let mut child_column = None;
@@ -1234,17 +1209,12 @@ fn decode_foreign_key(frame: &[u8]) -> std::result::Result<ForeignKeyRules, RowC
     if key_parts.is_empty() {
         return Err(RowCodecError::InvalidRow);
     }
-    let parent_target = decode_foreign_key_target(
-        parent_target_kind.ok_or(RowCodecError::MissingField(
-            TAG_FOREIGN_KEY_PARENT_TARGET_KIND,
-        ))?,
-        parent_keyspace.ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_PARENT_KEYSPACE))?,
-    )?;
     Ok(ForeignKeyRules {
         id: id.ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_ID))?,
         parent_table: parent_table
             .ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_PARENT_TABLE))?,
-        parent_target,
+        parent_index: parent_index
+            .ok_or(RowCodecError::MissingField(TAG_FOREIGN_KEY_PARENT_INDEX))?,
         key_parts,
     })
 }
@@ -1259,21 +1229,12 @@ fn encode_incoming_foreign_key(incoming: &IncomingForeignKeyRules) -> Vec<u8> {
         .expect("row field length fits in u32");
     writer
         .field(
-            TAG_INCOMING_CHILD_ROW_KEYSPACE,
-            &incoming.child_row_keyspace.as_bytes(),
+            TAG_INCOMING_CHILD_PRIMARY_INDEX,
+            &incoming.child_primary_index.as_bytes(),
         )
         .expect("row field length fits in u32");
     writer
-        .field(
-            TAG_INCOMING_PARENT_TARGET_KIND,
-            &[foreign_key_target_kind(incoming.parent_target)],
-        )
-        .expect("row field length fits in u32");
-    writer
-        .field(
-            TAG_INCOMING_PARENT_KEYSPACE,
-            &incoming.parent_target.keyspace_bytes(),
-        )
+        .field(TAG_INCOMING_PARENT_INDEX, &incoming.parent_index.as_bytes())
         .expect("row field length fits in u32");
     for part in &incoming.parent_key_parts {
         writer
@@ -1289,9 +1250,8 @@ fn decode_incoming_foreign_key(
     let mut reader = Reader::new(frame);
     let mut id = None;
     let mut child_table = None;
-    let mut child_row_keyspace = None;
-    let mut parent_target_kind = None;
-    let mut parent_keyspace = None;
+    let mut child_primary_index = None;
+    let mut parent_index = None;
     let mut parent_key_parts = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
@@ -1301,17 +1261,13 @@ fn decode_incoming_foreign_key(
             TAG_INCOMING_CHILD_TABLE => {
                 set_once(&mut child_table, TableId::from_bytes(uuid_bytes(value)?))?
             }
-            TAG_INCOMING_CHILD_ROW_KEYSPACE => set_once(
-                &mut child_row_keyspace,
-                RowKeyspaceId::from_bytes(uuid_bytes(value)?),
+            TAG_INCOMING_CHILD_PRIMARY_INDEX => set_once(
+                &mut child_primary_index,
+                IndexId::from_bytes(uuid_bytes(value)?),
             )?,
-            TAG_INCOMING_PARENT_TARGET_KIND => {
-                let [value] = value else {
-                    return Err(RowCodecError::InvalidLength);
-                };
-                set_once(&mut parent_target_kind, *value)?;
+            TAG_INCOMING_PARENT_INDEX => {
+                set_once(&mut parent_index, IndexId::from_bytes(uuid_bytes(value)?))?
             }
-            TAG_INCOMING_PARENT_KEYSPACE => set_once(&mut parent_keyspace, uuid_bytes(value)?)?,
             TAG_INCOMING_PARENT_PART => parent_key_parts.push(decode_key_part(value)?),
             _ => {}
         }
@@ -1322,37 +1278,12 @@ fn decode_incoming_foreign_key(
     Ok(IncomingForeignKeyRules {
         id: id.ok_or(RowCodecError::MissingField(TAG_INCOMING_FOREIGN_KEY_ID))?,
         child_table: child_table.ok_or(RowCodecError::MissingField(TAG_INCOMING_CHILD_TABLE))?,
-        child_row_keyspace: child_row_keyspace
-            .ok_or(RowCodecError::MissingField(TAG_INCOMING_CHILD_ROW_KEYSPACE))?,
-        parent_target: decode_foreign_key_target(
-            parent_target_kind
-                .ok_or(RowCodecError::MissingField(TAG_INCOMING_PARENT_TARGET_KIND))?,
-            parent_keyspace.ok_or(RowCodecError::MissingField(TAG_INCOMING_PARENT_KEYSPACE))?,
-        )?,
+        child_primary_index: child_primary_index.ok_or(RowCodecError::MissingField(
+            TAG_INCOMING_CHILD_PRIMARY_INDEX,
+        ))?,
+        parent_index: parent_index.ok_or(RowCodecError::MissingField(TAG_INCOMING_PARENT_INDEX))?,
         parent_key_parts,
     })
-}
-
-fn foreign_key_target_kind(target: ForeignKeyTarget) -> u8 {
-    match target {
-        ForeignKeyTarget::PrimaryKey { .. } => FOREIGN_KEY_TARGET_PRIMARY_KEY,
-        ForeignKeyTarget::Unique { .. } => FOREIGN_KEY_TARGET_UNIQUE,
-    }
-}
-
-fn decode_foreign_key_target(
-    kind: u8,
-    keyspace: [u8; 16],
-) -> std::result::Result<ForeignKeyTarget, RowCodecError> {
-    match kind {
-        FOREIGN_KEY_TARGET_PRIMARY_KEY => Ok(ForeignKeyTarget::PrimaryKey {
-            row_keyspace: RowKeyspaceId::from_bytes(keyspace),
-        }),
-        FOREIGN_KEY_TARGET_UNIQUE => Ok(ForeignKeyTarget::Unique {
-            keyspace: UniqueKeyspaceId::from_bytes(keyspace),
-        }),
-        _ => Err(RowCodecError::InvalidRow),
-    }
 }
 
 impl DeleteRows {
@@ -1369,7 +1300,7 @@ impl DeleteRows {
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let mut mutations = Vec::with_capacity(
             self.deleted.rows.len()
-                * (self.deleted.unique_keys.len() + self.deleted.foreign_keys.len() + 1),
+                * (self.deleted.indexes.len() + self.deleted.foreign_keys.len() + 1),
         );
         let mut footprint = ConflictFootprint::new();
         for row in &self.deleted.rows {
@@ -1381,13 +1312,13 @@ impl DeleteRows {
             mutations.push(Mutation::Delete { key });
         }
         for row in &self.deleted.rows {
-            for (key, _) in self
+            for entry in self
                 .deleted
-                .unique_entries(row)
+                .index_entries(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_write(key.clone());
-                mutations.push(Mutation::Delete { key });
+                footprint.add_write(entry.key.clone());
+                mutations.push(Mutation::Delete { key: entry.key });
             }
             for reference in self
                 .deleted
@@ -1411,7 +1342,7 @@ impl DeleteRows {
                 });
             }
         }
-        footprint.add_constraint(active_row_keyspace_key(self.deleted.table));
+        footprint.add_constraint(active_primary_index_key(self.deleted.table));
         footprint.add_constraint(write_revision_key(self.deleted.table));
         Ok(RowHomebaseOp {
             mutations,
@@ -1504,7 +1435,7 @@ impl UpdateRows {
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let mut mutations = Vec::with_capacity(
             self.after.rows.len()
-                * (self.after.unique_keys.len() * 2 + self.after.foreign_keys.len() * 2 + 2),
+                * (self.after.indexes.len() * 2 + self.after.foreign_keys.len() * 2 + 2),
         );
         let mut footprint = ConflictFootprint::new();
         let keys = self
@@ -1537,11 +1468,11 @@ impl UpdateRows {
         }
         let before_unique = self
             .before
-            .unique_entry_map()
+            .index_entry_map()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let after_unique = self
             .after
-            .unique_entry_map()
+            .index_entry_map()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         for (key, owner) in &before_unique {
             if after_unique.get(key) != Some(owner) {
@@ -1572,7 +1503,9 @@ impl UpdateRows {
         for (key, owner) in &after_unique {
             if before_unique.get(key) != Some(owner) {
                 footprint.add_write(key.clone());
-                footprint.add_constraint(key.clone());
+                if is_unique_entry_key(key) {
+                    footprint.add_constraint(key.clone());
+                }
                 mutations.push(Mutation::Set {
                     key: key.clone(),
                     value: owner.clone(),
@@ -1610,7 +1543,7 @@ impl UpdateRows {
                 });
             }
         }
-        footprint.add_constraint(active_row_keyspace_key(self.after.table));
+        footprint.add_constraint(active_primary_index_key(self.after.table));
         footprint.add_constraint(write_revision_key(self.after.table));
         Ok(RowHomebaseOp {
             mutations,
@@ -1795,10 +1728,10 @@ impl UpdateRows {
         self.after.validate_structure()?;
         if self.before.table != self.after.table
             || self.before.schema_revision != self.after.schema_revision
-            || self.before.row_keyspace != self.after.row_keyspace
+            || self.before.primary_index != self.after.primary_index
             || self.before.storage != self.after.storage
             || self.before.key_parts != self.after.key_parts
-            || self.before.unique_keys != self.after.unique_keys
+            || self.before.indexes != self.after.indexes
             || self.before.foreign_keys != self.after.foreign_keys
             || self.before.incoming_foreign_keys != self.after.incoming_foreign_keys
             || self.before.rows.len() != self.after.rows.len()
@@ -1822,10 +1755,10 @@ impl UpdateRows {
     }
 }
 
-/// Prefix covering every row encoded under a table's active row keyspace.
+/// Prefix covering every row encoded under a table's active primary index.
 #[cfg(test)]
-pub fn row_keyspace_prefix(created: &CreateTable) -> Key {
-    row_prefix(created.table_id(), created.row_keyspace_id(), Vec::new())
+pub fn primary_index_prefix(created: &CreateTable) -> Key {
+    row_prefix(created.table_id(), created.primary_index_id(), Vec::new())
         .expect("table row prefix is bounded and non-empty")
 }
 
@@ -1876,46 +1809,46 @@ pub fn primary_key_equality_prefix(
             )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    row_prefix(created.table_id(), created.row_keyspace_id(), images)
+    row_prefix(created.table_id(), created.primary_index_id(), images)
 }
 
-fn unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
+fn index_rules(created: &CreateTable) -> Vec<IndexRules> {
     created
         .unique_constraints()
         .iter()
-        .map(|unique| UniqueKeyRules {
-            keyspace: unique.keyspace_id(),
-            key_parts: unique_key_parts(created, unique.columns()),
+        .map(|unique| IndexRules {
+            index: unique.index_id(),
+            parts: index_parts(created, unique.columns()),
         })
         .chain(
             created
                 .indexes()
                 .iter()
-                .filter(|index| index.is_unique() && index.is_active())
-                .map(|index| UniqueKeyRules {
-                    keyspace: index.keyspace_id(),
-                    key_parts: unique_key_parts(created, index.columns()),
+                .filter(|index| index.is_active() && index.is_unique())
+                .map(|index| IndexRules {
+                    index: index.index_id(),
+                    parts: index_parts(created, index.columns()),
                 }),
         )
         .collect()
 }
 
-fn known_unique_key_rules(created: &CreateTable) -> Vec<UniqueKeyRules> {
+fn known_index_rules(created: &CreateTable) -> Vec<IndexRules> {
     created
         .unique_constraints()
         .iter()
-        .map(|unique| UniqueKeyRules {
-            keyspace: unique.keyspace_id(),
-            key_parts: unique_key_parts(created, unique.columns()),
+        .map(|unique| IndexRules {
+            index: unique.index_id(),
+            parts: index_parts(created, unique.columns()),
         })
         .chain(
             created
                 .indexes()
                 .iter()
                 .filter(|index| index.is_unique())
-                .map(|index| UniqueKeyRules {
-                    keyspace: index.keyspace_id(),
-                    key_parts: unique_key_parts(created, index.columns()),
+                .map(|index| IndexRules {
+                    index: index.index_id(),
+                    parts: index_parts(created, index.columns()),
                 }),
         )
         .collect()
@@ -1941,7 +1874,7 @@ fn foreign_key_rule(
         Error::InvalidDatabase("foreign key references an unknown parent table"),
     )?;
     let parent_columns = parent
-        .foreign_key_target_columns(foreign_key.referenced_target())
+        .foreign_key_target_columns(foreign_key.referenced_index())
         .ok_or(Error::InvalidDatabase(
             "foreign key target is no longer active in the parent schema",
         ))?;
@@ -1984,7 +1917,7 @@ fn foreign_key_rule(
     Ok(ForeignKeyRules {
         id: foreign_key.id(),
         parent_table: parent.table_id(),
-        parent_target: foreign_key.referenced_target(),
+        parent_index: foreign_key.referenced_index(),
         key_parts,
     })
 }
@@ -1998,7 +1931,7 @@ fn incoming_foreign_key_rules(
         // Reuse full relationship validation so corrupt catalog links do not
         // silently weaken parent-side deletion guards.
         let _ = foreign_key_rule(connection, &child, &foreign_key)?;
-        let target = foreign_key.referenced_target();
+        let target = foreign_key.referenced_index();
         let parent_key_parts = parent
             .foreign_key_target_columns(target)
             .ok_or(Error::InvalidDatabase(
@@ -2008,22 +1941,22 @@ fn incoming_foreign_key_rules(
             .map(|column| KeyPartRules {
                 column: column.id(),
                 affinity: column.affinity(parent.mode()),
-                rowid_alias: matches!(target, ForeignKeyTarget::PrimaryKey { .. })
+                rowid_alias: target == parent.primary_index_id()
                     && parent.is_rowid_alias(column.id()),
             })
             .collect();
         incoming.push(IncomingForeignKeyRules {
             id: foreign_key.id(),
             child_table: child.table_id(),
-            child_row_keyspace: child.row_keyspace_id(),
-            parent_target: target,
+            child_primary_index: child.primary_index_id(),
+            parent_index: target,
             parent_key_parts,
         });
     }
     Ok(incoming)
 }
 
-fn unique_key_parts(created: &CreateTable, columns: &[ColumnId]) -> Vec<KeyPartRules> {
+fn index_parts(created: &CreateTable, columns: &[ColumnId]) -> Vec<KeyPartRules> {
     columns
         .iter()
         .map(|id| {
@@ -2041,42 +1974,47 @@ fn unique_key_parts(created: &CreateTable, columns: &[ColumnId]) -> Vec<KeyPartR
         .collect()
 }
 
-/// Scan the current table and encode ownership cells for one new UNIQUE index.
+/// Scan the current table and encode ownership entries for one new UNIQUE index.
 pub fn backfill_unique_index(
     connection: &Connection,
     created: &CreateTable,
-    index: &IndexDefinition,
-) -> Result<Vec<UniqueBackfillEntry>> {
+    index: &NamedIndex,
+) -> Result<Vec<IndexBackfillEntry>> {
+    if !index.is_unique() {
+        return Err(Error::CaptureInvariant(
+            "ordinary secondary indexes do not have Homebase entries",
+        ));
+    }
     let captured = capture_table(connection, created)?;
     if captured.is_empty() {
         return Ok(Vec::new());
     }
     let mut inserted = InsertRows::from_captured(connection, &captured)?.ok_or(
-        Error::CaptureInvariant("UNIQUE index table is missing its schema catalog"),
+        Error::CaptureInvariant("index table is missing its schema catalog"),
     )?;
-    inserted.unique_keys = vec![UniqueKeyRules {
-        keyspace: index.keyspace_id(),
-        key_parts: unique_key_parts(created, index.columns()),
+    inserted.indexes = vec![IndexRules {
+        index: index.index_id(),
+        parts: index_parts(created, index.columns()),
     }];
     inserted
         .validate_structure()
         .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
     let mut entries = BTreeMap::new();
     for row in &inserted.rows {
-        for (key, owner) in inserted
-            .unique_entries(row)
+        for entry in inserted
+            .index_entries(row)
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
         {
-            if entries.insert(key, owner).is_some() {
+            if entries.insert(entry.key, entry.value).is_some() {
                 return Err(Error::InvalidMultiliteOp(
-                    "UNIQUE index backfill contains duplicate ownership".into(),
+                    "index backfill contains duplicate entries".into(),
                 ));
             }
         }
     }
     Ok(entries
         .into_iter()
-        .map(|(key, owner)| UniqueBackfillEntry { key, owner })
+        .map(|(key, value)| IndexBackfillEntry { key, value })
         .collect())
 }
 
@@ -2132,7 +2070,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
 
 fn row_prefix(
     table: TableId,
-    row_keyspace: RowKeyspaceId,
+    primary_index: IndexId,
     images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
     Key::from_bytes(
@@ -2141,7 +2079,7 @@ fn row_prefix(
             codes::TABLES.to_vec(),
             table.as_bytes().to_vec(),
             codes::ROWS.to_vec(),
-            row_keyspace.as_bytes().to_vec(),
+            primary_index.as_bytes().to_vec(),
         ]
         .into_iter()
         .chain(images),
@@ -2151,7 +2089,7 @@ fn row_prefix(
 
 fn unique_prefix(
     table: TableId,
-    keyspace: UniqueKeyspaceId,
+    index: IndexId,
     images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
     Key::from_bytes(
@@ -2160,7 +2098,7 @@ fn unique_prefix(
             codes::TABLES.to_vec(),
             table.as_bytes().to_vec(),
             codes::UNIQUE.to_vec(),
-            keyspace.as_bytes().to_vec(),
+            index.as_bytes().to_vec(),
         ]
         .into_iter()
         .chain(images),
@@ -2168,10 +2106,16 @@ fn unique_prefix(
     .map_err(RowCodecError::InvalidKey)
 }
 
+fn is_unique_entry_key(key: &Key) -> bool {
+    key.components()
+        .get(3)
+        .is_some_and(|component| component.as_bytes() == codes::UNIQUE)
+}
+
 fn foreign_reference_prefix(
     parent: TableId,
     relationship: ForeignKeyId,
-    parent_target: ForeignKeyTarget,
+    parent_index: IndexId,
     parent_images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
     Key::from_bytes(
@@ -2181,7 +2125,7 @@ fn foreign_reference_prefix(
             parent.as_bytes().to_vec(),
             codes::FOREIGN_REFERENCES.to_vec(),
             relationship.as_bytes().to_vec(),
-            parent_target.keyspace_bytes().to_vec(),
+            parent_index.as_bytes().to_vec(),
         ]
         .into_iter()
         .chain(parent_images),
@@ -2192,9 +2136,9 @@ fn foreign_reference_prefix(
 fn foreign_reference_key(
     parent: TableId,
     relationship: ForeignKeyId,
-    parent_target: ForeignKeyTarget,
+    parent_index: IndexId,
     parent_images: Vec<Vec<u8>>,
-    child_keyspace: RowKeyspaceId,
+    child_primary_index: IndexId,
     child_images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
     Key::from_bytes(
@@ -2204,11 +2148,11 @@ fn foreign_reference_key(
             parent.as_bytes().to_vec(),
             codes::FOREIGN_REFERENCES.to_vec(),
             relationship.as_bytes().to_vec(),
-            parent_target.keyspace_bytes().to_vec(),
+            parent_index.as_bytes().to_vec(),
         ]
         .into_iter()
         .chain(parent_images)
-        .chain([child_keyspace.as_bytes().to_vec()])
+        .chain([child_primary_index.as_bytes().to_vec()])
         .chain(child_images),
     )
     .map_err(RowCodecError::InvalidKey)
@@ -2261,6 +2205,17 @@ fn key_image(
             image.extend_from_slice(value);
             Ok(image)
         }
+    }
+}
+
+fn index_image(
+    value: &StoredValue,
+    rules: KeyPartRules,
+) -> std::result::Result<Vec<u8>, RowCodecError> {
+    if matches!(value, StoredValue::Null) {
+        Ok(vec![0])
+    } else {
+        key_image(value, rules)
     }
 }
 
@@ -2381,10 +2336,10 @@ fn decode_row(
 ) -> std::result::Result<
     (
         SchemaRevisionId,
-        RowKeyspaceId,
+        IndexId,
         TableStorage,
         Vec<KeyPartRules>,
-        Vec<UniqueKeyRules>,
+        Vec<IndexRules>,
         Vec<ForeignKeyRules>,
         Vec<IncomingForeignKeyRules>,
         Row,
@@ -2396,11 +2351,11 @@ fn decode_row(
         return Err(RowCodecError::UnknownVersion);
     }
     let mut schema_revision = None;
-    let mut row_keyspace = None;
+    let mut primary_index = None;
     let mut storage = None;
     let mut rowid = None;
     let mut key_parts = Vec::new();
-    let mut unique_keys = Vec::new();
+    let mut indexes = Vec::new();
     let mut foreign_keys = Vec::new();
     let mut incoming_foreign_keys = Vec::new();
     let mut values = Vec::new();
@@ -2410,10 +2365,9 @@ fn decode_row(
                 &mut schema_revision,
                 SchemaRevisionId::from_bytes(uuid_bytes(value)?),
             )?,
-            TAG_ROW_KEYSPACE => set_once(
-                &mut row_keyspace,
-                RowKeyspaceId::from_bytes(uuid_bytes(value)?),
-            )?,
+            TAG_PRIMARY_INDEX => {
+                set_once(&mut primary_index, IndexId::from_bytes(uuid_bytes(value)?))?
+            }
             TAG_TABLE_STORAGE => {
                 let [value] = value else {
                     return Err(RowCodecError::InvalidLength);
@@ -2428,7 +2382,7 @@ fn decode_row(
                 set_once(&mut rowid, i64::from_be_bytes(bytes))?;
             }
             TAG_KEY_PART => key_parts.push(decode_key_part(value)?),
-            TAG_UNIQUE_KEY => unique_keys.push(decode_unique_key(value)?),
+            TAG_INDEX_RULES => indexes.push(decode_index_rules(value)?),
             TAG_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
             TAG_INCOMING_FOREIGN_KEY => {
                 incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
@@ -2453,10 +2407,10 @@ fn decode_row(
     }
     Ok((
         schema_revision.ok_or(RowCodecError::MissingField(TAG_SCHEMA_REVISION))?,
-        row_keyspace.ok_or(RowCodecError::MissingField(TAG_ROW_KEYSPACE))?,
+        primary_index.ok_or(RowCodecError::MissingField(TAG_PRIMARY_INDEX))?,
         storage,
         key_parts,
-        unique_keys,
+        indexes,
         foreign_keys,
         incoming_foreign_keys,
         Row { rowid, values },
@@ -2613,6 +2567,7 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
+    use crate::database::index::IndexOperation;
     use crate::database::schema::{
         CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
     };
@@ -2664,6 +2619,17 @@ mod tests {
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, created).unwrap();
         connection
+    }
+
+    fn add_index(connection: &Connection, sql: &str) {
+        let super::super::sql::ValidatedExecute::CreateIndex(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        connection.execute(sql, ()).unwrap();
+        let operation = IndexOperation::prepare_create(connection, sql, &spec).unwrap();
+        operation.record_catalog(connection).unwrap();
     }
 
     fn without_rowid_definition() -> CreateTable {
@@ -2964,7 +2930,7 @@ mod tests {
             .map(|mutation| mutation.key().clone())
             .collect::<Vec<_>>();
         expected.extend([
-            active_row_keyspace_key(created.table_id()),
+            active_primary_index_key(created.table_id()),
             write_revision_key(created.table_id()),
         ]);
         assert_explicit_range_assertions(&lowered.footprint, &expected);
@@ -3019,9 +2985,7 @@ mod tests {
         let expected_prefix = foreign_reference_prefix(
             parent.table_id(),
             relationship,
-            ForeignKeyTarget::PrimaryKey {
-                row_keyspace: parent.row_keyspace_id(),
-            },
+            parent.primary_index_id(),
             vec![parent_image],
         )
         .unwrap();
@@ -3040,7 +3004,7 @@ mod tests {
             &[
                 child_key.clone(),
                 reference.key.clone(),
-                active_row_keyspace_key(child.table_id()),
+                active_primary_index_key(child.table_id()),
                 write_revision_key(child.table_id()),
             ],
         );
@@ -3101,7 +3065,7 @@ mod tests {
             &parent_delete.footprint,
             &[
                 expected_prefix.clone(),
-                active_row_keyspace_key(parent.table_id()),
+                active_primary_index_key(parent.table_id()),
                 write_revision_key(parent.table_id()),
             ],
         );
@@ -3120,11 +3084,9 @@ mod tests {
                 } if prefix == &expected_prefix
             )
         }));
-        assert!(
-            !parent_delete.footprint.constraints().contains(
-                &row_prefix(child.table_id(), child.row_keyspace_id(), Vec::new()).unwrap()
-            )
-        );
+        assert!(!parent_delete.footprint.constraints().contains(
+            &row_prefix(child.table_id(), child.primary_index_id(), Vec::new()).unwrap()
+        ));
 
         let parent_move = UpdateRows::from_captured(
             &connection,
@@ -3156,7 +3118,7 @@ mod tests {
             &[
                 primary_key_prefix(&parent, &[StoredValue::Integer(8)]).unwrap(),
                 expected_prefix.clone(),
-                active_row_keyspace_key(parent.table_id()),
+                active_primary_index_key(parent.table_id()),
                 write_revision_key(parent.table_id()),
             ],
         );
@@ -3202,10 +3164,8 @@ mod tests {
     #[test]
     fn unique_foreign_references_fence_parent_key_changes_by_reference_range() {
         let (connection, parent, child) = unique_foreign_key_tables();
-        let target = ForeignKeyTarget::Unique {
-            keyspace: parent.unique_constraints()[0].keyspace_id(),
-        };
-        assert_eq!(child.foreign_keys()[0].referenced_target(), target);
+        let target = parent.unique_constraints()[0].index_id();
+        assert_eq!(child.foreign_keys()[0].referenced_index(), target);
 
         let child_row = CapturedRow {
             table: "messages".into(),
@@ -3243,7 +3203,7 @@ mod tests {
         .collect::<Vec<_>>();
         let parent_ownership = unique_prefix(
             parent.table_id(),
-            parent.unique_constraints()[0].keyspace_id(),
+            parent.unique_constraints()[0].index_id(),
             images.clone(),
         )
         .unwrap();
@@ -3261,7 +3221,7 @@ mod tests {
             &[
                 inserted.row_key(&inserted.rows[0]).unwrap(),
                 reference.key.clone(),
-                active_row_keyspace_key(child.table_id()),
+                active_primary_index_key(child.table_id()),
                 write_revision_key(child.table_id()),
             ],
         );
@@ -3300,7 +3260,7 @@ mod tests {
             &lowered.footprint,
             &[
                 old_reference.clone(),
-                active_row_keyspace_key(parent.table_id()),
+                active_primary_index_key(parent.table_id()),
                 write_revision_key(parent.table_id()),
             ],
         );
@@ -3371,7 +3331,7 @@ mod tests {
             .map(|mutation| mutation.key().clone())
             .collect::<Vec<_>>();
         expected.extend([
-            active_row_keyspace_key(child.table_id()),
+            active_primary_index_key(child.table_id()),
             write_revision_key(child.table_id()),
         ]);
         assert_explicit_range_assertions(&lowered.footprint, &expected);
@@ -3419,7 +3379,7 @@ mod tests {
             &lowered.footprint,
             &[
                 after_reference_key,
-                active_row_keyspace_key(updated.after.table),
+                active_primary_index_key(updated.after.table),
                 write_revision_key(updated.after.table),
             ],
         );
@@ -3485,7 +3445,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_unique_keys_lower_per_part_and_skip_null_tuples() {
+    fn composite_indexes_lower_per_part_and_skip_null_tuples() {
         let created = unique_definition();
         let connection = connection(&created);
         let captured = [
@@ -3540,7 +3500,7 @@ mod tests {
             .map(|mutation| mutation.key().clone())
             .collect::<Vec<_>>();
         expected.extend([
-            active_row_keyspace_key(created.table_id()),
+            active_primary_index_key(created.table_id()),
             write_revision_key(created.table_id()),
         ]);
         assert_explicit_range_assertions(&lowered.footprint, &expected);
@@ -3579,7 +3539,101 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_unique_keyspaces_lower_and_delete_independently() {
+    fn secondary_indexes_do_not_change_row_lowering() {
+        let created = definition();
+        let connection = connection(&created);
+        let captured = [
+            CapturedRow {
+                table: "notes".into(),
+                rowid: 1,
+                values: vec![
+                    StoredValue::Integer(1),
+                    StoredValue::Text(b"same".to_vec()),
+                    StoredValue::Null,
+                ],
+            },
+            CapturedRow {
+                table: "notes".into(),
+                rowid: 2,
+                values: vec![
+                    StoredValue::Integer(2),
+                    StoredValue::Text(b"same".to_vec()),
+                    StoredValue::Blob(vec![7]),
+                ],
+            },
+        ];
+        let baseline = InsertRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+
+        add_index(&connection, "CREATE INDEX notes_body ON notes (body)");
+        add_index(
+            &connection,
+            "CREATE INDEX notes_payload_body ON notes (payload, body)",
+        );
+        let inserted = InsertRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap();
+
+        assert!(inserted.indexes.is_empty());
+        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        let lowered = inserted.to_homebase().unwrap();
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .all(|mutation| mutation.key().components()[3].as_bytes() != codes::INDEXES)
+        );
+        assert_eq!(lowered.mutations.len(), baseline.mutations.len());
+        assert_eq!(lowered.footprint, baseline.footprint);
+        assert_eq!(
+            InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
+            inserted
+        );
+
+        let deleted = DeleteRows::from_captured(&connection, &captured)
+            .unwrap()
+            .unwrap()
+            .to_homebase()
+            .unwrap();
+        assert!(
+            deleted
+                .mutations
+                .iter()
+                .all(|mutation| mutation.key().components()[3].as_bytes() != codes::INDEXES)
+        );
+
+        let updated = UpdateRows::from_captured(
+            &connection,
+            &[(
+                captured[0].clone(),
+                CapturedRow {
+                    table: "notes".into(),
+                    rowid: 1,
+                    values: vec![
+                        StoredValue::Integer(1),
+                        StoredValue::Text(b"changed".to_vec()),
+                        StoredValue::Null,
+                    ],
+                },
+            )],
+        )
+        .unwrap()
+        .unwrap()
+        .to_homebase()
+        .unwrap();
+        assert!(
+            updated
+                .mutations
+                .iter()
+                .all(|mutation| mutation.key().components()[3].as_bytes() != codes::INDEXES)
+        );
+    }
+
+    #[test]
+    fn overlapping_unique_indexes_lower_and_delete_independently() {
         let created = overlapping_unique_definition();
         let connection = connection(&created);
         let captured = profile(1, "acme", "same", "same");
@@ -3635,7 +3689,7 @@ mod tests {
     }
 
     #[test]
-    fn one_insert_operation_rejects_duplicates_in_any_unique_keyspace() {
+    fn one_insert_operation_rejects_duplicates_in_any_unique_index() {
         let created = overlapping_unique_definition();
         let connection = connection(&created);
         let captured = [
@@ -3734,7 +3788,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                active_row_keyspace_key(created.table_id()),
+                active_primary_index_key(created.table_id()),
                 write_revision_key(created.table_id()),
             ],
         );
@@ -3862,7 +3916,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                active_row_keyspace_key(created.table_id()),
+                active_primary_index_key(created.table_id()),
                 write_revision_key(created.table_id()),
             ],
         );
@@ -3956,7 +4010,7 @@ mod tests {
             &lowered.footprint,
             &[
                 claimed_unique,
-                active_row_keyspace_key(created.table_id()),
+                active_primary_index_key(created.table_id()),
                 write_revision_key(created.table_id()),
             ],
         );
@@ -3999,7 +4053,7 @@ mod tests {
     }
 
     #[test]
-    fn update_changes_only_the_affected_overlapping_unique_keyspaces() {
+    fn update_changes_only_the_affected_overlapping_indexes() {
         let created = overlapping_unique_definition();
         let connection = connection(&created);
         let before = profile(1, "acme", "same@example.com", "before");
@@ -4026,7 +4080,7 @@ mod tests {
         assert!(
             !counts.contains_key(
                 created.unique_constraints()[0]
-                    .keyspace_id()
+                    .index_id()
                     .as_bytes()
                     .as_slice()
             )
@@ -4172,7 +4226,7 @@ mod tests {
             &lowered.footprint,
             &[
                 destination,
-                active_row_keyspace_key(created.table_id()),
+                active_primary_index_key(created.table_id()),
                 write_revision_key(created.table_id()),
             ],
         );
@@ -4673,10 +4727,7 @@ mod tests {
         let inserted = InsertRows::from_captured(&connection, &captured)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            inserted.unique_keys[0].key_parts[0].affinity,
-            Affinity::Blob
-        );
+        assert_eq!(inserted.indexes[0].parts[0].affinity, Affinity::Blob);
         assert_eq!(inserted.to_homebase().unwrap().mutations.len(), 4);
 
         let mut invalid = inserted;

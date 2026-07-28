@@ -12,7 +12,7 @@ use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
-    DefaultDefinition, MAX_KEY_PARTS, SqlExpression, SqlName, TableMode, TableStorage,
+    DefaultDefinition, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode, TableStorage,
     TypeDeclaration, available_hidden_rowid_alias,
 };
 use crate::{Error, Result};
@@ -20,7 +20,7 @@ use crate::{Error, Result};
 #[derive(Clone)]
 pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
-    CreateUniqueIndex(CreateUniqueIndexSpec),
+    CreateIndex(CreateIndexSpec),
     DropIndex(DropIndexSpec),
     Insert,
     Delete,
@@ -28,7 +28,8 @@ pub enum ValidatedExecute {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateUniqueIndexSpec {
+pub struct CreateIndexSpec {
+    pub unique: bool,
     pub name: SqlName,
     pub table: SqlName,
     pub columns: Vec<SqlName>,
@@ -174,29 +175,22 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             columns,
             where_clause,
         } => {
-            if !unique {
-                return Err(Error::UnsupportedSql(
-                    "non-UNIQUE indexes are not supported",
-                ));
-            }
             if if_not_exists {
                 return Err(Error::UnsupportedSql(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS is not supported",
+                    "CREATE INDEX IF NOT EXISTS is not supported",
                 ));
             }
             if idx_name.db_name.is_some() || idx_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
-                    "qualified CREATE UNIQUE INDEX names are not supported",
+                    "qualified CREATE INDEX names are not supported",
                 ));
             }
             if where_clause.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "partial UNIQUE indexes are not supported",
-                ));
+                return Err(Error::UnsupportedSql("partial indexes are not supported"));
             }
-            if columns.is_empty() || columns.len() > MAX_KEY_PARTS {
+            if columns.is_empty() || columns.len() > MAX_INDEX_COLUMNS {
                 return Err(Error::UnsupportedSql(
-                    "UNIQUE index has an unsupported number of key columns",
+                    "index has an unsupported number of key columns",
                 ));
             }
             let name = identifier(&idx_name.name)?;
@@ -214,7 +208,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             for column in columns {
                 if column.order.is_some() || column.nulls.is_some() {
                     return Err(Error::UnsupportedSql(
-                        "UNIQUE index sort and NULLS clauses are not supported",
+                        "index sort and NULLS clauses are not supported",
                     ));
                 }
                 let column = match column.expr {
@@ -222,7 +216,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     Expr::Name(name) => identifier(&name)?,
                     _ => {
                         return Err(Error::UnsupportedSql(
-                            "UNIQUE index expressions and collations are not supported",
+                            "index expressions and collations are not supported",
                         ));
                     }
                 };
@@ -230,13 +224,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     .iter()
                     .any(|seen: &SqlName| seen.canonical() == column.canonical())
                 {
-                    return Err(Error::UnsupportedSql(
-                        "UNIQUE index columns must be distinct",
-                    ));
+                    return Err(Error::UnsupportedSql("index columns must be distinct"));
                 }
                 key_columns.push(column);
             }
-            Ok(ValidatedExecute::CreateUniqueIndex(CreateUniqueIndexSpec {
+            Ok(ValidatedExecute::CreateIndex(CreateIndexSpec {
+                unique,
                 name,
                 table,
                 columns: key_columns,
@@ -935,7 +928,7 @@ fn simple_indexed_column_names(
         })
         .collect::<Result<Vec<_>>>()?;
     if columns.is_empty()
-        || columns.len() > MAX_KEY_PARTS
+        || columns.len() > MAX_INDEX_COLUMNS
         || columns.iter().enumerate().any(|(index, column)| {
             columns[..index]
                 .iter()
@@ -967,7 +960,7 @@ fn simple_key_columns(
             expression_identifier(column.expr)
         })
         .collect::<Result<Vec<_>>>()?;
-    if columns.len() > MAX_KEY_PARTS {
+    if columns.len() > MAX_INDEX_COLUMNS {
         return Err(Error::UnsupportedSql(match kind {
             "PRIMARY KEY" => "PRIMARY KEY has too many columns",
             _ => "UNIQUE constraint has too many columns",
@@ -1100,6 +1093,8 @@ mod tests {
             )",
             "CREATE UNIQUE INDEX notes_body ON notes (body)",
             "CREATE UNIQUE INDEX notes_tenant_body ON notes (tenant, body)",
+            "CREATE INDEX notes_body_lookup ON notes (body)",
+            "CREATE INDEX notes_tenant_lookup ON notes (tenant, body)",
             "DROP INDEX notes_body",
             "INSERT INTO notes VALUES (1, 'ON CONFLICT')",
             "INSERT INTO \"replace\" VALUES (1)",
@@ -1111,6 +1106,35 @@ mod tests {
             "UPDATE notes SET body = (SELECT body FROM archived WHERE archived.id = notes.id)",
         ] {
             validate_execute(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn create_index_preserves_its_semantic_kind_and_column_order() {
+        for (sql, expected_unique) in [
+            ("CREATE INDEX notes_lookup ON notes (tenant, body)", false),
+            (
+                "CREATE UNIQUE INDEX notes_identity ON notes (tenant, body)",
+                true,
+            ),
+        ] {
+            let ValidatedExecute::CreateIndex(spec) = validate_execute(sql).unwrap() else {
+                panic!("CREATE INDEX parsed as another statement kind")
+            };
+            assert_eq!(spec.unique, expected_unique);
+            assert_eq!(
+                spec.name.value(),
+                if expected_unique {
+                    "notes_identity"
+                } else {
+                    "notes_lookup"
+                }
+            );
+            assert_eq!(spec.table.value(), "notes");
+            assert_eq!(
+                spec.columns.iter().map(SqlName::value).collect::<Vec<_>>(),
+                ["tenant", "body"]
+            );
         }
     }
 
@@ -1352,11 +1376,11 @@ mod tests {
 
     #[test]
     fn logical_keys_fit_within_homebase_component_limits() {
-        let key_columns = (0..=MAX_KEY_PARTS)
+        let key_columns = (0..=MAX_INDEX_COLUMNS)
             .map(|index| format!("key_{index} INTEGER"))
             .collect::<Vec<_>>()
             .join(", ");
-        let key_names = (0..=MAX_KEY_PARTS)
+        let key_names = (0..=MAX_INDEX_COLUMNS)
             .map(|index| format!("key_{index}"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1643,16 +1667,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unique_index_extensions_outside_the_initial_slice() {
+    fn rejects_index_extensions_outside_the_initial_slice() {
         for sql in [
-            "CREATE INDEX notes_body ON notes (body)",
             "CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes (body)",
+            "CREATE INDEX IF NOT EXISTS notes_body ON notes (body)",
             "CREATE UNIQUE INDEX main.notes_body ON notes (body)",
+            "CREATE INDEX main.notes_body ON notes (body)",
             "CREATE UNIQUE INDEX notes_body ON notes (body DESC)",
+            "CREATE INDEX notes_body ON notes (body DESC)",
             "CREATE UNIQUE INDEX notes_body ON notes (body COLLATE NOCASE)",
+            "CREATE INDEX notes_body ON notes (body COLLATE NOCASE)",
             "CREATE UNIQUE INDEX notes_body ON notes (lower(body))",
+            "CREATE INDEX notes_body ON notes (lower(body))",
             "CREATE UNIQUE INDEX notes_body ON notes (body) WHERE body IS NOT NULL",
+            "CREATE INDEX notes_body ON notes (body) WHERE body IS NOT NULL",
             "CREATE UNIQUE INDEX notes_body ON notes (body, body)",
+            "CREATE INDEX notes_body ON notes (body, body)",
             "DROP INDEX IF EXISTS notes_body",
             "DROP INDEX main.notes_body",
         ] {

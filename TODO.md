@@ -21,7 +21,7 @@ multilite
   the resulting checker into a broader explicit database integrity audit.
 
 - Exact reverse-reference assertions, parent prefix range fences, and parent
-  targets backed by table or explicit UNIQUE keyspaces have landed. A
+  targets backed by primary or explicit UNIQUE indexes have landed. A
   referenced explicit index currently cannot be dropped. Before widening the
   grammar, define retirement and GC for dropped relationships, then support
   durable retargeting/removal, affinity/collation coercion, self-references and
@@ -58,7 +58,7 @@ multilite
   SQLite changeset. Have the committer maintain and validate one physical
   schema/catalog generation at snapshot issue and canonical apply. A mismatch
   should detect an out-of-band SQLite schema change and enter the same
-  externally-modified/quarantine path; schema revision and keyspace IDs plus
+  externally-modified/quarantine path; schema revision and index IDs plus
   range assertions remain the distributed DDL/DML conflict mechanism.
 
 - Bound speculative DELETE capture deterministically. A DELETE currently buffers
@@ -77,10 +77,17 @@ multilite
   inert: `DROP INDEX` advances the schema head but not the write-contract
   revision, so operations compiled against the old index may still arrive and
   perform harmless superset bookkeeping. Garbage collection therefore needs an
-  explicit device/frontier retirement protocol; never delete those keyspaces
-  merely because the local submit window is empty. Also extend the admitted
-  grammar only alongside exact key-image support for collations, sort rules,
-  partial/expression indexes, and eventually ordinary secondary indexes.
+  explicit device/frontier retirement protocol; never delete those index-owned
+  namespaces merely because the local submit window is empty. Also extend the
+  admitted grammar only alongside exact key-image support for collations, sort rules,
+  and partial/expression UNIQUE indexes.
+
+- Ordinary secondary-index DDL now converges without row-level Homebase index
+  cells or `write-revision` churn. Keep serializable read tracing coarse until
+  measurements justify an optional secondary-index conflict projection. If
+  that projection is added, define its activation and backfill lifecycle so
+  snapshot-isolated writes do not pay permanent mutation overhead merely
+  because a SQLite access-path index exists.
 
 - Continue reducing private-transaction startup overhead. The committer now
   incrementally streams appended WAL frames into its snapshot cache, native
