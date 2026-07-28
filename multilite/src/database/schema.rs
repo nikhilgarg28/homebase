@@ -14,6 +14,7 @@ use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use sqlite3_parser::ast::Expr;
 use uuid::{Uuid, Variant, Version};
 
 use super::{catalog, codes};
@@ -333,6 +334,8 @@ pub struct CreateColumn {
     pub name: SqlName,
     pub declared_type: TypeDeclaration,
     pub not_null: bool,
+    pub not_null_name: Option<SqlName>,
+    pub default: Option<DefaultDefinition>,
     /// Position in the table's ordered primary key, if any.
     pub primary_key: Option<usize>,
 }
@@ -353,6 +356,37 @@ pub struct CreateForeignKey {
     pub referenced_columns: Option<Vec<SqlName>>,
 }
 
+/// One optional SQLite default owned by a column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultDefinition {
+    pub name: Option<SqlName>,
+    pub expression: SqlExpression,
+}
+
+/// An owned SQLite expression used only in the in-memory schema model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlExpression(Box<Expr>);
+
+impl SqlExpression {
+    pub(super) fn new(expression: Expr) -> Self {
+        Self(Box::new(expression))
+    }
+}
+
+impl fmt::Display for SqlExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.0, formatter)
+    }
+}
+
+/// One validated CHECK declaration before column names become stable IDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateCheckConstraint {
+    pub column: Option<SqlName>,
+    pub name: Option<SqlName>,
+    pub expression: SqlExpression,
+}
+
 /// Structured result of validating a restricted `CREATE TABLE` statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTableSpec {
@@ -360,8 +394,10 @@ pub struct CreateTableSpec {
     pub mode: TableMode,
     pub storage: TableStorage,
     pub columns: Vec<CreateColumn>,
+    pub primary_key_name: Option<SqlName>,
     pub unique_constraints: Vec<CreateUnique>,
     pub foreign_keys: Vec<CreateForeignKey>,
+    pub checks: Vec<CreateCheckConstraint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,11 +427,14 @@ pub struct Column {
     name: SqlName,
     declared_type: TypeDeclaration,
     not_null: bool,
+    not_null_name: Option<SqlName>,
+    default: Option<DefaultDefinition>,
 }
 
 /// Ordered durable primary-key definition owned by a table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimaryKey {
+    name: Option<SqlName>,
     columns: Vec<ColumnId>,
 }
 
@@ -434,6 +473,14 @@ pub struct ForeignKeyDefinition {
     referenced_column_names: Vec<SqlName>,
 }
 
+/// One SQLite CHECK declaration owned by a table schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckConstraint {
+    column: Option<ColumnId>,
+    name: Option<SqlName>,
+    expression: SqlExpression,
+}
+
 /// Complete schema known for one table revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableSchema {
@@ -444,6 +491,7 @@ pub struct TableSchema {
     unique_constraints: Vec<UniqueConstraint>,
     indexes: Vec<IndexDefinition>,
     foreign_keys: Vec<ForeignKeyDefinition>,
+    checks: Vec<CheckConstraint>,
 }
 
 /// Durable meaning of a restricted table creation.
@@ -512,9 +560,24 @@ impl Column {
     pub fn is_not_null(&self) -> bool {
         self.not_null
     }
+
+    #[cfg(test)]
+    pub fn not_null_name(&self) -> Option<&SqlName> {
+        self.not_null_name.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn default(&self) -> Option<&DefaultDefinition> {
+        self.default.as_ref()
+    }
 }
 
 impl PrimaryKey {
+    #[cfg(test)]
+    pub fn name(&self) -> Option<&SqlName> {
+        self.name.as_ref()
+    }
+
     pub fn columns(&self) -> &[ColumnId] {
         &self.columns
     }
@@ -548,6 +611,11 @@ impl TableSchema {
     #[allow(dead_code, reason = "populated when FOREIGN KEY grammar is admitted")]
     pub fn foreign_keys(&self) -> &[ForeignKeyDefinition] {
         &self.foreign_keys
+    }
+
+    #[cfg(test)]
+    pub fn checks(&self) -> &[CheckConstraint] {
+        &self.checks
     }
 }
 
@@ -762,8 +830,8 @@ impl CreateTable {
 
     /// Decode and validate one complete locally stored schema operation.
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
-        let created = decode_frame(frame)?;
-        validate_literal_sql(&created)?;
+        let mut created = decode_frame(frame)?;
+        hydrate_literal_sql(&mut created)?;
         validate_index_sql(&created)?;
         Ok(created)
     }
@@ -897,7 +965,7 @@ impl CreateTable {
         Ok(())
     }
 
-    fn matches_spec(&self, spec: &CreateTableSpec) -> bool {
+    fn matches_structural_spec(&self, spec: &CreateTableSpec) -> bool {
         self.name == spec.name
             && self.schema.mode == spec.mode
             && self.schema.storage == spec.storage
@@ -965,6 +1033,15 @@ impl CreateTable {
                                         })
                             })
                 })
+    }
+
+    fn hydrate_sql_metadata(&mut self, spec: CreateTableSpec) {
+        for (column, parsed) in self.schema.columns.iter_mut().zip(spec.columns) {
+            column.not_null_name = parsed.not_null_name;
+            column.default = parsed.default;
+        }
+        self.schema.primary_key.name = spec.primary_key_name;
+        self.schema.checks = lower_checks(spec.checks, &self.schema.columns);
     }
 }
 
@@ -1146,8 +1223,10 @@ fn build_create_table(
         mode,
         storage,
         columns: column_specs,
+        primary_key_name,
         unique_constraints: unique_specs,
         foreign_keys: _,
+        checks: check_specs,
     } = spec;
     let mutation_id = MutationId(mint());
     let table_id = TableId(mint());
@@ -1160,12 +1239,16 @@ fn build_create_table(
             name: column.name.clone(),
             declared_type: column.declared_type.clone(),
             not_null: column.not_null,
+            not_null_name: column.not_null_name.clone(),
+            default: column.default.clone(),
         })
         .collect::<Vec<_>>();
     let primary_key = PrimaryKey {
+        name: primary_key_name,
         columns: spec_primary_key_ids_from_columns(&column_specs, &columns)
             .expect("validated PRIMARY KEY columns exist"),
     };
+    let checks = lower_checks(check_specs, &columns);
     let unique_constraints = unique_specs
         .into_iter()
         .map(|unique| UniqueConstraint {
@@ -1231,8 +1314,26 @@ fn build_create_table(
             unique_constraints,
             indexes: Vec::new(),
             foreign_keys,
+            checks,
         },
     }
+}
+
+fn lower_checks(checks: Vec<CreateCheckConstraint>, columns: &[Column]) -> Vec<CheckConstraint> {
+    checks
+        .into_iter()
+        .map(|check| CheckConstraint {
+            column: check.column.as_ref().map(|name| {
+                columns
+                    .iter()
+                    .find(|column| column.name.canonical() == name.canonical())
+                    .expect("validated CHECK column exists")
+                    .id
+            }),
+            name: check.name,
+            expression: check.expression,
+        })
+        .collect()
 }
 
 fn spec_primary_key_ids(spec: &CreateTableSpec, columns: &[Column]) -> Option<Vec<ColumnId>> {
@@ -1886,6 +1987,7 @@ fn decode_create_table(
             unique_constraints,
             indexes,
             foreign_keys,
+            checks: Vec::new(),
         },
     ))
 }
@@ -2046,7 +2148,10 @@ fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCod
     if columns.is_empty() {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(PrimaryKey { columns })
+    Ok(PrimaryKey {
+        name: None,
+        columns,
+    })
 }
 
 fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> {
@@ -2075,11 +2180,14 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         }
     }
     let flags = flags.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_FLAGS))?;
+    let not_null = flags & COLUMN_NOT_NULL != 0;
     Ok(Column {
         id: id.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_ID))?,
         name: name.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_NAME))?,
         declared_type: declared_type.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_TYPE))?,
-        not_null: flags & COLUMN_NOT_NULL != 0,
+        not_null,
+        not_null_name: None,
+        default: None,
     })
 }
 
@@ -2190,11 +2298,12 @@ fn from_homebase_inner(
     Ok(created)
 }
 
-fn validate_literal_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
+fn hydrate_literal_sql(created: &mut CreateTable) -> std::result::Result<(), SchemaCodecError> {
     let parsed = parse_create_table(&created.sql)?;
-    if !created.matches_spec(&parsed) {
+    if !created.matches_structural_spec(&parsed) {
         return Err(SchemaCodecError::SqlMismatch);
     }
+    created.hydrate_sql_metadata(parsed);
     Ok(())
 }
 
@@ -2250,17 +2359,23 @@ mod tests {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),
                     not_null: false,
+                    not_null_name: None,
+                    default: None,
                     primary_key: Some(0),
                 },
                 CreateColumn {
                     name: SqlName::new("body".into()),
                     declared_type: TypeDeclaration::text(),
                     not_null: true,
+                    not_null_name: None,
+                    default: None,
                     primary_key: None,
                 },
             ],
             unique_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            primary_key_name: None,
+            checks: Vec::new(),
         }
     }
 
@@ -2296,18 +2411,24 @@ mod tests {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("organization".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: None,
                     },
                 ],
@@ -2319,6 +2440,8 @@ mod tests {
                     ],
                 }],
                 foreign_keys: Vec::new(),
+                primary_key_name: None,
+                checks: Vec::new(),
             },
             Vec::new(),
             || {
@@ -2349,24 +2472,32 @@ mod tests {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: Some(0),
                     },
                     CreateColumn {
                         name: SqlName::new("tenant".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("email".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: None,
                     },
                     CreateColumn {
                         name: SqlName::new("username".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: None,
                     },
                 ],
@@ -2392,6 +2523,8 @@ mod tests {
                     },
                 ],
                 foreign_keys: Vec::new(),
+                primary_key_name: None,
+                checks: Vec::new(),
             },
             Vec::new(),
             || {
@@ -2498,6 +2631,128 @@ mod tests {
     }
 
     #[test]
+    fn defaults_checks_and_constraint_names_roundtrip_structurally() {
+        let sql = "CREATE TABLE accounts (
+            id INTEGER,
+            state TEXT CONSTRAINT state_required NOT NULL
+                CONSTRAINT state_default DEFAULT ('new')
+                CONSTRAINT state_check CHECK (length(state) > 0),
+            score REAL DEFAULT -1.5,
+            CONSTRAINT account_pk PRIMARY KEY (id),
+            CONSTRAINT score_check CHECK (score IS NULL OR score >= 0)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let id = created.columns()[0].id();
+        let state = created.columns()[1].id();
+
+        assert_eq!(
+            created.columns()[1].not_null_name(),
+            Some(&SqlName::new("state_required".into()))
+        );
+        let state_default = created.columns()[1].default().unwrap();
+        assert_eq!(
+            state_default.name,
+            Some(SqlName::new("state_default".into()))
+        );
+        assert_eq!(state_default.expression.to_string(), "('new')");
+        let score_default = created.columns()[2].default().unwrap();
+        assert_eq!(score_default.name, None);
+        assert_eq!(score_default.expression.to_string(), "- 1.5");
+        assert_eq!(
+            created.schema().primary_key().name(),
+            Some(&SqlName::new("account_pk".into()))
+        );
+        let checks = created.schema().checks();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].column, Some(state));
+        assert_eq!(checks[0].name, Some(SqlName::new("state_check".into())));
+        assert_eq!(checks[0].expression.to_string(), "length (state) > 0");
+        assert_eq!(checks[1].column, None);
+        assert_eq!(checks[1].name, Some(SqlName::new("score_check".into())));
+        assert_eq!(
+            checks[1].expression.to_string(),
+            "score IS NULL OR score >= 0"
+        );
+        assert_eq!(created.primary_key_columns().next().unwrap().id(), id);
+        assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+    }
+
+    #[test]
+    fn derived_sql_metadata_is_hydrated_but_not_duplicated_in_the_codec() {
+        let sql = "CREATE TABLE accounts (
+            id INTEGER CONSTRAINT account_pk PRIMARY KEY,
+            state TEXT CONSTRAINT state_required NOT NULL
+                CONSTRAINT state_default DEFAULT 'new'
+                CONSTRAINT state_check CHECK (length(state) > 0),
+            score REAL,
+            CONSTRAINT score_check CHECK (score >= 0)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let encoded = created.encode();
+        let raw = decode_frame(&encoded).unwrap();
+        assert_eq!(raw.schema.primary_key.name, None);
+        assert!(
+            raw.schema
+                .columns
+                .iter()
+                .all(|column| column.not_null_name.is_none() && column.default.is_none())
+        );
+        assert!(raw.schema.checks.is_empty());
+
+        let mut without_derived_metadata = created.clone();
+        without_derived_metadata.schema.primary_key.name = None;
+        for column in &mut without_derived_metadata.schema.columns {
+            column.not_null_name = None;
+            column.default = None;
+        }
+        without_derived_metadata.schema.checks.clear();
+        assert_eq!(without_derived_metadata.encode(), encoded);
+        assert_eq!(CreateTable::decode(&encoded).unwrap(), created);
+
+        let mut changed_sql = raw;
+        changed_sql.sql = "CREATE TABLE accounts (
+            id INTEGER CONSTRAINT renamed_pk PRIMARY KEY,
+            state TEXT CONSTRAINT renamed_required NOT NULL
+                CONSTRAINT renamed_default DEFAULT 'changed'
+                CONSTRAINT renamed_check CHECK (length(state) > 1),
+            score REAL,
+            CONSTRAINT renamed_score_check CHECK (score < 10)
+        )"
+        .into();
+        let hydrated = CreateTable::decode(&changed_sql.encode()).unwrap();
+        assert_eq!(
+            hydrated.schema.primary_key.name(),
+            Some(&SqlName::new("renamed_pk".into()))
+        );
+        assert_eq!(
+            hydrated.columns()[1].not_null_name(),
+            Some(&SqlName::new("renamed_required".into()))
+        );
+        let default = hydrated.columns()[1].default().unwrap();
+        assert_eq!(default.name, Some(SqlName::new("renamed_default".into())));
+        assert_eq!(default.expression.to_string(), "'changed'");
+        assert_eq!(hydrated.schema.checks.len(), 2);
+        assert_eq!(
+            hydrated.schema.checks[0].expression.to_string(),
+            "length (state) > 1"
+        );
+        assert_eq!(
+            hydrated.schema.checks[1].expression.to_string(),
+            "score < 10"
+        );
+    }
+
+    #[test]
     fn foreign_keys_roundtrip_stable_parent_identity_and_fence_parent_writes() {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
@@ -2570,12 +2825,16 @@ mod tests {
                 name: SqlName::new(format!("child_key_{index}")),
                 declared_type: TypeDeclaration::integer(),
                 not_null: true,
+                not_null_name: None,
+                default: None,
                 primary_key: Some(index),
             });
             let foreign_columns = (0..parent_parts).map(|index| CreateColumn {
                 name: SqlName::new(format!("parent_key_{index}")),
                 declared_type: TypeDeclaration::integer(),
                 not_null: false,
+                not_null_name: None,
+                default: None,
                 primary_key: None,
             });
             CreateTableSpec {
@@ -2596,6 +2855,8 @@ mod tests {
                             .collect(),
                     ),
                 }],
+                primary_key_name: None,
+                checks: Vec::new(),
             }
         }
 
@@ -2812,15 +3073,24 @@ mod tests {
     }
 
     #[test]
-    fn literal_sql_must_match_the_structured_schema() {
+    fn stored_sql_must_match_the_structural_schema() {
         let created = deterministic_create("notes");
-        validate_literal_sql(&created).unwrap();
+        let mut decoded = decode_frame(&created.encode()).unwrap();
+        hydrate_literal_sql(&mut decoded).unwrap();
+        assert_eq!(decoded, created);
 
-        let mut mismatch = created.clone();
+        let mut mismatch = decode_frame(&created.encode()).unwrap();
         mismatch.sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body BLOB NOT NULL)".into();
         assert_eq!(
-            validate_literal_sql(&mismatch),
+            hydrate_literal_sql(&mut mismatch),
             Err(SchemaCodecError::SqlMismatch)
+        );
+
+        let mut invalid = decode_frame(&created.encode()).unwrap();
+        invalid.sql = "CREATE TABLE".into();
+        assert_eq!(
+            hydrate_literal_sql(&mut invalid),
+            Err(SchemaCodecError::InvalidSql)
         );
     }
 
@@ -3011,6 +3281,8 @@ mod tests {
             name: SqlName::new("key".into()),
             declared_type: TypeDeclaration::text(),
             not_null: true,
+            not_null_name: None,
+            default: None,
             primary_key: Some(0),
         };
         for name in ["rowid", "oid", "_rowid_"] {
@@ -3018,6 +3290,8 @@ mod tests {
                 name: SqlName::new(name.into()),
                 declared_type: TypeDeclaration::text(),
                 not_null: false,
+                not_null_name: None,
+                default: None,
                 primary_key: None,
             });
         }

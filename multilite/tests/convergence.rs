@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use homebase_client::ServerHandle;
 use homebase_core::space::SpaceId;
@@ -163,6 +164,111 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
                 i64::try_from(long_key.len()).unwrap(),
                 String::from("large")
             )]
+        );
+    }
+}
+
+#[test]
+fn captured_defaults_and_checks_converge_without_remote_reevaluation() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("defaults-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("defaults-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE events (
+                    id INTEGER CONSTRAINT event_pk PRIMARY KEY,
+                    state TEXT CONSTRAINT state_required NOT NULL
+                        CONSTRAINT state_default DEFAULT ('new')
+                        CONSTRAINT state_nonempty CHECK (length(state) > 0),
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    score INTEGER DEFAULT 0,
+                    CONSTRAINT score_nonnegative CHECK (score >= 0)
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO events (id) VALUES (1)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    let origin_created_at = first
+        .query("SELECT created_at FROM events WHERE id = 1", (), |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .remove(0);
+
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    assert_eq!(
+        second
+            .query("SELECT created_at FROM events WHERE id = 1", (), |row| {
+                row.get::<_, String>(0)
+            },)
+            .unwrap(),
+        [origin_created_at]
+    );
+
+    assert!(matches!(
+        first.execute("INSERT INTO events (id, score) VALUES (9, -1)", ()),
+        Err(multilite::Error::Sqlite(_))
+    ));
+    first
+        .execute("INSERT INTO events (id, score) VALUES (2, 2)", ())
+        .unwrap();
+    second
+        .execute("INSERT INTO events (id, state) VALUES (3, 'ready')", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, state, score FROM events ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            [
+                (1, "new".into(), 0),
+                (2, "new".into(), 2),
+                (3, "ready".into(), 0),
+            ]
+        );
+        assert_eq!(
+            database
+                .query("SELECT count(*) FROM events WHERE id = 9", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [0]
         );
     }
 }

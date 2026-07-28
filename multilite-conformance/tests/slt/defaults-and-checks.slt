@@ -1,0 +1,43 @@
+statement ok
+CREATE TABLE inventory (
+  tenant TEXT NOT NULL,
+  id INTEGER NOT NULL,
+  label TEXT CONSTRAINT label_default DEFAULT ('unlabeled'),
+  quantity NUMERIC DEFAULT ('3.0'),
+  CONSTRAINT inventory_pk PRIMARY KEY (tenant, id),
+  CONSTRAINT quantity_nonnegative CHECK (quantity >= 0)
+) WITHOUT ROWID
+
+statement ok
+INSERT INTO inventory (tenant, id) VALUES ('acme', 1)
+
+query ITIT
+SELECT id, label, quantity, typeof(quantity) FROM inventory
+----
+1
+unlabeled
+3
+integer
+
+statement error
+INSERT INTO inventory (tenant, id, quantity) VALUES ('acme', 2, -1)
+
+query I
+SELECT count(*) FROM inventory
+----
+1
+
+statement ok
+CREATE TABLE strict_defaults (
+  id INTEGER PRIMARY KEY,
+  value ANY DEFAULT ('003') CHECK (typeof(value) = 'text')
+) STRICT
+
+statement ok
+INSERT INTO strict_defaults (id) VALUES (1)
+
+query TT
+SELECT value, typeof(value) FROM strict_defaults
+----
+003
+text

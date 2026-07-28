@@ -11,8 +11,9 @@ use sqlite3_parser::ast::{
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
-    CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique, MAX_KEY_PARTS, SqlName,
-    TableMode, TableStorage, TypeDeclaration, available_hidden_rowid_alias,
+    CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
+    DefaultDefinition, MAX_KEY_PARTS, SqlExpression, SqlName, TableMode, TableStorage,
+    TypeDeclaration, available_hidden_rowid_alias,
 };
 use crate::{Error, Result};
 
@@ -588,8 +589,10 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
         TableStorage::Rowid
     };
     let mut inline_primary_keys = 0;
+    let mut primary_key_name = None;
     let mut unique_constraints = Vec::new();
     let mut foreign_keys = Vec::new();
+    let mut checks = Vec::new();
     let mut columns = columns
         .into_values()
         .map(|column| {
@@ -604,19 +607,20 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 ));
             }
             let mut not_null = false;
+            let mut not_null_name = None;
             let mut primary_key = None;
+            let mut default = None;
             for constraint in column.constraints {
+                let constraint_name = constraint
+                    .name
+                    .map(|name| identifier(&name))
+                    .transpose()?;
                 match constraint.constraint {
                     ColumnConstraint::PrimaryKey {
                         order,
                         conflict_clause,
                         auto_increment,
                     } => {
-                        if constraint.name.is_some() {
-                            return Err(Error::UnsupportedSql(
-                                "named PRIMARY KEY constraints are not supported",
-                            ));
-                        }
                         if auto_increment {
                             return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
                         }
@@ -632,22 +636,21 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         }
                         primary_key = Some(0);
                         inline_primary_keys += 1;
+                        if let Some(name) = constraint_name {
+                            primary_key_name = Some(name);
+                        }
                     }
                     ColumnConstraint::NotNull {
                         nullable: false,
                         conflict_clause: None,
                     } => {
-                        if constraint.name.is_some() {
-                            return Err(Error::UnsupportedSql(
-                                "named NOT NULL constraints are not supported",
-                            ));
-                        }
                         if not_null {
                             return Err(Error::UnsupportedSql(
                                 "duplicate NOT NULL constraints are not supported",
                             ));
                         }
                         not_null = true;
+                        not_null_name = constraint_name;
                     }
                     ColumnConstraint::NotNull { .. } => {
                         return Err(Error::UnsupportedSql(
@@ -661,8 +664,26 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                             ));
                         }
                         unique_constraints.push(CreateUnique {
-                            name: constraint.name.map(|name| identifier(&name)).transpose()?,
+                            name: constraint_name,
                             columns: vec![name.clone()],
+                        });
+                    }
+                    ColumnConstraint::Default(expression) => {
+                        if default.is_some() {
+                            return Err(Error::UnsupportedSql(
+                                "duplicate DEFAULT constraints are not supported",
+                            ));
+                        }
+                        default = Some(DefaultDefinition {
+                            name: constraint_name,
+                            expression: schema_expression(expression),
+                        });
+                    }
+                    ColumnConstraint::Check(expression) => {
+                        checks.push(CreateCheckConstraint {
+                            column: Some(name.clone()),
+                            name: constraint_name,
+                            expression: schema_expression(expression),
                         });
                     }
                     ColumnConstraint::ForeignKey {
@@ -670,7 +691,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         defer_clause,
                     } => {
                         foreign_keys.push(validate_foreign_key(
-                            constraint.name.map(|name| identifier(&name)).transpose()?,
+                            constraint_name,
                             vec![name.clone()],
                             clause,
                             defer_clause,
@@ -678,7 +699,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     }
                     _ => {
                         return Err(Error::UnsupportedSql(
-                            "only PRIMARY KEY, NOT NULL, UNIQUE, and REFERENCES column constraints are supported",
+                            "only PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK, and REFERENCES column constraints are supported",
                         ));
                     }
                 }
@@ -687,6 +708,8 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 name,
                 declared_type,
                 not_null,
+                not_null_name,
+                default,
                 primary_key,
             })
         })
@@ -723,11 +746,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 auto_increment,
                 conflict_clause,
             } => {
-                if constraint.name.is_some() {
-                    return Err(Error::UnsupportedSql(
-                        "named PRIMARY KEY constraints are not supported",
-                    ));
-                }
+                let constraint_name = constraint.name.map(|name| identifier(&name)).transpose()?;
                 if auto_increment {
                     return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
                 }
@@ -746,6 +765,19 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     &columns,
                     "PRIMARY KEY",
                 )?);
+                primary_key_name = constraint_name;
+            }
+            TableConstraint::Check(expression, conflict_clause) => {
+                if conflict_clause.is_some() {
+                    return Err(Error::UnsupportedSql(
+                        "CHECK conflict clauses are not supported",
+                    ));
+                }
+                checks.push(CreateCheckConstraint {
+                    column: None,
+                    name: constraint.name.map(|name| identifier(&name)).transpose()?,
+                    expression: schema_expression(expression),
+                });
             }
             TableConstraint::ForeignKey {
                 columns: child_columns,
@@ -759,11 +791,6 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     clause,
                     defer_clause,
                 )?);
-            }
-            _ => {
-                return Err(Error::UnsupportedSql(
-                    "only PRIMARY KEY, UNIQUE, and FOREIGN KEY table constraints are supported",
-                ));
             }
         }
     }
@@ -814,9 +841,15 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
         mode,
         storage,
         columns,
+        primary_key_name,
         unique_constraints,
         foreign_keys,
+        checks,
     }))
+}
+
+fn schema_expression(expression: Expr) -> SqlExpression {
+    SqlExpression::new(expression)
 }
 
 fn validate_foreign_key(
@@ -1105,11 +1138,8 @@ mod tests {
             "CREATE TABLE notes (id)",
             "CREATE TABLE notes (id VARCHAR PRIMARY KEY)",
             "CREATE TABLE notes (id TEXT PRIMARY KEY)",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'x')",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT CHECK(length(body) > 0))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT COLLATE nocase)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT GENERATED ALWAYS AS (id))",
-            "CREATE TABLE notes (id INTEGER CONSTRAINT pk PRIMARY KEY)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY ON CONFLICT REPLACE)",
             "CREATE TABLE notes (id INTEGER NOT NULL ON CONFLICT IGNORE)",
@@ -1123,6 +1153,74 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, body))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, BODY))",
             "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn normalizes_defaults_checks_and_named_constraints() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE accounts (
+                id INTEGER CONSTRAINT account_pk PRIMARY KEY,
+                state TEXT CONSTRAINT state_required NOT NULL
+                    CONSTRAINT state_default DEFAULT ('new')
+                    CONSTRAINT state_check CHECK (length(state) > 0),
+                score REAL DEFAULT -1.5,
+                CONSTRAINT score_check CHECK (score IS NULL OR score >= 0)
+            )",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            spec.primary_key_name,
+            Some(SqlName::new("account_pk".into()))
+        );
+        assert_eq!(
+            spec.columns[1].not_null_name,
+            Some(SqlName::new("state_required".into()))
+        );
+        let state_default = spec.columns[1].default.as_ref().unwrap();
+        assert_eq!(
+            state_default.name,
+            Some(SqlName::new("state_default".into()))
+        );
+        assert_eq!(state_default.expression.to_string(), "('new')");
+        let score_default = spec.columns[2].default.as_ref().unwrap();
+        assert_eq!(score_default.name, None);
+        assert_eq!(score_default.expression.to_string(), "- 1.5");
+        assert_eq!(spec.checks.len(), 2);
+        assert_eq!(spec.checks[0].column, Some(SqlName::new("state".into())));
+        assert_eq!(
+            spec.checks[0].name,
+            Some(SqlName::new("state_check".into()))
+        );
+        assert_eq!(spec.checks[0].expression.to_string(), "length (state) > 0");
+        assert_eq!(spec.checks[1].column, None);
+        assert_eq!(
+            spec.checks[1].name,
+            Some(SqlName::new("score_check".into()))
+        );
+        assert_eq!(
+            spec.checks[1].expression.to_string(),
+            "score IS NULL OR score >= 0"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_defaults_and_check_conflict_clauses() {
+        for sql in [
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT DEFAULT 'one' DEFAULT 'two'
+            )",
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT,
+                CHECK (length(body) > 0) ON CONFLICT IGNORE
+            )",
         ] {
             assert_unsupported(sql);
         }

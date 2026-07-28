@@ -61,12 +61,31 @@ fn affinity_fixture_matches_sqlite() {
 }
 
 #[test]
+fn defaults_and_checks_fixture_matches_sqlite() {
+    let report = run_file(
+        "tests/slt/defaults-and-checks.slt",
+        &RunOptions {
+            engine: multilite_conformance::Engine::Both,
+            max_records: None,
+        },
+    );
+
+    assert_eq!(report.record_count(), 8);
+    assert_eq!(report.failed_count(), 0);
+}
+
+#[test]
 fn corpus_walker_discovers_sqllogictest_files() {
     let paths = vec![PathBuf::from("tests/slt")];
     let files = collect_test_files(&paths);
 
     assert!(files.iter().any(|file| file.ends_with("basic.slt")));
     assert!(files.iter().any(|file| file.ends_with("affinity.slt")));
+    assert!(
+        files
+            .iter()
+            .any(|file| file.ends_with("defaults-and-checks.slt"))
+    );
 
     let report = run_paths(&paths, &RunOptions::sqlite());
     assert!(report.record_count() >= 10);

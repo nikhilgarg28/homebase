@@ -2,6 +2,191 @@ use multilite::{Error, MultiliteConnection};
 use rusqlite::Connection;
 
 #[test]
+fn defaults_checks_and_named_constraints_follow_sqlite_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("defaults-and-checks.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    db.execute(
+        "CREATE TABLE inventory (
+            id INTEGER,
+            label TEXT CONSTRAINT label_required NOT NULL
+                CONSTRAINT label_default DEFAULT ('unlabeled')
+                CONSTRAINT label_nonempty CHECK (length(label) > 0),
+            quantity NUMERIC DEFAULT ('3.0'),
+            note TEXT,
+            CONSTRAINT inventory_pk PRIMARY KEY (id),
+            CONSTRAINT quantity_nonnegative
+                CHECK (quantity IS NULL OR quantity >= 0),
+            CHECK (quantity != 0 OR note IS NOT NULL)
+        )",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO inventory (id) VALUES (1)", ())
+        .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT id, label, quantity, typeof(quantity), note
+             FROM inventory",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(1, "unlabeled".into(), 3, "integer".into(), None)]
+    );
+
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO inventory (id, label, quantity) VALUES
+                (2, 'valid', 1),
+                (3, '', 1)",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id FROM inventory ORDER BY id", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [1]
+    );
+
+    db.update(|transaction| {
+        assert!(matches!(
+            transaction.execute("INSERT INTO inventory (id, quantity) VALUES (4, -1)", (),),
+            Err(Error::Sqlite(_))
+        ));
+        transaction.execute(
+            "INSERT INTO inventory (id, quantity, note) VALUES (5, 0, 'allowed')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(
+        db.execute("UPDATE inventory SET label = '' WHERE id = 1", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query(
+            "SELECT id, label, quantity, note FROM inventory ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            (1, "unlabeled".into(), 3, None),
+            (5, "unlabeled".into(), 0, Some("allowed".into())),
+        ]
+    );
+
+    drop(db);
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    reopened
+        .execute("INSERT INTO inventory (id) VALUES (6)", ())
+        .unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT label, quantity FROM inventory WHERE id = 6",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        [("unlabeled".into(), 3)]
+    );
+}
+
+#[test]
+fn strict_defaults_preserve_storage_class_and_failing_defaults_are_atomic() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("strict-defaults.sqlite")).unwrap();
+
+    db.execute(
+        "CREATE TABLE strict_values (
+            id INTEGER PRIMARY KEY,
+            value ANY DEFAULT ('003')
+                CHECK (typeof(value) = 'text'),
+            count INTEGER DEFAULT 2 CHECK (count > 0),
+            payload BLOB DEFAULT X'CAFE' CHECK (length(payload) = 2),
+            nullable INTEGER DEFAULT NULL CHECK (nullable > 0),
+            ratio REAL DEFAULT (1 + 0.5)
+        ) STRICT",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO strict_values (id) VALUES (1)", ())
+        .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT value, typeof(value), count, payload, nullable,
+                    ratio, typeof(ratio)
+             FROM strict_values",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(
+            "003".into(),
+            "text".into(),
+            2,
+            vec![0xca, 0xfe],
+            None,
+            1.5,
+            "real".into(),
+        )]
+    );
+
+    db.execute(
+        "CREATE TABLE invalid_default (
+            id INTEGER PRIMARY KEY,
+            value INTEGER DEFAULT -1 CHECK (value >= 0)
+        )",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute("INSERT INTO invalid_default (id) VALUES (1)", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT count(*) FROM invalid_default", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [0]
+    );
+}
+
+#[test]
 fn create_select_and_insert_work_for_arbitrary_user_tables() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("surface.sqlite")).unwrap();

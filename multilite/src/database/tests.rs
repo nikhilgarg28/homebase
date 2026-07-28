@@ -240,10 +240,14 @@ fn create_operation(name: &str) -> MultiliteOp {
                 name: schema::SqlName::new("id".into()),
                 declared_type: schema::TypeDeclaration::integer(),
                 not_null: false,
+                not_null_name: None,
+                default: None,
                 primary_key: Some(0),
             }],
             unique_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            primary_key_name: None,
+            checks: Vec::new(),
         },
     )
 }

@@ -1456,17 +1456,23 @@ mod tests {
                             name: SqlName::new("id".into()),
                             declared_type: TypeDeclaration::integer(),
                             not_null: false,
+                            not_null_name: None,
+                            default: None,
                             primary_key: Some(0),
                         },
                         CreateColumn {
                             name: SqlName::new("body".into()),
                             declared_type: TypeDeclaration::text(),
                             not_null: true,
+                            not_null_name: None,
+                            default: None,
                             primary_key: None,
                         },
                     ],
                     unique_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
+                    primary_key_name: None,
+                    checks: Vec::new(),
                 },
             );
             writer.execute(created.sql(), ()).unwrap();
@@ -1538,10 +1544,14 @@ mod tests {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
+                        not_null_name: None,
+                        default: None,
                         primary_key: Some(0),
                     }],
                     unique_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
+                    primary_key_name: None,
+                    checks: Vec::new(),
                 },
             ))])
             .unwrap();
