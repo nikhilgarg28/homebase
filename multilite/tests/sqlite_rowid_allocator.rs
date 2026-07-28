@@ -173,6 +173,33 @@ fn collisions_retry_and_invalid_candidates_fail() {
 }
 
 #[test]
+fn collision_retry_budget_is_bounded() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY);
+             INSERT INTO items VALUES (700);",
+        )
+        .unwrap();
+    let observed = install(&connection, std::iter::repeat_n(Ok(700), 100), None);
+
+    let error = connection
+        .execute("INSERT INTO items DEFAULT VALUES", ())
+        .unwrap_err();
+    assert_eq!(
+        error.sqlite_error().map(|error| error.extended_code),
+        Some(ffi::SQLITE_FULL)
+    );
+    assert_eq!(observed.calls.lock().unwrap().len(), 100);
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM items", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn callback_failure_rolls_back_the_whole_statement() {
     let connection = Connection::open_in_memory().unwrap();
     connection
@@ -197,6 +224,46 @@ fn callback_failure_rolls_back_the_whole_statement() {
             .query_row("SELECT count(*) FROM items", (), |row| row.get::<_, i64>(0))
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn trigger_inserts_receive_ids_from_the_same_connection_allocator() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE audit (id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL);
+             CREATE TRIGGER audit_item AFTER INSERT ON items BEGIN
+                INSERT INTO audit(item_id) VALUES (NEW.id);
+             END;",
+        )
+        .unwrap();
+    let observed = install(&connection, [Ok(901), Ok(902)], None);
+
+    connection
+        .execute("INSERT INTO items(body) VALUES ('triggered')", ())
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT id FROM items", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        901
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT id, item_id FROM audit", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap(),
+        (902, 901)
+    );
+    assert_eq!(
+        observed.calls.lock().unwrap().as_slice(),
+        [
+            ("main".into(), "items".into()),
+            ("main".into(), "audit".into())
+        ]
     );
 }
 

@@ -515,6 +515,30 @@ mod tests {
     }
 
     #[test]
+    fn final_partial_lease_is_clamped_before_slot_rotation() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection, device(8)).unwrap();
+        let state = load_state(&connection).unwrap();
+        let final_start = SLOT_CAPACITY - 17;
+        connection
+            .execute(
+                &format!("UPDATE {STATE_TABLE} SET leased_through = ?1"),
+                [final_start],
+            )
+            .unwrap();
+
+        let final_lease = lease(&connection).unwrap();
+        assert_eq!(final_lease.slot(), state.active_slot);
+        assert_eq!(final_lease.offsets(), final_start..SLOT_CAPACITY);
+
+        let old_suffix = (state.active_slot as u32) & RANDOM_SLOT_MASK;
+        let new_suffix = old_suffix.wrapping_add(1) & RANDOM_SLOT_MASK;
+        let rotated = lease_with(&connection, || Ok(new_suffix)).unwrap();
+        assert_ne!(rotated.slot(), state.active_slot);
+        assert_eq!(rotated.offsets(), 0..LEASE_SIZE);
+    }
+
+    #[test]
     fn validation_rejects_device_mismatch_and_corrupt_state() {
         let connection = Connection::open_in_memory().unwrap();
         initialize(&connection, device(1)).unwrap();
