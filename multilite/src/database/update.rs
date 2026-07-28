@@ -578,6 +578,7 @@ pub(super) struct BranchUpdate<T> {
 
 pub(super) fn run_branch_update<H, T>(
     snapshot: CommitSnapshot,
+    rowid_allocator: crate::rowid::RowidAllocator,
     isolation: IsolationLevel,
     operation: impl FnOnce(&mut UpdateTransaction<'_, H>) -> Result<T>,
 ) -> Result<BranchUpdate<T>>
@@ -591,6 +592,7 @@ where
     } = snapshot;
     let branch = WritableBranch::open(physical, OverlayOptions::default())
         .map_err(|error| Error::Branch(error.to_string()))?;
+    crate::rowid::install(branch.connection(), rowid_allocator)?;
     let mut update = UpdateTransaction::branch(branch.connection(), isolation)?;
     let value = operation(&mut update)?;
     let (operations, footprint) = update.into_branch_parts()?;
@@ -644,7 +646,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             value,
             proposal,
             history_pin: _history_pin,
-        } = run_branch_update(snapshot, options.isolation_level(), operation)?;
+        } = run_branch_update(
+            snapshot,
+            self.rowid_allocator.clone(),
+            options.isolation_level(),
+            operation,
+        )?;
         if let Some(proposal) = proposal {
             let receipt = self.commit_proposal(proposal)?;
             self.finish_branch_write(receipt)?;

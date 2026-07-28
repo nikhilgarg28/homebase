@@ -1,9 +1,16 @@
 //! Durable, device-scoped allocation of positive SQLite rowids.
 
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+
 use homebase_core::tag::DeviceId;
+use parking_lot::Mutex;
+use rusqlite::ffi;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+use crate::commit::committer::Committer;
 use crate::{Error, Result};
 
 const STATE_TABLE: &str = "__multilite__rowid_state";
@@ -52,6 +59,100 @@ impl RowidLease {
     pub(crate) fn for_test(slot: u64, next: u32, end: u32) -> Self {
         Self { slot, next, end }
     }
+}
+
+struct LeaseCursor {
+    committer: Committer,
+    lease: Option<RowidLease>,
+}
+
+/// Process-local lease cursor shared by every writable branch of one database.
+#[derive(Clone)]
+pub(crate) struct RowidAllocator {
+    cursor: Arc<Mutex<LeaseCursor>>,
+}
+
+impl RowidAllocator {
+    pub(crate) fn new(committer: Committer) -> Self {
+        Self {
+            cursor: Arc::new(Mutex::new(LeaseCursor {
+                committer,
+                lease: None,
+            })),
+        }
+    }
+
+    fn next(&mut self) -> Result<i64> {
+        let mut cursor = self.cursor.lock();
+        loop {
+            if let Some(rowid) = cursor.lease.as_mut().and_then(RowidLease::next_rowid) {
+                return Ok(rowid);
+            }
+            cursor.lease = Some(cursor.committer.lease_rowids_blocking()?);
+        }
+    }
+}
+
+/// Install durable allocation on one private writable branch connection.
+pub(crate) fn install(connection: &Connection, allocator: RowidAllocator) -> Result<()> {
+    let allocator = Box::new(allocator);
+    // SAFETY: SQLite owns the box after this call. The callback does not
+    // re-enter this connection, and the destructor reclaims the box once.
+    let result = unsafe {
+        ffi::sqlite3_multilite_set_rowid_allocator(
+            connection.handle(),
+            Some(allocate),
+            Box::into_raw(allocator).cast(),
+            Some(destroy_allocator),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result),
+            Some("could not install the Multilite rowid allocator".into()),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn allocate(
+    context: *mut c_void,
+    _connection: *mut ffi::sqlite3,
+    schema: *const c_char,
+    table: *const c_char,
+    rowid: *mut ffi::sqlite3_int64,
+) -> c_int {
+    // SAFETY: SQLite retains the box passed by `install` until its destructor.
+    let allocator = unsafe { &mut *context.cast::<RowidAllocator>() };
+    // SAFETY: SQLite supplies stable NUL-terminated names for this callback.
+    let schema = unsafe { CStr::from_ptr(schema) }.to_bytes();
+    // SAFETY: Same contract as `schema`.
+    let table = unsafe { CStr::from_ptr(table) }.to_bytes();
+    if !schema.eq_ignore_ascii_case(b"main") || has_internal_prefix(table) {
+        return ffi::SQLITE_NOTFOUND;
+    }
+
+    match catch_unwind(AssertUnwindSafe(|| allocator.next())) {
+        Ok(Ok(candidate)) => {
+            // SAFETY: SQLite supplies a valid output pointer.
+            unsafe { *rowid = candidate };
+            ffi::SQLITE_OK
+        }
+        Ok(Err(_)) => ffi::SQLITE_IOERR,
+        Err(_) => ffi::SQLITE_ABORT,
+    }
+}
+
+unsafe extern "C" fn destroy_allocator(context: *mut c_void) {
+    // SAFETY: SQLite invokes this exactly once for the box passed by `install`.
+    drop(unsafe { Box::from_raw(context.cast::<RowidAllocator>()) });
+}
+
+fn has_internal_prefix(table: &[u8]) -> bool {
+    table
+        .get(.."__multilite__".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"__multilite__"))
 }
 
 /// Create allocator metadata for one newly adopted or initialized replica.
@@ -204,13 +305,13 @@ fn lease_with(
 }
 
 #[derive(Clone, Copy)]
-struct AllocatorState {
+struct DurableState {
     device: DeviceId,
     active_slot: u64,
     leased_through: u32,
 }
 
-fn load_state(connection: &Connection) -> Result<AllocatorState> {
+fn load_state(connection: &Connection) -> Result<DurableState> {
     let row = connection
         .query_row(
             &format!(
@@ -239,7 +340,7 @@ fn load_state(connection: &Connection) -> Result<AllocatorState> {
         .map_err(|_| Error::InvalidDatabase("rowid allocator active slot is malformed"))?;
     let leased_through = u32::try_from(row.2)
         .map_err(|_| Error::InvalidDatabase("rowid allocator lease is malformed"))?;
-    Ok(AllocatorState {
+    Ok(DurableState {
         device,
         active_slot,
         leased_through,

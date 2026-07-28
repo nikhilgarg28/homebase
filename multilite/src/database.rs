@@ -416,6 +416,7 @@ pub(crate) struct Database<H: ServerHandle> {
     policy: PolicyState,
     isolation_level: IsolationLevel,
     committer: Committer,
+    rowid_allocator: rowid::RowidAllocator,
     authority: Authority,
     scheduler: PushScheduler,
 }
@@ -1146,6 +1147,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         checkpoint: Mutex::new(CheckpointPolicy::default()),
     });
     let committer = Committer::new(Arc::clone(&commit_backend)).map_err(committer_error)?;
+    let rowid_allocator = rowid::RowidAllocator::new(committer.clone());
     canonical.install(Arc::new(CommitterMetaSink {
         committer: committer.downgrade(),
     }))?;
@@ -1158,6 +1160,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         policy: PolicyState::new(sync_policy),
         isolation_level,
         committer,
+        rowid_allocator,
         authority,
         scheduler: PushScheduler::new(),
     })

@@ -211,14 +211,20 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
     let mut statement = db
         .prepare("SELECT id, upper(body) FROM notes ORDER BY id")
         .unwrap();
+    let rows = statement
+        .query_map((), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
     assert_eq!(
-        statement
-            .query_map((), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap(),
-        [(1, "ONE".into()), (2, "TWO".into()), (3, "THREE".into())]
+        rows.iter()
+            .map(|(_, body)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["ONE", "TWO", "THREE"]
     );
+    assert!(rows[0].0 >= 1_i64 << 47);
+    assert_eq!(rows[1].0, rows[0].0 + 1);
+    assert_eq!(rows[2].0, rows[1].0 + 1);
 }
 
 #[test]
