@@ -1,6 +1,6 @@
 //! Managed local update execution.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -9,10 +9,11 @@ use homebase_core::key::Key;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
+use super::alter::AlterTableOperation;
 use super::index::IndexOperation;
 use super::operation::MultiliteOp;
 use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
-use super::schema::{CreateTable, table_prefix};
+use super::schema::{CreateTable, TableId, table_prefix};
 use super::sql::ValidatedExecute;
 use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
@@ -93,6 +94,29 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         validated: ValidatedExecute,
     ) -> Result<usize> {
         match validated {
+            ValidatedExecute::RenameTable(spec) => {
+                let operation = self.hooks.with_internal(|| {
+                    AlterTableOperation::prepare_rename(self.connection, sql, &spec)
+                })?;
+                let logical = MultiliteOp::AlterTable(operation.clone());
+                let (_, footprint) = logical.to_homebase()?.into_parts();
+                let (changed, events) = self.hooks.run_schema(
+                    || {
+                        let changed = self.connection.execute(sql, params)?;
+                        self.hooks
+                            .with_internal(|| operation.record_catalog(self.connection))?;
+                        Ok(changed)
+                    },
+                    |_| Ok(()),
+                )?;
+                if !events.is_empty() {
+                    return Err(Error::CaptureInvariant(
+                        "ALTER TABLE captured application rows",
+                    ));
+                }
+                self.record_operation(logical, footprint);
+                Ok(changed)
+            }
             ValidatedExecute::CreateTable(table) => {
                 let operation = MultiliteOp::CreateTable(
                     self.hooks
@@ -102,7 +126,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 let MultiliteOp::CreateTable(created) = &operation else {
                     unreachable!("create-table constructor returned another operation")
                 };
-                let (changed, events) = self.hooks.run(
+                let (changed, events) = self.hooks.run_schema(
                     || {
                         let changed = self.connection.execute(sql, params)?;
                         self.hooks
@@ -121,7 +145,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             }
             ValidatedExecute::CreateIndex(spec) => {
                 let mut captured_operation = None;
-                let (changed, events) = self.hooks.run(
+                let (changed, events) = self.hooks.run_schema(
                     || {
                         let changed = self.connection.execute(sql, params)?;
                         let operation = self.hooks.with_internal(|| {
@@ -150,7 +174,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 let operation = self
                     .hooks
                     .with_internal(|| IndexOperation::prepare_drop(self.connection, sql, &spec))?;
-                let (changed, events) = self.hooks.run(
+                let (changed, events) = self.hooks.run_schema(
                     || {
                         let changed = self.connection.execute(sql, params)?;
                         self.hooks
@@ -291,7 +315,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     }
 
     fn into_branch_parts(mut self) -> Result<(Vec<MultiliteOp>, ConflictFootprint)> {
-        let reads = self.hooks.read_prefixes(self.connection)?;
+        let reads = self.hooks.read_prefixes()?;
         for read in reads {
             self.footprint.add_read(read);
         }
@@ -305,7 +329,9 @@ struct BranchHookState {
     error: Option<Error>,
     internal_depth: usize,
     trace_reads: bool,
-    read_tables: BTreeSet<String>,
+    table_bindings: BTreeMap<String, TableId>,
+    read_tables: BTreeSet<[u8; 16]>,
+    unresolved_read_tables: BTreeSet<String>,
 }
 
 struct BranchHooks<'connection> {
@@ -315,8 +341,10 @@ struct BranchHooks<'connection> {
 
 impl<'connection> BranchHooks<'connection> {
     fn install(connection: &'connection Connection, trace_reads: bool) -> Result<Self> {
+        let table_bindings = load_table_bindings(connection)?;
         let state = Arc::new(Mutex::new(BranchHookState {
             trace_reads,
+            table_bindings,
             ..BranchHookState::default()
         }));
 
@@ -339,7 +367,11 @@ impl<'connection> BranchHooks<'connection> {
             {
                 let mut canonical = table_name.to_owned();
                 canonical.make_ascii_lowercase();
-                state.read_tables.insert(canonical);
+                if let Some(table) = state.table_bindings.get(&canonical).copied() {
+                    state.read_tables.insert(table.as_bytes());
+                } else {
+                    state.unresolved_read_tables.insert(canonical);
+                }
             }
             authorization
         }))?;
@@ -366,6 +398,23 @@ impl<'connection> BranchHooks<'connection> {
         operation: impl FnOnce() -> Result<T>,
         finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
     ) -> Result<(T, Vec<CapturedChange>)> {
+        self.run_inner(operation, finalize, false)
+    }
+
+    fn run_schema<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+        finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
+    ) -> Result<(T, Vec<CapturedChange>)> {
+        self.run_inner(operation, finalize, true)
+    }
+
+    fn run_inner<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+        finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
+        refresh_bindings: bool,
+    ) -> Result<(T, Vec<CapturedChange>)> {
         let checkpoint = lock(&self.state).events.len();
         self.with_internal(|| {
             self.connection
@@ -377,7 +426,13 @@ impl<'connection> BranchHooks<'connection> {
         match result.and_then(|value| callback_error.map_or(Ok(value), Err)) {
             Ok(value) => {
                 let mut events = lock(&self.state).events.split_off(checkpoint);
-                let finalized = self.with_internal(|| finalize(&mut events));
+                let finalized = self.with_internal(|| finalize(&mut events)).and_then(|_| {
+                    if refresh_bindings {
+                        self.with_internal(|| self.refresh_bindings())
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(error) = finalized {
                     self.rollback_statement()?;
                     return Err(error);
@@ -412,21 +467,40 @@ impl<'connection> BranchHooks<'connection> {
         })
     }
 
-    fn read_prefixes(&self, connection: &Connection) -> Result<Vec<Key>> {
-        let tables = lock(&self.state).read_tables.clone();
-        self.with_internal(|| {
-            tables
-                .into_iter()
-                .map(|table| {
-                    let created =
-                        catalog::by_name(connection, &table)?.ok_or(Error::UnsupportedSql(
-                            "serializable reads require synchronized table identities",
-                        ))?;
-                    Ok(table_prefix(created.table_id()))
-                })
-                .collect()
-        })
+    fn refresh_bindings(&self) -> Result<()> {
+        let bindings = load_table_bindings(self.connection)?;
+        lock(&self.state).table_bindings = bindings;
+        Ok(())
     }
+
+    fn read_prefixes(&self) -> Result<Vec<Key>> {
+        let state = lock(&self.state);
+        if !state.unresolved_read_tables.is_empty() {
+            return Err(Error::UnsupportedSql(
+                "serializable reads require synchronized table identities",
+            ));
+        }
+        Ok(state
+            .read_tables
+            .iter()
+            .copied()
+            .map(TableId::from_bytes)
+            .map(table_prefix)
+            .collect())
+    }
+}
+
+fn load_table_bindings(connection: &Connection) -> Result<BTreeMap<String, TableId>> {
+    catalog::all(connection)?
+        .into_iter()
+        .map(|created| {
+            let table = created.table_id();
+            let name = catalog::name_by_id(connection, table)?.ok_or(Error::InvalidDatabase(
+                "schema catalog table has no current name binding",
+            ))?;
+            Ok((name.value().to_owned(), table))
+        })
+        .collect()
 }
 
 struct BranchInternalGuard {

@@ -6,9 +6,10 @@ the Homebase coordination kernel.
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits a restricted persistent
-`CREATE TABLE`, read-only prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE`
-against non-reserved tables. A table must use the initial four declared types
-and exactly one inline primary key. Inline and table-level `UNIQUE`
+`CREATE TABLE`, identity-preserving `ALTER TABLE ... RENAME TO`, read-only
+prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE` against non-reserved tables.
+A table must use the initial four declared types and exactly one inline primary
+key. Inline and table-level `UNIQUE`
 declarations, including ordered multi-column constraints, are supported with
 SQLite's default comparison rules, as are explicit composite
 `CREATE [UNIQUE] INDEX`/`DROP INDEX` operations. Immediate `NO ACTION` foreign
@@ -75,6 +76,16 @@ index precision. Ordinary definitions may contain repeated column terms,
 predicate. These richer forms remain rejected for `UNIQUE` indexes until
 Multilite can reproduce their exact comparison semantics in Homebase key
 images.
+
+Table rename preserves the table, column, primary-index, UNIQUE-index,
+secondary-index, foreign-key, and schema-revision UUIDs. It moves only the
+canonical table-name registry cell; immutable DDL records keep their historical
+SQL and stable references. When an operation must execute SQLite DDL, Multilite
+renders its physical SQL from the current UUID-to-name bindings. A rename
+therefore advances neither schema nor `write-revision`, and stale row, index,
+or incoming-relationship operations compiled under the old spelling remain
+valid. Rejection runs the inverse binding change and physical rename in the
+same canonical transaction.
 
 Foreign-key declarations retain stable parent table, target index, and
 ordered parent-column identities. Non-NULL child tuples write and assert an
@@ -216,9 +227,10 @@ effects are stored under `__multilite__pending`; this is a local disposition
 journal, not a second operation log. Its versioned record codec stores repeated
 effect lists derived from all ordered operations: acceptance runs forward,
 while rejection unwinds operations in reverse. CREATE TABLE rejection drops
-the speculative table and catalog entry, while INSERT rejection removes the
-exact speculative rows, DELETE rejection restores each complete old row, and
-UPDATE rejection restores its complete before images.
+the speculative table and catalog entry, ALTER TABLE rename rejection restores
+the old physical and catalog names, INSERT rejection removes the exact
+speculative rows, DELETE rejection restores each complete old row, and UPDATE
+rejection restores its complete before images.
 `__multilite__schema` is the local lookup index from SQLite names and stable
 table UUIDs to authenticated schema definitions.
 The ordered-store adapter executes synchronously under a serialized,

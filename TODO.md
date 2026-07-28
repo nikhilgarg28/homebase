@@ -13,6 +13,15 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
+- Table rename now preserves all table-owned UUIDs and immutable DDL
+  definitions; physical SQLite SQL is rendered from current UUID-to-name
+  bindings when an operation is applied. Before adding column
+  rename/add/drop, define projection rules for old row frames, defaults and
+  generated values, retired columns, key-definition changes, and dependent
+  index/relationship evolution. Treat name-only changes as identity
+  preserving; mint a replacement table identity when primary-key identity
+  changes.
+
 - Add a randomized, two-replica integrity-audit simulation. Generate parent
   and child inserts, retargets, primary-key moves, and deletes; vary
   push/pull/rebase/restart order; then require converged SQLite rows, a valid

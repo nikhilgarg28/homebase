@@ -7,6 +7,7 @@ use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
+use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
 use super::catalog;
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
@@ -22,10 +23,12 @@ const INSERT_ROWS_OPERATION: u8 = 2;
 const DELETE_ROWS_OPERATION: u8 = 3;
 const UPDATE_ROWS_OPERATION: u8 = 4;
 const INDEX_OPERATION: u8 = 5;
+const ALTER_TABLE_OPERATION: u8 = 6;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MultiliteOp {
+    AlterTable(AlterTableOperation),
     CreateTable(CreateTable),
     InsertRows(InsertRows),
     DeleteRows(DeleteRows),
@@ -59,6 +62,10 @@ impl MultiliteOp {
         let mut writer = Writer::new();
         writer.u8(OPERATION_FRAME_VERSION);
         match self {
+            Self::AlterTable(altered) => {
+                writer.u8(ALTER_TABLE_OPERATION);
+                writer.bytes(&altered.encode());
+            }
             Self::CreateTable(created) => {
                 writer.u8(CREATE_TABLE_OPERATION);
                 writer.bytes(&created.encode());
@@ -91,6 +98,9 @@ impl MultiliteOp {
             return Err(OperationCodecError::UnknownVersion(version));
         }
         match reader.u8().ok_or(OperationCodecError::Truncated)? {
+            ALTER_TABLE_OPERATION => AlterTableOperation::decode(reader.rest())
+                .map(Self::AlterTable)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             CREATE_TABLE_OPERATION => CreateTable::decode(reader.rest())
                 .map(Self::CreateTable)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
@@ -113,6 +123,13 @@ impl MultiliteOp {
     /// Lower this operation to its complete Homebase representation.
     pub fn to_homebase(&self) -> Result<HomebaseOp> {
         let (mutations, footprint) = match self {
+            Self::AlterTable(altered) => {
+                let AlterTableHomebaseOp {
+                    mutations,
+                    footprint,
+                } = altered.to_homebase()?;
+                (mutations, footprint)
+            }
             Self::CreateTable(created) => {
                 let schema = created.to_homebase();
                 (schema.mutations, schema.footprint)
@@ -161,6 +178,7 @@ impl MultiliteOp {
     /// Materialize this logical operation in canonical SQLite.
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         match self {
+            Self::AlterTable(altered) => altered.apply(connection),
             Self::CreateTable(created) => {
                 created.validate_foreign_key_parents(connection)?;
                 connection.execute(&created.materialization_sql(connection)?, ())?;

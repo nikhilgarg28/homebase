@@ -1,13 +1,13 @@
 //! SQLite-AST checks for the database's current public SQL surface.
 
 use fallible_iterator::FallibleIterator as _;
+use sqlite3_parser::ast::{
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, IndexedColumn,
+    InsertBody, Literal, Name, OneSelect, RefAct, RefArg, ResultColumn, Select, SelectTable, Stmt,
+    TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
+};
 #[cfg(test)]
 use sqlite3_parser::ast::{As, Operator};
-use sqlite3_parser::ast::{
-    Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, IndexedColumn, InsertBody,
-    Literal, Name, OneSelect, RefAct, RefArg, ResultColumn, Select, SelectTable, Stmt, TabFlags,
-    TableConstraint, Type, TypeSize, UnaryOperator,
-};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
@@ -19,12 +19,19 @@ use crate::{Error, Result};
 
 #[derive(Clone)]
 pub enum ValidatedExecute {
+    RenameTable(RenameTableSpec),
     CreateTable(CreateTableSpec),
     CreateIndex(CreateIndexSpec),
     DropIndex(DropIndexSpec),
     Insert,
     Delete,
     Update,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameTableSpec {
+    pub table: SqlName,
+    pub new_name: SqlName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +188,36 @@ pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
 
 fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
     match statement {
+        Stmt::AlterTable(table, AlterTableBody::RenameTo(new_name)) => {
+            if table.db_name.is_some() || table.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified ALTER TABLE names are not supported",
+                ));
+            }
+            let table = identifier(&table.name)?;
+            let new_name = identifier(&new_name)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+                || super::has_multilite_prefix(new_name.value())
+                || super::is_sqlite_internal_table(new_name.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            if table.canonical() == new_name.canonical() {
+                return Err(Error::UnsupportedSql(
+                    "ALTER TABLE RENAME TO must change the table's case-insensitive identity",
+                ));
+            }
+            Ok(ValidatedExecute::RenameTable(RenameTableSpec {
+                table,
+                new_name,
+            }))
+        }
+        Stmt::AlterTable(..) => Err(Error::UnsupportedSql(
+            "only ALTER TABLE RENAME TO is supported",
+        )),
         Stmt::CreateIndex {
             unique,
             if_not_exists,
@@ -641,7 +678,6 @@ fn rewrite_parent_clause(
 fn quoted_name(name: &SqlName) -> Name {
     Name(format!("\"{}\"", name.value().replace('"', "\"\"")).into())
 }
-
 fn parse_one(sql: &str) -> Result<Stmt> {
     match parse_one_command(sql)? {
         Cmd::Stmt(statement) => Ok(statement),
@@ -1373,6 +1409,7 @@ mod tests {
     #[test]
     fn accepts_restricted_create_insert_delete_and_update_forms() {
         for sql in [
+            "ALTER TABLE notes RENAME TO archived_notes",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
             "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
             "CREATE TABLE accounts (
@@ -1437,6 +1474,29 @@ mod tests {
                 .all(|foreign_key| foreign_key.referenced_table
                     == SqlName::new("Archived Parents".into()))
         );
+    }
+
+    #[test]
+    fn table_rename_preserves_case_insensitive_names_and_rejects_other_alter_forms() {
+        let ValidatedExecute::RenameTable(spec) =
+            validate_execute("ALTER TABLE \"Old Notes\" RENAME TO `Archived Notes`").unwrap()
+        else {
+            panic!("table rename parsed as another statement kind")
+        };
+        assert_eq!(spec.table, SqlName::new("Old Notes".into()));
+        assert_eq!(spec.new_name, SqlName::new("Archived Notes".into()));
+
+        for sql in [
+            "ALTER TABLE main.notes RENAME TO archived",
+            "ALTER TABLE notes RENAME TO NOTES",
+            "ALTER TABLE notes RENAME TO __multilite__notes",
+            "ALTER TABLE notes RENAME TO sqlite_notes",
+            "ALTER TABLE notes RENAME COLUMN body TO text",
+            "ALTER TABLE notes ADD COLUMN extra TEXT",
+            "ALTER TABLE notes DROP COLUMN body",
+        ] {
+            assert_unsupported(sql);
+        }
     }
 
     #[test]

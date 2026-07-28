@@ -1069,11 +1069,6 @@ impl CreateTable {
         sql: &str,
         spec: &super::sql::CreateIndexSpec,
     ) -> Result<NamedIndex> {
-        if spec.table != self.name {
-            return Err(Error::UnsupportedSql(
-                "CREATE INDEX target does not match its synchronized table",
-            ));
-        }
         let (columns, terms) = self.resolve_index_terms(spec)?;
         if spec.unique {
             Ok(NamedIndex::new_unique(
@@ -1096,8 +1091,7 @@ impl CreateTable {
         index: &NamedIndex,
         spec: &super::sql::CreateIndexSpec,
     ) -> bool {
-        if spec.name != *index.name() || spec.table != self.name || spec.unique != index.is_unique()
-        {
+        if spec.name != *index.name() || spec.unique != index.is_unique() {
             return false;
         }
         let Ok((columns, terms)) = self.resolve_index_terms(spec) else {
@@ -1720,7 +1714,7 @@ pub fn schema_log_key(id: MutationId) -> Key {
         .expect("schema log components are bounded and non-empty")
 }
 
-fn table_name_scope_key(name: &SqlName) -> Key {
+pub fn table_name_scope_key(name: &SqlName) -> Key {
     let component = name_component(name.canonical());
     Key::from_bytes([
         codes::ROOT,

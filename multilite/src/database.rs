@@ -1,5 +1,6 @@
 //! General Multilite database identity and Homebase lifecycle.
 
+mod alter;
 mod async_api;
 mod authority;
 pub(crate) mod catalog;
@@ -893,6 +894,10 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         AuthAction::CreateTable { table_name } => {
             authorize_user_table(context.database_name, table_name)
         }
+        AuthAction::AlterTable {
+            database_name,
+            table_name,
+        } => authorize_user_table(Some(database_name), table_name),
         AuthAction::CreateIndex {
             index_name,
             table_name,
@@ -915,13 +920,13 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
             authorize_main(context.database_name)
         }
         AuthAction::Insert { table_name } if is_schema_table(table_name) => {
-            authorize_main(context.database_name)
+            authorize_schema(context.database_name)
         }
         AuthAction::Update { table_name, .. } if is_schema_table(table_name) => {
-            authorize_main(context.database_name)
+            authorize_schema(context.database_name)
         }
         AuthAction::Delete { table_name } if is_schema_table(table_name) => {
-            authorize_main(context.database_name)
+            authorize_schema(context.database_name)
         }
         AuthAction::Insert { table_name } => {
             authorize_user_table(context.database_name, table_name)
@@ -942,7 +947,11 @@ fn authorize_public(context: AuthContext<'_>) -> Authorization {
 
 fn authorize_read(database: Option<&str>, table: &str) -> Authorization {
     if is_schema_table(table) {
-        authorize_main(database)
+        if is_main(database) || database == Some("temp") {
+            Authorization::Allow
+        } else {
+            Authorization::Deny
+        }
     } else {
         authorize_user_table(database, table)
     }
@@ -964,12 +973,23 @@ fn authorize_main(database: Option<&str>) -> Authorization {
     }
 }
 
+fn authorize_schema(database: Option<&str>) -> Authorization {
+    if is_main(database) || database == Some("temp") {
+        Authorization::Allow
+    } else {
+        Authorization::Deny
+    }
+}
+
 fn is_main(database: Option<&str>) -> bool {
     matches!(database, None | Some("main"))
 }
 
 fn is_schema_table(table: &str) -> bool {
-    table.eq_ignore_ascii_case("sqlite_master") || table.eq_ignore_ascii_case("sqlite_schema")
+    table.eq_ignore_ascii_case("sqlite_master")
+        || table.eq_ignore_ascii_case("sqlite_schema")
+        || table.eq_ignore_ascii_case("sqlite_temp_master")
+        || table.eq_ignore_ascii_case("sqlite_temp_schema")
 }
 
 fn is_sqlite_internal_table(table: &str) -> bool {

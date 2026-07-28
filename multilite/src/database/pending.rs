@@ -9,6 +9,7 @@ use homebase_core::tag::DeviceSeq;
 use homebase_core::writer::Writer;
 use rusqlite::{Connection, params};
 
+use super::alter::AlterTableOperation;
 use super::catalog;
 use super::index::IndexOperation;
 use super::operation::MultiliteOp;
@@ -32,10 +33,12 @@ const DELETE_ROWS_EFFECT: u8 = 2;
 const RESTORE_ROWS_EFFECT: u8 = 3;
 const RESTORE_UPDATED_ROWS_EFFECT: u8 = 4;
 const REVERT_INDEX_EFFECT: u8 = 5;
+const REVERT_ALTER_TABLE_EFFECT: u8 = 6;
 
 /// A local effect to run when a speculative transaction gets its disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    RevertAlterTable { operation: AlterTableOperation },
     DropTable { created: CreateTable },
     DeleteRows { inserted: InsertRows },
     RestoreRows { deleted: DeleteRows },
@@ -168,6 +171,10 @@ impl PendingCodec {
         let mut writer = Writer::new();
         writer.u8(EFFECT_FRAME_VERSION);
         match effect {
+            Effect::RevertAlterTable { operation } => {
+                writer.u8(REVERT_ALTER_TABLE_EFFECT);
+                writer.bytes(&operation.encode());
+            }
             Effect::DropTable { created } => {
                 writer.u8(DROP_TABLE_EFFECT);
                 writer.bytes(&created.encode());
@@ -202,6 +209,9 @@ impl PendingCodec {
             });
         }
         match reader.u8().ok_or(PendingCodecError::Truncated)? {
+            REVERT_ALTER_TABLE_EFFECT => AlterTableOperation::decode(reader.rest())
+                .map(|operation| Effect::RevertAlterTable { operation })
+                .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
             DROP_TABLE_EFFECT => CreateTable::decode(reader.rest())
                 .map(|created| Effect::DropTable { created })
                 .map_err(|error| PendingCodecError::InvalidOperation(error.to_string())),
@@ -421,6 +431,12 @@ fn effects_for(transaction: &MultiliteTransaction) -> (Vec<Effect>, Vec<Effect>)
 
 fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) {
     match operation {
+        MultiliteOp::AlterTable(operation) => (
+            Vec::new(),
+            vec![Effect::RevertAlterTable {
+                operation: operation.clone(),
+            }],
+        ),
         MultiliteOp::CreateTable(created) => (
             Vec::new(),
             vec![Effect::DropTable {
@@ -457,6 +473,7 @@ fn effects_for_operation(operation: &MultiliteOp) -> (Vec<Effect>, Vec<Effect>) 
 fn apply_effects(connection: &Connection, effects: &[Effect]) -> Result<()> {
     for effect in effects {
         match effect {
+            Effect::RevertAlterTable { operation } => operation.rollback(connection)?,
             Effect::DropTable { created } => {
                 if catalog::by_id(connection, created.table_id())?.as_ref() != Some(created) {
                     return Err(Error::InvalidDatabase(
@@ -673,6 +690,25 @@ mod tests {
         )
     }
 
+    fn alter_operation() -> MultiliteOp {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let MultiliteOp::CreateTable(created) = operation("notes") else {
+            unreachable!()
+        };
+        connection.execute(created.sql(), ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        let sql = "ALTER TABLE notes RENAME TO archived_notes";
+        let super::super::sql::ValidatedExecute::RenameTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        MultiliteOp::AlterTable(
+            AlterTableOperation::prepare_rename(&connection, sql, &spec).unwrap(),
+        )
+    }
+
     fn transaction(operation: MultiliteOp) -> MultiliteTransaction {
         MultiliteTransaction::new(vec![operation]).unwrap()
     }
@@ -737,6 +773,31 @@ mod tests {
         initialize(&connection).unwrap();
         insert(&connection, DeviceSeq(11), &transaction).unwrap();
         assert_eq!(load(&connection).unwrap(), [pending]);
+    }
+
+    #[test]
+    fn codec_roundtrips_table_rename_and_its_inverse_binding_effect() {
+        let operation = alter_operation();
+        let transaction = transaction(operation.clone());
+        let pending = PendingTransaction::new(DeviceSeq(12), transaction);
+        let MultiliteOp::AlterTable(operation) = operation else {
+            unreachable!()
+        };
+        assert!(pending.on_accept.is_empty());
+        assert_eq!(
+            pending.on_reject,
+            [Effect::RevertAlterTable {
+                operation: operation.clone(),
+            }]
+        );
+        assert_eq!(
+            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            pending
+        );
+        assert_eq!(
+            MultiliteOp::decode(&MultiliteOp::AlterTable(operation.clone()).encode()).unwrap(),
+            MultiliteOp::AlterTable(operation)
+        );
     }
 
     #[test]

@@ -1696,6 +1696,408 @@ fn conflicting_index_ddl_repairs_local_sqlite_before_converging() {
 }
 
 #[test]
+fn conflicting_table_renames_repair_physical_names_and_converge() {
+    let directory = tempfile::tempdir().unwrap();
+    let second_path = directory.path().join("rename-ddl-second.sqlite");
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("rename-ddl-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute("CREATE TABLE alpha (id INTEGER PRIMARY KEY)", ())?;
+            transaction.execute("CREATE TABLE beta (id INTEGER PRIMARY KEY)", ())?;
+            transaction.execute("INSERT INTO alpha VALUES (1)", ())?;
+            transaction.execute("INSERT INTO beta VALUES (2)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("ALTER TABLE alpha RENAME TO shared", ())
+        .unwrap();
+    second
+        .execute("ALTER TABLE beta RENAME TO shared", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("two tables acquired the same synchronized name")
+    };
+    drop(second);
+
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name IN ('alpha', 'beta', 'shared')
+                 ORDER BY name",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        ["alpha", "beta"],
+        "rename rejection must restore the speculative source name after reopen"
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("ALTER TABLE shared RENAME TO canonical", ())
+        .unwrap();
+    second
+        .update(|transaction| {
+            transaction.execute("ALTER TABLE shared RENAME TO alternate", ())?;
+            transaction.execute("ALTER TABLE alternate RENAME TO detour", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("one table admitted two concurrent names")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query("SELECT id FROM shared", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id FROM canonical", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            [1]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id FROM beta", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            [2]
+        );
+        assert!(
+            database
+                .query("SELECT id FROM shared", (), |row| row.get::<_, i64>(0))
+                .is_err()
+        );
+        assert!(
+            database
+                .query("SELECT id FROM alternate", (), |row| row.get::<_, i64>(0))
+                .is_err()
+        );
+        assert!(
+            database
+                .query("SELECT id FROM detour", (), |row| row.get::<_, i64>(0))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn table_rename_and_stale_foreign_key_writes_converge_across_replicas() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("rename-fk-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("rename-fk-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT UNIQUE
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE INDEX parents_code_lookup
+                 ON parents (lower(code), code COLLATE NOCASE DESC)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parents(id)
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (1, 'one')", ())?;
+            transaction.execute("INSERT INTO children VALUES (1, 1)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("ALTER TABLE parents RENAME TO accounts", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second
+        .update(|transaction| {
+            transaction.execute("INSERT INTO parents VALUES (2, 'two')", ())?;
+            transaction.execute("INSERT INTO children VALUES (2, 2)", ())?;
+            transaction.execute("CREATE INDEX stale_code_lookup ON parents (code)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "parent rename must not invalidate stale parent or child row writes"
+    );
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id, code FROM accounts ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(1, "one".into()), (2, "two".into())]
+        );
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, parent_id FROM children ORDER BY id",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            [(1, 1), (2, 2)]
+        );
+        assert_eq!(
+            database
+                .query(
+                    "SELECT name, tbl_name FROM sqlite_schema
+                     WHERE type = 'index'
+                       AND name IN ('parents_code_lookup', 'stale_code_lookup')
+                     ORDER BY name",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [
+                ("parents_code_lookup".into(), "accounts".into()),
+                ("stale_code_lookup".into(), "accounts".into()),
+            ]
+        );
+    }
+}
+
+#[test]
+fn stale_row_operations_follow_identity_after_the_old_name_is_reused() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("rename-reuse-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("rename-reuse-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())?;
+            transaction.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .update(|transaction| {
+            transaction.execute("UPDATE notes SET body = 'updated' WHERE id = 1", ())?;
+            transaction.execute("DELETE FROM notes WHERE id = 2", ())?;
+            transaction.execute("INSERT INTO notes VALUES (3, 'three')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    first
+        .execute("ALTER TABLE notes RENAME TO archived_notes", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first
+        .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "stale DML should remain addressed to the original table UUID"
+    );
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT id, body FROM archived_notes ORDER BY id",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [(1, "updated".into()), (3, "three".into())]
+        );
+        assert!(
+            database
+                .query("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap()
+                .is_empty(),
+            "reusing the old name must not retarget stale DML"
+        );
+    }
+}
+
+#[test]
+fn parent_rename_and_stale_incoming_foreign_key_converge_in_either_order() {
+    let directory = tempfile::tempdir().unwrap();
+    for rename_first in [true, false] {
+        let label = if rename_first {
+            "rename-first"
+        } else {
+            "relationship-first"
+        };
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory.path().join(format!("{label}-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join(format!("{label}-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        first
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("ALTER TABLE parents RENAME TO accounts", ())
+            .unwrap();
+        second
+            .execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parents(id)
+                )",
+                (),
+            )
+            .unwrap();
+
+        if rename_first {
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            assert_eq!(
+                second.push().unwrap(),
+                PushOutcome::Drained,
+                "stable parent identity should survive an admitted rename"
+            );
+        } else {
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+            assert_eq!(
+                first.push().unwrap(),
+                PushOutcome::Drained,
+                "a rename should not invalidate an incoming stable relationship"
+            );
+        }
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            let names = database
+                .query(
+                    "SELECT name FROM sqlite_schema
+                     WHERE type = 'table' AND name NOT LIKE '__multilite__%'
+                     ORDER BY name",
+                    (),
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(names, ["accounts", "children"], "{label}");
+            assert!(
+                database
+                    .query(
+                        "SELECT sql FROM sqlite_schema
+                         WHERE type = 'table' AND name = 'children'",
+                        (),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .all(|sql| sql.contains("accounts")),
+                "{label}: physical foreign-key SQL did not follow the current parent name"
+            );
+        }
+    }
+}
+
+#[test]
 fn composite_without_rowid_rows_converge_and_repair_conflicts() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

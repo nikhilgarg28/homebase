@@ -1020,6 +1020,182 @@ fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
 }
 
 #[test]
+fn table_rename_preserves_rows_indexes_foreign_keys_and_reopens() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rename.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                code TEXT UNIQUE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE INDEX parents_code_lookup
+             ON parents (lower(code), code COLLATE NOCASE DESC)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parents(id)
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1, 'one')", ())?;
+        transaction.execute("INSERT INTO children VALUES (1, 1)", ())?;
+        transaction.execute("ALTER TABLE parents RENAME TO \"renamed parents\"", ())?;
+        transaction.execute(
+            "CREATE INDEX renamed_parent_id ON \"renamed parents\" (id)",
+            (),
+        )?;
+        transaction.execute("INSERT INTO \"renamed parents\" VALUES (2, 'two')", ())?;
+        transaction.execute("INSERT INTO children VALUES (2, 2)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(
+        db.query("SELECT id FROM parents", (), |row| row.get::<_, i64>(0))
+            .is_err()
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, code FROM \"renamed parents\" ORDER BY id",
+            (),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap(),
+        [(1, "one".into()), (2, "two".into())]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, parent_id FROM children ORDER BY id",
+            (),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        [(1, 1), (2, 2)]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tbl_name FROM sqlite_schema
+             WHERE type = 'index' AND name = 'parents_code_lookup'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        ["renamed parents"]
+    );
+    drop(db);
+
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute("INSERT INTO \"renamed parents\" VALUES (3, 'three')", ())
+        .unwrap();
+    db.execute("INSERT INTO children VALUES (3, 3)", ())
+        .unwrap();
+    drop(db);
+
+    let stock = Connection::open(&path).unwrap();
+    stock.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    assert_eq!(
+        stock
+            .query_row("SELECT count(*) FROM \"renamed parents\"", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        stock
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map((), |_| Ok(()))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        stock
+            .query_row("PRAGMA integrity_check", (), |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[test]
+fn table_rename_preserves_strict_and_without_rowid_storage_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("rename-storage-modes.sqlite")).unwrap();
+
+    database
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE composite (
+                    tenant TEXT,
+                    id INTEGER,
+                    body BLOB,
+                    PRIMARY KEY (tenant, id)
+                ) WITHOUT ROWID",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE strict_notes (
+                    id INTEGER PRIMARY KEY,
+                    body ANY
+                ) STRICT",
+                (),
+            )?;
+            transaction.execute("ALTER TABLE composite RENAME TO archived_composite", ())?;
+            transaction.execute("ALTER TABLE strict_notes RENAME TO archived_strict", ())?;
+            transaction.execute(
+                "INSERT INTO archived_composite VALUES ('one', 1, x'0102')",
+                (),
+            )?;
+            transaction.execute("INSERT INTO archived_strict VALUES (1, '0007')", ())?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        database
+            .query(
+                "SELECT tenant, id, hex(body) FROM archived_composite",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        [("one".into(), 1, "0102".into())]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT id, body, typeof(body) FROM archived_strict",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        [(1, "0007".into(), "text".into())]
+    );
+}
+
+#[test]
 fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rejected.sqlite");
@@ -1175,6 +1351,69 @@ fn update_of_an_adopted_table_rolls_back_without_a_schema_identity() {
         ))
     ));
     assert_eq!(read_note(&db), "original");
+}
+
+#[test]
+fn rename_of_an_adopted_table_is_rejected_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adopted-rename.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes VALUES (1, 'original')",
+        )
+        .unwrap();
+
+    let db = MultiliteConnection::open(&path).unwrap();
+    assert!(matches!(
+        db.execute("ALTER TABLE notes RENAME TO archived_notes", ()),
+        Err(Error::UnsupportedSql(
+            "ALTER TABLE target has no synchronized schema identity"
+        ))
+    ));
+    assert_eq!(read_note(&db), "original");
+    assert!(
+        db.query(
+            "SELECT name FROM sqlite_schema WHERE name = 'archived_notes'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn failed_rename_target_collision_rolls_back_its_statement_savepoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("rename-collision.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+
+    db.update(|transaction| {
+        assert!(
+            transaction
+                .execute("ALTER TABLE notes RENAME TO tasks", ())
+                .is_err()
+        );
+        transaction.execute("INSERT INTO notes VALUES (1)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert!(
+        db.query("SELECT id FROM tasks", (), |row| row.get::<_, i64>(0))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

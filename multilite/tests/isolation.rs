@@ -277,6 +277,111 @@ fn secondary_index_ddl_does_not_invalidate_unsynced_row_writes_at_either_isolati
 }
 
 #[test]
+fn table_rename_does_not_invalidate_unsynced_row_writes_at_either_isolation() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation) in [
+        ("snapshot", IsolationLevel::Snapshot),
+        ("serializable", IsolationLevel::Serializable),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-rename-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-rename-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        synchronize_schema(&first, &second);
+
+        first
+            .execute("ALTER TABLE bookings RENAME TO archived_bookings", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained, "{label}");
+
+        // The second replica deliberately writes through the old local name.
+        insert_without_read(&second, isolation, 7, "mon");
+        assert_eq!(
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "{label}: identity-preserving rename invalidated a stale row write"
+        );
+        converge(&first, &second);
+
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .query("SELECT id FROM bookings", (), |row| row.get::<_, i64>(0))
+                    .is_err(),
+                "{label}"
+            );
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT id, day FROM archived_bookings ORDER BY id",
+                        (),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap(),
+                [(7, String::from("mon"))],
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn serializable_read_tracing_keeps_stable_identity_across_an_in_transaction_rename() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("rename-read-trace.sqlite")).unwrap();
+    database.execute(CREATE_BOOKINGS, ()).unwrap();
+    database
+        .execute("INSERT INTO bookings VALUES (1, 'mon')", ())
+        .unwrap();
+
+    database
+        .update_with(
+            UpdateOptions::new(IsolationLevel::Serializable),
+            |transaction| {
+                assert_eq!(
+                    transaction.query("SELECT id FROM bookings", (), |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    [1]
+                );
+                transaction.execute("ALTER TABLE bookings RENAME TO archived_bookings", ())?;
+                assert_eq!(
+                    transaction.query("SELECT id FROM archived_bookings", (), |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    [1]
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        database
+            .query("SELECT id FROM archived_bookings", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        [1]
+    );
+}
+
+#[test]
 fn coarse_serializable_reads_ignore_secondary_indexes_and_conflict_across_disjoint_predicates() {
     let directory = tempfile::tempdir().unwrap();
     let authority = server();
