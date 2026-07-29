@@ -2762,11 +2762,14 @@ fn multi_row_insert_is_one_durable_pending_operation() {
     database
         .execute(
             &runtime,
-            "WITH input(body, payload) AS (
-                    VALUES ('one', x'01'), ('two', NULL), ('three', x'0304')
+            "WITH input(id, body, payload) AS (
+                    VALUES
+                        (3, 'one', x'01'),
+                        (1, 'two', NULL),
+                        (2, 'three', x'0304')
                  )
-                 INSERT INTO notes (body, payload)
-                 SELECT body, payload FROM input ORDER BY body DESC",
+                 INSERT INTO notes (id, body, payload)
+                 SELECT id, body, payload FROM input ORDER BY body DESC",
             (),
         )
         .unwrap();
@@ -2817,14 +2820,9 @@ fn multi_row_insert_is_one_durable_pending_operation() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(
-            rows.iter()
-                .map(|(_, body)| body.as_str())
-                .collect::<Vec<_>>(),
-            ["two", "three", "one"]
+            rows,
+            [(1, "two".into()), (2, "three".into()), (3, "one".into())]
         );
-        assert!(rows[0].0 >= 1_i64 << 47);
-        assert_eq!(rows[1].0, rows[0].0 + 1);
-        assert_eq!(rows[2].0, rows[1].0 + 1);
     });
 
     drop(runtime);

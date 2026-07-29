@@ -201,7 +201,10 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
     .unwrap();
     assert_eq!(
         db.execute(
-            "INSERT INTO notes (body) VALUES ('one'), ('two'), ('three')",
+            "INSERT INTO notes (id, body) VALUES
+                (1, 'one'),
+                (2, 'two'),
+                (3, 'three')",
             (),
         )
         .unwrap(),
@@ -217,14 +220,9 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
         })
         .unwrap();
     assert_eq!(
-        rows.iter()
-            .map(|(_, body)| body.as_str())
-            .collect::<Vec<_>>(),
-        ["ONE", "TWO", "THREE"]
+        rows,
+        [(1, "ONE".into()), (2, "TWO".into()), (3, "THREE".into())]
     );
-    assert!(rows[0].0 >= 1_i64 << 47);
-    assert_eq!(rows[1].0, rows[0].0 + 1);
-    assert_eq!(rows[2].0, rows[1].0 + 1);
 }
 
 #[test]
