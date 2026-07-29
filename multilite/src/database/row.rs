@@ -190,6 +190,22 @@ pub struct Row {
     values: Vec<(ColumnId, StoredValue)>,
 }
 
+impl Row {
+    fn value(&self, column: ColumnId) -> Option<&StoredValue> {
+        self.values
+            .iter()
+            .find(|(candidate, _)| *candidate == column)
+            .map(|(_, value)| value)
+    }
+
+    fn value_mut(&mut self, column: ColumnId) -> Option<&mut StoredValue> {
+        self.values
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == column)
+            .map(|(_, value)| value)
+    }
+}
+
 /// One logical multi-row INSERT captured from a single SQLite statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InsertRows {
@@ -523,8 +539,15 @@ impl InsertRows {
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         let created = self.catalog_definition(connection)?;
         let table_name = materialized_table_name(connection, self.table)?;
-        let columns = created.columns();
-        let column_names = catalog::column_names(connection, &created)?;
+        let columns = created
+            .columns()
+            .iter()
+            .filter(|column| self.rows[0].value(column.id()).is_some())
+            .collect::<Vec<_>>();
+        let column_names = columns
+            .iter()
+            .map(|column| materialized_column_name(connection, self.table, column.id()))
+            .collect::<Result<Vec<_>>>()?;
         let hidden_rowid = hidden_rowid_alias(connection, &created)?;
         let mut names = column_names
             .iter()
@@ -547,13 +570,9 @@ impl InsertRows {
             let values = columns
                 .iter()
                 .map(|column| {
-                    row.values
-                        .iter()
-                        .find(|(id, _)| *id == column.id())
-                        .map(|(_, value)| value)
-                        .ok_or(Error::InvalidMultiliteOp(
-                            "row is missing a schema column".into(),
-                        ))
+                    row.value(column.id()).ok_or(Error::InvalidMultiliteOp(
+                        "row is missing a schema column".into(),
+                    ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut parameters = Vec::<&dyn ToSql>::with_capacity(
@@ -627,6 +646,16 @@ impl InsertRows {
         created: &CreateTable,
         mismatch: &'static str,
     ) -> Result<()> {
+        self.materialized_rows(connection, created, mismatch)
+            .map(|_| ())
+    }
+
+    fn materialized_rows(
+        &self,
+        connection: &Connection,
+        created: &CreateTable,
+        mismatch: &'static str,
+    ) -> Result<Vec<Row>> {
         let table_name = materialized_table_name(connection, self.table)?;
         let columns = created.columns();
         let primary = created.primary_key_columns().collect::<Vec<_>>();
@@ -655,6 +684,7 @@ impl InsertRows {
             quote_identifier(&table_name)
         );
         let mut select = connection.prepare(&select_sql)?;
+        let mut materialized = Vec::with_capacity(self.rows.len());
         for row in self.rows.iter().rev() {
             let primary = self.primary_values(row)?;
             let mut parameters = Vec::<&dyn ToSql>::with_capacity(
@@ -669,31 +699,48 @@ impl InsertRows {
             let actual = select
                 .query_row(params_from_iter(parameters.iter().copied()), |result| {
                     let values = (0..columns.len())
-                        .map(|index| result.get_ref(index).map(StoredValue::capture))
+                        .zip(columns)
+                        .map(|(index, column)| {
+                            result
+                                .get_ref(index)
+                                .map(StoredValue::capture)
+                                .map(|value| (column.id(), value))
+                        })
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let rowid = hidden_rowid
-                        .map(|_| result.get::<_, i64>(columns.len()))
-                        .transpose()?;
-                    Ok((values, rowid))
+                    let rowid = if hidden_rowid.is_some() {
+                        Some(result.get::<_, i64>(columns.len())?)
+                    } else if created.storage() == TableStorage::Rowid {
+                        values.iter().find_map(|(column, value)| {
+                            if created.is_rowid_alias(*column) {
+                                match value {
+                                    StoredValue::Integer(value) => Some(*value),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(Row { values, rowid })
                 })
                 .optional()?;
-            let expected = columns
-                .iter()
-                .map(|column| {
-                    row.values
-                        .iter()
-                        .find(|(id, _)| *id == column.id())
-                        .map(|(_, value)| value.clone())
-                        .ok_or(Error::InvalidMultiliteOp(
-                            "row is missing a schema column".into(),
-                        ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if actual != Some((expected, hidden_rowid.and(row.rowid))) {
+            let Some(actual) = actual else {
+                return Err(Error::InvalidDatabase(mismatch));
+            };
+            if row.values.iter().any(|(column, expected)| {
+                actual
+                    .value(*column)
+                    .is_some_and(|actual| actual != expected)
+            }) || (hidden_rowid.is_some() && actual.rowid != row.rowid)
+            {
                 return Err(Error::InvalidDatabase(mismatch));
             }
+            materialized.push(actual);
         }
-        Ok(())
+        materialized.reverse();
+        Ok(materialized)
     }
 
     fn catalog_definition(&self, connection: &Connection) -> Result<CreateTable> {
@@ -702,6 +749,38 @@ impl InsertRows {
         ))?;
         self.validate_against(connection, &created)?;
         Ok(created)
+    }
+
+    fn for_current_rows(
+        connection: &Connection,
+        created: &CreateTable,
+        rows: Vec<Row>,
+    ) -> Result<Self> {
+        let table = materialized_table_name(connection, created.table_id())?;
+        let captured = rows
+            .into_iter()
+            .map(|row| {
+                let values = created
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        row.value(column.id())
+                            .cloned()
+                            .ok_or(Error::InvalidDatabase(
+                                "materialized row is missing a current schema column",
+                            ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CapturedRow {
+                    table: table.clone(),
+                    rowid: row.rowid.unwrap_or_default(),
+                    values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_captured(connection, &captured)?.ok_or(Error::CaptureInvariant(
+            "materialized row projection unexpectedly became empty",
+        ))
     }
 
     fn validate_against(&self, connection: &Connection, created: &CreateTable) -> Result<()> {
@@ -738,25 +817,10 @@ impl InsertRows {
             ));
         }
         for row in &self.rows {
-            if row.values.len() != created.columns().len()
-                || created
-                    .columns()
-                    .iter()
-                    .any(|column| !row.values.iter().any(|(id, _)| *id == column.id()))
-            {
-                return Err(Error::InvalidMultiliteOp(
-                    "row values contradict the local schema catalog".into(),
-                ));
-            }
             if created.mode() == TableMode::Strict
                 && created.columns().iter().any(|column| {
-                    let value = row
-                        .values
-                        .iter()
-                        .find(|(id, _)| *id == column.id())
-                        .map(|(_, value)| value)
-                        .expect("row width and column identities were validated");
-                    !strict_value_matches(column, value)
+                    row.value(column.id())
+                        .is_some_and(|value| !strict_value_matches(column, value))
                 })
             {
                 return Err(Error::InvalidMultiliteOp(
@@ -785,6 +849,21 @@ impl InsertRows {
             .iter()
             .any(|row| row.rowid.is_some() != (self.storage == TableStorage::Rowid))
         {
+            return Err(RowCodecError::InvalidRow);
+        }
+        let columns = self.rows[0]
+            .values
+            .iter()
+            .map(|(column, _)| *column)
+            .collect::<Vec<_>>();
+        if self.rows.iter().any(|row| {
+            row.values.len() != columns.len()
+                || row
+                    .values
+                    .iter()
+                    .zip(&columns)
+                    .any(|((column, _), expected)| column != expected)
+        }) {
             return Err(RowCodecError::InvalidRow);
         }
         if self.key_parts.iter().enumerate().any(|(index, part)| {
@@ -1625,11 +1704,9 @@ impl UpdateRows {
         after: &InsertRows,
         mismatch: &'static str,
     ) -> Result<()> {
-        before.validate_materialized_against(connection, created, mismatch)?;
-        let mut moved_before = before.clone();
-        moved_before.rows.clear();
-        let mut moved_after = after.clone();
-        moved_after.rows.clear();
+        let materialized = before.materialized_rows(connection, created, mismatch)?;
+        let mut moved_before = Vec::new();
+        let mut moved_after = Vec::new();
         let mut stable = Vec::new();
         for (index, (before_row, after_row)) in before.rows.iter().zip(&after.rows).enumerate() {
             let before_key = before
@@ -1641,17 +1718,26 @@ impl UpdateRows {
             if before_key == after_key {
                 stable.push(index);
             } else {
-                moved_before.rows.push(before_row.clone());
-                moved_after.rows.push(after_row.clone());
+                let current = materialized[index].clone();
+                let mut target = current.clone();
+                for (column, value) in &after_row.values {
+                    if let Some(target) = target.value_mut(*column) {
+                        *target = value.clone();
+                    }
+                }
+                target.rowid = after_row.rowid;
+                moved_before.push(current);
+                moved_after.push(target);
             }
         }
 
-        if !moved_before.rows.is_empty() {
-            moved_before.delete_materialized_with(connection, mismatch)?;
+        if !moved_before.is_empty() {
+            InsertRows::for_current_rows(connection, created, moved_before)?
+                .delete_materialized_with(connection, mismatch)?;
         }
         self.update_stable_rows(connection, created, before, after, &stable, mismatch)?;
-        if !moved_after.rows.is_empty() {
-            moved_after.apply(connection)?;
+        if !moved_after.is_empty() {
+            InsertRows::for_current_rows(connection, created, moved_after)?.apply(connection)?;
         }
         Ok(())
     }
@@ -1668,11 +1754,25 @@ impl UpdateRows {
         if stable.is_empty() {
             return Ok(());
         }
-        let columns = created.columns();
-        let assignments = catalog::column_names(connection, created)?
+        let columns = created
+            .columns()
             .iter()
-            .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            .collect::<Vec<_>>()
+            .filter(|column| {
+                stable.iter().any(|index| {
+                    before.rows[*index].value(column.id()) != after.rows[*index].value(column.id())
+                })
+            })
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let assignments = columns
+            .iter()
+            .map(|column| {
+                materialized_column_name(connection, created.table_id(), column.id())
+                    .map(|name| format!("{} = ?", quote_identifier(name.value())))
+            })
+            .collect::<Result<Vec<_>>>()?
             .join(", ");
         let mut predicates = created
             .primary_key_columns()
@@ -1698,10 +1798,7 @@ impl UpdateRows {
                 .iter()
                 .map(|column| {
                     after_row
-                        .values
-                        .iter()
-                        .find(|(id, _)| *id == column.id())
-                        .map(|(_, value)| value)
+                        .value(column.id())
                         .ok_or(Error::InvalidMultiliteOp(
                             "row is missing a schema column".into(),
                         ))
@@ -2596,6 +2693,7 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
+    use crate::database::alter::AlterTableOperation;
     use crate::database::index::IndexOperation;
     use crate::database::schema::{
         CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
@@ -2659,6 +2757,19 @@ mod tests {
         connection.execute(sql, ()).unwrap();
         let operation = IndexOperation::prepare_create(connection, sql, &spec).unwrap();
         operation.record_catalog(connection).unwrap();
+    }
+
+    fn alter_table(connection: &Connection, sql: &str) {
+        let operation = match super::super::sql::validate_execute(sql).unwrap() {
+            super::super::sql::ValidatedExecute::AddColumn(spec) => {
+                AlterTableOperation::prepare_add_column(connection, sql, &spec).unwrap()
+            }
+            super::super::sql::ValidatedExecute::DropColumn(spec) => {
+                AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        operation.apply(connection).unwrap();
     }
 
     fn without_rowid_definition() -> CreateTable {
@@ -3878,6 +3989,163 @@ mod tests {
                 Affinity::Integer
             );
         }
+    }
+
+    #[test]
+    fn historical_inserts_project_through_added_and_dropped_columns() {
+        let created = definition();
+        let source = connection(&created);
+        let inserted = InsertRows::from_captured(
+            &source,
+            &[CapturedRow {
+                table: "notes".into(),
+                rowid: 7,
+                values: vec![
+                    StoredValue::Integer(7),
+                    StoredValue::Text(b"body".to_vec()),
+                    StoredValue::Blob(vec![1, 2]),
+                ],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        let added = connection(&created);
+        alter_table(
+            &added,
+            "ALTER TABLE notes ADD COLUMN summary TEXT NOT NULL DEFAULT 'new'",
+        );
+        inserted.apply(&added).unwrap();
+        assert_eq!(
+            added
+                .query_row(
+                    "SELECT body, payload, summary FROM notes WHERE id = 7",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            ("body".into(), vec![1, 2], "new".into())
+        );
+
+        let dropped = connection(&created);
+        alter_table(&dropped, "ALTER TABLE notes DROP COLUMN payload");
+        inserted.apply(&dropped).unwrap();
+        assert_eq!(
+            dropped
+                .query_row("SELECT id, body FROM notes", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            (7, "body".into())
+        );
+    }
+
+    #[test]
+    fn historical_updates_preserve_columns_added_after_capture() {
+        let created = definition();
+        let source = connection(&created);
+        let stable = UpdateRows::from_captured(
+            &source,
+            &[(
+                CapturedRow {
+                    table: "notes".into(),
+                    rowid: 1,
+                    values: vec![
+                        StoredValue::Integer(1),
+                        StoredValue::Text(b"before".to_vec()),
+                        StoredValue::Blob(vec![1]),
+                    ],
+                },
+                CapturedRow {
+                    table: "notes".into(),
+                    rowid: 1,
+                    values: vec![
+                        StoredValue::Integer(1),
+                        StoredValue::Text(b"after".to_vec()),
+                        StoredValue::Blob(vec![1]),
+                    ],
+                },
+            )],
+        )
+        .unwrap()
+        .unwrap();
+        let moved = UpdateRows::from_captured(
+            &source,
+            &[(
+                CapturedRow {
+                    table: "notes".into(),
+                    rowid: 1,
+                    values: vec![
+                        StoredValue::Integer(1),
+                        StoredValue::Text(b"before".to_vec()),
+                        StoredValue::Blob(vec![1]),
+                    ],
+                },
+                CapturedRow {
+                    table: "notes".into(),
+                    rowid: 2,
+                    values: vec![
+                        StoredValue::Integer(2),
+                        StoredValue::Text(b"moved".to_vec()),
+                        StoredValue::Blob(vec![1]),
+                    ],
+                },
+            )],
+        )
+        .unwrap()
+        .unwrap();
+
+        let stable_target = connection(&created);
+        stable_target
+            .execute("INSERT INTO notes VALUES (1, 'before', x'01')", ())
+            .unwrap();
+        alter_table(
+            &stable_target,
+            "ALTER TABLE notes ADD COLUMN summary TEXT DEFAULT 'default'",
+        );
+        stable_target
+            .execute("UPDATE notes SET summary = 'preserved'", ())
+            .unwrap();
+        stable.apply(&stable_target).unwrap();
+        assert_eq!(
+            stable_target
+                .query_row("SELECT body, summary FROM notes", (), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            ("after".into(), "preserved".into())
+        );
+
+        let moved_target = connection(&created);
+        moved_target
+            .execute("INSERT INTO notes VALUES (1, 'before', x'01')", ())
+            .unwrap();
+        alter_table(
+            &moved_target,
+            "ALTER TABLE notes ADD COLUMN summary TEXT DEFAULT 'default'",
+        );
+        moved_target
+            .execute("UPDATE notes SET summary = 'preserved'", ())
+            .unwrap();
+        moved.apply(&moved_target).unwrap();
+        assert_eq!(
+            moved_target
+                .query_row("SELECT id, body, summary FROM notes", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap(),
+            (2, "moved".into(), "preserved".into())
+        );
     }
 
     #[test]
