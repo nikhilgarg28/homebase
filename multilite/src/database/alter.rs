@@ -1,4 +1,4 @@
-//! Identity-preserving table-name binding changes.
+//! Identity-resolved table and column schema deltas.
 
 use std::fmt;
 
@@ -19,7 +19,7 @@ use crate::commit::footprint::ConflictFootprint;
 use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ALTER_TABLE_VERSION: u8 = 2;
+const ALTER_TABLE_VERSION: u8 = 3;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_TABLE: u8 = 3;
@@ -41,14 +41,6 @@ const TAG_DROPPED_PRIMARY: u8 = 1;
 const TAG_DROPPED_ROWID: u8 = 2;
 const TAG_DROPPED_COLUMN: u8 = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AlterAction {
-    RenameTable,
-    RenameColumn(ColumnId),
-    AddColumn(ColumnId),
-    DropColumn(ColumnId),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DroppedValue {
     primary: Vec<StoredValue>,
@@ -56,7 +48,40 @@ struct DroppedValue {
     value: StoredValue,
 }
 
-/// One stable table identity moving between two mutable name bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AlterTableDelta {
+    RenameTable {
+        old_name: SqlName,
+        new_name: SqlName,
+    },
+    RenameColumn {
+        column: ColumnId,
+        old_name: SqlName,
+        new_name: SqlName,
+    },
+    AddColumn {
+        column: ColumnId,
+        name: SqlName,
+        before: CreateTable,
+        after: CreateTable,
+    },
+    DropColumn {
+        column: ColumnId,
+        name: SqlName,
+        before: CreateTable,
+        after: CreateTable,
+        column_sql: String,
+        dropped_values: Vec<DroppedValue>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameTarget {
+    Table,
+    Column,
+}
+
+/// One identity-resolved table-schema delta.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlterTableOperation {
     mutation_id: MutationId,
@@ -64,13 +89,7 @@ pub struct AlterTableOperation {
     table: TableId,
     schema_revision: SchemaRevisionId,
     source_table: SqlName,
-    action: AlterAction,
-    old_name: SqlName,
-    new_name: SqlName,
-    before: Option<CreateTable>,
-    after: Option<CreateTable>,
-    column_sql: Option<String>,
-    dropped_values: Vec<DroppedValue>,
+    delta: AlterTableDelta,
 }
 
 /// Homebase mutations and conflict footprint for one table alteration.
@@ -100,13 +119,10 @@ impl AlterTableOperation {
             table: created.table_id(),
             schema_revision: created.schema_revision_id(),
             source_table: spec.table.clone(),
-            action: AlterAction::RenameTable,
-            old_name: spec.table.clone(),
-            new_name: spec.new_name.clone(),
-            before: None,
-            after: None,
-            column_sql: None,
-            dropped_values: Vec::new(),
+            delta: AlterTableDelta::RenameTable {
+                old_name: spec.table.clone(),
+                new_name: spec.new_name.clone(),
+            },
         };
         operation.validate().map_err(invalid_operation)?;
         Ok(operation)
@@ -153,13 +169,11 @@ impl AlterTableOperation {
             table: created.table_id(),
             schema_revision: created.schema_revision_id(),
             source_table: spec.table.clone(),
-            action: AlterAction::RenameColumn(column),
-            old_name: spec.old_name.clone(),
-            new_name: spec.new_name.clone(),
-            before: None,
-            after: None,
-            column_sql: None,
-            dropped_values: Vec::new(),
+            delta: AlterTableDelta::RenameColumn {
+                column,
+                old_name: spec.old_name.clone(),
+                new_name: spec.new_name.clone(),
+            },
         };
         operation.validate().map_err(invalid_operation)?;
         Ok(operation)
@@ -202,13 +216,12 @@ impl AlterTableOperation {
             table: before.table_id(),
             schema_revision: before.schema_revision_id(),
             source_table: spec.table.clone(),
-            action: AlterAction::AddColumn(column),
-            old_name: spec.column.name.clone(),
-            new_name: spec.column.name.clone(),
-            before: Some(before),
-            after: Some(after),
-            column_sql: None,
-            dropped_values: Vec::new(),
+            delta: AlterTableDelta::AddColumn {
+                column,
+                name: spec.column.name.clone(),
+                before,
+                after,
+            },
         };
         operation.validate().map_err(invalid_operation)?;
         Ok(operation)
@@ -261,13 +274,14 @@ impl AlterTableOperation {
             table: before.table_id(),
             schema_revision: before.schema_revision_id(),
             source_table: spec.table.clone(),
-            action: AlterAction::DropColumn(column),
-            old_name: spec.column.clone(),
-            new_name: spec.column.clone(),
-            before: Some(before),
-            after: Some(after),
-            column_sql: Some(column_sql),
-            dropped_values,
+            delta: AlterTableDelta::DropColumn {
+                column,
+                name: spec.column.clone(),
+                before,
+                after,
+                column_sql,
+                dropped_values,
+            },
         };
         operation.validate().map_err(invalid_operation)?;
         Ok(operation)
@@ -276,68 +290,210 @@ impl AlterTableOperation {
     /// Move the name registry without evolving table-owned schema state.
     pub fn to_homebase(&self) -> Result<AlterTableHomebaseOp> {
         self.validate().map_err(invalid_operation)?;
-        if let AlterAction::AddColumn(column) | AlterAction::DropColumn(column) = self.action {
-            let after = self
-                .after
-                .as_ref()
-                .expect("validated ADD COLUMN has after schema");
-            let name = column_name_scope_key(self.table, &self.new_name);
-            let schema_head = active_schema_revision_key(self.table);
-            let write_revision = write_revision_key(self.table);
-            let mut footprint = ConflictFootprint::new();
-            footprint.add_constraint(name.clone());
-            footprint.add_constraint(schema_head.clone());
-            footprint.add_write(schema_head.clone());
-            footprint.add_write(write_revision.clone());
-            let binding = match self.action {
-                AlterAction::AddColumn(_) => Mutation::Set {
-                    key: name,
-                    value: column.as_bytes().to_vec(),
-                },
-                AlterAction::DropColumn(_) => Mutation::Delete { key: name },
-                _ => unreachable!(),
-            };
-            return Ok(AlterTableHomebaseOp {
-                mutations: vec![
-                    Mutation::Set {
-                        key: schema_log_key(self.mutation_id),
-                        value: self.encode(),
+        match &self.delta {
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                after,
+                ..
+            }
+            | AlterTableDelta::DropColumn {
+                column,
+                name,
+                after,
+                ..
+            } => {
+                let name_key = column_name_scope_key(self.table, name);
+                let schema_head = active_schema_revision_key(self.table);
+                let write_revision = write_revision_key(self.table);
+                let mut footprint = ConflictFootprint::new();
+                footprint.add_constraint(name_key.clone());
+                footprint.add_constraint(schema_head.clone());
+                footprint.add_write(schema_head.clone());
+                footprint.add_write(write_revision.clone());
+                let binding = match self.delta {
+                    AlterTableDelta::AddColumn { .. } => Mutation::Set {
+                        key: name_key,
+                        value: column.as_bytes().to_vec(),
                     },
-                    binding,
-                    Mutation::Set {
-                        key: table_schema_key(self.table, after.schema_revision_id()),
-                        value: after.encode(),
-                    },
-                    Mutation::Set {
-                        key: schema_head,
-                        value: after.schema_revision_id().as_bytes().to_vec(),
-                    },
-                    Mutation::Set {
-                        key: write_revision,
-                        value: self.mutation_id.as_bytes().to_vec(),
-                    },
-                ],
-                footprint,
-            });
-        }
-        let (old_name, new_name, value) = match self.action {
-            AlterAction::RenameTable => (
-                table_name_scope_key(&self.old_name),
-                table_name_scope_key(&self.new_name),
+                    AlterTableDelta::DropColumn { .. } => Mutation::Delete { key: name_key },
+                    _ => unreachable!(),
+                };
+                Ok(AlterTableHomebaseOp {
+                    mutations: vec![
+                        Mutation::Set {
+                            key: schema_log_key(self.mutation_id),
+                            value: self.encode(),
+                        },
+                        binding,
+                        Mutation::Set {
+                            key: table_schema_key(self.table, after.schema_revision_id()),
+                            value: after.encode(),
+                        },
+                        Mutation::Set {
+                            key: schema_head,
+                            value: after.schema_revision_id().as_bytes().to_vec(),
+                        },
+                        Mutation::Set {
+                            key: write_revision,
+                            value: self.mutation_id.as_bytes().to_vec(),
+                        },
+                    ],
+                    footprint,
+                })
+            }
+            AlterTableDelta::RenameTable { old_name, new_name } => self.rename_homebase(
+                table_name_scope_key(old_name),
+                table_name_scope_key(new_name),
                 self.table.as_bytes().to_vec(),
+                false,
             ),
-            AlterAction::RenameColumn(column) => (
-                column_name_scope_key(self.table, &self.old_name),
-                column_name_scope_key(self.table, &self.new_name),
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => self.rename_homebase(
+                column_name_scope_key(self.table, old_name),
+                column_name_scope_key(self.table, new_name),
                 column.as_bytes().to_vec(),
+                true,
             ),
-            AlterAction::AddColumn(_) => unreachable!(),
-            AlterAction::DropColumn(_) => unreachable!(),
+        }
+    }
+
+    /// Apply an authenticated binding change to canonical SQLite.
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        self.validate().map_err(invalid_operation)?;
+        self.validate_catalog_before(connection)?;
+        let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+            "ALTER TABLE identity is missing from the schema catalog",
+        ))?;
+        let sql = match &self.delta {
+            AlterTableDelta::AddColumn { .. } | AlterTableDelta::DropColumn { .. } => {
+                super::sql::render_alter_table(&self.sql, &table)?
+            }
+            AlterTableDelta::RenameTable { old_name, new_name } => {
+                rename_sql(&table, RenameTarget::Table, old_name, new_name)
+            }
+            AlterTableDelta::RenameColumn {
+                old_name, new_name, ..
+            } => rename_sql(&table, RenameTarget::Column, old_name, new_name),
         };
+        connection.execute_batch(&sql)?;
+        self.record_catalog(connection)
+    }
+
+    /// Record the binding change after a branch has executed the user's SQL.
+    pub fn record_catalog(&self, connection: &Connection) -> Result<()> {
+        self.validate_catalog_before(connection)?;
+        match &self.delta {
+            AlterTableDelta::RenameTable { old_name, new_name } => {
+                catalog::rename_binding(connection, self.table, old_name, new_name)
+            }
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => {
+                catalog::rename_column_binding(connection, self.table, *column, old_name, new_name)
+            }
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                before,
+                after,
+            } => {
+                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
+                    return Err(Error::InvalidDatabase(
+                        "ADD COLUMN no longer matches the schema catalog",
+                    ));
+                }
+                catalog::insert_column_binding(connection, self.table, *column, name)?;
+                catalog::replace(connection, after)
+            }
+            AlterTableDelta::DropColumn {
+                column,
+                before,
+                after,
+                ..
+            } => {
+                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
+                    return Err(Error::InvalidDatabase(
+                        "DROP COLUMN no longer matches the schema catalog",
+                    ));
+                }
+                catalog::remove_column_binding(connection, self.table, *column)?;
+                catalog::replace(connection, after)
+            }
+        }
+    }
+
+    /// Reverse one speculative binding change after authority rejects it.
+    pub fn rollback(&self, connection: &Connection) -> Result<()> {
+        self.validate().map_err(invalid_operation)?;
+        self.validate_catalog_after(connection)?;
+        let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+            "pending ALTER TABLE identity is missing from the catalog",
+        ))?;
+        let sql = match &self.delta {
+            AlterTableDelta::AddColumn { name, .. } => format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                quote_identifier(table.value()),
+                quote_identifier(name.value())
+            ),
+            AlterTableDelta::DropColumn { column_sql, .. } => format!(
+                "ALTER TABLE {} ADD COLUMN {}",
+                quote_identifier(table.value()),
+                column_sql
+            ),
+            AlterTableDelta::RenameTable { old_name, new_name } => {
+                rename_sql(&table, RenameTarget::Table, new_name, old_name)
+            }
+            AlterTableDelta::RenameColumn {
+                old_name, new_name, ..
+            } => rename_sql(&table, RenameTarget::Column, new_name, old_name),
+        };
+        connection.execute_batch(&sql)?;
+        match &self.delta {
+            AlterTableDelta::RenameTable { old_name, new_name } => {
+                catalog::rename_binding(connection, self.table, new_name, old_name)
+            }
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => {
+                catalog::rename_column_binding(connection, self.table, *column, new_name, old_name)
+            }
+            AlterTableDelta::AddColumn { column, before, .. } => {
+                catalog::remove_column_binding(connection, self.table, *column)?;
+                catalog::replace(connection, before)
+            }
+            AlterTableDelta::DropColumn {
+                column,
+                name,
+                before,
+                dropped_values,
+                ..
+            } => {
+                restore_dropped_values(connection, before, *column, name, dropped_values)?;
+                catalog::insert_column_binding(connection, self.table, *column, name)?;
+                catalog::replace(connection, before)
+            }
+        }
+    }
+
+    fn rename_homebase(
+        &self,
+        old_name: homebase_core::key::Key,
+        new_name: homebase_core::key::Key,
+        value: Vec<u8>,
+        fence_schema: bool,
+    ) -> Result<AlterTableHomebaseOp> {
         let mut footprint = ConflictFootprint::new();
         footprint.add_constraint(old_name.clone());
         footprint.add_constraint(new_name.clone());
-        let schema_fence = matches!(self.action, AlterAction::RenameColumn(_)).then(|| {
+        let schema_fence = fence_schema.then(|| {
             let key = active_schema_revision_key(self.table);
             footprint.add_write(key.clone());
             Mutation::Set {
@@ -363,137 +519,6 @@ impl AlterTableOperation {
         })
     }
 
-    /// Apply an authenticated binding change to canonical SQLite.
-    pub fn apply(&self, connection: &Connection) -> Result<()> {
-        self.validate().map_err(invalid_operation)?;
-        self.validate_catalog_before(connection)?;
-        let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
-            "ALTER TABLE identity is missing from the schema catalog",
-        ))?;
-        let sql = match self.action {
-            AlterAction::AddColumn(_) | AlterAction::DropColumn(_) => {
-                super::sql::render_alter_table(&self.sql, &table)?
-            }
-            _ => rename_sql(&table, self.action, &self.old_name, &self.new_name),
-        };
-        connection.execute_batch(&sql)?;
-        self.record_catalog(connection)
-    }
-
-    /// Record the binding change after a branch has executed the user's SQL.
-    pub fn record_catalog(&self, connection: &Connection) -> Result<()> {
-        self.validate_catalog_before(connection)?;
-        match self.action {
-            AlterAction::RenameTable => {
-                catalog::rename_binding(connection, self.table, &self.old_name, &self.new_name)
-            }
-            AlterAction::RenameColumn(column) => catalog::rename_column_binding(
-                connection,
-                self.table,
-                column,
-                &self.old_name,
-                &self.new_name,
-            ),
-            AlterAction::AddColumn(column) => {
-                let before = self
-                    .before
-                    .as_ref()
-                    .expect("validated ADD COLUMN has before schema");
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
-                    return Err(Error::InvalidDatabase(
-                        "ADD COLUMN no longer matches the schema catalog",
-                    ));
-                }
-                catalog::insert_column_binding(connection, self.table, column, &self.new_name)?;
-                catalog::replace(
-                    connection,
-                    self.after
-                        .as_ref()
-                        .expect("validated ADD COLUMN has after schema"),
-                )
-            }
-            AlterAction::DropColumn(column) => {
-                let before = self
-                    .before
-                    .as_ref()
-                    .expect("validated DROP COLUMN has before schema");
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
-                    return Err(Error::InvalidDatabase(
-                        "DROP COLUMN no longer matches the schema catalog",
-                    ));
-                }
-                catalog::remove_column_binding(connection, self.table, column)?;
-                catalog::replace(
-                    connection,
-                    self.after
-                        .as_ref()
-                        .expect("validated DROP COLUMN has after schema"),
-                )
-            }
-        }
-    }
-
-    /// Reverse one speculative binding change after authority rejects it.
-    pub fn rollback(&self, connection: &Connection) -> Result<()> {
-        self.validate().map_err(invalid_operation)?;
-        self.validate_catalog_after(connection)?;
-        let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
-            "pending ALTER TABLE identity is missing from the catalog",
-        ))?;
-        let sql = match self.action {
-            AlterAction::AddColumn(_) => format!(
-                "ALTER TABLE {} DROP COLUMN {}",
-                quote_identifier(table.value()),
-                quote_identifier(self.new_name.value())
-            ),
-            AlterAction::DropColumn(_) => format!(
-                "ALTER TABLE {} ADD COLUMN {}",
-                quote_identifier(table.value()),
-                self.column_sql
-                    .as_deref()
-                    .expect("validated DROP COLUMN has a column definition")
-            ),
-            _ => rename_sql(&table, self.action, &self.new_name, &self.old_name),
-        };
-        connection.execute_batch(&sql)?;
-        match self.action {
-            AlterAction::RenameTable => {
-                catalog::rename_binding(connection, self.table, &self.new_name, &self.old_name)
-            }
-            AlterAction::RenameColumn(column) => catalog::rename_column_binding(
-                connection,
-                self.table,
-                column,
-                &self.new_name,
-                &self.old_name,
-            ),
-            AlterAction::AddColumn(column) => {
-                catalog::remove_column_binding(connection, self.table, column)?;
-                catalog::replace(
-                    connection,
-                    self.before
-                        .as_ref()
-                        .expect("validated ADD COLUMN has before schema"),
-                )
-            }
-            AlterAction::DropColumn(column) => {
-                let before = self
-                    .before
-                    .as_ref()
-                    .expect("validated DROP COLUMN has before schema");
-                restore_dropped_values(
-                    connection,
-                    before,
-                    column,
-                    &self.old_name,
-                    &self.dropped_values,
-                )?;
-                catalog::insert_column_binding(connection, self.table, column, &self.old_name)?;
-                catalog::replace(connection, before)
-            }
-        }
-    }
-
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ALTER_TABLE_VERSION);
@@ -512,51 +537,65 @@ impl AlterTableOperation {
         writer
             .field(TAG_SOURCE_TABLE, self.source_table.value().as_bytes())
             .expect("ALTER TABLE field fits in u32");
-        writer
-            .field(
-                TAG_ACTION,
-                &[match self.action {
-                    AlterAction::RenameTable => RENAME_TABLE,
-                    AlterAction::RenameColumn(_) => RENAME_COLUMN,
-                    AlterAction::AddColumn(_) => ADD_COLUMN,
-                    AlterAction::DropColumn(_) => DROP_COLUMN,
-                }],
-            )
-            .expect("ALTER TABLE field fits in u32");
-        if let AlterAction::RenameColumn(column)
-        | AlterAction::AddColumn(column)
-        | AlterAction::DropColumn(column) = self.action
-        {
-            writer
-                .field(TAG_COLUMN, &column.as_bytes())
-                .expect("ALTER TABLE field fits in u32");
+        match &self.delta {
+            AlterTableDelta::RenameTable { old_name, new_name } => {
+                put_action(&mut writer, RENAME_TABLE);
+                put_name(&mut writer, TAG_OLD_NAME, old_name);
+                put_name(&mut writer, TAG_NEW_NAME, new_name);
+            }
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => {
+                put_action(&mut writer, RENAME_COLUMN);
+                put_column(&mut writer, *column);
+                put_name(&mut writer, TAG_OLD_NAME, old_name);
+                put_name(&mut writer, TAG_NEW_NAME, new_name);
+            }
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                before,
+                after,
+            } => {
+                put_action(&mut writer, ADD_COLUMN);
+                put_column(&mut writer, *column);
+                put_name(&mut writer, TAG_NEW_NAME, name);
+                writer
+                    .field(TAG_BEFORE, &before.encode())
+                    .expect("ALTER TABLE field fits in u32");
+                writer
+                    .field(TAG_AFTER, &after.encode())
+                    .expect("ALTER TABLE field fits in u32");
+            }
+            AlterTableDelta::DropColumn {
+                column,
+                name,
+                before,
+                after,
+                column_sql,
+                dropped_values,
+            } => {
+                put_action(&mut writer, DROP_COLUMN);
+                put_column(&mut writer, *column);
+                put_name(&mut writer, TAG_OLD_NAME, name);
+                writer
+                    .field(TAG_BEFORE, &before.encode())
+                    .expect("ALTER TABLE field fits in u32");
+                writer
+                    .field(TAG_AFTER, &after.encode())
+                    .expect("ALTER TABLE field fits in u32");
+                writer
+                    .field(TAG_COLUMN_SQL, column_sql.as_bytes())
+                    .expect("ALTER TABLE field fits in u32");
+                for value in dropped_values {
+                    writer
+                        .field(TAG_DROPPED_VALUE, &encode_dropped_value(value))
+                        .expect("ALTER TABLE field fits in u32");
+                }
+            }
         }
-        if let Some(before) = &self.before {
-            writer
-                .field(TAG_BEFORE, &before.encode())
-                .expect("ALTER TABLE field fits in u32");
-        }
-        if let Some(after) = &self.after {
-            writer
-                .field(TAG_AFTER, &after.encode())
-                .expect("ALTER TABLE field fits in u32");
-        }
-        if let Some(column_sql) = &self.column_sql {
-            writer
-                .field(TAG_COLUMN_SQL, column_sql.as_bytes())
-                .expect("ALTER TABLE field fits in u32");
-        }
-        for value in &self.dropped_values {
-            writer
-                .field(TAG_DROPPED_VALUE, &encode_dropped_value(value))
-                .expect("ALTER TABLE field fits in u32");
-        }
-        writer
-            .field(TAG_OLD_NAME, self.old_name.value().as_bytes())
-            .expect("ALTER TABLE field fits in u32");
-        writer
-            .field(TAG_NEW_NAME, self.new_name.value().as_bytes())
-            .expect("ALTER TABLE field fits in u32");
         writer.finish()
     }
 
@@ -617,16 +656,44 @@ impl AlterTableOperation {
                 _ => {}
             }
         }
-        let action = match (
-            action.ok_or(AlterTableCodecError::MissingField(TAG_ACTION))?,
-            column,
-        ) {
-            (RENAME_TABLE, None) => AlterAction::RenameTable,
-            (RENAME_COLUMN, Some(column)) => AlterAction::RenameColumn(column),
-            (ADD_COLUMN, Some(column)) => AlterAction::AddColumn(column),
-            (DROP_COLUMN, Some(column)) => AlterAction::DropColumn(column),
+        let action = action.ok_or(AlterTableCodecError::MissingField(TAG_ACTION))?;
+        let unexpected_dropped_values = action != DROP_COLUMN && !dropped_values.is_empty();
+        let delta = match action {
+            RENAME_TABLE => AlterTableDelta::RenameTable {
+                old_name: take_required(&mut old_name, TAG_OLD_NAME)?,
+                new_name: take_required(&mut new_name, TAG_NEW_NAME)?,
+            },
+            RENAME_COLUMN => AlterTableDelta::RenameColumn {
+                column: take_required(&mut column, TAG_COLUMN)?,
+                old_name: take_required(&mut old_name, TAG_OLD_NAME)?,
+                new_name: take_required(&mut new_name, TAG_NEW_NAME)?,
+            },
+            ADD_COLUMN => AlterTableDelta::AddColumn {
+                column: take_required(&mut column, TAG_COLUMN)?,
+                name: take_required(&mut new_name, TAG_NEW_NAME)?,
+                before: take_required(&mut before, TAG_BEFORE)?,
+                after: take_required(&mut after, TAG_AFTER)?,
+            },
+            DROP_COLUMN => AlterTableDelta::DropColumn {
+                column: take_required(&mut column, TAG_COLUMN)?,
+                name: take_required(&mut old_name, TAG_OLD_NAME)?,
+                before: take_required(&mut before, TAG_BEFORE)?,
+                after: take_required(&mut after, TAG_AFTER)?,
+                column_sql: take_required(&mut column_sql, TAG_COLUMN_SQL)?,
+                dropped_values,
+            },
             _ => return Err(AlterTableCodecError::InvalidAction),
         };
+        if column.is_some()
+            || before.is_some()
+            || after.is_some()
+            || column_sql.is_some()
+            || old_name.is_some()
+            || new_name.is_some()
+            || unexpected_dropped_values
+        {
+            return Err(AlterTableCodecError::InvalidAction);
+        }
         let operation = Self {
             mutation_id: mutation_id.ok_or(AlterTableCodecError::MissingField(TAG_MUTATION_ID))?,
             sql: sql.ok_or(AlterTableCodecError::MissingField(TAG_SQL))?,
@@ -635,146 +702,140 @@ impl AlterTableOperation {
                 .ok_or(AlterTableCodecError::MissingField(TAG_SCHEMA_REVISION))?,
             source_table: source_table
                 .ok_or(AlterTableCodecError::MissingField(TAG_SOURCE_TABLE))?,
-            action,
-            old_name: old_name.ok_or(AlterTableCodecError::MissingField(TAG_OLD_NAME))?,
-            new_name: new_name.ok_or(AlterTableCodecError::MissingField(TAG_NEW_NAME))?,
-            before,
-            after,
-            column_sql,
-            dropped_values,
+            delta,
         };
         operation.validate()?;
         Ok(operation)
     }
 
     fn validate(&self) -> std::result::Result<(), AlterTableCodecError> {
-        match self.action {
-            AlterAction::RenameTable | AlterAction::RenameColumn(_)
-                if self.before.is_some()
-                    || self.after.is_some()
-                    || self.column_sql.is_some()
-                    || !self.dropped_values.is_empty() =>
-            {
-                return Err(AlterTableCodecError::InvalidSchema);
-            }
-            AlterAction::AddColumn(_)
-                if self.column_sql.is_some() || !self.dropped_values.is_empty() =>
-            {
-                return Err(AlterTableCodecError::InvalidSchema);
-            }
-            _ => {}
-        }
-        match (
-            self.action,
-            super::sql::validate_execute(&self.sql)
-                .map_err(|_| AlterTableCodecError::InvalidSql)?,
-        ) {
-            (AlterAction::RenameTable, ValidatedExecute::RenameTable(spec))
-                if spec.table == self.source_table
-                    && spec.table == self.old_name
-                    && spec.new_name == self.new_name => {}
-            (AlterAction::RenameColumn(_), ValidatedExecute::RenameColumn(spec))
-                if spec.table == self.source_table
-                    && spec.old_name == self.old_name
-                    && spec.new_name == self.new_name => {}
-            (AlterAction::AddColumn(column), ValidatedExecute::AddColumn(spec))
-                if spec.table == self.source_table
-                    && spec.column.name == self.new_name
-                    && self.old_name == self.new_name
-                    && self.before.as_ref().is_some_and(|before| {
-                        self.after.as_ref().is_some_and(|after| {
-                            before.table_id() == self.table
-                                && before.schema_revision_id() == self.schema_revision
-                                && before.schema_revision_id() != after.schema_revision_id()
-                                && before
-                                    .with_added_column_identity(
-                                        after.schema_revision_id(),
-                                        column,
-                                        &spec.column,
-                                        &spec.checks,
-                                    )
-                                    .is_ok_and(|expected| expected == *after)
-                        })
-                    }) => {}
-            (AlterAction::DropColumn(column), ValidatedExecute::DropColumn(spec))
-                if spec.table == self.source_table
-                    && spec.column == self.old_name
-                    && self.old_name == self.new_name
-                    && self.column_sql.as_ref().is_some_and(|sql| !sql.is_empty())
-                    && self.before.as_ref().is_some_and(|before| {
-                        self.after.as_ref().is_some_and(|after| {
-                            before.table_id() == self.table
-                                && before.schema_revision_id() == self.schema_revision
-                                && before.schema_revision_id() != after.schema_revision_id()
-                                && before
-                                    .with_removed_column(after.schema_revision_id(), column)
-                                    .is_ok_and(|expected| expected == *after)
-                                && self.dropped_values.iter().all(|value| {
-                                    value.primary.len() == before.primary_key_columns().count()
-                                })
-                        })
-                    }) => {}
+        let validated = super::sql::validate_execute(&self.sql)
+            .map_err(|_| AlterTableCodecError::InvalidSql)?;
+        match (&self.delta, validated) {
+            (
+                AlterTableDelta::RenameTable { old_name, new_name },
+                ValidatedExecute::RenameTable(spec),
+            ) if spec.table == self.source_table
+                && spec.table == *old_name
+                && spec.new_name == *new_name => {}
+            (
+                AlterTableDelta::RenameColumn {
+                    old_name, new_name, ..
+                },
+                ValidatedExecute::RenameColumn(spec),
+            ) if spec.table == self.source_table
+                && spec.old_name == *old_name
+                && spec.new_name == *new_name => {}
+            (
+                AlterTableDelta::AddColumn {
+                    column,
+                    name,
+                    before,
+                    after,
+                },
+                ValidatedExecute::AddColumn(spec),
+            ) if spec.table == self.source_table
+                && spec.column.name == *name
+                && before.table_id() == self.table
+                && before.schema_revision_id() == self.schema_revision
+                && before.schema_revision_id() != after.schema_revision_id()
+                && before
+                    .with_added_column_identity(
+                        after.schema_revision_id(),
+                        *column,
+                        &spec.column,
+                        &spec.checks,
+                    )
+                    .is_ok_and(|expected| expected == *after) => {}
+            (
+                AlterTableDelta::DropColumn {
+                    column,
+                    name,
+                    before,
+                    after,
+                    column_sql,
+                    dropped_values,
+                },
+                ValidatedExecute::DropColumn(spec),
+            ) if spec.table == self.source_table
+                && spec.column == *name
+                && !column_sql.is_empty()
+                && before.table_id() == self.table
+                && before.schema_revision_id() == self.schema_revision
+                && before.schema_revision_id() != after.schema_revision_id()
+                && before
+                    .with_removed_column(after.schema_revision_id(), *column)
+                    .is_ok_and(|expected| expected == *after)
+                && dropped_values
+                    .iter()
+                    .all(|value| value.primary.len() == before.primary_key_columns().count()) => {}
             _ => return Err(AlterTableCodecError::InvalidRename),
         }
         Ok(())
     }
 
     fn validate_catalog_before(&self, connection: &Connection) -> Result<()> {
-        match self.action {
-            AlterAction::RenameTable => {
+        match &self.delta {
+            AlterTableDelta::RenameTable { old_name, new_name } => {
                 let current =
                     catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
                         "table rename identity is missing from the schema catalog",
                     ))?;
-                if current.canonical() != self.old_name.canonical()
-                    || catalog::by_name(connection, self.new_name.value())?.is_some()
+                if current.canonical() != old_name.canonical()
+                    || catalog::by_name(connection, new_name.value())?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "table rename no longer matches the schema catalog",
                     ));
                 }
             }
-            AlterAction::RenameColumn(column) => {
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => {
                 let definition =
                     catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
                         "column rename table is missing from the schema catalog",
                     ))?;
-                let current = catalog::column_name_by_id(connection, self.table, column)?.ok_or(
+                let current = catalog::column_name_by_id(connection, self.table, *column)?.ok_or(
                     Error::InvalidDatabase(
                         "column rename identity is missing from the schema catalog",
                     ),
                 )?;
                 if definition.schema_revision_id() != self.schema_revision
-                    || current.canonical() != self.old_name.canonical()
-                    || catalog::column_id_by_name(connection, self.table, &self.new_name)?.is_some()
+                    || current.canonical() != old_name.canonical()
+                    || catalog::column_id_by_name(connection, self.table, new_name)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "column rename no longer matches the schema catalog",
                     ));
                 }
             }
-            AlterAction::AddColumn(column) => {
-                let before = self
-                    .before
-                    .as_ref()
-                    .expect("validated ADD COLUMN has before schema");
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                before,
+                ..
+            } => {
                 if catalog::by_id(connection, self.table)?.as_ref() != Some(before)
-                    || catalog::column_id_by_name(connection, self.table, &self.new_name)?.is_some()
-                    || catalog::column_name_by_id(connection, self.table, column)?.is_some()
+                    || catalog::column_id_by_name(connection, self.table, name)?.is_some()
+                    || catalog::column_name_by_id(connection, self.table, *column)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "ADD COLUMN no longer matches the schema catalog",
                     ));
                 }
             }
-            AlterAction::DropColumn(column) => {
-                let before = self
-                    .before
-                    .as_ref()
-                    .expect("validated DROP COLUMN has before schema");
+            AlterTableDelta::DropColumn {
+                column,
+                name,
+                before,
+                ..
+            } => {
                 if catalog::by_id(connection, self.table)?.as_ref() != Some(before)
-                    || catalog::column_name_by_id(connection, self.table, column)?
-                        .is_none_or(|name| name.canonical() != self.old_name.canonical())
+                    || catalog::column_name_by_id(connection, self.table, *column)?
+                        .is_none_or(|current| current.canonical() != name.canonical())
                 {
                     return Err(Error::InvalidDatabase(
                         "DROP COLUMN no longer matches the schema catalog",
@@ -786,60 +847,61 @@ impl AlterTableOperation {
     }
 
     fn validate_catalog_after(&self, connection: &Connection) -> Result<()> {
-        match self.action {
-            AlterAction::RenameTable => {
+        match &self.delta {
+            AlterTableDelta::RenameTable { old_name, new_name } => {
                 let current =
                     catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
                         "pending table rename identity is missing from the catalog",
                     ))?;
-                if current.canonical() != self.new_name.canonical()
-                    || catalog::by_name(connection, self.old_name.value())?.is_some()
+                if current.canonical() != new_name.canonical()
+                    || catalog::by_name(connection, old_name.value())?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "pending table rename no longer matches SQLite state",
                     ));
                 }
             }
-            AlterAction::RenameColumn(column) => {
+            AlterTableDelta::RenameColumn {
+                column,
+                old_name,
+                new_name,
+            } => {
                 let definition =
                     catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
                         "pending column rename table is missing from the schema catalog",
                     ))?;
-                let current = catalog::column_name_by_id(connection, self.table, column)?.ok_or(
+                let current = catalog::column_name_by_id(connection, self.table, *column)?.ok_or(
                     Error::InvalidDatabase(
                         "pending column rename identity is missing from the catalog",
                     ),
                 )?;
                 if definition.schema_revision_id() != self.schema_revision
-                    || current.canonical() != self.new_name.canonical()
-                    || catalog::column_id_by_name(connection, self.table, &self.old_name)?.is_some()
+                    || current.canonical() != new_name.canonical()
+                    || catalog::column_id_by_name(connection, self.table, old_name)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "pending column rename no longer matches SQLite state",
                     ));
                 }
             }
-            AlterAction::AddColumn(column) => {
-                let after = self
-                    .after
-                    .as_ref()
-                    .expect("validated ADD COLUMN has after schema");
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                after,
+                ..
+            } => {
                 if catalog::by_id(connection, self.table)?.as_ref() != Some(after)
-                    || catalog::column_name_by_id(connection, self.table, column)?
-                        .is_none_or(|name| name.canonical() != self.new_name.canonical())
+                    || catalog::column_name_by_id(connection, self.table, *column)?
+                        .is_none_or(|current| current.canonical() != name.canonical())
                 {
                     return Err(Error::InvalidDatabase(
                         "pending ADD COLUMN no longer matches SQLite state",
                     ));
                 }
             }
-            AlterAction::DropColumn(column) => {
-                let after = self
-                    .after
-                    .as_ref()
-                    .expect("validated DROP COLUMN has after schema");
+            AlterTableDelta::DropColumn { column, after, .. } => {
                 if catalog::by_id(connection, self.table)?.as_ref() != Some(after)
-                    || catalog::column_name_by_id(connection, self.table, column)?.is_some()
+                    || catalog::column_name_by_id(connection, self.table, *column)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
                         "pending DROP COLUMN no longer matches SQLite state",
@@ -1072,21 +1134,19 @@ fn decode_stored_value(frame: &[u8]) -> std::result::Result<StoredValue, AlterTa
     }
 }
 
-fn rename_sql(table: &SqlName, action: AlterAction, from: &SqlName, to: &SqlName) -> String {
-    match action {
-        AlterAction::RenameTable => format!(
+fn rename_sql(table: &SqlName, target: RenameTarget, from: &SqlName, to: &SqlName) -> String {
+    match target {
+        RenameTarget::Table => format!(
             "ALTER TABLE {} RENAME TO {}",
             quote_identifier(from.value()),
             quote_identifier(to.value())
         ),
-        AlterAction::RenameColumn(_) => format!(
+        RenameTarget::Column => format!(
             "ALTER TABLE {} RENAME COLUMN {} TO {}",
             quote_identifier(table.value()),
             quote_identifier(from.value()),
             quote_identifier(to.value())
         ),
-        AlterAction::AddColumn(_) => unreachable!("ADD COLUMN uses its stored SQL"),
-        AlterAction::DropColumn(_) => unreachable!("DROP COLUMN uses its stored SQL"),
     }
 }
 
@@ -1096,6 +1156,28 @@ fn quote_identifier(identifier: &str) -> String {
 
 fn decode_string(value: &[u8]) -> std::result::Result<String, AlterTableCodecError> {
     String::from_utf8(value.to_vec()).map_err(|_| AlterTableCodecError::InvalidUtf8)
+}
+
+fn put_action(writer: &mut Writer, action: u8) {
+    writer
+        .field(TAG_ACTION, &[action])
+        .expect("ALTER TABLE field fits in u32");
+}
+
+fn put_column(writer: &mut Writer, column: ColumnId) {
+    writer
+        .field(TAG_COLUMN, &column.as_bytes())
+        .expect("ALTER TABLE field fits in u32");
+}
+
+fn put_name(writer: &mut Writer, tag: u8, name: &SqlName) {
+    writer
+        .field(tag, name.value().as_bytes())
+        .expect("ALTER TABLE field fits in u32");
+}
+
+fn take_required<T>(slot: &mut Option<T>, tag: u8) -> std::result::Result<T, AlterTableCodecError> {
+    slot.take().ok_or(AlterTableCodecError::MissingField(tag))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), AlterTableCodecError> {
@@ -1289,7 +1371,7 @@ mod tests {
 
     #[test]
     fn codec_rejects_truncation_and_sql_metadata_mismatch() {
-        let (connection, _) = connection();
+        let (connection, created) = connection();
         let operation = operation(&connection);
         let encoded = operation.encode();
         assert_eq!(
@@ -1302,10 +1384,24 @@ mod tests {
         );
 
         let mut mismatched = operation;
-        mismatched.new_name = SqlName::new("different".into());
+        let AlterTableDelta::RenameTable { new_name, .. } = &mut mismatched.delta else {
+            unreachable!()
+        };
+        *new_name = SqlName::new("different".into());
         assert_eq!(
             AlterTableOperation::decode(&mismatched.encode()),
             Err(AlterTableCodecError::InvalidRename)
+        );
+
+        let mut crossed = encoded;
+        let mut extra = Writer::new();
+        extra
+            .field(TAG_BEFORE, &created.encode())
+            .expect("test schema fits in a field");
+        crossed.extend_from_slice(&extra.finish());
+        assert_eq!(
+            AlterTableOperation::decode(&crossed),
+            Err(AlterTableCodecError::InvalidAction)
         );
     }
 
