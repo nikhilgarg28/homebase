@@ -311,11 +311,17 @@ impl AlterTableOperation {
                 footprint.add_constraint(schema_head.clone());
                 footprint.add_write(schema_head.clone());
                 footprint.add_write(write_revision.clone());
-                let binding = match self.delta {
-                    AlterTableDelta::AddColumn { .. } => Mutation::Set {
-                        key: name_key,
-                        value: column.as_bytes().to_vec(),
-                    },
+                let binding = match &self.delta {
+                    AlterTableDelta::AddColumn { .. } => {
+                        for dependency in after.added_column_dependencies(*column) {
+                            footprint
+                                .add_constraint(column_name_scope_key(self.table, &dependency));
+                        }
+                        Mutation::Set {
+                            key: name_key,
+                            value: column.as_bytes().to_vec(),
+                        }
+                    }
                     AlterTableDelta::DropColumn { .. } => Mutation::Delete { key: name_key },
                     _ => unreachable!(),
                 };
@@ -346,7 +352,6 @@ impl AlterTableOperation {
                 table_name_scope_key(old_name),
                 table_name_scope_key(new_name),
                 self.table.as_bytes().to_vec(),
-                false,
             ),
             AlterTableDelta::RenameColumn {
                 column,
@@ -356,7 +361,6 @@ impl AlterTableOperation {
                 column_name_scope_key(self.table, old_name),
                 column_name_scope_key(self.table, new_name),
                 column.as_bytes().to_vec(),
-                true,
             ),
         }
     }
@@ -488,20 +492,11 @@ impl AlterTableOperation {
         old_name: homebase_core::key::Key,
         new_name: homebase_core::key::Key,
         value: Vec<u8>,
-        fence_schema: bool,
     ) -> Result<AlterTableHomebaseOp> {
         let mut footprint = ConflictFootprint::new();
         footprint.add_constraint(old_name.clone());
         footprint.add_constraint(new_name.clone());
-        let schema_fence = fence_schema.then(|| {
-            let key = active_schema_revision_key(self.table);
-            footprint.add_write(key.clone());
-            Mutation::Set {
-                key,
-                value: self.schema_revision.as_bytes().to_vec(),
-            }
-        });
-        let mut mutations = vec![
+        let mutations = vec![
             Mutation::Set {
                 key: schema_log_key(self.mutation_id),
                 value: self.encode(),
@@ -512,7 +507,6 @@ impl AlterTableOperation {
                 value,
             },
         ];
-        mutations.extend(schema_fence);
         Ok(AlterTableHomebaseOp {
             mutations,
             footprint,
@@ -794,17 +788,12 @@ impl AlterTableOperation {
                 old_name,
                 new_name,
             } => {
-                let definition =
-                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
-                        "column rename table is missing from the schema catalog",
-                    ))?;
                 let current = catalog::column_name_by_id(connection, self.table, *column)?.ok_or(
                     Error::InvalidDatabase(
                         "column rename identity is missing from the schema catalog",
                     ),
                 )?;
-                if definition.schema_revision_id() != self.schema_revision
-                    || current.canonical() != old_name.canonical()
+                if current.canonical() != old_name.canonical()
                     || catalog::column_id_by_name(connection, self.table, new_name)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
@@ -866,17 +855,12 @@ impl AlterTableOperation {
                 old_name,
                 new_name,
             } => {
-                let definition =
-                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
-                        "pending column rename table is missing from the schema catalog",
-                    ))?;
                 let current = catalog::column_name_by_id(connection, self.table, *column)?.ok_or(
                     Error::InvalidDatabase(
                         "pending column rename identity is missing from the catalog",
                     ),
                 )?;
-                if definition.schema_revision_id() != self.schema_revision
-                    || current.canonical() != new_name.canonical()
+                if current.canonical() != new_name.canonical()
                     || catalog::column_id_by_name(connection, self.table, old_name)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
@@ -1297,7 +1281,8 @@ mod tests {
     }
 
     fn add_operation(connection: &Connection) -> AlterTableOperation {
-        let sql = "ALTER TABLE notes ADD COLUMN body TEXT DEFAULT 'empty' CHECK (length(body) > 0)";
+        let sql = "ALTER TABLE notes ADD COLUMN body TEXT DEFAULT 'empty'
+                   CHECK (id > 0 AND length(body) > 0)";
         let ValidatedExecute::AddColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
@@ -1414,24 +1399,13 @@ mod tests {
             operation
         );
         let lowered = operation.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 4);
+        assert_eq!(lowered.mutations.len(), 3);
         assert_eq!(lowered.footprint.constraints().len(), 2);
-        assert_eq!(lowered.footprint.writes().len(), 1);
-        assert!(
-            lowered
-                .footprint
-                .writes()
-                .contains(&active_schema_revision_key(created.table_id()))
-        );
+        assert!(lowered.footprint.writes().is_empty());
         let Mutation::Set { value, .. } = &lowered.mutations[2] else {
             panic!("new column name registry entry was not set")
         };
         assert_eq!(value, &created.columns()[0].id().as_bytes());
-        let Mutation::Set { key, value } = &lowered.mutations[3] else {
-            panic!("column rename schema fence was not set")
-        };
-        assert_eq!(key, &active_schema_revision_key(created.table_id()));
-        assert_eq!(value, &created.schema_revision_id().as_bytes());
 
         operation.apply(&connection).unwrap();
         assert_eq!(
@@ -1471,7 +1445,7 @@ mod tests {
         );
         let lowered = operation.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 5);
-        assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 3);
         assert_eq!(lowered.footprint.writes().len(), 2);
 
         operation.apply(&connection).unwrap();

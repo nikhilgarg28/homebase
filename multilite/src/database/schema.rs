@@ -4,7 +4,7 @@
 //! mutable revision cells. It can be reconstructed only from a complete,
 //! self-consistent admitted envelope.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use homebase_core::key::{Key, MAX_COMPONENTS};
@@ -391,12 +391,127 @@ impl SqlExpression {
     pub(super) fn new(expression: Expr) -> Self {
         Self(Box::new(expression))
     }
+
+    fn referenced_columns(&self) -> Vec<SqlName> {
+        let mut columns = BTreeMap::new();
+        collect_expression_columns(&self.0, &mut columns);
+        columns.into_values().collect()
+    }
 }
 
 impl fmt::Display for SqlExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&*self.0, formatter)
     }
+}
+
+fn collect_expression_columns(expression: &Expr, columns: &mut BTreeMap<Vec<u8>, SqlName>) {
+    match expression {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            collect_expression_columns(lhs, columns);
+            collect_expression_columns(start, columns);
+            collect_expression_columns(end, columns);
+        }
+        Expr::Binary(left, _, right) => {
+            collect_expression_columns(left, columns);
+            collect_expression_columns(right, columns);
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                collect_expression_columns(base, columns);
+            }
+            for (when, then) in when_then_pairs {
+                collect_expression_columns(when, columns);
+                collect_expression_columns(then, columns);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_expression_columns(else_expr, columns);
+            }
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => collect_expression_columns(expr, columns),
+        Expr::DoublyQualified(_, _, column) | Expr::Qualified(_, column) => {
+            record_expression_column(columns, &column.0)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            if let Some(args) = args {
+                for argument in args {
+                    collect_expression_columns(argument, columns);
+                }
+            }
+            if let Some(sqlite3_parser::ast::FunctionCallOrder::SortList(order_by)) = order_by {
+                for column in order_by {
+                    collect_expression_columns(&column.expr, columns);
+                }
+            }
+            if let Some(filter) = filter_over
+                .as_ref()
+                .and_then(|tail| tail.filter_clause.as_deref())
+            {
+                collect_expression_columns(filter, columns);
+            }
+        }
+        Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter) = filter_over
+                .as_ref()
+                .and_then(|tail| tail.filter_clause.as_deref())
+            {
+                collect_expression_columns(filter, columns);
+            }
+        }
+        Expr::Id(identifier) => record_expression_column(columns, &identifier.0),
+        Expr::InList { lhs, rhs, .. } => {
+            collect_expression_columns(lhs, columns);
+            if let Some(rhs) = rhs {
+                for expression in rhs {
+                    collect_expression_columns(expression, columns);
+                }
+            }
+        }
+        Expr::InSelect { lhs, .. } | Expr::InTable { lhs, .. } => {
+            collect_expression_columns(lhs, columns);
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            collect_expression_columns(lhs, columns);
+            collect_expression_columns(rhs, columns);
+            if let Some(escape) = escape {
+                collect_expression_columns(escape, columns);
+            }
+        }
+        Expr::Name(name) => record_expression_column(columns, &name.0),
+        Expr::Parenthesized(expressions) => {
+            for expression in expressions {
+                collect_expression_columns(expression, columns);
+            }
+        }
+        Expr::Raise(_, expression) => {
+            if let Some(expression) = expression {
+                collect_expression_columns(expression, columns);
+            }
+        }
+        Expr::Exists(_) | Expr::Literal(_) | Expr::Subquery(_) | Expr::Variable(_) => {}
+    }
+}
+
+fn record_expression_column(columns: &mut BTreeMap<Vec<u8>, SqlName>, value: &str) {
+    let name = SqlName::new(value.to_owned());
+    columns.entry(name.canonical().to_vec()).or_insert(name);
 }
 
 /// One validated CHECK declaration before column names become stable IDs.
@@ -1249,6 +1364,25 @@ impl CreateTable {
                 expression: check.expression.clone(),
             }));
         Ok(evolved)
+    }
+
+    /// Names read by constraints introduced with one column.
+    ///
+    /// These are SQL bindings rather than durable identities: a concurrent
+    /// rename must conflict with DDL compiled against the old spelling.
+    pub fn added_column_dependencies(&self, column: ColumnId) -> Vec<SqlName> {
+        let mut dependencies = BTreeMap::new();
+        for check in self
+            .schema
+            .checks
+            .iter()
+            .filter(|check| check.column == Some(column))
+        {
+            for name in check.expression.referenced_columns() {
+                dependencies.insert(name.canonical().to_vec(), name);
+            }
+        }
+        dependencies.into_values().collect()
     }
 
     pub fn with_removed_column(

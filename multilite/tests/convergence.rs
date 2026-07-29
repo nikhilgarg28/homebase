@@ -1883,6 +1883,79 @@ fn column_rename_and_stale_row_writes_converge_by_stable_column_identity() {
 }
 
 #[test]
+fn renaming_distinct_columns_commutes_across_devices() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("rename-distinct-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("rename-distinct-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT,
+                title TEXT
+            )",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("ALTER TABLE notes RENAME COLUMN body TO contents", ())
+        .unwrap();
+    second
+        .execute("ALTER TABLE notes RENAME COLUMN title TO headline", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    assert_eq!(
+        second.push().unwrap(),
+        PushOutcome::Drained,
+        "separate column-name cells must admit independently"
+    );
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        database
+            .execute(
+                "INSERT INTO notes (id, contents, headline)
+                 VALUES (1, 'body', 'title')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .query(
+                    "SELECT contents, headline FROM notes WHERE id = 1",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [("body".into(), "title".into())]
+        );
+        database
+            .execute("DELETE FROM notes WHERE id = 1", ())
+            .unwrap();
+    }
+}
+
+#[test]
 fn column_rename_fences_stale_name_bound_ddl_but_not_row_writes() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
