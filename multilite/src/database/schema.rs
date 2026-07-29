@@ -1202,15 +1202,14 @@ impl CreateTable {
             "foreign keys must be resolved against a schema catalog"
         );
         build_create_table(sql, spec, Vec::new(), || Uuid::new_v4().into_bytes())
+            .expect("test CREATE TABLE specification is valid")
     }
 
     /// Resolve stable parent identities and mint one table definition.
     pub fn prepare(connection: &Connection, sql: &str, spec: CreateTableSpec) -> Result<Self> {
         let resolved = resolve_foreign_keys(connection, &spec)?;
         validate_foreign_reference_key_shapes(&spec, &resolved)?;
-        Ok(build_create_table(sql, spec, resolved, || {
-            Uuid::new_v4().into_bytes()
-        }))
+        build_create_table(sql, spec, resolved, || Uuid::new_v4().into_bytes())
     }
 
     /// Lower this schema change to its complete Homebase representation.
@@ -1314,7 +1313,15 @@ impl CreateTable {
     /// Decode and validate one complete locally stored schema operation.
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
         let created = decode_frame(frame)?;
-        validate_provenance_sql(&created)?;
+        validate_snapshot_provenance_sql(&created)?;
+        Ok(created)
+    }
+
+    /// Decode an initial table-creation operation and bind every SQL spelling
+    /// back to its stable structured identity.
+    pub fn decode_operation(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
+        let created = decode_frame(frame)?;
+        validate_initial_provenance_sql(&created)?;
         Ok(created)
     }
 
@@ -1424,16 +1431,23 @@ impl CreateTable {
                 && index.terms().is_empty()
                 && index.predicate().is_none()
                 && spec.predicate.is_none()
-                && spec.terms.iter().all(|term| {
-                    matches!(
-                        term,
-                        super::sql::CreateIndexTerm::Column {
+                && index
+                    .columns()
+                    .iter()
+                    .zip(&spec.terms)
+                    .all(|(encoded, term)| {
+                        let super::sql::CreateIndexTerm::Column {
+                            name,
                             collation: None,
                             order: None,
-                            ..
-                        }
-                    )
-                })
+                        } = term
+                        else {
+                            return false;
+                        };
+                        self.columns().iter().any(|column| {
+                            column.id == *encoded && column.name.canonical() == name.canonical()
+                        })
+                    })
         } else {
             index.columns().is_empty()
                 && index.terms().len() == spec.terms.len()
@@ -1445,16 +1459,23 @@ impl CreateTable {
                     .all(|(encoded, parsed)| match (encoded, parsed) {
                         (
                             IndexTerm::Column {
+                                column: encoded_column,
                                 collation: encoded_collation,
                                 order: encoded_order,
-                                ..
                             },
                             super::sql::CreateIndexTerm::Column {
+                                name: parsed_name,
                                 collation: parsed_collation,
                                 order: parsed_order,
-                                ..
                             },
-                        ) => encoded_collation == parsed_collation && encoded_order == parsed_order,
+                        ) => {
+                            encoded_collation == parsed_collation
+                                && encoded_order == parsed_order
+                                && self.columns().iter().any(|column| {
+                                    column.id == *encoded_column
+                                        && column.name.canonical() == parsed_name.canonical()
+                                })
+                        }
                         (
                             IndexTerm::Expression {
                                 expression: encoded_expression,
@@ -2357,7 +2378,7 @@ fn build_create_table(
     spec: CreateTableSpec,
     resolved_foreign_keys: Vec<ResolvedForeignKey>,
     mut mint: impl FnMut() -> [u8; 16],
-) -> CreateTable {
+) -> Result<CreateTable> {
     let CreateTableSpec {
         name,
         mode,
@@ -2392,7 +2413,7 @@ fn build_create_table(
                 .expect("validated PRIMARY KEY columns exist"),
         },
     };
-    let checks = lower_checks(check_specs, &columns);
+    let checks = lower_checks(check_specs, &columns)?;
     let unique_constraints = unique_specs
         .into_iter()
         .map(|unique| UniqueConstraint {
@@ -2465,24 +2486,36 @@ fn build_create_table(
         },
     };
     table.refresh_schema_revision();
-    table
+    Ok(table)
 }
 
-fn lower_checks(checks: Vec<CreateCheckConstraint>, columns: &[Column]) -> Vec<CheckConstraint> {
+fn lower_checks(
+    checks: Vec<CreateCheckConstraint>,
+    columns: &[Column],
+) -> Result<Vec<CheckConstraint>> {
     checks
         .into_iter()
-        .map(|check| CheckConstraint {
-            column: check.column.as_ref().map(|name| {
-                columns
-                    .iter()
-                    .find(|column| column.name.canonical() == name.canonical())
-                    .expect("validated CHECK column exists")
-                    .id
-            }),
-            name: check.name,
-            dependencies: resolve_expression_dependencies(&check.expression, columns)
-                .expect("validated CHECK references existing columns"),
-            expression: check.expression,
+        .map(|check| {
+            let column = check
+                .column
+                .as_ref()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.name.canonical() == name.canonical())
+                        .map(Column::id)
+                        .ok_or(Error::UnsupportedSql(
+                            "CHECK constraint owner is not a table column",
+                        ))
+                })
+                .transpose()?;
+            let dependencies = resolve_expression_dependencies(&check.expression, columns)?;
+            Ok(CheckConstraint {
+                column,
+                name: check.name,
+                dependencies,
+                expression: check.expression,
+            })
         })
         .collect()
 }
@@ -3702,10 +3735,38 @@ fn decode_type_declaration(frame: &[u8]) -> std::result::Result<TypeDeclaration,
     if declaration.name.is_empty()
         || declaration.arguments.len() > 2
         || declaration.arguments.iter().any(String::is_empty)
+        || !type_declaration_roundtrips(&declaration)
     {
         return Err(SchemaCodecError::InvalidColumnType);
     }
     Ok(declaration)
+}
+
+fn type_declaration_roundtrips(declaration: &TypeDeclaration) -> bool {
+    let sql = format!(
+        "CREATE TABLE __multilite_type_probe (
+            id INTEGER PRIMARY KEY,
+            value {}
+        )",
+        declaration.to_sql()
+    );
+    let Ok(super::sql::ValidatedExecute::CreateTable(spec)) = super::sql::validate_execute(&sql)
+    else {
+        return false;
+    };
+    matches!(
+        spec.columns.as_slice(),
+        [_, value]
+            if value.name == SqlName::new("value".into())
+                && value.declared_type == *declaration
+                && !value.not_null
+                && value.not_null_name.is_none()
+                && value.default.is_none()
+                && value.primary_key.is_none()
+                && spec.unique_constraints.is_empty()
+                && spec.foreign_keys.is_empty()
+                && spec.checks.is_empty()
+    )
 }
 
 fn decode_unique_constraint(
@@ -3797,7 +3858,7 @@ fn from_homebase_inner(
     else {
         return Err(SchemaCodecError::InvalidBatch);
     };
-    let created = CreateTable::decode(frame)?;
+    let created = CreateTable::decode_operation(frame)?;
     if admitted_log_key != &schema_log_key(created.mutation_id) {
         return Err(SchemaCodecError::InvalidBatch);
     }
@@ -3813,7 +3874,9 @@ fn from_homebase_inner(
     Ok(created)
 }
 
-fn validate_provenance_sql(created: &CreateTable) -> std::result::Result<(), SchemaCodecError> {
+fn validate_snapshot_provenance_sql(
+    created: &CreateTable,
+) -> std::result::Result<(), SchemaCodecError> {
     let parsed = parse_create_table(&created.sql)?;
     if parsed.name != created.name {
         return Err(SchemaCodecError::SqlMismatch);
@@ -3829,6 +3892,101 @@ fn validate_provenance_sql(created: &CreateTable) -> std::result::Result<(), Sch
         }
     }
     Ok(())
+}
+
+fn validate_initial_provenance_sql(
+    created: &CreateTable,
+) -> std::result::Result<(), SchemaCodecError> {
+    let parsed = parse_create_table(&created.sql)?;
+    if parsed.name != created.name
+        || parsed.mode != created.schema.mode
+        || parsed.storage != created.schema.storage
+        || !created.schema.indexes.is_empty()
+        || parsed.primary_key_name != created.schema.primary_key.name
+        || parsed.columns.len() != created.schema.columns.len()
+        || parsed.unique_constraints.len() != created.schema.unique_constraints.len()
+        || parsed.foreign_keys.len() != created.schema.foreign_keys.len()
+        || parsed.checks.len() != created.schema.checks.len()
+    {
+        return Err(SchemaCodecError::SqlMismatch);
+    }
+
+    for (parsed, encoded) in parsed.columns.iter().zip(&created.schema.columns) {
+        let primary_key = created
+            .schema
+            .primary_key
+            .columns()
+            .iter()
+            .position(|column| *column == encoded.id);
+        if parsed.name != encoded.name
+            || parsed.declared_type != encoded.declared_type
+            || parsed.not_null != encoded.not_null
+            || parsed.not_null_name != encoded.not_null_name
+            || parsed.default != encoded.default
+            || parsed.primary_key != primary_key
+        {
+            return Err(SchemaCodecError::SqlMismatch);
+        }
+    }
+
+    for (parsed, encoded) in parsed
+        .unique_constraints
+        .iter()
+        .zip(&created.schema.unique_constraints)
+    {
+        let columns = encoded
+            .columns()
+            .iter()
+            .map(|column| column_name(created, *column))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(SchemaCodecError::SqlMismatch)?;
+        if parsed.name != encoded.name || parsed.columns.as_slice() != columns.as_slice() {
+            return Err(SchemaCodecError::SqlMismatch);
+        }
+    }
+
+    for (parsed, encoded) in parsed.foreign_keys.iter().zip(&created.schema.foreign_keys) {
+        let columns = encoded
+            .columns
+            .iter()
+            .map(|column| column_name(created, *column))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(SchemaCodecError::SqlMismatch)?;
+        if parsed.name != encoded.name
+            || parsed.columns.as_slice() != columns.as_slice()
+            || parsed.referenced_table != encoded.referenced_table_name
+            || parsed.referenced_columns.as_ref().is_some_and(|columns| {
+                columns.as_slice() != encoded.referenced_column_names.as_slice()
+            })
+        {
+            return Err(SchemaCodecError::SqlMismatch);
+        }
+    }
+
+    for (parsed, encoded) in parsed.checks.iter().zip(&created.schema.checks) {
+        let column = match encoded.column {
+            Some(column) => {
+                Some(column_name(created, column).ok_or(SchemaCodecError::SqlMismatch)?)
+            }
+            None => None,
+        };
+        if parsed.column.as_ref() != column.as_ref()
+            || parsed.name != encoded.name
+            || parsed.expression != encoded.expression
+        {
+            return Err(SchemaCodecError::SqlMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn column_name(created: &CreateTable, id: ColumnId) -> Option<SqlName> {
+    created
+        .schema
+        .columns
+        .iter()
+        .find(|column| column.id == id)
+        .map(|column| column.name.clone())
 }
 
 fn parse_create_table(sql: &str) -> std::result::Result<CreateTableSpec, SchemaCodecError> {
@@ -3893,6 +4051,7 @@ mod tests {
                 id
             },
         )
+        .unwrap()
     }
 
     fn deterministic_unique_create() -> CreateTable {
@@ -3952,6 +4111,7 @@ mod tests {
                 id
             },
         )
+        .unwrap()
     }
 
     fn deterministic_overlapping_unique_create() -> CreateTable {
@@ -4035,6 +4195,7 @@ mod tests {
                 id
             },
         )
+        .unwrap()
     }
 
     fn test_uuid(byte: u8) -> [u8; 16] {
@@ -4312,6 +4473,32 @@ mod tests {
             CreateTable::decode(&duplicate_index_dependency.encode()),
             Err(SchemaCodecError::InvalidSchema)
         );
+    }
+
+    #[test]
+    fn index_provenance_binds_sql_column_order_to_stable_ids() {
+        let created = deterministic_create("notes");
+        let super::super::sql::ValidatedExecute::CreateIndex(spec) =
+            super::super::sql::validate_execute(
+                "CREATE UNIQUE INDEX notes_identity ON notes (id, body)",
+            )
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let correct = NamedIndex::new_unique(
+            "CREATE UNIQUE INDEX notes_identity ON notes (id, body)".into(),
+            spec.name.clone(),
+            vec![created.columns()[0].id(), created.columns()[1].id()],
+        );
+        let crossed = NamedIndex::new_unique(
+            "CREATE UNIQUE INDEX notes_identity ON notes (id, body)".into(),
+            spec.name.clone(),
+            vec![created.columns()[1].id(), created.columns()[0].id()],
+        );
+
+        assert!(created.named_index_matches_spec(&correct, &spec));
+        assert!(!created.named_index_matches_spec(&crossed, &spec));
     }
 
     #[test]
@@ -4761,12 +4948,20 @@ mod tests {
     fn structural_schema_is_self_contained_and_sql_remains_valid_provenance() {
         let created = deterministic_create("notes");
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+        assert_eq!(
+            CreateTable::decode_operation(&created.encode()).unwrap(),
+            created
+        );
 
         let mut mismatch = decode_frame(&created.encode()).unwrap();
         mismatch.sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body BLOB NOT NULL)".into();
         assert_eq!(
             CreateTable::decode(&mismatch.encode()).unwrap().schema,
             created.schema
+        );
+        assert_eq!(
+            CreateTable::decode_operation(&mismatch.encode()),
+            Err(SchemaCodecError::SqlMismatch)
         );
 
         let mut invalid = decode_frame(&created.encode()).unwrap();
@@ -4801,6 +4996,12 @@ mod tests {
         assert_eq!(
             decode_type_declaration(&missing_name.finish()),
             Err(SchemaCodecError::MissingField(TAG_TYPE_NAME))
+        );
+
+        let injected = TypeDeclaration::new("TEXT NOT NULL".into(), Vec::new());
+        assert_eq!(
+            decode_type_declaration(&encode_type_declaration(&injected)),
+            Err(SchemaCodecError::InvalidColumnType)
         );
     }
 

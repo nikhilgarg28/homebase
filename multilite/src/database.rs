@@ -55,7 +55,7 @@ use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 use self::authority::Authority;
-use self::policy::{PolicyState, PushScheduler};
+use self::policy::{PolicyState, PushScheduler, RefreshGate};
 use self::row::{CapturedChange, CapturedRow, StoredValue};
 use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
 
@@ -413,6 +413,7 @@ pub(crate) struct Database<H: ServerHandle> {
     database_id: DatabaseId,
     client: Arc<DatabaseClient<H>>,
     policy: PolicyState,
+    refresh: RefreshGate,
     isolation_level: IsolationLevel,
     committer: Committer,
     authority: Authority,
@@ -1149,6 +1150,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         database_id,
         client,
         policy: PolicyState::new(sync_policy),
+        refresh: RefreshGate::new(),
         isolation_level,
         committer,
         authority,

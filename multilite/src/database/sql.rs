@@ -1145,6 +1145,17 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             ));
         }
     }
+    if checks.iter().any(|check| {
+        check.expression.referenced_columns().iter().any(|name| {
+            !columns
+                .iter()
+                .any(|column| column.name.canonical() == name.canonical())
+        })
+    }) {
+        return Err(Error::UnsupportedSql(
+            "CHECK constraints reference unknown table columns",
+        ));
+    }
     Ok(ValidatedExecute::CreateTable(CreateTableSpec {
         name,
         mode,
@@ -1846,6 +1857,19 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 body TEXT,
                 CHECK (length(body) > 0) ON CONFLICT IGNORE
+            )",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn rejects_check_references_to_unknown_columns_without_panicking() {
+        for sql in [
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, CHECK (missing > 0))",
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT CHECK (length(unknown_body) > 0)
             )",
         ] {
             assert_unsupported(sql);

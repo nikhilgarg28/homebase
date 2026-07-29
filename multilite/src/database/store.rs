@@ -25,6 +25,7 @@ pub struct DatabaseMetaStore {
     owner: ConnectionOwner,
     inner: OrderedMetaStore<SqliteOrderedStore>,
     canonical: CanonicalRouter,
+    joined_dispositions: bool,
 }
 
 pub trait CanonicalMetaSink: Send + Sync + 'static {
@@ -59,6 +60,7 @@ impl DatabaseMetaStore {
             inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
             owner,
             canonical: CanonicalRouter::default(),
+            joined_dispositions: false,
         }
     }
 
@@ -67,8 +69,69 @@ impl DatabaseMetaStore {
             inner: OrderedMetaStore::new(SqliteOrderedStore::new(owner.clone())),
             owner,
             canonical,
+            joined_dispositions: true,
         }
     }
+
+    fn rollback_without_sink(
+        &self,
+        space: SpaceId,
+        to: DeviceSeq,
+        expected: Option<OplogCursors>,
+    ) -> MultiliteResult<()> {
+        self.owner
+            .with_savepoint("__multilite__reject", |connection| {
+                let current = pollster::block_on(self.inner.oplog_cursors(space))?;
+                let already_completed = expected
+                    .map(completed_rollback_cursors)
+                    .transpose()?
+                    .is_some_and(|completed| current == completed);
+                if let Some(expected) = expected
+                    && current != expected
+                    && !already_completed
+                {
+                    return Err(Error::StalePushRejection);
+                }
+
+                if to >= current.neck && to < current.tail {
+                    let through = DeviceSeq(
+                        current
+                            .tail
+                            .0
+                            .checked_sub(1)
+                            .ok_or(Error::InvalidDatabase("submit tail cannot be zero"))?,
+                    );
+                    let active =
+                        pollster::block_on(self.inner.oplog(space, current.neck, through))?;
+                    if let Some(repair) = pending::prepare_rejection(connection, &active)? {
+                        repair.apply(connection)?;
+                    }
+                }
+
+                match expected {
+                    Some(expected) => {
+                        pollster::block_on(self.inner.rollback_if_unchanged(space, to, expected))?
+                    }
+                    None => pollster::block_on(self.inner.rollback(space, to))?,
+                }
+                let after = pollster::block_on(self.inner.oplog_cursors(space))?;
+                pending::validate_active_from(connection, after.neck)
+            })
+    }
+}
+
+fn completed_rollback_cursors(expected: OplogCursors) -> MultiliteResult<OplogCursors> {
+    Ok(OplogCursors {
+        head: expected.head,
+        neck: expected.tail,
+        tail: DeviceSeq(
+            expected
+                .tail
+                .0
+                .checked_add(1)
+                .ok_or_else(|| Error::CommitConflict("submit tail is exhausted".into()))?,
+        ),
+    })
 }
 
 impl MetaStore for DatabaseMetaStore {
@@ -157,7 +220,17 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     async fn rollback(&self, space: SpaceId, to: DeviceSeq) -> Result<(), StorageError> {
-        self.inner.rollback(space, to).await
+        if !self.joined_dispositions {
+            return self.inner.rollback(space, to).await;
+        }
+        if let Some(sink) = self.canonical.sink() {
+            let expected = self.inner.oplog_cursors(space).await?;
+            let proposal =
+                CommitProposal::reject_submissions(to, expected).map_err(storage_error)?;
+            return sink.propose(proposal).map_err(storage_error);
+        }
+        self.rollback_without_sink(space, to, None)
+            .map_err(storage_error)
     }
 
     async fn rollback_if_unchanged(
@@ -166,12 +239,16 @@ impl MetaStore for DatabaseMetaStore {
         to: DeviceSeq,
         expected: OplogCursors,
     ) -> Result<(), StorageError> {
+        if !self.joined_dispositions {
+            return self.inner.rollback_if_unchanged(space, to, expected).await;
+        }
         if let Some(sink) = self.canonical.sink() {
             let proposal =
                 CommitProposal::reject_submissions(to, expected).map_err(storage_error)?;
             return sink.propose(proposal).map_err(storage_error);
         }
-        self.inner.rollback_if_unchanged(space, to, expected).await
+        self.rollback_without_sink(space, to, Some(expected))
+            .map_err(storage_error)
     }
 
     async fn append_admits(
@@ -246,9 +323,17 @@ fn storage_error(error: Error) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use homebase_client::meta::conformance;
+    use homebase_client::meta::{SubmitMode, conformance};
+    use homebase_core::seal::Seal;
+    use homebase_core::space::SpaceId;
+    use homebase_core::tag::{CipherEpoch, DeviceEntry, DeviceId, DeviceTag, OpaqueValue};
 
     use super::*;
+    use crate::database::catalog;
+    use crate::database::operation::MultiliteOp;
+    use crate::database::schema::CreateTable;
+    use crate::database::sql::ValidatedExecute;
+    use crate::database::transaction::MultiliteTransaction;
 
     #[test]
     fn joined_store_passes_homebase_conformance() {
@@ -257,5 +342,105 @@ mod tests {
         owner.with_connection(pending::initialize).unwrap();
 
         pollster::block_on(conformance::run_all(&DatabaseMetaStore::new(owner)));
+    }
+
+    #[test]
+    fn no_sink_rollbacks_join_inverse_effects_pending_rows_and_cursors() {
+        for guarded in [false, true] {
+            let owner = ConnectionOwner::open_in_memory().unwrap();
+            SqliteOrderedStore::initialize(&owner).unwrap();
+            owner.with_connection(pending::initialize).unwrap();
+            owner.with_connection(catalog::initialize).unwrap();
+            let canonical = CanonicalRouter::default();
+            let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
+            let space = SpaceId([7; 16]);
+            let sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY)";
+            let ValidatedExecute::CreateTable(spec) =
+                super::super::sql::validate_execute(sql).unwrap()
+            else {
+                unreachable!()
+            };
+            let created = CreateTable::new(sql, spec);
+            let transaction =
+                MultiliteTransaction::new(vec![MultiliteOp::CreateTable(created.clone())]).unwrap();
+            let (mutations, _) = transaction.to_homebase().unwrap().into_parts();
+            let reserved = pollster::block_on(store.reserve_commit(
+                space,
+                mutations.len(),
+                Vec::new(),
+                SubmitMode::Checked,
+            ))
+            .unwrap();
+            let entries = mutations
+                .into_iter()
+                .zip(&reserved.versions)
+                .map(|(mutation, ver)| DeviceEntry {
+                    mutation: match mutation {
+                        homebase_core::tag::Mutation::Set { key, value } => {
+                            homebase_core::tag::Mutation::Set {
+                                key,
+                                value: OpaqueValue(value),
+                            }
+                        }
+                        homebase_core::tag::Mutation::Delete { key } => {
+                            homebase_core::tag::Mutation::Delete { key }
+                        }
+                        homebase_core::tag::Mutation::DeleteRange { range } => {
+                            homebase_core::tag::Mutation::DeleteRange { range }
+                        }
+                    },
+                    tag: DeviceTag {
+                        device: DeviceId([3; 16]),
+                        device_seq: reserved.seq,
+                        ver: *ver,
+                        cipher_epoch: CipherEpoch(0),
+                    },
+                    seal: Seal::empty_aead_v1(),
+                })
+                .collect();
+            let committed = pollster::block_on(store.commit(space, reserved, entries)).unwrap();
+            owner
+                .with_savepoint("__multilite__speculate", |connection| {
+                    connection.execute(&created.materialization_sql(connection)?, ())?;
+                    catalog::insert(connection, &created)?;
+                    pending::insert(connection, committed.seq, &transaction)
+                })
+                .unwrap();
+            let expected = pollster::block_on(store.oplog_cursors(space)).unwrap();
+
+            if guarded {
+                pollster::block_on(store.rollback_if_unchanged(space, committed.seq, expected))
+                    .unwrap();
+                pollster::block_on(store.rollback_if_unchanged(space, committed.seq, expected))
+                    .unwrap();
+            } else {
+                pollster::block_on(store.rollback(space, committed.seq)).unwrap();
+                pollster::block_on(store.rollback(space, committed.seq)).unwrap();
+            }
+
+            owner
+                .with_connection(|connection| {
+                    assert!(pending::load(connection)?.is_empty());
+                    assert!(
+                        !catalog::is_initialized(connection)? || {
+                            catalog::by_name(connection, "notes")?.is_none()
+                        }
+                    );
+                    let exists = connection.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_schema
+                            WHERE type = 'table' AND name = 'notes'
+                        )",
+                        (),
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    assert!(!exists);
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+            let after = pollster::block_on(store.oplog_cursors(space)).unwrap();
+            assert_eq!(after.neck, expected.tail);
+            assert_eq!(after.tail, DeviceSeq(expected.tail.0 + 1));
+        }
     }
 }

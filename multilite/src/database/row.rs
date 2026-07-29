@@ -1133,6 +1133,14 @@ impl InsertRows {
         Ok(prefixes)
     }
 
+    fn incoming_reference_prefix_set(&self) -> std::result::Result<BTreeSet<Key>, RowCodecError> {
+        let mut prefixes = BTreeSet::new();
+        for row in &self.rows {
+            prefixes.extend(self.incoming_reference_prefixes(row)?);
+        }
+        Ok(prefixes)
+    }
+
     fn encode_row(&self, row: &Row) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_FRAME_VERSION);
@@ -1611,26 +1619,20 @@ impl UpdateRows {
                 });
             }
         }
-        for (before, after) in self.before.rows.iter().zip(&self.after.rows) {
-            let before_prefixes = self
-                .before
-                .incoming_reference_prefixes(before)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            let after_prefixes = self
-                .after
-                .incoming_reference_prefixes(after)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            for reference_prefix in before_prefixes.difference(&after_prefixes) {
-                footprint.add_write(reference_prefix.clone());
-                footprint.add_constraint(reference_prefix.clone());
-                mutations.push(Mutation::DeleteRange {
-                    range: Range::Prefix(reference_prefix.clone()),
-                });
-            }
+        let before_incoming = self
+            .before
+            .incoming_reference_prefix_set()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let after_incoming = self
+            .after
+            .incoming_reference_prefix_set()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        for reference_prefix in before_incoming.difference(&after_incoming) {
+            footprint.add_write(reference_prefix.clone());
+            footprint.add_constraint(reference_prefix.clone());
+            mutations.push(Mutation::DeleteRange {
+                range: Range::Prefix(reference_prefix.clone()),
+            });
         }
         footprint.add_constraint(active_primary_index_key(self.after.table));
         footprint.add_constraint(write_revision_key(self.after.table));
@@ -3413,6 +3415,74 @@ mod tests {
                 } if prefix == &old_reference
             )
         }));
+    }
+
+    #[test]
+    fn multi_row_parent_key_moves_retire_only_operation_wide_removed_references() {
+        let (connection, _, _) = foreign_key_tables();
+        let before_two = CapturedRow {
+            table: "parents".into(),
+            rowid: 2,
+            values: vec![StoredValue::Integer(2), StoredValue::Text(b"two".to_vec())],
+        };
+        let before_three = CapturedRow {
+            table: "parents".into(),
+            rowid: 3,
+            values: vec![
+                StoredValue::Integer(3),
+                StoredValue::Text(b"three".to_vec()),
+            ],
+        };
+        let after_one = CapturedRow {
+            rowid: 1,
+            values: vec![StoredValue::Integer(1), StoredValue::Text(b"two".to_vec())],
+            ..before_two.clone()
+        };
+        let after_two = CapturedRow {
+            rowid: 2,
+            values: vec![
+                StoredValue::Integer(2),
+                StoredValue::Text(b"three".to_vec()),
+            ],
+            ..before_three.clone()
+        };
+        let updated = UpdateRows::from_captured(
+            &connection,
+            &[(before_two, after_one), (before_three, after_two)],
+        )
+        .unwrap()
+        .unwrap();
+        let retained = updated
+            .before
+            .incoming_reference_prefixes(&updated.before.rows[0])
+            .unwrap()
+            .remove(0);
+        let retired = updated
+            .before
+            .incoming_reference_prefixes(&updated.before.rows[1])
+            .unwrap()
+            .remove(0);
+
+        let lowered = updated.to_homebase().unwrap();
+        assert!(!lowered.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::DeleteRange {
+                    range: Range::Prefix(prefix)
+                } if prefix == &retained
+            )
+        }));
+        assert!(lowered.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::DeleteRange {
+                    range: Range::Prefix(prefix)
+                } if prefix == &retired
+            )
+        }));
+        assert!(!lowered.footprint.writes().contains(&retained));
+        assert!(lowered.footprint.writes().contains(&retired));
+        assert!(lowered.footprint.constraints().contains(&retired));
     }
 
     #[test]

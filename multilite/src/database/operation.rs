@@ -101,7 +101,7 @@ impl MultiliteOp {
             ALTER_TABLE_OPERATION => AlterTableOperation::decode(reader.rest())
                 .map(Self::AlterTable)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
-            CREATE_TABLE_OPERATION => CreateTable::decode(reader.rest())
+            CREATE_TABLE_OPERATION => CreateTable::decode_operation(reader.rest())
                 .map(Self::CreateTable)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())

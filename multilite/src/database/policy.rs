@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use homebase_client::ServerHandle;
 
 use super::Database;
@@ -29,7 +30,6 @@ pub enum SyncPolicy {
 
 pub struct PolicyState {
     policy: SyncPolicy,
-    last_pull: Mutex<Option<Instant>>,
     last_refresh: Mutex<Option<Instant>>,
 }
 
@@ -37,7 +37,6 @@ impl PolicyState {
     pub fn new(policy: SyncPolicy) -> Self {
         Self {
             policy,
-            last_pull: Mutex::new(None),
             last_refresh: Mutex::new(None),
         }
     }
@@ -53,10 +52,12 @@ impl PolicyState {
         }
     }
 
-    pub fn read_requires_refresh(&self) -> bool {
+    pub fn read_requires_refresh_since(&self, requested_at: Instant) -> bool {
         match self.policy {
             SyncPolicy::LocalOnly => false,
-            SyncPolicy::Remote => true,
+            SyncPolicy::Remote => {
+                lock(&self.last_refresh).is_none_or(|refreshed| refreshed < requested_at)
+            }
             SyncPolicy::LocalFirst { read_staleness, .. } => {
                 read_staleness.is_zero()
                     || lock(&self.last_refresh)
@@ -66,13 +67,47 @@ impl PolicyState {
     }
 
     pub fn mark_pulled(&self) {
-        *lock(&self.last_pull) = Some(Instant::now());
+        *lock(&self.last_refresh) = None;
     }
 
-    pub fn mark_rebased(&self) {
-        if let Some(pulled) = lock(&self.last_pull).take() {
-            *lock(&self.last_refresh) = Some(pulled);
-        }
+    pub fn mark_rebased(&self, pulled_at: Instant) {
+        *lock(&self.last_refresh) = Some(pulled_at);
+    }
+}
+
+/// Async mutex for pull/rebase freshness transitions.
+pub struct RefreshGate {
+    sender: AsyncSender<()>,
+    receiver: AsyncReceiver<()>,
+}
+
+impl RefreshGate {
+    pub fn new() -> Self {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender
+            .try_send(())
+            .expect("new refresh gate has one empty token slot");
+        Self { sender, receiver }
+    }
+
+    pub async fn enter(&self) -> Result<RefreshGuard> {
+        self.receiver
+            .recv()
+            .await
+            .map_err(|_| Error::BackgroundWorker("refresh gate is unavailable".into()))?;
+        Ok(RefreshGuard {
+            sender: self.sender.clone(),
+        })
+    }
+}
+
+pub struct RefreshGuard {
+    sender: AsyncSender<()>,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(());
     }
 }
 
@@ -179,6 +214,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::mpsc::TryRecvError;
 
     use super::*;
@@ -203,5 +239,43 @@ mod tests {
             Ok(SchedulerCommand::Schedule(_))
         ));
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn remote_freshness_coalesces_only_requests_observed_by_one_refresh() {
+        let policy = PolicyState::new(SyncPolicy::Remote);
+        let first_request = Instant::now();
+        assert!(policy.read_requires_refresh_since(first_request));
+
+        let refreshed = Instant::now();
+        policy.mark_rebased(refreshed);
+        assert!(!policy.read_requires_refresh_since(first_request));
+
+        std::thread::sleep(Duration::from_millis(1));
+        let later_request = Instant::now();
+        assert!(policy.read_requires_refresh_since(later_request));
+        policy.mark_pulled();
+        assert!(policy.read_requires_refresh_since(first_request));
+    }
+
+    #[test]
+    fn refresh_gate_serializes_complete_pull_and_rebase_cycles() {
+        let gate = Arc::new(RefreshGate::new());
+        let first = pollster::block_on(gate.enter()).unwrap();
+        let second_gate = Arc::clone(&gate);
+        let (entered, observed) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let second = pollster::block_on(second_gate.enter()).unwrap();
+            entered.send(()).unwrap();
+            drop(second);
+        });
+
+        assert!(matches!(
+            observed.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
     }
 }

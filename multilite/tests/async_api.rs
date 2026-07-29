@@ -234,14 +234,31 @@ fn async_remote_policy_refreshes_reads_and_admits_exact_writes() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            second
-                .query_async("SELECT id, body FROM notes", (), |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .await
-                .unwrap(),
-            [(1, "first".into())]
+        let readers = 8;
+        let start = Arc::new(std::sync::Barrier::new(readers));
+        let observed = std::thread::scope(|scope| {
+            let mut reads = Vec::new();
+            for _ in 0..readers {
+                let database = &second;
+                let start = Arc::clone(&start);
+                reads.push(scope.spawn(move || {
+                    start.wait();
+                    pollster::block_on(database.query_async(
+                        "SELECT id, body FROM notes",
+                        (),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    ))
+                }));
+            }
+            reads
+                .into_iter()
+                .map(|read| read.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            observed
+                .iter()
+                .all(|rows| rows == &[(1, String::from("first"))])
         );
 
         second

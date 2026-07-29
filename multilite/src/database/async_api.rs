@@ -1,6 +1,7 @@
 //! Async-first orchestration over owned committer, authority, and branch work.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use homebase_client::meta::{MetaStore, OplogCursors};
 use homebase_client::{ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
@@ -63,12 +64,22 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) async fn pull_async(self: &Arc<Self>) -> Result<PullOutcome> {
+        let _refresh = self.refresh.enter().await?;
+        self.pull_locked_async().await
+    }
+
+    async fn pull_locked_async(self: &Arc<Self>) -> Result<PullOutcome> {
         let through = self.authority.pull().await?;
         self.policy.mark_pulled();
         Ok(PullOutcome { through })
     }
 
     pub(crate) async fn rebase_async(self: &Arc<Self>) -> Result<()> {
+        let _refresh = self.refresh.enter().await?;
+        self.rebase_locked_async().await
+    }
+
+    async fn rebase_locked_async(self: &Arc<Self>) -> Result<()> {
         let space_id = self.database_id.space_id();
         let owner = self.owner.clone();
         let (initial_submit, initial_admits) = blocking::run(move || {
@@ -87,7 +98,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
         let admit_range = initial_admits.neck..initial_admits.tail;
         if admit_range.is_empty() {
-            self.policy.mark_rebased();
             return Ok(());
         }
         let client = Arc::clone(&self.client);
@@ -127,7 +137,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             transactions,
         )?;
         self.committer.propose(proposal).await?;
-        self.policy.mark_rebased();
         Ok(())
     }
 
@@ -205,7 +214,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(super) async fn refresh_read_async(self: &Arc<Self>) -> Result<()> {
-        if !self.policy.read_requires_refresh() {
+        let requested_at = Instant::now();
+        if !self.policy.read_requires_refresh_since(requested_at) {
+            return Ok(());
+        }
+        let _refresh = self.refresh.enter().await?;
+        if !self.policy.read_requires_refresh_since(requested_at) {
             return Ok(());
         }
         let submit = self.submit_cursors_async().await?;
@@ -217,8 +231,11 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 }
             }
         }
-        self.pull_async().await?;
-        self.rebase_async().await
+        self.pull_locked_async().await?;
+        let pulled_at = Instant::now();
+        self.rebase_locked_async().await?;
+        self.policy.mark_rebased(pulled_at);
+        Ok(())
     }
 
     async fn submit_cursors_async(self: &Arc<Self>) -> Result<OplogCursors> {
