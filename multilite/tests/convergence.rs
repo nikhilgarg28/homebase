@@ -2144,6 +2144,100 @@ fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels()
 }
 
 #[test]
+fn compatible_column_evolution_commutes_with_stale_dml_at_both_isolation_levels() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("compatible-column-{isolation:?}-first.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("compatible-column-{isolation:?}-second.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE notes
+                 ADD COLUMN summary TEXT DEFAULT 'new'",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "INSERT INTO notes (id, body) VALUES (1, 'stale insert')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "a defaulted column must project a stale insert"
+        );
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("UPDATE notes SET body = 'stale update' WHERE id = 1", ())
+            .unwrap();
+        second
+            .execute("ALTER TABLE notes DROP COLUMN summary", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "dropping a non-key column must commute with a stale row update"
+        );
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, body FROM notes", (), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap(),
+                [(1, "stale update".into())]
+            );
+            assert!(
+                database
+                    .query("SELECT summary FROM notes", (), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn table_rename_and_stale_foreign_key_writes_converge_across_replicas() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

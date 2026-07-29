@@ -305,12 +305,13 @@ impl AlterTableOperation {
             } => {
                 let name_key = column_name_scope_key(self.table, name);
                 let schema_head = active_schema_revision_key(self.table);
-                let write_revision = write_revision_key(self.table);
+                let changes_write_contract =
+                    matches!(&self.delta, AlterTableDelta::AddColumn { .. })
+                        && after.added_column_changes_write_contract(*column);
                 let mut footprint = ConflictFootprint::new();
                 footprint.add_constraint(name_key.clone());
                 footprint.add_constraint(schema_head.clone());
                 footprint.add_write(schema_head.clone());
-                footprint.add_write(write_revision.clone());
                 let binding = match &self.delta {
                     AlterTableDelta::AddColumn { .. } => {
                         for dependency in after.added_column_dependencies(*column) {
@@ -325,26 +326,31 @@ impl AlterTableOperation {
                     AlterTableDelta::DropColumn { .. } => Mutation::Delete { key: name_key },
                     _ => unreachable!(),
                 };
+                let mut mutations = vec![
+                    Mutation::Set {
+                        key: schema_log_key(self.mutation_id),
+                        value: self.encode(),
+                    },
+                    binding,
+                    Mutation::Set {
+                        key: table_schema_key(self.table, after.schema_revision_id()),
+                        value: after.encode(),
+                    },
+                    Mutation::Set {
+                        key: schema_head,
+                        value: after.schema_revision_id().as_bytes().to_vec(),
+                    },
+                ];
+                if changes_write_contract {
+                    let write_revision = write_revision_key(self.table);
+                    footprint.add_write(write_revision.clone());
+                    mutations.push(Mutation::Set {
+                        key: write_revision,
+                        value: self.mutation_id.as_bytes().to_vec(),
+                    });
+                }
                 Ok(AlterTableHomebaseOp {
-                    mutations: vec![
-                        Mutation::Set {
-                            key: schema_log_key(self.mutation_id),
-                            value: self.encode(),
-                        },
-                        binding,
-                        Mutation::Set {
-                            key: table_schema_key(self.table, after.schema_revision_id()),
-                            value: after.encode(),
-                        },
-                        Mutation::Set {
-                            key: schema_head,
-                            value: after.schema_revision_id().as_bytes().to_vec(),
-                        },
-                        Mutation::Set {
-                            key: write_revision,
-                            value: self.mutation_id.as_bytes().to_vec(),
-                        },
-                    ],
+                    mutations,
                     footprint,
                 })
             }
@@ -1434,6 +1440,7 @@ mod tests {
 
     #[test]
     fn add_column_evolves_schema_and_write_contract_and_rolls_back() {
+        let (compatible, compatible_created) = connection();
         let (connection, created) = connection();
         connection
             .execute("INSERT INTO notes VALUES (1)", ())
@@ -1447,6 +1454,15 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 5);
         assert_eq!(lowered.footprint.constraints().len(), 3);
         assert_eq!(lowered.footprint.writes().len(), 2);
+
+        let compatible = simple_add_operation(&compatible).to_homebase().unwrap();
+        assert_eq!(compatible.mutations.len(), 4);
+        assert_eq!(compatible.footprint.writes().len(), 1);
+        assert!(
+            compatible.mutations.iter().all(
+                |mutation| mutation.key() != &write_revision_key(compatible_created.table_id())
+            )
+        );
 
         operation.apply(&connection).unwrap();
         let evolved = catalog::by_id(&connection, created.table_id())
@@ -1499,9 +1515,9 @@ mod tests {
         let drop = drop_operation(&connection);
         assert_eq!(AlterTableOperation::decode(&drop.encode()).unwrap(), drop);
         let lowered = drop.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 5);
+        assert_eq!(lowered.mutations.len(), 4);
         assert_eq!(lowered.footprint.constraints().len(), 2);
-        assert_eq!(lowered.footprint.writes().len(), 2);
+        assert_eq!(lowered.footprint.writes().len(), 1);
 
         drop.apply(&connection).unwrap();
         assert_eq!(

@@ -1385,6 +1385,25 @@ impl CreateTable {
         dependencies.into_values().collect()
     }
 
+    /// Whether introducing this column changes which pre-existing row writes
+    /// are valid. Defaults and nullability project deterministically; CHECK
+    /// constraints and an unfilled NOT NULL column do not.
+    pub fn added_column_changes_write_contract(&self, column: ColumnId) -> bool {
+        let Some(column) = self
+            .columns()
+            .iter()
+            .find(|candidate| candidate.id() == column)
+        else {
+            return true;
+        };
+        (column.is_not_null() && column.default().is_none())
+            || self
+                .schema
+                .checks
+                .iter()
+                .any(|check| check.column == Some(column.id()))
+    }
+
     pub fn with_removed_column(
         &self,
         revision: SchemaRevisionId,
