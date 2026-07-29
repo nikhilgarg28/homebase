@@ -276,14 +276,24 @@ fn unique_index_ddl_is_atomic_and_names_can_be_reused_after_drop() {
         (),
     )
     .unwrap();
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO notes VALUES (3, 'one', 'different', 'first')",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
     assert_eq!(
         db.query(
-            "SELECT sql FROM sqlite_schema WHERE name = 'notes_identity'",
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'index'
+               AND name = 'notes_identity'
+               AND tbl_name = 'notes'",
             (),
-            |row| row.get::<_, String>(0),
+            |row| row.get::<_, i64>(0),
         )
         .unwrap(),
-        ["CREATE UNIQUE INDEX notes_identity ON notes (tenant, body)"]
+        [1]
     );
 }
 
@@ -1747,7 +1757,7 @@ fn autoincrement_and_schema_conflict_policies_are_rejected_without_schema_change
 }
 
 #[test]
-fn alter_column_rejects_shapes_that_cannot_be_replayed_safely() {
+fn alter_column_rejects_identity_unsafe_shapes_and_accepts_rebuildable_drops() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("alter-safety.sqlite")).unwrap();
 
@@ -1811,22 +1821,28 @@ fn alter_column_rejects_shapes_that_cannot_be_replayed_safely() {
         (),
     )
     .unwrap();
-    assert!(matches!(
-        db.execute("ALTER TABLE checked DROP COLUMN value", ()),
-        Err(Error::UnsupportedSql(_))
-    ));
+    db.execute("INSERT INTO checked VALUES (1, 'valid')", ())
+        .unwrap();
+    db.execute("ALTER TABLE checked DROP COLUMN value", ())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE checked ADD COLUMN value TEXT DEFAULT 'replacement'",
+        (),
+    )
+    .unwrap();
     db.execute(
         "CREATE TABLE required (
             id INTEGER PRIMARY KEY,
-            value TEXT NOT NULL
+            value TEXT NOT NULL,
+            tail TEXT
         )",
         (),
     )
     .unwrap();
-    assert!(matches!(
-        db.execute("ALTER TABLE required DROP COLUMN value", ()),
-        Err(Error::UnsupportedSql(_))
-    ));
+    db.execute("INSERT INTO required VALUES (1, 'required', 'tail')", ())
+        .unwrap();
+    db.execute("ALTER TABLE required DROP COLUMN value", ())
+        .unwrap();
 
     assert_eq!(
         db.query("SELECT spare FROM aliases", (), |row| {
@@ -1849,6 +1865,132 @@ fn alter_column_rejects_shapes_that_cannot_be_replayed_safely() {
         })
         .unwrap(),
         ["blob"]
+    );
+    assert_eq!(
+        db.query("SELECT id, tail FROM required", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "tail".into())]
+    );
+    assert_eq!(
+        db.query("SELECT id, value FROM checked", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "replacement".into())]
+    );
+}
+
+#[test]
+fn column_rename_keeps_checks_and_expression_indexes_valid_across_rebuild() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rename-expression-rebuild.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT CONSTRAINT body_nonempty CHECK (length(body) > 0),
+                spare TEXT
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE INDEX notes_body_search
+             ON notes (lower(body), body COLLATE NOCASE DESC)
+             WHERE body IS NOT NULL",
+            (),
+        )?;
+        transaction.execute("INSERT INTO notes VALUES (1, 'one', 'spare')", ())?;
+        Ok(())
+    })
+    .unwrap();
+    db.execute("ALTER TABLE notes RENAME COLUMN body TO contents", ())
+        .unwrap();
+    db.execute("ALTER TABLE notes DROP COLUMN spare", ())
+        .unwrap();
+
+    assert_eq!(
+        db.query("SELECT id, contents FROM notes", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "one".into())]
+    );
+    assert!(
+        db.execute("INSERT INTO notes VALUES (2, '')", ()).is_err(),
+        "the renamed CHECK constraint must survive a later table rebuild"
+    );
+    db.execute("INSERT INTO notes VALUES (2, 'two')", ())
+        .unwrap();
+    drop(db);
+
+    let stock = Connection::open(&path).unwrap();
+    let table_sql = stock
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'notes'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let index_sql = stock
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'index' AND name = 'notes_body_search'",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(
+        table_sql.contains("CHECK (length (\"contents\") > 0)"),
+        "{table_sql}"
+    );
+    assert!(index_sql.contains("lower (\"contents\")"), "{index_sql}");
+    assert!(
+        index_sql.contains("WHERE \"contents\" IS NOT NULL"),
+        "{index_sql}"
+    );
+    assert_eq!(
+        stock
+            .query_row("PRAGMA integrity_check", (), |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[test]
+fn managed_update_adds_multiple_columns_in_statement_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("multi-add.sqlite")).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1)", ()).unwrap();
+
+    db.update(|transaction| {
+        transaction.execute(
+            "ALTER TABLE notes ADD COLUMN first TEXT DEFAULT 'first'",
+            (),
+        )?;
+        transaction.execute(
+            "ALTER TABLE notes ADD COLUMN second TEXT DEFAULT 'second'",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.query("SELECT * FROM notes", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(1, "first".into(), "second".into())]
     );
 }
 

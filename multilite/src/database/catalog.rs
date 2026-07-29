@@ -25,10 +25,11 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         ) WITHOUT ROWID;
         CREATE TABLE {COLUMN_TABLE} (
             table_id BLOB NOT NULL CHECK(length(table_id) = 16),
-            column_name BLOB NOT NULL,
             column_id BLOB NOT NULL CHECK(length(column_id) = 16),
-            PRIMARY KEY (table_id, column_name),
-            UNIQUE (table_id, column_id)
+            predecessor_id BLOB CHECK(predecessor_id IS NULL OR length(predecessor_id) = 16),
+            column_name BLOB,
+            PRIMARY KEY (table_id, column_id),
+            UNIQUE (table_id, column_name)
         ) WITHOUT ROWID"
     ))?;
     Ok(())
@@ -100,8 +101,14 @@ pub fn validate(connection: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let expected = vec![
         (String::from("table_id"), String::from("BLOB"), true, 1),
-        (String::from("column_name"), String::from("BLOB"), true, 2),
-        (String::from("column_id"), String::from("BLOB"), true, 0),
+        (String::from("column_id"), String::from("BLOB"), true, 2),
+        (
+            String::from("predecessor_id"),
+            String::from("BLOB"),
+            false,
+            0,
+        ),
+        (String::from("column_name"), String::from("BLOB"), false, 0),
     ];
     if columns != expected {
         return Err(Error::InvalidDatabase(
@@ -157,10 +164,17 @@ pub fn validate(connection: &Connection) -> Result<()> {
         }
         let bindings = column_bindings(connection, created.table_id())?;
         if bindings.len() != created.columns().len()
-            || created
-                .columns()
-                .iter()
-                .any(|column| !bindings.iter().any(|(id, _)| *id == column.id()))
+            || created.columns().iter().any(|column| {
+                !bindings.iter().any(|(id, name)| {
+                    *id == column.id() && name.canonical() == column.name().canonical()
+                })
+            })
+            || column_order(connection, created.table_id())?
+                != created
+                    .columns()
+                    .iter()
+                    .map(|column| column.id())
+                    .collect::<Vec<_>>()
         {
             return Err(Error::InvalidDatabase(
                 "schema column bindings contradict their definition",
@@ -202,15 +216,20 @@ pub fn insert(connection: &Connection, created: &CreateTable) -> Result<()> {
         ],
     )?;
     let mut statement = connection.prepare(&format!(
-        "INSERT INTO {COLUMN_TABLE} (table_id, column_name, column_id)
-         VALUES (?1, ?2, ?3)"
+        "INSERT INTO {COLUMN_TABLE} (
+            table_id, column_id, predecessor_id, column_name
+         ) VALUES (?1, ?2, ?3, ?4)"
     ))?;
+    let mut predecessor = None::<ColumnId>;
     for column in created.columns() {
+        let predecessor_bytes = predecessor.map(ColumnId::as_bytes);
         statement.execute(params![
             created.table_id().as_bytes().as_slice(),
-            column.name().canonical(),
             column.id().as_bytes().as_slice(),
+            predecessor_bytes.as_ref().map(<[u8; 16]>::as_slice),
+            column.name().canonical(),
         ])?;
+        predecessor = Some(column.id());
     }
     Ok(())
 }
@@ -271,7 +290,7 @@ pub fn column_name_by_id(
         .query_row(
             &format!(
                 "SELECT column_name FROM {COLUMN_TABLE}
-                 WHERE table_id = ?1 AND column_id = ?2"
+                 WHERE table_id = ?1 AND column_id = ?2 AND column_name IS NOT NULL"
             ),
             params![table.as_bytes().as_slice(), column.as_bytes().as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
@@ -331,34 +350,65 @@ pub fn insert_column_binding(
     connection: &Connection,
     table: TableId,
     column: ColumnId,
+    predecessor: ColumnId,
     name: &SqlName,
 ) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT INTO {COLUMN_TABLE} (table_id, column_name, column_id)
-             VALUES (?1, ?2, ?3)"
+            "INSERT INTO {COLUMN_TABLE} (
+                table_id, column_id, predecessor_id, column_name
+             ) VALUES (?1, ?2, ?3, ?4)"
         ),
         params![
             table.as_bytes().as_slice(),
-            name.canonical(),
             column.as_bytes().as_slice(),
+            predecessor.as_bytes().as_slice(),
+            name.canonical(),
         ],
     )?;
     Ok(())
 }
 
-pub fn remove_column_binding(
+pub fn retire_column_binding(
     connection: &Connection,
     table: TableId,
     column: ColumnId,
 ) -> Result<()> {
     let changed = connection.execute(
-        &format!("DELETE FROM {COLUMN_TABLE} WHERE table_id = ?1 AND column_id = ?2"),
+        &format!(
+            "UPDATE {COLUMN_TABLE} SET column_name = NULL
+             WHERE table_id = ?1 AND column_id = ?2 AND column_name IS NOT NULL"
+        ),
         params![table.as_bytes().as_slice(), column.as_bytes().as_slice()],
     )?;
     if changed != 1 {
         return Err(Error::InvalidDatabase(
             "schema catalog column changed during removal",
+        ));
+    }
+    Ok(())
+}
+
+pub fn restore_column_binding(
+    connection: &Connection,
+    table: TableId,
+    column: ColumnId,
+    name: &SqlName,
+) -> Result<()> {
+    let changed = connection.execute(
+        &format!(
+            "UPDATE {COLUMN_TABLE} SET column_name = ?1
+             WHERE table_id = ?2 AND column_id = ?3 AND column_name IS NULL"
+        ),
+        params![
+            name.canonical(),
+            table.as_bytes().as_slice(),
+            column.as_bytes().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidDatabase(
+            "schema catalog column changed during restoration",
         ));
     }
     Ok(())
@@ -380,7 +430,7 @@ pub fn column_names(connection: &Connection, definition: &CreateTable) -> Result
 fn column_bindings(connection: &Connection, table: TableId) -> Result<Vec<(ColumnId, SqlName)>> {
     let mut statement = connection.prepare(&format!(
         "SELECT column_id, column_name FROM {COLUMN_TABLE}
-         WHERE table_id = ?1 ORDER BY column_name"
+         WHERE table_id = ?1 AND column_name IS NOT NULL ORDER BY column_name"
     ))?;
     statement
         .query_map([table.as_bytes().as_slice()], |row| {
@@ -391,6 +441,90 @@ fn column_bindings(connection: &Connection, table: TableId) -> Result<Vec<(Colum
             Ok((decode_column_id(&id)?, decode_column_binding(&name)?))
         })
         .collect()
+}
+
+/// Linearize active column identities from their durable predecessor graph.
+pub fn column_order(connection: &Connection, table: TableId) -> Result<Vec<ColumnId>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT column_id, predecessor_id, column_name
+         FROM {COLUMN_TABLE} WHERE table_id = ?1 ORDER BY column_id"
+    ))?;
+    let rows = statement
+        .query_map([table.as_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut nodes = std::collections::BTreeMap::new();
+    for (column, predecessor, name) in rows {
+        let column = decode_column_id(&column)?;
+        let predecessor = predecessor.as_deref().map(decode_column_id).transpose()?;
+        if nodes
+            .insert(column, (predecessor, name.is_some()))
+            .is_some()
+        {
+            return Err(Error::InvalidDatabase(
+                "schema column catalog contains a duplicate identity",
+            ));
+        }
+    }
+    if nodes.is_empty() {
+        return Err(Error::InvalidDatabase(
+            "schema column catalog has no ordering root",
+        ));
+    }
+
+    let mut children = std::collections::BTreeMap::<Option<ColumnId>, Vec<ColumnId>>::new();
+    for (column, (predecessor, _)) in &nodes {
+        if predecessor.is_some_and(|predecessor| !nodes.contains_key(&predecessor)) {
+            return Err(Error::InvalidDatabase(
+                "schema column predecessor is unknown",
+            ));
+        }
+        children.entry(*predecessor).or_default().push(*column);
+    }
+    if children.get(&None).is_none_or(|roots| roots.len() != 1) {
+        return Err(Error::InvalidDatabase(
+            "schema column catalog has an invalid ordering root",
+        ));
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_unstable();
+    }
+
+    fn visit(
+        parent: Option<ColumnId>,
+        nodes: &std::collections::BTreeMap<ColumnId, (Option<ColumnId>, bool)>,
+        children: &std::collections::BTreeMap<Option<ColumnId>, Vec<ColumnId>>,
+        visited: &mut BTreeSet<ColumnId>,
+        active: &mut Vec<ColumnId>,
+    ) -> Result<()> {
+        for column in children.get(&parent).into_iter().flatten() {
+            if !visited.insert(*column) {
+                return Err(Error::InvalidDatabase(
+                    "schema column predecessor graph contains a cycle",
+                ));
+            }
+            if nodes[column].1 {
+                active.push(*column);
+            }
+            visit(Some(*column), nodes, children, visited, active)?;
+        }
+        Ok(())
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut active = Vec::new();
+    visit(None, &nodes, &children, &mut visited, &mut active)?;
+    if visited.len() != nodes.len() || active.is_empty() {
+        return Err(Error::InvalidDatabase(
+            "schema column predecessor graph is disconnected",
+        ));
+    }
+    Ok(active)
 }
 
 /// Return the current SQLite spelling bound to a stable table identity.
@@ -550,6 +684,8 @@ fn decode_column_id(bytes: &[u8]) -> Result<ColumnId> {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
     use crate::database::schema::{CreateColumn, CreateTableSpec, TypeDeclaration};
 
@@ -664,16 +800,107 @@ mod tests {
         orphaned
             .execute(
                 &format!(
-                    "INSERT INTO {COLUMN_TABLE} (table_id, column_name, column_id)
-                     VALUES (?1, ?2, ?3)"
+                    "INSERT INTO {COLUMN_TABLE} (
+                        table_id, column_id, predecessor_id, column_name
+                     ) VALUES (?1, ?2, NULL, ?3)"
                 ),
-                params![[1_u8; 16].as_slice(), b"body", [2_u8; 16].as_slice()],
+                params![[1_u8; 16].as_slice(), [2_u8; 16].as_slice(), b"body"],
             )
             .unwrap();
         assert!(matches!(
             validate(&orphaned),
             Err(Error::InvalidDatabase(
                 "schema column catalog contains an unknown table identity"
+            ))
+        ));
+    }
+
+    #[test]
+    fn tombstoned_predecessors_keep_live_descendants_in_order() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let created = created();
+        insert(&connection, &created).unwrap();
+        let id = created.columns()[0].id();
+        let body = created.columns()[1].id();
+        let tail = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
+        insert_column_binding(
+            &connection,
+            created.table_id(),
+            tail,
+            body,
+            &SqlName::new("tail".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            column_order(&connection, created.table_id()).unwrap(),
+            [id, body, tail]
+        );
+        retire_column_binding(&connection, created.table_id(), body).unwrap();
+        assert_eq!(
+            column_order(&connection, created.table_id()).unwrap(),
+            [id, tail]
+        );
+        restore_column_binding(
+            &connection,
+            created.table_id(),
+            body,
+            &SqlName::new("body".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            column_order(&connection, created.table_id()).unwrap(),
+            [id, body, tail]
+        );
+    }
+
+    #[test]
+    fn column_order_rejects_unknown_and_disconnected_predecessors() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let created = created();
+        insert(&connection, &created).unwrap();
+        let body = created.columns()[1].id();
+        connection
+            .execute(
+                &format!(
+                    "UPDATE {COLUMN_TABLE} SET predecessor_id = ?1
+                     WHERE table_id = ?2 AND column_id = ?3"
+                ),
+                params![
+                    Uuid::new_v4().into_bytes().as_slice(),
+                    created.table_id().as_bytes().as_slice(),
+                    body.as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            column_order(&connection, created.table_id()),
+            Err(Error::InvalidDatabase(
+                "schema column predecessor is unknown"
+            ))
+        ));
+
+        let disconnected = Connection::open_in_memory().unwrap();
+        initialize(&disconnected).unwrap();
+        insert(&disconnected, &created).unwrap();
+        disconnected
+            .execute(
+                &format!(
+                    "UPDATE {COLUMN_TABLE} SET predecessor_id = column_id
+                     WHERE table_id = ?1 AND column_id = ?2"
+                ),
+                params![
+                    created.table_id().as_bytes().as_slice(),
+                    body.as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            column_order(&disconnected, created.table_id()),
+            Err(Error::InvalidDatabase(
+                "schema column predecessor graph is disconnected"
             ))
         ));
     }

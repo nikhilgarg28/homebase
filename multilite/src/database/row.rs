@@ -1866,7 +1866,6 @@ impl UpdateRows {
 }
 
 /// Prefix covering every row encoded under a table's active primary index.
-#[cfg(test)]
 pub fn primary_index_prefix(created: &CreateTable) -> Key {
     row_prefix(created.table_id(), created.primary_index_id(), Vec::new())
         .expect("table row prefix is bounded and non-empty")

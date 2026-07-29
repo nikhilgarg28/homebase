@@ -6,6 +6,7 @@ pub const LOG: &[u8] = b"log";
 pub const NAMES: &[u8] = b"names";
 pub const TABLES: &[u8] = b"tables";
 pub const COLUMNS: &[u8] = b"columns";
+pub const COLUMN_DEPENDENCIES: &[u8] = b"column-dependencies";
 pub const MAIN: &[u8] = b"main";
 pub const INDEXES: &[u8] = b"indexes";
 pub const ACTIVE_SCHEMA_REVISION: &[u8] = b"active-schema-revision";

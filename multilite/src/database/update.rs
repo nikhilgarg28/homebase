@@ -323,10 +323,19 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         let (_, footprint) = logical.to_homebase()?.into_parts();
         let (changed, events) = self.hooks.run_schema(
             || {
-                let changed = self.connection.execute(sql, params)?;
-                self.hooks
-                    .with_internal(|| operation.record_catalog(self.connection))?;
-                Ok(changed)
+                if operation.materializes_internally() {
+                    let mut statement = self.connection.prepare(sql)?;
+                    params.__bind_in(&mut statement)?;
+                    drop(statement);
+                    self.hooks
+                        .with_internal(|| operation.apply(self.connection))?;
+                    Ok(0)
+                } else {
+                    let changed = self.connection.execute(sql, params)?;
+                    self.hooks
+                        .with_internal(|| operation.record_catalog(self.connection))?;
+                    Ok(changed)
+                }
             },
             |_| Ok(()),
         )?;
@@ -358,6 +367,7 @@ struct BranchHookState {
     events: Vec<CapturedChange>,
     error: Option<Error>,
     internal_depth: usize,
+    read_trace_suppression_depth: usize,
     trace_reads: bool,
     table_bindings: BTreeMap<String, TableId>,
     read_tables: BTreeSet<[u8; 16]>,
@@ -389,6 +399,7 @@ impl<'connection> BranchHooks<'connection> {
             let authorization = super::authorize_database(mode, &context);
             if state.trace_reads
                 && mode == ExecutionMode::Public
+                && state.read_trace_suppression_depth == 0
                 && authorization == Authorization::Allow
                 && let AuthAction::Read { table_name, .. } = context.action
                 && super::is_main(context.database_name)
@@ -436,6 +447,7 @@ impl<'connection> BranchHooks<'connection> {
         operation: impl FnOnce() -> Result<T>,
         finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
     ) -> Result<(T, Vec<CapturedChange>)> {
+        let _guard = BranchReadTraceGuard::enter(Arc::clone(&self.state));
         self.run_inner(operation, finalize, true)
     }
 
@@ -551,6 +563,27 @@ impl Drop for BranchInternalGuard {
             .internal_depth
             .checked_sub(1)
             .expect("branch internal hook depth is balanced");
+    }
+}
+
+struct BranchReadTraceGuard {
+    state: Arc<Mutex<BranchHookState>>,
+}
+
+impl BranchReadTraceGuard {
+    fn enter(state: Arc<Mutex<BranchHookState>>) -> Self {
+        lock(&state).read_trace_suppression_depth += 1;
+        Self { state }
+    }
+}
+
+impl Drop for BranchReadTraceGuard {
+    fn drop(&mut self) {
+        let mut state = lock(&self.state);
+        state.read_trace_suppression_depth = state
+            .read_trace_suppression_depth
+            .checked_sub(1)
+            .expect("branch read-trace suppression depth is balanced");
     }
 }
 

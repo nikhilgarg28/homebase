@@ -748,21 +748,6 @@ fn select_table_reads_reserved(table: &SelectTable) -> bool {
     }
 }
 
-/// Render an immutable CREATE INDEX definition for its owner's current name.
-pub(super) fn render_create_index(sql: &str, table: &SqlName) -> Result<String> {
-    let mut statement = parse_one(sql)?;
-    let Stmt::CreateIndex { tbl_name, .. } = &mut statement else {
-        return Err(Error::InvalidMultiliteOp(
-            "index definition is not CREATE INDEX".into(),
-        ));
-    };
-    if identifier(tbl_name)?.canonical() == table.canonical() {
-        return Ok(sql.to_owned());
-    }
-    *tbl_name = quoted_name(table);
-    Ok(Cmd::Stmt(statement).to_string())
-}
-
 /// Render an immutable ALTER TABLE statement for its owner's current name.
 pub(super) fn render_alter_table(sql: &str, table: &SqlName) -> Result<String> {
     let mut statement = parse_one(sql)?;
@@ -774,6 +759,25 @@ pub(super) fn render_alter_table(sql: &str, table: &SqlName) -> Result<String> {
     name.db_name = None;
     name.name = quoted_name(table);
     name.alias = None;
+    Ok(Cmd::Stmt(statement).to_string())
+}
+
+/// Render one complete CREATE TABLE definition under a temporary owner name.
+pub(super) fn render_create_table_name(sql: &str, table: &SqlName) -> Result<String> {
+    let mut statement = parse_one(sql)?;
+    let Stmt::CreateTable { tbl_name, body, .. } = &mut statement else {
+        return Err(Error::InvalidDatabase(
+            "materialized table definition is not CREATE TABLE",
+        ));
+    };
+    if !matches!(body, CreateTableBody::ColumnsAndConstraints { .. }) {
+        return Err(Error::InvalidDatabase(
+            "materialized table has no column definitions",
+        ));
+    }
+    tbl_name.db_name = None;
+    tbl_name.name = quoted_name(table);
+    tbl_name.alias = None;
     Ok(Cmd::Stmt(statement).to_string())
 }
 
@@ -1528,32 +1532,7 @@ fn expression_identifier(expression: Expr) -> Result<SqlName> {
 }
 
 fn identifier(name: &Name) -> Result<SqlName> {
-    let token = name.0.as_ref();
-    let bytes = token.as_bytes();
-    let value = match bytes {
-        [b'"', middle @ .., b'"'] => unescape_identifier(middle, b'"'),
-        [b'`', middle @ .., b'`'] => unescape_identifier(middle, b'`'),
-        [b'[', middle @ .., b']'] => unescape_identifier(middle, b']'),
-        [b'\'', middle @ .., b'\''] => unescape_identifier(middle, b'\''),
-        _ => token.to_owned(),
-    };
-    if value.is_empty() {
-        return Err(Error::UnsupportedSql("empty identifiers are not supported"));
-    }
-    Ok(SqlName::new(value))
-}
-
-fn unescape_identifier(bytes: &[u8], quote: u8) -> String {
-    let mut value = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        value.push(bytes[index]);
-        if bytes[index] == quote && bytes.get(index + 1) == Some(&quote) {
-            index += 1;
-        }
-        index += 1;
-    }
-    String::from_utf8(value).expect("SQLite parser identifiers originate in UTF-8 SQL")
+    SqlName::from_sqlite_token(&name.0)
 }
 
 #[cfg(test)]
@@ -1606,17 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn materialization_renderers_change_only_uuid_resolved_table_names() {
-        let rendered = render_create_index(
-            "CREATE INDEX notes_body ON notes (body COLLATE NOCASE DESC)",
-            &SqlName::new("Archived Notes".into()),
-        )
-        .unwrap();
-        let ValidatedExecute::CreateIndex(spec) = validate_execute(&rendered).unwrap() else {
-            panic!("rendered index parsed as another statement kind")
-        };
-        assert_eq!(spec.table, SqlName::new("Archived Notes".into()));
-
+    fn materialization_renderer_changes_only_uuid_resolved_table_names() {
         let rendered = render_create_table(
             "CREATE TABLE children (
                 id INTEGER PRIMARY KEY,

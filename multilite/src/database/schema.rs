@@ -21,7 +21,7 @@ use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
-const SCHEMA_FRAME_VERSION: u8 = 5;
+const SCHEMA_FRAME_VERSION: u8 = 6;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -49,6 +49,7 @@ const TAG_PRIMARY_NAME: u8 = 2;
 const TAG_CHECK_COLUMN: u8 = 1;
 const TAG_CHECK_NAME: u8 = 2;
 const TAG_CHECK_EXPRESSION: u8 = 3;
+const TAG_CHECK_DEPENDENCY: u8 = 4;
 const TYPE_DECLARATION_FRAME_VERSION: u8 = 1;
 const TAG_TYPE_NAME: u8 = 1;
 const TAG_TYPE_ARGUMENT: u8 = 2;
@@ -60,6 +61,7 @@ const TAG_INDEX_SQL: u8 = 5;
 const TAG_INDEX_ACTIVE: u8 = 6;
 const TAG_INDEX_TERM: u8 = 7;
 const TAG_INDEX_PREDICATE: u8 = 8;
+const TAG_INDEX_DEPENDENCY: u8 = 9;
 const INDEX_TERM_FRAME_VERSION: u8 = 1;
 const TAG_INDEX_TERM_COLUMN: u8 = 1;
 const TAG_INDEX_TERM_COLLATION: u8 = 2;
@@ -116,6 +118,34 @@ impl SqlName {
     pub fn canonical(&self) -> &[u8] {
         &self.canonical
     }
+
+    pub(super) fn from_sqlite_token(token: &str) -> Result<Self> {
+        let bytes = token.as_bytes();
+        let value = match bytes {
+            [b'"', middle @ .., b'"'] => unescape_identifier(middle, b'"'),
+            [b'`', middle @ .., b'`'] => unescape_identifier(middle, b'`'),
+            [b'[', middle @ .., b']'] => unescape_identifier(middle, b']'),
+            [b'\'', middle @ .., b'\''] => unescape_identifier(middle, b'\''),
+            _ => token.to_owned(),
+        };
+        if value.is_empty() {
+            return Err(Error::UnsupportedSql("empty identifiers are not supported"));
+        }
+        Ok(Self::new(value))
+    }
+}
+
+fn unescape_identifier(bytes: &[u8], quote: u8) -> String {
+    let mut value = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        value.push(bytes[index]);
+        if bytes[index] == quote && bytes.get(index + 1) == Some(&quote) {
+            index += 1;
+        }
+        index += 1;
+    }
+    String::from_utf8(value).expect("SQLite parser identifiers originate in UTF-8 SQL")
 }
 
 pub fn available_hidden_rowid_alias<'a>(
@@ -392,10 +422,14 @@ impl SqlExpression {
         Self(Box::new(expression))
     }
 
-    fn referenced_columns(&self) -> Vec<SqlName> {
+    pub(super) fn referenced_columns(&self) -> Vec<SqlName> {
         let mut columns = BTreeMap::new();
         collect_expression_columns(&self.0, &mut columns);
         columns.into_values().collect()
+    }
+
+    fn rename_column(&mut self, old_name: &SqlName, new_name: &SqlName) {
+        rename_expression_column(&mut self.0, old_name, new_name);
     }
 }
 
@@ -510,8 +544,131 @@ fn collect_expression_columns(expression: &Expr, columns: &mut BTreeMap<Vec<u8>,
 }
 
 fn record_expression_column(columns: &mut BTreeMap<Vec<u8>, SqlName>, value: &str) {
-    let name = SqlName::new(value.to_owned());
+    let name = SqlName::from_sqlite_token(value)
+        .expect("validated schema expressions contain non-empty SQLite identifiers");
     columns.entry(name.canonical().to_vec()).or_insert(name);
+}
+
+fn rename_expression_column(expression: &mut Expr, old_name: &SqlName, new_name: &SqlName) {
+    match expression {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            rename_expression_column(lhs, old_name, new_name);
+            rename_expression_column(start, old_name, new_name);
+            rename_expression_column(end, old_name, new_name);
+        }
+        Expr::Binary(left, _, right) => {
+            rename_expression_column(left, old_name, new_name);
+            rename_expression_column(right, old_name, new_name);
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                rename_expression_column(base, old_name, new_name);
+            }
+            for (when, then) in when_then_pairs {
+                rename_expression_column(when, old_name, new_name);
+                rename_expression_column(then, old_name, new_name);
+            }
+            if let Some(else_expr) = else_expr {
+                rename_expression_column(else_expr, old_name, new_name);
+            }
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => rename_expression_column(expr, old_name, new_name),
+        Expr::DoublyQualified(_, _, column) | Expr::Qualified(_, column) => {
+            rename_expression_name(column, old_name, new_name)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            for argument in args.iter_mut().flatten() {
+                rename_expression_column(argument, old_name, new_name);
+            }
+            if let Some(sqlite3_parser::ast::FunctionCallOrder::SortList(order_by)) = order_by {
+                for column in order_by {
+                    rename_expression_column(&mut column.expr, old_name, new_name);
+                }
+            }
+            if let Some(filter) = filter_over
+                .as_mut()
+                .and_then(|tail| tail.filter_clause.as_deref_mut())
+            {
+                rename_expression_column(filter, old_name, new_name);
+            }
+        }
+        Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter) = filter_over
+                .as_mut()
+                .and_then(|tail| tail.filter_clause.as_deref_mut())
+            {
+                rename_expression_column(filter, old_name, new_name);
+            }
+        }
+        Expr::Id(identifier) => {
+            if expression_name_matches(&identifier.0, old_name) {
+                identifier.0 = quoted_identifier(new_name);
+            }
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            rename_expression_column(lhs, old_name, new_name);
+            for expression in rhs.iter_mut().flatten() {
+                rename_expression_column(expression, old_name, new_name);
+            }
+        }
+        Expr::InSelect { lhs, .. } | Expr::InTable { lhs, .. } => {
+            rename_expression_column(lhs, old_name, new_name);
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            rename_expression_column(lhs, old_name, new_name);
+            rename_expression_column(rhs, old_name, new_name);
+            if let Some(escape) = escape {
+                rename_expression_column(escape, old_name, new_name);
+            }
+        }
+        Expr::Name(name) => rename_expression_name(name, old_name, new_name),
+        Expr::Parenthesized(expressions) => {
+            for expression in expressions {
+                rename_expression_column(expression, old_name, new_name);
+            }
+        }
+        Expr::Raise(_, expression) => {
+            if let Some(expression) = expression {
+                rename_expression_column(expression, old_name, new_name);
+            }
+        }
+        Expr::Exists(_) | Expr::Literal(_) | Expr::Subquery(_) | Expr::Variable(_) => {}
+    }
+}
+
+fn rename_expression_name(
+    name: &mut sqlite3_parser::ast::Name,
+    old_name: &SqlName,
+    new_name: &SqlName,
+) {
+    if expression_name_matches(&name.0, old_name) {
+        name.0 = quoted_identifier(new_name);
+    }
+}
+
+fn expression_name_matches(token: &str, expected: &SqlName) -> bool {
+    SqlName::from_sqlite_token(token).is_ok_and(|name| name.canonical() == expected.canonical())
+}
+
+fn quoted_identifier(name: &SqlName) -> Box<str> {
+    format!("\"{}\"", name.value().replace('"', "\"\"")).into()
 }
 
 /// One validated CHECK declaration before column names become stable IDs.
@@ -550,7 +707,7 @@ pub struct IndexId([u8; 16]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForeignKeyId([u8; 16]);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ColumnId([u8; 16]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -626,6 +783,7 @@ pub struct NamedIndex {
     active: bool,
     terms: Vec<IndexTerm>,
     predicate: Option<SqlExpression>,
+    dependencies: Vec<ColumnId>,
 }
 
 /// One stable immediate `NO ACTION` relationship owned by the child table.
@@ -647,6 +805,7 @@ pub struct CheckConstraint {
     column: Option<ColumnId>,
     name: Option<SqlName>,
     expression: SqlExpression,
+    dependencies: Vec<ColumnId>,
 }
 
 /// Complete schema known for one table revision.
@@ -880,6 +1039,7 @@ impl IndexDefinition {
 
 impl NamedIndex {
     pub fn new_unique(sql: String, name: SqlName, columns: Vec<ColumnId>) -> Self {
+        let dependencies = columns.iter().copied().collect::<BTreeSet<_>>();
         Self {
             name,
             index: IndexDefinition {
@@ -891,6 +1051,7 @@ impl NamedIndex {
             active: true,
             terms: Vec::new(),
             predicate: None,
+            dependencies: dependencies.into_iter().collect(),
         }
     }
 
@@ -899,6 +1060,7 @@ impl NamedIndex {
         name: SqlName,
         terms: Vec<IndexTerm>,
         predicate: Option<SqlExpression>,
+        dependencies: Vec<ColumnId>,
     ) -> Self {
         Self {
             name,
@@ -911,6 +1073,7 @@ impl NamedIndex {
             active: true,
             terms,
             predicate,
+            dependencies,
         }
     }
 
@@ -938,6 +1101,10 @@ impl NamedIndex {
         self.predicate.as_ref()
     }
 
+    pub fn dependencies(&self) -> &[ColumnId] {
+        &self.dependencies
+    }
+
     pub fn index(&self) -> &IndexDefinition {
         &self.index
     }
@@ -946,9 +1113,65 @@ impl NamedIndex {
         &self.sql
     }
 
-    /// Render this immutable definition for its owner's current SQLite name.
-    pub fn materialization_sql(&self, table: &SqlName) -> Result<String> {
-        super::sql::render_create_index(&self.sql, table)
+    /// Render this typed definition against current table and column bindings.
+    pub fn materialization_sql(
+        &self,
+        connection: &Connection,
+        owner: &CreateTable,
+        table: &SqlName,
+    ) -> Result<String> {
+        if owner.index_definition(self.index_id()) != Some(self.index()) {
+            return Err(Error::InvalidDatabase(
+                "materialized index is not owned by its table definition",
+            ));
+        }
+        let column_name = |column| {
+            catalog::column_name_by_id(connection, owner.table_id(), column)?.ok_or(
+                Error::InvalidDatabase("materialized index column has no current name binding"),
+            )
+        };
+        let terms = if self.is_unique() {
+            self.columns()
+                .iter()
+                .map(|column| column_name(*column).map(|name| quote_identifier(name.value())))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.terms
+                .iter()
+                .map(|term| match term {
+                    IndexTerm::Column {
+                        column,
+                        collation,
+                        order,
+                    } => {
+                        let mut term = quote_identifier(column_name(*column)?.value());
+                        if let Some(collation) = collation {
+                            term.push_str(" COLLATE ");
+                            term.push_str(&quote_identifier(collation.value()));
+                        }
+                        push_index_order(&mut term, *order);
+                        Ok(term)
+                    }
+                    IndexTerm::Expression { expression, order } => {
+                        let mut term = expression.to_string();
+                        push_index_order(&mut term, *order);
+                        Ok(term)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut sql = format!(
+            "CREATE {}INDEX {} ON {} ({})",
+            if self.is_unique() { "UNIQUE " } else { "" },
+            quote_identifier(self.name.value()),
+            quote_identifier(table.value()),
+            terms.join(", ")
+        );
+        if let Some(predicate) = &self.predicate {
+            sql.push_str(" WHERE ");
+            sql.push_str(&predicate.to_string());
+        }
+        Ok(sql)
     }
 
     pub fn is_active(&self) -> bool {
@@ -1170,7 +1393,7 @@ impl CreateTable {
         sql: &str,
         spec: &super::sql::CreateIndexSpec,
     ) -> Result<NamedIndex> {
-        let (columns, terms) = self.resolve_index_terms(connection, spec)?;
+        let (columns, terms, dependencies) = self.resolve_index_terms(connection, spec)?;
         if spec.unique {
             Ok(NamedIndex::new_unique(
                 sql.to_owned(),
@@ -1183,6 +1406,7 @@ impl CreateTable {
                 spec.name.clone(),
                 terms,
                 spec.predicate.clone(),
+                dependencies,
             ))
         }
     }
@@ -1252,9 +1476,10 @@ impl CreateTable {
         &self,
         connection: &Connection,
         spec: &super::sql::CreateIndexSpec,
-    ) -> Result<(Vec<ColumnId>, Vec<IndexTerm>)> {
+    ) -> Result<(Vec<ColumnId>, Vec<IndexTerm>, Vec<ColumnId>)> {
         let mut columns = Vec::new();
         let mut terms = Vec::new();
+        let mut dependencies = BTreeSet::new();
         for term in &spec.terms {
             match term {
                 super::sql::CreateIndexTerm::Column {
@@ -1266,6 +1491,7 @@ impl CreateTable {
                         .ok_or(Error::UnsupportedSql(
                             "CREATE INDEX references an unknown column",
                         ))?;
+                    dependencies.insert(column_id);
                     if spec.unique {
                         if collation.is_some() || order.is_some() {
                             return Err(Error::UnsupportedSql(
@@ -1291,10 +1517,15 @@ impl CreateTable {
                         expression: expression.clone(),
                         order: *order,
                     });
+                    dependencies
+                        .extend(resolve_expression_dependencies(expression, self.columns())?);
                 }
             }
         }
-        Ok((columns, terms))
+        if let Some(predicate) = &spec.predicate {
+            dependencies.extend(resolve_expression_dependencies(predicate, self.columns())?);
+        }
+        Ok((columns, terms, dependencies.into_iter().collect()))
     }
 
     pub fn index_named(&self, name: &SqlName) -> Option<&NamedIndex> {
@@ -1320,6 +1551,81 @@ impl CreateTable {
         evolved.schema_revision_id = revision;
         evolved.schema.indexes[position].active = false;
         Some(evolved)
+    }
+
+    pub fn fold_added_index(&self, index: &NamedIndex) -> Result<Self> {
+        if !index.is_active()
+            || !named_index_definition_is_valid(index, self.columns())
+            || self
+                .schema
+                .indexes
+                .iter()
+                .any(|current| current.index_id() == index.index_id())
+            || self.index_named(index.name()).is_some()
+        {
+            return Err(Error::InvalidDatabase(
+                "index addition contradicts the current table components",
+            ));
+        }
+        let mut folded = self.clone();
+        folded.schema.indexes.push(index.clone());
+        folded.refresh_schema_revision();
+        Ok(folded)
+    }
+
+    pub fn fold_retired_index(&self, index: &NamedIndex) -> Result<Self> {
+        let mut folded = self.clone();
+        let current = folded
+            .schema
+            .indexes
+            .iter_mut()
+            .find(|current| current.index_id() == index.index_id())
+            .ok_or(Error::InvalidDatabase(
+                "index retirement references an unknown identity",
+            ))?;
+        if current != index || !current.is_active() {
+            return Err(Error::InvalidDatabase(
+                "index retirement contradicts the current table components",
+            ));
+        }
+        current.active = false;
+        folded.refresh_schema_revision();
+        Ok(folded)
+    }
+
+    pub fn fold_removed_index(&self, index: &NamedIndex) -> Result<Self> {
+        let mut folded = self.clone();
+        let position = folded
+            .schema
+            .indexes
+            .iter()
+            .position(|current| current == index)
+            .ok_or(Error::InvalidDatabase(
+                "index rollback references an unknown identity",
+            ))?;
+        folded.schema.indexes.remove(position);
+        folded.refresh_schema_revision();
+        Ok(folded)
+    }
+
+    pub fn fold_restored_index(&self, index: &NamedIndex) -> Result<Self> {
+        let mut folded = self.clone();
+        let current = folded
+            .schema
+            .indexes
+            .iter_mut()
+            .find(|current| current.index_id() == index.index_id())
+            .ok_or(Error::InvalidDatabase(
+                "index restoration references an unknown identity",
+            ))?;
+        if current != &index.retired() {
+            return Err(Error::InvalidDatabase(
+                "index restoration contradicts the current table components",
+            ));
+        }
+        *current = index.clone();
+        folded.refresh_schema_revision();
+        Ok(folded)
     }
 
     pub fn with_added_column(
@@ -1355,14 +1661,21 @@ impl CreateTable {
             not_null_name: spec.not_null_name.clone(),
             default: spec.default.clone(),
         });
-        evolved
-            .schema
-            .checks
-            .extend(checks.iter().map(|check| CheckConstraint {
-                column: check.column.as_ref().map(|_| id),
-                name: check.name.clone(),
-                expression: check.expression.clone(),
-            }));
+        let checks = checks
+            .iter()
+            .map(|check| {
+                Ok(CheckConstraint {
+                    column: check.column.as_ref().map(|_| id),
+                    name: check.name.clone(),
+                    expression: check.expression.clone(),
+                    dependencies: resolve_expression_dependencies(
+                        &check.expression,
+                        &evolved.schema.columns,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        evolved.schema.checks.extend(checks);
         Ok(evolved)
     }
 
@@ -1383,6 +1696,17 @@ impl CreateTable {
             }
         }
         dependencies.into_values().collect()
+    }
+
+    pub fn column_check_dependencies(&self, column: ColumnId) -> Vec<ColumnId> {
+        self.schema
+            .checks
+            .iter()
+            .filter(|check| check.column == Some(column))
+            .flat_map(|check| check.dependencies.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Whether introducing this column changes which pre-existing row writes
@@ -1415,21 +1739,24 @@ impl CreateTable {
                 .unique_constraints
                 .iter()
                 .any(|unique| unique.columns().contains(&column))
-            || self.schema.indexes.iter().any(|index| {
-                index.active
-                    && (index.columns().contains(&column)
-                        || index.terms().iter().any(
-                            |term| matches!(term, IndexTerm::Column { column: id, .. } if *id == column),
-                        ))
-            })
+            || self
+                .schema
+                .indexes
+                .iter()
+                .any(|index| index.active && index.dependencies().contains(&column))
             || self
                 .schema
                 .foreign_keys
                 .iter()
                 .any(|foreign_key| foreign_key.columns().contains(&column))
+            || self
+                .schema
+                .checks
+                .iter()
+                .any(|check| check.column != Some(column) && check.dependencies.contains(&column))
         {
             return Err(Error::UnsupportedSql(
-                "DROP COLUMN does not support key, index, or foreign-key columns",
+                "DROP COLUMN does not support key, index, CHECK, or foreign-key dependencies",
             ));
         }
         let mut evolved = self.clone();
@@ -1450,40 +1777,140 @@ impl CreateTable {
         Ok(evolved)
     }
 
-    pub fn reversible_column_sql(
+    /// Fold one independently admitted column addition into the current table.
+    pub fn fold_added_column(
         &self,
+        source: &Self,
         column: ColumnId,
-        current_name: &SqlName,
-    ) -> Result<String> {
-        let column = self
+        order: &[ColumnId],
+    ) -> Result<Self> {
+        if self.table_id != source.table_id
+            || self.mode() != source.mode()
+            || self.storage() != source.storage()
+            || self.schema.primary_key != source.schema.primary_key
+            || self
+                .columns()
+                .iter()
+                .any(|candidate| candidate.id() == column)
+        {
+            return Err(Error::InvalidDatabase(
+                "column addition contradicts the current table components",
+            ));
+        }
+        let added = source
             .columns()
             .iter()
             .find(|candidate| candidate.id() == column)
-            .ok_or(Error::UnsupportedSql(
-                "ALTER TABLE DROP COLUMN references an unknown column",
+            .ok_or(Error::InvalidDatabase(
+                "column addition is missing its column definition",
             ))?;
-        if column.is_not_null()
-            || self
+        let mut folded = self.clone();
+        folded.schema.columns.push(added.clone());
+        folded.schema.checks.extend(
+            source
                 .schema
                 .checks
                 .iter()
-                .any(|check| check.column == Some(column.id()))
+                .filter(|check| check.column == Some(column))
+                .cloned(),
+        );
+        folded.reorder_columns(order)?;
+        folded.refresh_schema_revision();
+        Ok(folded)
+    }
+
+    /// Fold one independently admitted column removal into the current table.
+    pub fn fold_removed_column(&self, column: ColumnId, order: &[ColumnId]) -> Result<Self> {
+        let mut folded = self.with_removed_column(self.schema_revision_id, column)?;
+        folded.reorder_columns(order)?;
+        folded.refresh_schema_revision();
+        Ok(folded)
+    }
+
+    /// Refresh expression spellings after one stable column binding moves.
+    pub fn fold_renamed_column_expressions(
+        &self,
+        column: ColumnId,
+        old_name: &SqlName,
+        new_name: &SqlName,
+    ) -> Result<Self> {
+        if !self
+            .columns()
+            .iter()
+            .any(|candidate| candidate.id() == column)
         {
-            return Err(Error::UnsupportedSql(
-                "DROP COLUMN currently requires a nullable column without an inline CHECK",
+            return Err(Error::InvalidDatabase(
+                "column rename references an unknown table component",
             ));
         }
-        let mut sql = format!(
-            "{} {}",
-            quote_identifier(current_name.value()),
-            column.declared_type().to_sql()
-        );
-        if let Some(default) = column.default() {
-            push_constraint_name(&mut sql, default.name.as_ref());
-            sql.push_str(" DEFAULT ");
-            sql.push_str(&default.expression.to_string());
+        let mut folded = self.clone();
+        for check in &mut folded.schema.checks {
+            check.expression.rename_column(old_name, new_name);
         }
-        Ok(sql)
+        let renamed = folded
+            .schema
+            .columns
+            .iter_mut()
+            .find(|candidate| candidate.id() == column)
+            .expect("column existence was checked");
+        if renamed.name.canonical() != old_name.canonical() {
+            return Err(Error::InvalidDatabase(
+                "column rename contradicts the folded schema binding",
+            ));
+        }
+        renamed.name = new_name.clone();
+        for index in &mut folded.schema.indexes {
+            for term in &mut index.terms {
+                if let IndexTerm::Expression { expression, .. } = term {
+                    expression.rename_column(old_name, new_name);
+                }
+            }
+            if let Some(predicate) = &mut index.predicate {
+                predicate.rename_column(old_name, new_name);
+            }
+        }
+        Ok(folded)
+    }
+
+    fn reorder_columns(&mut self, order: &[ColumnId]) -> Result<()> {
+        if order.len() != self.schema.columns.len() {
+            return Err(Error::InvalidDatabase(
+                "column order contradicts the active table definition",
+            ));
+        }
+        let mut columns = std::mem::take(&mut self.schema.columns)
+            .into_iter()
+            .map(|column| (column.id(), column))
+            .collect::<BTreeMap<_, _>>();
+        self.schema.columns = order
+            .iter()
+            .map(|column| {
+                columns.remove(column).ok_or(Error::InvalidDatabase(
+                    "column order references an unknown definition",
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !columns.is_empty() {
+            return Err(Error::InvalidDatabase(
+                "column order omits an active definition",
+            ));
+        }
+        Ok(())
+    }
+
+    fn refresh_schema_revision(&mut self) {
+        const DOMAIN: &[u8] = b"multilite:folded-schema:v1\0";
+
+        self.schema_revision_id = SchemaRevisionId([0; 16]);
+        let mut hash = Sha256::new();
+        hash.update(DOMAIN);
+        hash.update(encode_create_table(self));
+        let mut revision: [u8; 16] = hash.finalize()[..16]
+            .try_into()
+            .expect("SHA-256 prefix has a fixed length");
+        revision[6] = (revision[6] & 0x0f) | 0x40;
+        revision[8] = (revision[8] & 0x3f) | 0x80;
+        self.schema_revision_id = SchemaRevisionId(revision);
     }
 
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
@@ -1731,6 +2158,14 @@ fn push_constraint_name(sql: &mut String, name: Option<&SqlName>) {
     }
 }
 
+fn push_index_order(sql: &mut String, order: Option<IndexOrder>) {
+    match order {
+        Some(IndexOrder::Asc) => sql.push_str(" ASC"),
+        Some(IndexOrder::Desc) => sql.push_str(" DESC"),
+        None => {}
+    }
+}
+
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -1935,7 +2370,7 @@ fn build_create_table(
     } = spec;
     let mutation_id = MutationId(mint());
     let table_id = TableId(mint());
-    let schema_revision_id = SchemaRevisionId(mint());
+    let schema_revision_id = SchemaRevisionId([0; 16]);
     let row_index_id = IndexId(mint());
     let columns = column_specs
         .iter()
@@ -2012,7 +2447,7 @@ fn build_create_table(
             }
         })
         .collect();
-    CreateTable {
+    let mut table = CreateTable {
         mutation_id,
         sql: sql.to_owned(),
         table_id,
@@ -2028,7 +2463,9 @@ fn build_create_table(
             foreign_keys,
             checks,
         },
-    }
+    };
+    table.refresh_schema_revision();
+    table
 }
 
 fn lower_checks(checks: Vec<CreateCheckConstraint>, columns: &[Column]) -> Vec<CheckConstraint> {
@@ -2043,9 +2480,32 @@ fn lower_checks(checks: Vec<CreateCheckConstraint>, columns: &[Column]) -> Vec<C
                     .id
             }),
             name: check.name,
+            dependencies: resolve_expression_dependencies(&check.expression, columns)
+                .expect("validated CHECK references existing columns"),
             expression: check.expression,
         })
         .collect()
+}
+
+fn resolve_expression_dependencies(
+    expression: &SqlExpression,
+    columns: &[Column],
+) -> Result<Vec<ColumnId>> {
+    expression
+        .referenced_columns()
+        .into_iter()
+        .map(|name| {
+            columns
+                .iter()
+                .find(|column| column.name.canonical() == name.canonical())
+                .map(Column::id)
+                .ok_or(Error::UnsupportedSql(
+                    "schema expression references an unknown column",
+                ))
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
 }
 
 fn spec_primary_key_ids_from_columns(
@@ -2113,6 +2573,43 @@ pub fn column_name_scope_key(table: TableId, name: &SqlName) -> Key {
         component.as_slice(),
     ])
     .expect("column-name scope components are bounded and non-empty")
+}
+
+pub fn column_dependency_prefix(table: TableId, column: ColumnId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::COLUMN_DEPENDENCIES,
+        column.0.as_slice(),
+    ])
+    .expect("column dependency prefix is bounded")
+}
+
+pub fn column_index_dependency_key(table: TableId, column: ColumnId, index: IndexId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::COLUMN_DEPENDENCIES,
+        column.0.as_slice(),
+        codes::INDEXES,
+        index.0.as_slice(),
+    ])
+    .expect("column index dependency key is bounded")
+}
+
+pub fn column_check_dependency_key(table: TableId, column: ColumnId, owner: ColumnId) -> Key {
+    Key::from_bytes([
+        codes::ROOT,
+        codes::TABLES,
+        table.0.as_slice(),
+        codes::COLUMN_DEPENDENCIES,
+        column.0.as_slice(),
+        codes::COLUMNS,
+        owner.0.as_slice(),
+    ])
+    .expect("column CHECK dependency key is bounded")
 }
 
 /// Prefix covering every durable schema and row cell owned by one table.
@@ -2341,6 +2838,11 @@ fn encode_check_constraint(check: &CheckConstraint) -> Vec<u8> {
             check.expression.to_string().as_bytes(),
         )
         .expect("CHECK field length must fit in u32");
+    for dependency in &check.dependencies {
+        writer
+            .field(TAG_CHECK_DEPENDENCY, &dependency.as_bytes())
+            .expect("CHECK dependency field length must fit in u32");
+    }
     writer.finish()
 }
 
@@ -2397,6 +2899,11 @@ fn encode_named_index(index: &NamedIndex) -> Vec<u8> {
         writer
             .field(TAG_INDEX_PREDICATE, predicate.to_string().as_bytes())
             .expect("index predicate field length must fit in u32");
+    }
+    for dependency in &index.dependencies {
+        writer
+            .field(TAG_INDEX_DEPENDENCY, &dependency.as_bytes())
+            .expect("index dependency field length must fit in u32");
     }
     writer.finish()
 }
@@ -2597,7 +3104,7 @@ fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], SchemaCodecError> {
 }
 
 fn named_index_definition_is_valid(index: &NamedIndex, columns: &[Column]) -> bool {
-    match index.index.kind {
+    let shape_is_valid = match index.index.kind {
         IndexKind::Unique => {
             !index.columns().is_empty()
                 && index_columns_supported(IndexKind::Unique, index.columns().len())
@@ -2624,7 +3131,42 @@ fn named_index_definition_is_valid(index: &NamedIndex, columns: &[Column]) -> bo
                 })
         }
         IndexKind::Primary => false,
+    };
+    shape_is_valid && index_dependencies_match(index, columns)
+}
+
+fn index_dependencies_match(index: &NamedIndex, columns: &[Column]) -> bool {
+    let mut expected = BTreeSet::new();
+    expected.extend(index.columns().iter().copied());
+    for term in index.terms() {
+        match term {
+            IndexTerm::Column { column, .. } => {
+                expected.insert(*column);
+            }
+            IndexTerm::Expression { expression, .. } => {
+                let Ok(dependencies) = resolve_expression_dependencies(expression, columns) else {
+                    return false;
+                };
+                expected.extend(dependencies);
+            }
+        }
     }
+    if let Some(predicate) = index.predicate() {
+        let Ok(dependencies) = resolve_expression_dependencies(predicate, columns) else {
+            return false;
+        };
+        expected.extend(dependencies);
+    }
+    index.dependencies == expected.into_iter().collect::<Vec<_>>()
+}
+
+fn expression_dependencies_match(
+    expression: &SqlExpression,
+    dependencies: &[ColumnId],
+    columns: &[Column],
+) -> bool {
+    resolve_expression_dependencies(expression, columns)
+        .is_ok_and(|expected| expected == dependencies)
 }
 
 fn decode_create_table(
@@ -2790,6 +3332,7 @@ fn decode_create_table(
             check
                 .column
                 .is_some_and(|id| !columns.iter().any(|column| column.id == id))
+                || !expression_dependencies_match(&check.expression, &check.dependencies, &columns)
         })
         || (storage == TableStorage::Rowid
             && !rowid_alias
@@ -2910,6 +3453,7 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
     let mut active = None;
     let mut terms = Vec::new();
     let mut predicate = None;
+    let mut dependencies = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_NAMED_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
@@ -2939,6 +3483,9 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
                     })?;
                 set_once(&mut predicate, expression)?;
             }
+            TAG_INDEX_DEPENDENCY => {
+                dependencies.push(ColumnId::from_bytes(uuid_bytes(value)?));
+            }
             _ => {}
         }
     }
@@ -2949,6 +3496,7 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
         active: active.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ACTIVE))?,
         terms,
         predicate,
+        dependencies,
     })
 }
 
@@ -3098,6 +3646,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
     let mut column = None;
     let mut name = None;
     let mut expression = None;
+    let mut dependencies = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_CHECK_COLUMN => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
@@ -3111,6 +3660,9 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
                         .map_err(|_| SchemaCodecError::InvalidSql)?,
                 )?;
             }
+            TAG_CHECK_DEPENDENCY => {
+                dependencies.push(ColumnId::from_bytes(uuid_bytes(value)?));
+            }
             _ => {}
         }
     }
@@ -3118,6 +3670,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
         column,
         name,
         expression: expression.ok_or(SchemaCodecError::MissingField(TAG_CHECK_EXPRESSION))?,
+        dependencies,
     })
 }
 
@@ -3525,6 +4078,68 @@ mod tests {
     }
 
     #[test]
+    fn independent_column_folds_have_one_definition_and_revision() {
+        let base = deterministic_create("notes");
+        let alpha = ColumnId(test_uuid(30));
+        let beta = ColumnId(test_uuid(20));
+        let added = |name: &str| CreateColumn {
+            name: SqlName::new(name.into()),
+            declared_type: TypeDeclaration::text(),
+            not_null: false,
+            not_null_name: None,
+            default: None,
+            primary_key: None,
+        };
+        let alpha_source = base
+            .with_added_column_identity(
+                SchemaRevisionId(test_uuid(31)),
+                alpha,
+                &added("alpha"),
+                &[],
+            )
+            .unwrap();
+        let beta_source = base
+            .with_added_column_identity(SchemaRevisionId(test_uuid(21)), beta, &added("beta"), &[])
+            .unwrap();
+        let base_order = base
+            .columns()
+            .iter()
+            .map(|column| column.id())
+            .collect::<Vec<_>>();
+        let mut alpha_order = base_order.clone();
+        alpha_order.push(alpha);
+        let mut beta_order = base_order.clone();
+        beta_order.push(beta);
+        let mut final_order = base_order;
+        final_order.extend([beta, alpha]);
+
+        let alpha_then_beta = base
+            .fold_added_column(&alpha_source, alpha, &alpha_order)
+            .unwrap()
+            .fold_added_column(&beta_source, beta, &final_order)
+            .unwrap();
+        let beta_then_alpha = base
+            .fold_added_column(&beta_source, beta, &beta_order)
+            .unwrap()
+            .fold_added_column(&alpha_source, alpha, &final_order)
+            .unwrap();
+
+        assert_eq!(alpha_then_beta, beta_then_alpha);
+        assert_eq!(
+            alpha_then_beta
+                .columns()
+                .iter()
+                .map(|column| column.name().value())
+                .collect::<Vec<_>>(),
+            ["id", "body", "beta", "alpha"]
+        );
+        assert_eq!(
+            CreateTable::decode(&alpha_then_beta.encode()).unwrap(),
+            alpha_then_beta
+        );
+    }
+
+    #[test]
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase();
@@ -3563,7 +4178,7 @@ mod tests {
     fn composite_unique_constraints_roundtrip_with_their_own_index() {
         let created = deterministic_unique_create();
         let unique = &created.schema.unique_constraints[0];
-        assert_eq!(unique.index.id.0, test_uuid(8));
+        assert_eq!(unique.index.id.0, test_uuid(7));
         assert_eq!(
             unique.columns(),
             vec![created.schema.columns[1].id, created.schema.columns[2].id]
@@ -3647,6 +4262,56 @@ mod tests {
         );
         assert_eq!(created.primary_key_columns().next().unwrap().id(), id);
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+    }
+
+    #[test]
+    fn decoder_rejects_expression_dependency_mismatches() {
+        let sql = "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            body TEXT,
+            summary TEXT CHECK (body IS NULL OR length(body) > 0)
+        )";
+        let super::super::sql::ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let body = created.columns()[1].id();
+        assert_eq!(created.schema.checks[0].dependencies, [body]);
+        assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+
+        let mut missing_check_dependency = created.clone();
+        missing_check_dependency.schema.checks[0]
+            .dependencies
+            .clear();
+        assert_eq!(
+            CreateTable::decode(&missing_check_dependency.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+
+        let index = NamedIndex::new_secondary(
+            "CREATE INDEX notes_body ON notes (body)".into(),
+            SqlName::new("notes_body".into()),
+            vec![IndexTerm::Column {
+                column: body,
+                collation: None,
+                order: None,
+            }],
+            None,
+            vec![body],
+        );
+        let indexed = created.with_added_index(SchemaRevisionId(test_uuid(90)), index);
+        assert_eq!(CreateTable::decode(&indexed.encode()).unwrap(), indexed);
+
+        let mut duplicate_index_dependency = indexed;
+        duplicate_index_dependency.schema.indexes[0]
+            .dependencies
+            .push(body);
+        assert_eq!(
+            CreateTable::decode(&duplicate_index_dependency.encode()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
     }
 
     #[test]
@@ -3970,7 +4635,7 @@ mod tests {
                 .iter()
                 .map(|unique| unique.index.id.0)
                 .collect::<Vec<_>>(),
-            [test_uuid(9), test_uuid(10), test_uuid(11), test_uuid(12)]
+            [test_uuid(8), test_uuid(9), test_uuid(10), test_uuid(11)]
         );
         assert_eq!(
             created

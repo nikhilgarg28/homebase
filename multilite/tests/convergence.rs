@@ -2033,7 +2033,451 @@ fn column_rename_fences_stale_name_bound_ddl_but_not_row_writes() {
 }
 
 #[test]
-fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels() {
+fn unrelated_column_add_and_index_creation_commute_at_both_isolation_levels() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("add-index-{isolation:?}-first.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("add-index-{isolation:?}-second.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )
+            .unwrap();
+        first
+            .execute("INSERT INTO notes VALUES (1, 'one')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE notes ADD COLUMN summary TEXT DEFAULT 'summary'",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("CREATE INDEX notes_body ON notes (body)", ())
+            .unwrap();
+
+        // Admit the index first so applying the later column addition must
+        // preserve a physical object absent from its original schema snapshot.
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(
+            first.push().unwrap(),
+            PushOutcome::Drained,
+            "index DDL must depend on its referenced columns, not the whole table schema"
+        );
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, body, summary FROM notes", (), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap(),
+                [(1, "one".into(), "summary".into())]
+            );
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT name FROM sqlite_schema
+                         WHERE type = 'index' AND name = 'notes_body'",
+                        (),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                ["notes_body"]
+            );
+        }
+    }
+}
+
+#[test]
+fn column_rename_rejects_a_stale_index_bound_to_the_old_name() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("rename-index-{isolation:?}-first.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("rename-index-{isolation:?}-second.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("ALTER TABLE notes RENAME COLUMN body TO contents", ())
+            .unwrap();
+        second
+            .execute(
+                "CREATE INDEX stale_notes_body ON notes (lower(body)) WHERE body IS NOT NULL",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("an index compiled against a renamed column unexpectedly admitted")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        assert!(
+            second
+                .query("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
+                .is_err()
+        );
+        second
+            .execute(
+                "CREATE INDEX notes_contents ON notes (lower(contents))
+                 WHERE contents IS NOT NULL",
+                (),
+            )
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT name FROM sqlite_schema
+                         WHERE type = 'index' AND name = 'notes_contents'",
+                        (),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                ["notes_contents"]
+            );
+        }
+    }
+}
+
+#[test]
+fn index_creation_and_referenced_column_drop_conflict_in_either_order() {
+    for (isolation, index_wins) in [
+        (IsolationLevel::Snapshot, false),
+        (IsolationLevel::Snapshot, true),
+        (IsolationLevel::Serializable, false),
+        (IsolationLevel::Serializable, true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory.path().join(format!(
+                "index-drop-{isolation:?}-{index_wins}-first.sqlite"
+            )),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join(format!(
+                "index-drop-{isolation:?}-{index_wins}-second.sqlite"
+            )),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "CREATE INDEX notes_body ON notes (lower(body)) WHERE body IS NOT NULL",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("ALTER TABLE notes DROP COLUMN body", ())
+            .unwrap();
+
+        let (winner, loser) = if index_wins {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = loser.push().unwrap() else {
+            panic!("an index and removal of its referenced column both admitted")
+        };
+        loser.rollback(&rejection).unwrap();
+        assert_eq!(loser.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            if index_wins {
+                database
+                    .execute("INSERT INTO notes VALUES (1, 'indexed')", ())
+                    .unwrap();
+                assert_eq!(
+                    database
+                        .query("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    ["indexed"]
+                );
+                database.execute("DELETE FROM notes", ()).unwrap();
+            } else {
+                assert!(
+                    database
+                        .query("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
+                        .is_err()
+                );
+                assert!(
+                    database
+                        .query(
+                            "SELECT name FROM sqlite_schema
+                             WHERE type = 'index' AND name = 'notes_body'",
+                            (),
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn admitted_check_dependency_rejects_a_stale_referenced_column_drop() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("check-drop-{isolation:?}-first.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("check-drop-{isolation:?}-second.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE notes ADD COLUMN summary TEXT
+                 CHECK (body IS NULL OR length(body) > 0)",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("ALTER TABLE notes DROP COLUMN body", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("a stale drop ignored an admitted CHECK dependency")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            database
+                .execute("INSERT INTO notes VALUES (1, 'valid', 'summary')", ())
+                .unwrap();
+            assert!(
+                database
+                    .execute("INSERT INTO notes VALUES (2, '', 'invalid')", ())
+                    .is_err()
+            );
+            database.execute("DELETE FROM notes", ()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn validated_add_column_checks_conflict_with_intervening_rows_in_either_order() {
+    for (isolation, check_wins) in [
+        (IsolationLevel::Snapshot, false),
+        (IsolationLevel::Snapshot, true),
+        (IsolationLevel::Serializable, false),
+        (IsolationLevel::Serializable, true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory.path().join(format!(
+                "add-check-row-{isolation:?}-{check_wins}-first.sqlite"
+            )),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join(format!(
+                "add-check-row-{isolation:?}-{check_wins}-second.sqlite"
+            )),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE notes ADD COLUMN summary TEXT
+                 CHECK (body IS NULL OR body <> 'invalid')",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("INSERT INTO notes (id, body) VALUES (1, 'invalid')", ())
+            .unwrap();
+
+        if check_wins {
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+                panic!("a stale row bypassed an admitted CHECK contract")
+            };
+            second.rollback(&rejection).unwrap();
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        } else {
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+            let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+                panic!("CHECK DDL ignored a row admitted after its validated snapshot")
+            };
+            first.rollback(&rejection).unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        }
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            if check_wins {
+                assert!(
+                    database
+                        .query("SELECT id, body, summary FROM notes", (), |row| Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        )),)
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(
+                    database
+                        .query("SELECT id, body FROM notes", (), |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .unwrap(),
+                    [(1, "invalid".into())]
+                );
+                assert!(
+                    database
+                        .query("SELECT summary FROM notes", (), |row| {
+                            row.get::<_, Option<String>>(0)
+                        })
+                        .is_err()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn disjoint_add_and_drop_columns_commute_at_both_isolation_levels() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();
         let server = server();
@@ -2088,29 +2532,50 @@ fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels()
             .execute("ALTER TABLE notes DROP COLUMN detail", ())
             .unwrap();
         assert_eq!(first.push().unwrap(), PushOutcome::Drained);
-        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
-            panic!("concurrent structural ALTER TABLE unexpectedly drained")
-        };
-        second.rollback(&rejection).unwrap();
         assert_eq!(
-            second
-                .query("SELECT detail FROM notes", (), |row| row
-                    .get::<_, String>(0))
-                .unwrap(),
-            ["must survive rollback"]
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "independent schema components must admit together"
         );
-        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
         second.pull().unwrap();
+        first.rebase().unwrap();
         second.rebase().unwrap();
         assert_eq!(
             second
-                .query("SELECT detail, remote_value FROM notes", (), |row| Ok((
+                .query("SELECT body, remote_value FROM notes", (), |row| Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?
                 )),)
                 .unwrap(),
-            [("must survive rollback".into(), "remote".into())]
+            [("body".into(), "remote".into())]
         );
+        assert!(
+            second
+                .query("SELECT detail FROM notes", (), |row| row
+                    .get::<_, String>(0))
+                .is_err()
+        );
+
+        first
+            .execute("ALTER TABLE notes RENAME COLUMN body TO contents", ())
+            .unwrap();
+        second
+            .execute(
+                "ALTER TABLE notes ADD COLUMN local_tag TEXT DEFAULT 'tag'",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(
+            second.push().unwrap(),
+            PushOutcome::Drained,
+            "an unrelated rename and addition must commute"
+        );
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
 
         first
             .execute("ALTER TABLE notes DROP COLUMN remote_value", ())
@@ -2122,7 +2587,7 @@ fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels()
         for database in [&first, &second] {
             assert_eq!(
                 database
-                    .query("SELECT id, body, detail FROM notes", (), |row| {
+                    .query("SELECT id, contents, local_tag FROM notes", (), |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
@@ -2130,7 +2595,7 @@ fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels()
                         ))
                     })
                     .unwrap(),
-                [(1, "body".into(), "must survive rollback".into())]
+                [(1, "body".into(), "tag".into())]
             );
             assert!(
                 database
@@ -2141,6 +2606,220 @@ fn add_and_drop_columns_repair_conflicts_and_converge_at_both_isolation_levels()
             );
         }
     }
+}
+
+#[test]
+fn concurrent_add_columns_converge_to_one_physical_order() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory
+            .path()
+            .join(format!("two-adds-{isolation:?}-first.sqlite"));
+        let second_path = directory
+            .path()
+            .join(format!("two-adds-{isolation:?}-second.sqlite"));
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )
+            .unwrap();
+        first
+            .execute("INSERT INTO notes VALUES (1, 'original')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE notes ADD COLUMN alpha TEXT DEFAULT 'alpha'",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("ALTER TABLE notes ADD COLUMN beta TEXT DEFAULT 'beta'", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        let physical_row = |database: &MultiliteConnection<_>| {
+            database
+                .query("SELECT * FROM notes", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+        };
+        let first_physical = physical_row(&first);
+        assert_eq!(physical_row(&second), first_physical);
+        assert_eq!(first_physical[0].0, 1);
+        assert_eq!(first_physical[0].1, "original");
+        assert!(["alpha", "beta"].contains(&first_physical[0].2.as_str()));
+        assert!(["alpha", "beta"].contains(&first_physical[0].3.as_str()));
+        assert_ne!(first_physical[0].2, first_physical[0].3);
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, body, alpha, beta FROM notes", (), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap(),
+                [(1, "original".into(), "alpha".into(), "beta".into())]
+            );
+        }
+
+        drop(first);
+        drop(second);
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert_eq!(physical_row(&first), physical_row(&second));
+    }
+}
+
+#[test]
+fn rejected_general_drop_restores_schema_rows_and_incoming_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("drop-repair-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("drop-repair-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    id INTEGER PRIMARY KEY,
+                    middle TEXT CONSTRAINT middle_nn NOT NULL DEFAULT 'seed'
+                        CONSTRAINT middle_nonempty CHECK (length(middle) > 0),
+                    tail TEXT
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parents(id)
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (1, 'saved', 'tail')", ())?;
+            transaction.execute("INSERT INTO children VALUES (7, 1)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("ALTER TABLE parents RENAME COLUMN middle TO canonical", ())
+        .unwrap();
+    second
+        .execute("ALTER TABLE parents DROP COLUMN middle", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("DROP and RENAME of the same stable column both admitted")
+    };
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query(
+                "SELECT parents.middle, children.parent_id
+                 FROM parents JOIN children ON children.parent_id = parents.id",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+        [("saved".into(), 1)]
+    );
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT parents.canonical, children.parent_id
+                     FROM parents JOIN children ON children.parent_id = parents.id",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            [("saved".into(), 1)]
+        );
+    }
+    first
+        .execute("INSERT INTO parents (id, tail) VALUES (2, 'defaulted')", ())
+        .unwrap();
+    assert_eq!(
+        first
+            .query("SELECT canonical FROM parents WHERE id = 2", (), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        ["seed"]
+    );
+    assert!(
+        first
+            .execute("INSERT INTO parents VALUES (3, '', 'invalid')", ())
+            .is_err()
+    );
 }
 
 #[test]

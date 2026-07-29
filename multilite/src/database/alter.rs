@@ -2,24 +2,29 @@
 
 use std::fmt;
 
+use homebase_core::range::Range;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
+use super::row::primary_index_prefix;
 use super::schema::{
     ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId, TableStorage,
-    active_schema_revision_key, available_hidden_rowid_alias, column_name_scope_key,
-    schema_log_key, table_name_scope_key, table_schema_key, write_revision_key,
+    available_hidden_rowid_alias, column_check_dependency_key, column_dependency_prefix,
+    column_name_scope_key, schema_log_key, table_name_scope_key, table_schema_key,
+    write_revision_key,
 };
 use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
+use crate::connection::ConnectionSavepoint;
 use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ALTER_TABLE_VERSION: u8 = 3;
+const ALTER_TABLE_VERSION: u8 = 4;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_TABLE: u8 = 3;
@@ -30,9 +35,9 @@ const TAG_SOURCE_TABLE: u8 = 7;
 const TAG_COLUMN: u8 = 8;
 const TAG_BEFORE: u8 = 9;
 const TAG_AFTER: u8 = 10;
-const TAG_COLUMN_SQL: u8 = 11;
-const TAG_DROPPED_VALUE: u8 = 12;
-const TAG_SCHEMA_REVISION: u8 = 13;
+const TAG_DROPPED_VALUE: u8 = 11;
+const TAG_SCHEMA_REVISION: u8 = 12;
+const TAG_PREDECESSOR: u8 = 13;
 const RENAME_TABLE: u8 = 1;
 const RENAME_COLUMN: u8 = 2;
 const ADD_COLUMN: u8 = 3;
@@ -61,6 +66,7 @@ enum AlterTableDelta {
     },
     AddColumn {
         column: ColumnId,
+        predecessor: ColumnId,
         name: SqlName,
         before: CreateTable,
         after: CreateTable,
@@ -70,7 +76,6 @@ enum AlterTableDelta {
         name: SqlName,
         before: CreateTable,
         after: CreateTable,
-        column_sql: String,
         dropped_values: Vec<DroppedValue>,
     },
 }
@@ -210,6 +215,11 @@ impl AlterTableOperation {
             &spec.column,
             &spec.checks,
         )?;
+        let predecessor = before
+            .columns()
+            .last()
+            .expect("validated tables have a primary-key column")
+            .id();
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
@@ -218,6 +228,7 @@ impl AlterTableOperation {
             source_table: spec.table.clone(),
             delta: AlterTableDelta::AddColumn {
                 column,
+                predecessor,
                 name: spec.column.name.clone(),
                 before,
                 after,
@@ -239,21 +250,6 @@ impl AlterTableOperation {
             .ok_or(Error::UnsupportedSql(
                 "ALTER TABLE DROP COLUMN references an unknown column",
             ))?;
-        let position = before
-            .columns()
-            .iter()
-            .position(|candidate| candidate.id() == column)
-            .expect("catalog binding belongs to its table");
-        if position + 1 != before.columns().len() {
-            return Err(Error::UnsupportedSql(
-                "DROP COLUMN currently supports only the final table column",
-            ));
-        }
-        if before.columns()[position].is_not_null() {
-            return Err(Error::UnsupportedSql(
-                "DROP COLUMN of NOT NULL columns requires table-rebuild rollback",
-            ));
-        }
         if catalog::incoming_foreign_keys(connection, before.table_id())?
             .iter()
             .any(|(_, foreign_key)| foreign_key.referenced_columns().contains(&column))
@@ -266,7 +262,6 @@ impl AlterTableOperation {
             SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
             column,
         )?;
-        let column_sql = before.reversible_column_sql(column, &spec.column)?;
         let dropped_values = capture_dropped_values(connection, &before, column, &spec.column)?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -279,7 +274,6 @@ impl AlterTableOperation {
                 name: spec.column.clone(),
                 before,
                 after,
-                column_sql,
                 dropped_values,
             },
         };
@@ -294,24 +288,23 @@ impl AlterTableOperation {
             AlterTableDelta::AddColumn {
                 column,
                 name,
+                before,
                 after,
                 ..
             }
             | AlterTableDelta::DropColumn {
                 column,
                 name,
+                before,
                 after,
                 ..
             } => {
                 let name_key = column_name_scope_key(self.table, name);
-                let schema_head = active_schema_revision_key(self.table);
                 let changes_write_contract =
                     matches!(&self.delta, AlterTableDelta::AddColumn { .. })
                         && after.added_column_changes_write_contract(*column);
                 let mut footprint = ConflictFootprint::new();
                 footprint.add_constraint(name_key.clone());
-                footprint.add_constraint(schema_head.clone());
-                footprint.add_write(schema_head.clone());
                 let binding = match &self.delta {
                     AlterTableDelta::AddColumn { .. } => {
                         for dependency in after.added_column_dependencies(*column) {
@@ -336,14 +329,39 @@ impl AlterTableOperation {
                         key: table_schema_key(self.table, after.schema_revision_id()),
                         value: after.encode(),
                     },
-                    Mutation::Set {
-                        key: schema_head,
-                        value: after.schema_revision_id().as_bytes().to_vec(),
-                    },
                 ];
+                match &self.delta {
+                    AlterTableDelta::AddColumn { .. } => {
+                        for dependency in after.column_check_dependencies(*column) {
+                            let key = column_check_dependency_key(self.table, dependency, *column);
+                            footprint.add_constraint(key.clone());
+                            footprint.add_write(key.clone());
+                            mutations.push(Mutation::Set {
+                                key,
+                                value: column.as_bytes().to_vec(),
+                            });
+                        }
+                    }
+                    AlterTableDelta::DropColumn { .. } => {
+                        for dependency in before.column_check_dependencies(*column) {
+                            let key = column_check_dependency_key(self.table, dependency, *column);
+                            footprint.add_constraint(key.clone());
+                            footprint.add_write(key.clone());
+                            mutations.push(Mutation::Delete { key });
+                        }
+                        let dependents = column_dependency_prefix(self.table, *column);
+                        footprint.add_constraint(dependents.clone());
+                        footprint.add_write(dependents.clone());
+                        mutations.push(Mutation::DeleteRange {
+                            range: Range::Prefix(dependents),
+                        });
+                    }
+                    _ => unreachable!(),
+                }
                 if changes_write_contract {
                     let write_revision = write_revision_key(self.table);
                     footprint.add_write(write_revision.clone());
+                    footprint.add_constraint(primary_index_prefix(before));
                     mutations.push(Mutation::Set {
                         key: write_revision,
                         value: self.mutation_id.as_bytes().to_vec(),
@@ -374,13 +392,17 @@ impl AlterTableOperation {
     /// Apply an authenticated binding change to canonical SQLite.
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         self.validate().map_err(invalid_operation)?;
+        if matches!(self.delta, AlterTableDelta::DropColumn { .. }) {
+            return self.record_catalog(connection);
+        }
         self.validate_catalog_before(connection)?;
         let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
             "ALTER TABLE identity is missing from the schema catalog",
         ))?;
         let sql = match &self.delta {
-            AlterTableDelta::AddColumn { .. } | AlterTableDelta::DropColumn { .. } => {
-                super::sql::render_alter_table(&self.sql, &table)?
+            AlterTableDelta::AddColumn { .. } => super::sql::render_alter_table(&self.sql, &table)?,
+            AlterTableDelta::DropColumn { .. } => {
+                unreachable!("DROP COLUMN materializes through table rebuild")
             }
             AlterTableDelta::RenameTable { old_name, new_name } => {
                 rename_sql(&table, RenameTarget::Table, old_name, new_name)
@@ -393,8 +415,18 @@ impl AlterTableOperation {
         self.record_catalog(connection)
     }
 
+    pub fn materializes_internally(&self) -> bool {
+        matches!(self.delta, AlterTableDelta::DropColumn { .. })
+    }
+
     /// Record the binding change after a branch has executed the user's SQL.
     pub fn record_catalog(&self, connection: &Connection) -> Result<()> {
+        with_savepoint(connection, "__multilite__record_alter", || {
+            self.record_catalog_inner(connection)
+        })
+    }
+
+    fn record_catalog_inner(&self, connection: &Connection) -> Result<()> {
         self.validate_catalog_before(connection)?;
         match &self.delta {
             AlterTableDelta::RenameTable { old_name, new_name } => {
@@ -405,67 +437,72 @@ impl AlterTableOperation {
                 old_name,
                 new_name,
             } => {
-                catalog::rename_column_binding(connection, self.table, *column, old_name, new_name)
+                catalog::rename_column_binding(
+                    connection, self.table, *column, old_name, new_name,
+                )?;
+                let current = catalog::by_id(connection, self.table)?.ok_or(
+                    Error::InvalidDatabase("renamed table is missing from the schema catalog"),
+                )?;
+                let folded =
+                    current.fold_renamed_column_expressions(*column, old_name, new_name)?;
+                catalog::replace(connection, &folded)
             }
             AlterTableDelta::AddColumn {
                 column,
+                predecessor,
                 name,
-                before,
-                after,
-            } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
-                    return Err(Error::InvalidDatabase(
-                        "ADD COLUMN no longer matches the schema catalog",
-                    ));
-                }
-                catalog::insert_column_binding(connection, self.table, *column, name)?;
-                catalog::replace(connection, after)
-            }
-            AlterTableDelta::DropColumn {
-                column,
-                before,
                 after,
                 ..
             } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before) {
-                    return Err(Error::InvalidDatabase(
-                        "DROP COLUMN no longer matches the schema catalog",
-                    ));
-                }
-                catalog::remove_column_binding(connection, self.table, *column)?;
-                catalog::replace(connection, after)
+                let current = catalog::by_id(connection, self.table)?.ok_or(
+                    Error::InvalidDatabase("ADD COLUMN table is missing from the schema catalog"),
+                )?;
+                catalog::insert_column_binding(
+                    connection,
+                    self.table,
+                    *column,
+                    *predecessor,
+                    name,
+                )?;
+                let order = catalog::column_order(connection, self.table)?;
+                let folded = current.fold_added_column(after, *column, &order)?;
+                catalog::replace(connection, &folded)?;
+                rebuild_table_if_needed(connection, &folded, false)
+            }
+            AlterTableDelta::DropColumn { column, .. } => {
+                let current = catalog::by_id(connection, self.table)?.ok_or(
+                    Error::InvalidDatabase("DROP COLUMN table is missing from the schema catalog"),
+                )?;
+                catalog::retire_column_binding(connection, self.table, *column)?;
+                let order = catalog::column_order(connection, self.table)?;
+                let folded = current.fold_removed_column(*column, &order)?;
+                catalog::replace(connection, &folded)?;
+                rebuild_table_if_needed(connection, &folded, false)
             }
         }
     }
 
     /// Reverse one speculative binding change after authority rejects it.
     pub fn rollback(&self, connection: &Connection) -> Result<()> {
+        with_savepoint(connection, "__multilite__rollback_alter", || {
+            self.rollback_inner(connection)
+        })
+    }
+
+    fn rollback_inner(&self, connection: &Connection) -> Result<()> {
         self.validate().map_err(invalid_operation)?;
         self.validate_catalog_after(connection)?;
         let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
             "pending ALTER TABLE identity is missing from the catalog",
         ))?;
-        let sql = match &self.delta {
-            AlterTableDelta::AddColumn { name, .. } => format!(
-                "ALTER TABLE {} DROP COLUMN {}",
-                quote_identifier(table.value()),
-                quote_identifier(name.value())
-            ),
-            AlterTableDelta::DropColumn { column_sql, .. } => format!(
-                "ALTER TABLE {} ADD COLUMN {}",
-                quote_identifier(table.value()),
-                column_sql
-            ),
-            AlterTableDelta::RenameTable { old_name, new_name } => {
-                rename_sql(&table, RenameTarget::Table, new_name, old_name)
-            }
-            AlterTableDelta::RenameColumn {
-                old_name, new_name, ..
-            } => rename_sql(&table, RenameTarget::Column, new_name, old_name),
-        };
-        connection.execute_batch(&sql)?;
         match &self.delta {
             AlterTableDelta::RenameTable { old_name, new_name } => {
+                connection.execute_batch(&rename_sql(
+                    &table,
+                    RenameTarget::Table,
+                    new_name,
+                    old_name,
+                ))?;
                 catalog::rename_binding(connection, self.table, new_name, old_name)
             }
             AlterTableDelta::RenameColumn {
@@ -473,11 +510,37 @@ impl AlterTableOperation {
                 old_name,
                 new_name,
             } => {
-                catalog::rename_column_binding(connection, self.table, *column, new_name, old_name)
+                connection.execute_batch(&rename_sql(
+                    &table,
+                    RenameTarget::Column,
+                    new_name,
+                    old_name,
+                ))?;
+                catalog::rename_column_binding(
+                    connection, self.table, *column, new_name, old_name,
+                )?;
+                let current = catalog::by_id(connection, self.table)?.ok_or(
+                    Error::InvalidDatabase("renamed table is missing from the schema catalog"),
+                )?;
+                let folded =
+                    current.fold_renamed_column_expressions(*column, new_name, old_name)?;
+                catalog::replace(connection, &folded)
             }
-            AlterTableDelta::AddColumn { column, before, .. } => {
-                catalog::remove_column_binding(connection, self.table, *column)?;
-                catalog::replace(connection, before)
+            AlterTableDelta::AddColumn { column, name, .. } => {
+                connection.execute_batch(&format!(
+                    "ALTER TABLE {} DROP COLUMN {}",
+                    quote_identifier(table.value()),
+                    quote_identifier(name.value())
+                ))?;
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending ADD COLUMN table is missing from the schema catalog",
+                    ))?;
+                catalog::retire_column_binding(connection, self.table, *column)?;
+                let order = catalog::column_order(connection, self.table)?;
+                let folded = current.fold_removed_column(*column, &order)?;
+                catalog::replace(connection, &folded)?;
+                rebuild_table_if_needed(connection, &folded, false)
             }
             AlterTableDelta::DropColumn {
                 column,
@@ -486,9 +549,21 @@ impl AlterTableOperation {
                 dropped_values,
                 ..
             } => {
-                restore_dropped_values(connection, before, *column, name, dropped_values)?;
-                catalog::insert_column_binding(connection, self.table, *column, name)?;
-                catalog::replace(connection, before)
+                connection.execute_batch(&format!(
+                    "ALTER TABLE {} ADD COLUMN {} BLOB",
+                    quote_identifier(table.value()),
+                    quote_identifier(name.value())
+                ))?;
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending DROP COLUMN table is missing from the schema catalog",
+                    ))?;
+                catalog::restore_column_binding(connection, self.table, *column, name)?;
+                let order = catalog::column_order(connection, self.table)?;
+                let folded = current.fold_added_column(before, *column, &order)?;
+                catalog::replace(connection, &folded)?;
+                restore_dropped_values(connection, &folded, *column, name, dropped_values)?;
+                rebuild_table_if_needed(connection, &folded, true)
             }
         }
     }
@@ -555,12 +630,16 @@ impl AlterTableOperation {
             }
             AlterTableDelta::AddColumn {
                 column,
+                predecessor,
                 name,
                 before,
                 after,
             } => {
                 put_action(&mut writer, ADD_COLUMN);
                 put_column(&mut writer, *column);
+                writer
+                    .field(TAG_PREDECESSOR, &predecessor.as_bytes())
+                    .expect("ALTER TABLE field fits in u32");
                 put_name(&mut writer, TAG_NEW_NAME, name);
                 writer
                     .field(TAG_BEFORE, &before.encode())
@@ -574,7 +653,6 @@ impl AlterTableOperation {
                 name,
                 before,
                 after,
-                column_sql,
                 dropped_values,
             } => {
                 put_action(&mut writer, DROP_COLUMN);
@@ -585,9 +663,6 @@ impl AlterTableOperation {
                     .expect("ALTER TABLE field fits in u32");
                 writer
                     .field(TAG_AFTER, &after.encode())
-                    .expect("ALTER TABLE field fits in u32");
-                writer
-                    .field(TAG_COLUMN_SQL, column_sql.as_bytes())
                     .expect("ALTER TABLE field fits in u32");
                 for value in dropped_values {
                     writer
@@ -611,9 +686,9 @@ impl AlterTableOperation {
         let mut source_table = None;
         let mut action = None;
         let mut column = None;
+        let mut predecessor = None;
         let mut before = None;
         let mut after = None;
-        let mut column_sql = None;
         let mut dropped_values = Vec::new();
         let mut old_name = None;
         let mut new_name = None;
@@ -641,6 +716,9 @@ impl AlterTableOperation {
                     set_once(&mut action, *value)?;
                 }
                 TAG_COLUMN => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
+                TAG_PREDECESSOR => {
+                    set_once(&mut predecessor, ColumnId::from_bytes(uuid_bytes(value)?))?
+                }
                 TAG_BEFORE => set_once(
                     &mut before,
                     CreateTable::decode(value).map_err(|_| AlterTableCodecError::InvalidSchema)?,
@@ -649,7 +727,6 @@ impl AlterTableOperation {
                     &mut after,
                     CreateTable::decode(value).map_err(|_| AlterTableCodecError::InvalidSchema)?,
                 )?,
-                TAG_COLUMN_SQL => set_once(&mut column_sql, decode_string(value)?)?,
                 TAG_DROPPED_VALUE => dropped_values.push(decode_dropped_value(value)?),
                 TAG_OLD_NAME => set_once(&mut old_name, SqlName::new(decode_string(value)?))?,
                 TAG_NEW_NAME => set_once(&mut new_name, SqlName::new(decode_string(value)?))?,
@@ -670,6 +747,7 @@ impl AlterTableOperation {
             },
             ADD_COLUMN => AlterTableDelta::AddColumn {
                 column: take_required(&mut column, TAG_COLUMN)?,
+                predecessor: take_required(&mut predecessor, TAG_PREDECESSOR)?,
                 name: take_required(&mut new_name, TAG_NEW_NAME)?,
                 before: take_required(&mut before, TAG_BEFORE)?,
                 after: take_required(&mut after, TAG_AFTER)?,
@@ -679,15 +757,14 @@ impl AlterTableOperation {
                 name: take_required(&mut old_name, TAG_OLD_NAME)?,
                 before: take_required(&mut before, TAG_BEFORE)?,
                 after: take_required(&mut after, TAG_AFTER)?,
-                column_sql: take_required(&mut column_sql, TAG_COLUMN_SQL)?,
                 dropped_values,
             },
             _ => return Err(AlterTableCodecError::InvalidAction),
         };
         if column.is_some()
+            || predecessor.is_some()
             || before.is_some()
             || after.is_some()
-            || column_sql.is_some()
             || old_name.is_some()
             || new_name.is_some()
             || unexpected_dropped_values
@@ -729,6 +806,7 @@ impl AlterTableOperation {
             (
                 AlterTableDelta::AddColumn {
                     column,
+                    predecessor,
                     name,
                     before,
                     after,
@@ -739,6 +817,10 @@ impl AlterTableOperation {
                 && before.table_id() == self.table
                 && before.schema_revision_id() == self.schema_revision
                 && before.schema_revision_id() != after.schema_revision_id()
+                && before
+                    .columns()
+                    .last()
+                    .is_some_and(|column| column.id() == *predecessor)
                 && before
                     .with_added_column_identity(
                         after.schema_revision_id(),
@@ -753,13 +835,11 @@ impl AlterTableOperation {
                     name,
                     before,
                     after,
-                    column_sql,
                     dropped_values,
                 },
                 ValidatedExecute::DropColumn(spec),
             ) if spec.table == self.source_table
                 && spec.column == *name
-                && !column_sql.is_empty()
                 && before.table_id() == self.table
                 && before.schema_revision_id() == self.schema_revision
                 && before.schema_revision_id() != after.schema_revision_id()
@@ -807,13 +887,8 @@ impl AlterTableOperation {
                     ));
                 }
             }
-            AlterTableDelta::AddColumn {
-                column,
-                name,
-                before,
-                ..
-            } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before)
+            AlterTableDelta::AddColumn { column, name, .. } => {
+                if catalog::by_id(connection, self.table)?.is_none()
                     || catalog::column_id_by_name(connection, self.table, name)?.is_some()
                     || catalog::column_name_by_id(connection, self.table, *column)?.is_some()
                 {
@@ -822,13 +897,8 @@ impl AlterTableOperation {
                     ));
                 }
             }
-            AlterTableDelta::DropColumn {
-                column,
-                name,
-                before,
-                ..
-            } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(before)
+            AlterTableDelta::DropColumn { column, name, .. } => {
+                if catalog::by_id(connection, self.table)?.is_none()
                     || catalog::column_name_by_id(connection, self.table, *column)?
                         .is_none_or(|current| current.canonical() != name.canonical())
                 {
@@ -874,13 +944,15 @@ impl AlterTableOperation {
                     ));
                 }
             }
-            AlterTableDelta::AddColumn {
-                column,
-                name,
-                after,
-                ..
-            } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(after)
+            AlterTableDelta::AddColumn { column, name, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending ADD COLUMN table is missing from the schema catalog",
+                    ))?;
+                if !current
+                    .columns()
+                    .iter()
+                    .any(|candidate| candidate.id() == *column)
                     || catalog::column_name_by_id(connection, self.table, *column)?
                         .is_none_or(|current| current.canonical() != name.canonical())
                 {
@@ -889,8 +961,15 @@ impl AlterTableOperation {
                     ));
                 }
             }
-            AlterTableDelta::DropColumn { column, after, .. } => {
-                if catalog::by_id(connection, self.table)?.as_ref() != Some(after)
+            AlterTableDelta::DropColumn { column, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending DROP COLUMN table is missing from the schema catalog",
+                    ))?;
+                if current
+                    .columns()
+                    .iter()
+                    .any(|candidate| candidate.id() == *column)
                     || catalog::column_name_by_id(connection, self.table, *column)?.is_some()
                 {
                     return Err(Error::InvalidDatabase(
@@ -901,6 +980,164 @@ impl AlterTableOperation {
         }
         Ok(())
     }
+}
+
+fn with_savepoint<T>(
+    connection: &Connection,
+    prefix: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+    let savepoint = ConnectionSavepoint::begin(connection, name)?;
+    match operation() {
+        Ok(value) => {
+            savepoint.release()?;
+            Ok(value)
+        }
+        Err(error) => {
+            savepoint.rollback()?;
+            Err(error)
+        }
+    }
+}
+
+fn rebuild_table_if_needed(
+    connection: &Connection,
+    table: &CreateTable,
+    force: bool,
+) -> Result<()> {
+    let table_name = catalog::name_by_id(connection, table.table_id())?.ok_or(
+        Error::InvalidDatabase("rebuilt table has no current name binding"),
+    )?;
+    let desired = catalog::column_names(connection, table)?;
+    let materialized = materialized_column_names(connection, &table_name)?;
+    if !force
+        && materialized.len() == desired.len()
+        && materialized
+            .iter()
+            .zip(&desired)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected.value()))
+    {
+        return Ok(());
+    }
+
+    let source_sql = table.materialization_sql(connection)?;
+    let dependent_sql = materialized_dependents(connection, &table_name)?;
+    let temporary = SqlName::new(format!("__multilite__rebuild_{}", Uuid::new_v4().simple()));
+    let create_sql = super::sql::render_create_table_name(&source_sql, &temporary)?;
+
+    let mut copied = desired
+        .iter()
+        .map(|name| quote_identifier(name.value()))
+        .collect::<Vec<_>>();
+    if let Some(rowid) = current_hidden_rowid_alias(connection, table)? {
+        copied.push(quote_identifier(rowid));
+    }
+    let copied = copied.join(", ");
+
+    // Dropping the old parent name makes SQLite enforce incoming immediate
+    // foreign keys before the replacement can claim that name. The connection
+    // API can suspend enforcement within the surrounding savepoint; a complete
+    // integrity check runs before enforcement and the savepoint are restored.
+    let foreign_keys = ForeignKeyGuard::suspend(connection)?;
+    let rebuild = (|| {
+        connection.execute_batch(&create_sql)?;
+        connection.execute_batch(&format!(
+            "INSERT INTO {} ({copied}) SELECT {copied} FROM {}",
+            quote_identifier(temporary.value()),
+            quote_identifier(table_name.value())
+        ))?;
+        connection.execute_batch(&format!(
+            "DROP TABLE {};
+             ALTER TABLE {} RENAME TO {}",
+            quote_identifier(table_name.value()),
+            quote_identifier(temporary.value()),
+            quote_identifier(table_name.value())
+        ))?;
+        for sql in dependent_sql {
+            connection.execute_batch(&sql)?;
+        }
+        if connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+            (),
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(Error::InvalidDatabase(
+                "table rebuild violates a foreign-key relationship",
+            ));
+        }
+        Ok(())
+    })();
+    let restore = foreign_keys.restore();
+    rebuild?;
+    restore
+}
+
+struct ForeignKeyGuard<'connection> {
+    connection: &'connection Connection,
+    enabled: bool,
+    active: bool,
+}
+
+impl<'connection> ForeignKeyGuard<'connection> {
+    fn suspend(connection: &'connection Connection) -> Result<Self> {
+        let enabled = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)?;
+        Ok(Self {
+            connection,
+            enabled,
+            active: true,
+        })
+    }
+
+    fn restore(mut self) -> Result<()> {
+        self.connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, self.enabled)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ForeignKeyGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .connection
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, self.enabled);
+        }
+    }
+}
+
+fn materialized_column_names(connection: &Connection, table: &SqlName) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(&format!(
+        "PRAGMA main.table_xinfo({})",
+        quote_identifier(table.value())
+    ))?;
+    let columns = statement
+        .query_map((), |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(6)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|(_, hidden)| *hidden != 0) {
+        return Err(Error::InvalidDatabase(
+            "materialized table contains unsupported hidden columns",
+        ));
+    }
+    Ok(columns.into_iter().map(|(name, _)| name).collect())
+}
+
+fn materialized_dependents(connection: &Connection, table: &SqlName) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT sql FROM main.sqlite_schema
+         WHERE tbl_name = ?1 COLLATE NOCASE
+           AND type IN ('index', 'trigger')
+           AND sql IS NOT NULL
+         ORDER BY type, name",
+    )?;
+    statement
+        .query_map([table.value()], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn capture_dropped_values(
@@ -1235,6 +1472,7 @@ mod tests {
     use homebase_core::tag::Mutation;
 
     use super::*;
+    use crate::commit::footprint::assert_explicit_range_assertions;
     use crate::database::schema::{
         CreateColumn, CreateTable, CreateTableSpec, TableMode, TableStorage, TypeDeclaration,
     };
@@ -1265,6 +1503,27 @@ mod tests {
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
         (connection, created)
+    }
+
+    fn connection_with(sql: &str) -> (Connection, CreateTable) {
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let ValidatedExecute::CreateTable(spec) = super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        connection.execute(sql, ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        (connection, created)
+    }
+
+    fn prepare_drop(connection: &Connection, sql: &str) -> AlterTableOperation {
+        let ValidatedExecute::DropColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
     }
 
     fn operation(connection: &Connection) -> AlterTableOperation {
@@ -1451,13 +1710,24 @@ mod tests {
             operation
         );
         let lowered = operation.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 5);
-        assert_eq!(lowered.footprint.constraints().len(), 3);
-        assert_eq!(lowered.footprint.writes().len(), 2);
+        let AlterTableDelta::AddColumn { column, after, .. } = &operation.delta else {
+            unreachable!()
+        };
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                column_check_dependency_key(after.table_id(), created.columns()[0].id(), *column),
+                column_check_dependency_key(after.table_id(), *column, *column),
+                primary_index_prefix(&created),
+            ],
+        );
+        assert_eq!(lowered.mutations.len(), 6);
+        assert_eq!(lowered.footprint.constraints().len(), 5);
+        assert_eq!(lowered.footprint.writes().len(), 3);
 
         let compatible = simple_add_operation(&compatible).to_homebase().unwrap();
-        assert_eq!(compatible.mutations.len(), 4);
-        assert_eq!(compatible.footprint.writes().len(), 1);
+        assert_eq!(compatible.mutations.len(), 3);
+        assert!(compatible.footprint.writes().is_empty());
         assert!(
             compatible.mutations.iter().all(
                 |mutation| mutation.key() != &write_revision_key(compatible_created.table_id())
@@ -1515,6 +1785,13 @@ mod tests {
         let drop = drop_operation(&connection);
         assert_eq!(AlterTableOperation::decode(&drop.encode()).unwrap(), drop);
         let lowered = drop.to_homebase().unwrap();
+        let AlterTableDelta::DropColumn { column, after, .. } = &drop.delta else {
+            unreachable!()
+        };
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[column_dependency_prefix(after.table_id(), *column)],
+        );
         assert_eq!(lowered.mutations.len(), 4);
         assert_eq!(lowered.footprint.constraints().len(), 2);
         assert_eq!(lowered.footprint.writes().len(), 1);
@@ -1542,6 +1819,249 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
             [(1, Some("custom".into())), (2, None)]
+        );
+        catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn middle_not_null_column_rollback_restores_definition_order_and_values() {
+        let (connection, created) = connection_with(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                guarded TEXT CONSTRAINT guarded_nn NOT NULL DEFAULT 'seed'
+                    CONSTRAINT guarded_nonempty CHECK (length(guarded) > 0),
+                tail TEXT DEFAULT 'tail'
+            )",
+        );
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'custom', 'end')", ())
+            .unwrap();
+        let drop = prepare_drop(&connection, "ALTER TABLE notes DROP COLUMN guarded");
+
+        drop.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .prepare("SELECT name FROM pragma_table_info('notes') ORDER BY cid")
+                .unwrap()
+                .query_map((), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            ["id", "tail"]
+        );
+        drop.rollback(&connection).unwrap();
+
+        let columns = connection
+            .prepare(
+                "SELECT name, \"notnull\", dflt_value
+                 FROM pragma_table_info('notes') ORDER BY cid",
+            )
+            .unwrap()
+            .query_map((), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                ("id".into(), false, None),
+                ("guarded".into(), true, Some("'seed'".into())),
+                ("tail".into(), false, Some("'tail'".into())),
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT guarded, tail FROM notes WHERE id = 1",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("custom".into(), "end".into())
+        );
+        connection
+            .execute("INSERT INTO notes (id) VALUES (2)", ())
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT guarded FROM notes WHERE id = 2", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "seed"
+        );
+        assert!(
+            connection
+                .execute("INSERT INTO notes VALUES (3, '', 'bad')", ())
+                .is_err()
+        );
+        assert_eq!(
+            catalog::by_id(&connection, created.table_id()).unwrap(),
+            Some(created)
+        );
+        catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn table_rebuild_preserves_hidden_rowids_indexes_and_triggers() {
+        let (connection, _) = connection_with(
+            "CREATE TABLE notes (
+                key TEXT PRIMARY KEY NOT NULL,
+                middle TEXT,
+                tail TEXT
+            )",
+        );
+        connection
+            .execute_batch(
+                "CREATE INDEX notes_tail ON notes(tail);
+                 CREATE TABLE audit (key TEXT);
+                 CREATE TRIGGER notes_audit AFTER UPDATE OF tail ON notes
+                 BEGIN INSERT INTO audit VALUES (NEW.key); END;
+                 INSERT INTO notes(rowid, key, middle, tail)
+                 VALUES (77, 'one', 'middle', 'tail')",
+            )
+            .unwrap();
+        let drop = prepare_drop(&connection, "ALTER TABLE notes DROP COLUMN middle");
+
+        drop.apply(&connection).unwrap();
+        drop.rollback(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rowid, middle FROM notes WHERE key = 'one'",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            (77, "middle".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema
+                     WHERE type = 'index' AND name = 'notes_tail'",
+                    (),
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute("UPDATE notes SET tail = 'changed' WHERE key = 'one'", ())
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT key FROM audit", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn without_rowid_middle_column_rollback_preserves_composite_rows() {
+        let (connection, _) = connection_with(
+            "CREATE TABLE pairs (
+                tenant TEXT,
+                sequence INTEGER,
+                middle BLOB,
+                tail TEXT,
+                PRIMARY KEY (tenant, sequence)
+            ) WITHOUT ROWID",
+        );
+        connection
+            .execute(
+                "INSERT INTO pairs VALUES ('acme', 7, x'0001ff', 'tail')",
+                (),
+            )
+            .unwrap();
+        let drop = prepare_drop(&connection, "ALTER TABLE pairs DROP COLUMN middle");
+
+        drop.apply(&connection).unwrap();
+        drop.rollback(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT hex(middle), tail FROM pairs
+                     WHERE tenant = 'acme' AND sequence = 7",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("0001FF".into(), "tail".into())
+        );
+        catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn table_rebuild_keeps_incoming_foreign_keys_valid() {
+        let (connection, _) = connection_with(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                middle TEXT,
+                tail TEXT
+            )",
+        );
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        let child_sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES parents(id)
+                ON UPDATE NO ACTION ON DELETE NO ACTION
+        )";
+        let ValidatedExecute::CreateTable(spec) =
+            super::super::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, spec).unwrap();
+        connection
+            .execute(&child.materialization_sql(&connection).unwrap(), ())
+            .unwrap();
+        catalog::insert(&connection, &child).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO parents VALUES (1, 'middle', 'tail');
+                 INSERT INTO children VALUES (7, 1)",
+            )
+            .unwrap();
+        let drop = prepare_drop(&connection, "ALTER TABLE parents DROP COLUMN middle");
+
+        drop.apply(&connection).unwrap();
+        drop.rollback(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parents.middle, children.parent_id
+                     FROM parents JOIN children ON children.parent_id = parents.id",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            ("middle".into(), 1)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
         );
         catalog::validate(&connection).unwrap();
     }

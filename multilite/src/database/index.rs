@@ -1,5 +1,6 @@
 //! Explicit index schema operations and durable entry backfills.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use homebase_core::key::Key;
@@ -11,13 +12,13 @@ use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
 use super::codes;
-use super::row::{IndexBackfillEntry, backfill_unique_index};
+use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
     CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
-    index_definition_key, index_name_scope_key, schema_log_key, table_schema_key,
-    write_revision_key,
+    column_index_dependency_key, column_name_scope_key, index_definition_key, index_name_scope_key,
+    schema_log_key, table_schema_key, write_revision_key,
 };
-use super::sql::{CreateIndexSpec, DropIndexSpec, ValidatedExecute};
+use super::sql::{CreateIndexSpec, CreateIndexTerm, DropIndexSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
@@ -131,6 +132,11 @@ impl IndexOperation {
         footprint.add_constraint(name.clone());
         footprint.add_constraint(schema_head.clone());
         footprint.add_write(schema_head.clone());
+        if self.action == IndexAction::Create {
+            for dependency in self.create_dependencies()? {
+                footprint.add_constraint(column_name_scope_key(self.after.table_id(), &dependency));
+            }
+        }
         let mut mutations = vec![Mutation::Set {
             key: schema_log_key(self.mutation_id),
             value: self.encode(),
@@ -150,6 +156,23 @@ impl IndexOperation {
             key: schema_head,
             value: self.after.schema_revision_id().as_bytes().to_vec(),
         });
+
+        for dependency in self.index.dependencies() {
+            let key = column_index_dependency_key(
+                self.after.table_id(),
+                *dependency,
+                self.index.index_id(),
+            );
+            footprint.add_constraint(key.clone());
+            footprint.add_write(key.clone());
+            mutations.push(match self.action {
+                IndexAction::Create => Mutation::Set {
+                    key,
+                    value: self.index.index_id().as_bytes().to_vec(),
+                },
+                IndexAction::Drop => Mutation::Delete { key },
+            });
+        }
 
         if self.action == IndexAction::Create {
             mutations.push(Mutation::Set {
@@ -183,56 +206,119 @@ impl IndexOperation {
 
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         self.validate().map_err(invalid_operation)?;
-        if catalog::by_id(connection, self.before.table_id())?.as_ref() != Some(&self.before) {
+        let current = catalog::by_id(connection, self.before.table_id())?.ok_or(
+            Error::InvalidDatabase("index operation references an unknown table identity"),
+        )?;
+        if self.action == IndexAction::Drop {
+            if current.index_named(self.index.name()) != Some(&self.index) {
+                return Err(Error::InvalidDatabase(
+                    "index operation no longer matches the schema catalog",
+                ));
+            }
+            ensure_not_referenced(connection, &current, &self.index)?;
+        } else if current.index_named(self.index.name()).is_some() {
             return Err(Error::InvalidDatabase(
                 "index operation no longer matches the schema catalog",
             ));
-        }
-        if self.action == IndexAction::Drop {
-            ensure_not_referenced(connection, &self.before, &self.index)?;
         }
         match self.action {
             IndexAction::Create => {
                 let table = catalog::name_by_id(connection, self.before.table_id())?.ok_or(
                     Error::InvalidDatabase("index operation references an unknown table identity"),
                 )?;
-                connection.execute(&self.index.materialization_sql(&table)?, ())?;
+                connection.execute(
+                    &self
+                        .index
+                        .materialization_sql(connection, &self.after, &table)?,
+                    (),
+                )?;
             }
             IndexAction::Drop => {
                 connection.execute(&self.sql, ())?;
             }
         }
-        catalog::replace(connection, &self.after)
+        self.record_catalog(connection)
     }
 
     pub fn record_catalog(&self, connection: &Connection) -> Result<()> {
-        catalog::replace(connection, &self.after)
+        let current = catalog::by_id(connection, self.before.table_id())?.ok_or(
+            Error::InvalidDatabase("index operation references an unknown table identity"),
+        )?;
+        let folded = match self.action {
+            IndexAction::Create => current.fold_added_index(&self.index)?,
+            IndexAction::Drop => current.fold_retired_index(&self.index)?,
+        };
+        catalog::replace(connection, &folded)
     }
 
     pub fn rollback(&self, connection: &Connection) -> Result<()> {
         self.validate().map_err(invalid_operation)?;
-        if catalog::by_id(connection, self.after.table_id())?.as_ref() != Some(&self.after) {
-            return Err(Error::InvalidDatabase(
-                "pending index operation no longer matches SQLite state",
-            ));
-        }
+        let current = catalog::by_id(connection, self.after.table_id())?.ok_or(
+            Error::InvalidDatabase("pending index operation references an unknown table identity"),
+        )?;
         match self.action {
             IndexAction::Create => {
+                if current.index_named(self.index.name()) != Some(&self.index) {
+                    return Err(Error::InvalidDatabase(
+                        "pending index operation no longer matches SQLite state",
+                    ));
+                }
                 connection.execute_batch(&format!(
                     "DROP INDEX {}",
                     quote_identifier(self.index.name().value())
                 ))?;
             }
             IndexAction::Drop => {
+                if current.index_named(self.index.name()).is_some() {
+                    return Err(Error::InvalidDatabase(
+                        "pending index operation no longer matches SQLite state",
+                    ));
+                }
                 let table = catalog::name_by_id(connection, self.after.table_id())?.ok_or(
                     Error::InvalidDatabase(
                         "pending index operation references an unknown table identity",
                     ),
                 )?;
-                connection.execute(&self.index.materialization_sql(&table)?, ())?;
+                connection.execute(
+                    &self
+                        .index
+                        .materialization_sql(connection, &current, &table)?,
+                    (),
+                )?;
             }
         }
-        catalog::replace(connection, &self.before)
+        let folded = match self.action {
+            IndexAction::Create => current.fold_removed_index(&self.index)?,
+            IndexAction::Drop => current.fold_restored_index(&self.index)?,
+        };
+        catalog::replace(connection, &folded)
+    }
+
+    fn create_dependencies(&self) -> Result<Vec<super::schema::SqlName>> {
+        let ValidatedExecute::CreateIndex(spec) = super::sql::validate_execute(&self.sql)? else {
+            return Err(Error::InvalidMultiliteOp(
+                "CREATE index operation has invalid SQL provenance".into(),
+            ));
+        };
+        let mut dependencies = BTreeMap::new();
+        for term in spec.terms {
+            match term {
+                CreateIndexTerm::Column { name, .. } => {
+                    dependencies.insert(name.canonical().to_vec(), name);
+                }
+                CreateIndexTerm::Expression { expression, .. } => {
+                    for name in expression.referenced_columns() {
+                        dependencies.insert(name.canonical().to_vec(), name);
+                    }
+                }
+            }
+        }
+        if let Some(predicate) = spec.predicate {
+            for name in predicate.referenced_columns() {
+                dependencies.insert(name.canonical().to_vec(), name);
+            }
+        }
+        Ok(dependencies.into_values().collect())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -417,17 +503,6 @@ fn ensure_not_referenced(
         ));
     }
     Ok(())
-}
-
-fn primary_index_prefix(table: &CreateTable) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.table_id().as_bytes().as_slice(),
-        codes::ROWS,
-        table.primary_index_id().as_bytes().as_slice(),
-    ])
-    .expect("primary index prefix is bounded")
 }
 
 fn unique_prefix(table: &CreateTable, index: &NamedIndex) -> Key {
@@ -663,6 +738,24 @@ mod tests {
                 index_name_scope_key(operation.index.name()),
                 active_schema_revision_key(before.table_id()),
                 primary_index_prefix(&before),
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("tenant".into()),
+                ),
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("slug".into()),
+                ),
+                column_index_dependency_key(
+                    before.table_id(),
+                    before.columns()[1].id(),
+                    operation.index.index_id(),
+                ),
+                column_index_dependency_key(
+                    before.table_id(),
+                    before.columns()[2].id(),
+                    operation.index.index_id(),
+                ),
             ],
         );
         assert!(
@@ -683,7 +776,7 @@ mod tests {
                 .writes()
                 .contains(&write_revision_key(before.table_id()))
         );
-        assert_eq!(lowered.footprint.constraints().len(), 3);
+        assert_eq!(lowered.footprint.constraints().len(), 7);
 
         operation.record_catalog(&connection).unwrap();
         assert_eq!(
@@ -734,9 +827,27 @@ mod tests {
             &[
                 index_name_scope_key(operation.index.name()),
                 active_schema_revision_key(before.table_id()),
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("tenant".into()),
+                ),
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("slug".into()),
+                ),
+                column_index_dependency_key(
+                    before.table_id(),
+                    before.columns()[1].id(),
+                    operation.index.index_id(),
+                ),
+                column_index_dependency_key(
+                    before.table_id(),
+                    before.columns()[2].id(),
+                    operation.index.index_id(),
+                ),
             ],
         );
-        assert_eq!(lowered.mutations.len(), 5);
+        assert_eq!(lowered.mutations.len(), 7);
         assert!(
             !lowered
                 .footprint
@@ -872,6 +983,19 @@ mod tests {
             operation
         );
         let lowered = operation.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("tenant".into()),
+                ),
+                column_name_scope_key(
+                    before.table_id(),
+                    &super::super::schema::SqlName::new("slug".into()),
+                ),
+            ],
+        );
         let definition = lowered
             .mutations
             .iter()
@@ -918,6 +1042,66 @@ mod tests {
         assert_eq!(catalog_index, operation.index);
         operation.rollback(&connection).unwrap();
         operation.apply(&connection).unwrap();
+    }
+
+    #[test]
+    fn index_restoration_renders_current_column_bindings_from_typed_terms() {
+        let (connection, _) = connection();
+        let create_sql =
+            "CREATE INDEX notes_search ON notes (lower(\"slug\")) WHERE \"slug\" IS NOT NULL";
+        let ValidatedExecute::CreateIndex(create_spec) =
+            super::super::sql::validate_execute(create_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        connection.execute(create_sql, ()).unwrap();
+        let create = IndexOperation::prepare_create(&connection, create_sql, &create_spec).unwrap();
+        create.record_catalog(&connection).unwrap();
+
+        let rename_sql = "ALTER TABLE notes RENAME COLUMN slug TO contents";
+        let ValidatedExecute::RenameColumn(rename_spec) =
+            super::super::sql::validate_execute(rename_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let rename = super::super::alter::AlterTableOperation::prepare_rename_column(
+            &connection,
+            rename_sql,
+            &rename_spec,
+        )
+        .unwrap();
+        connection.execute(rename_sql, ()).unwrap();
+        rename.record_catalog(&connection).unwrap();
+
+        let drop_sql = "DROP INDEX notes_search";
+        let drop = IndexOperation::prepare_drop(
+            &connection,
+            drop_sql,
+            &DropIndexSpec {
+                name: super::super::schema::SqlName::new("notes_search".into()),
+            },
+        )
+        .unwrap();
+        connection.execute(drop_sql, ()).unwrap();
+        drop.record_catalog(&connection).unwrap();
+        drop.rollback(&connection).unwrap();
+
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'notes_search'",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(sql.contains("\"contents\""), "{sql}");
+        assert!(!sql.contains("\"slug\""), "{sql}");
+        connection
+            .execute(
+                "INSERT INTO notes (id, tenant, contents) VALUES (7, 'tenant', 'restored')",
+                (),
+            )
+            .unwrap();
+        catalog::validate(&connection).unwrap();
     }
 
     #[test]
@@ -991,9 +1175,19 @@ mod tests {
                 index_name_scope_key(drop.index.name()),
                 active_schema_revision_key(drop.after.table_id()),
                 write_revision_key(drop.after.table_id()),
+                column_index_dependency_key(
+                    drop.after.table_id(),
+                    drop.after.columns()[1].id(),
+                    drop.index.index_id(),
+                ),
+                column_index_dependency_key(
+                    drop.after.table_id(),
+                    drop.after.columns()[2].id(),
+                    drop.index.index_id(),
+                ),
             ],
         );
-        assert_eq!(lowered.footprint.writes().len(), 1);
+        assert_eq!(lowered.footprint.writes().len(), 3);
         assert!(
             lowered
                 .footprint
