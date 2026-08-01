@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use sqlite3_parser::ast::Expr;
 use uuid::{Uuid, Variant, Version};
 
+use super::guard::LogicalTarget;
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
@@ -93,9 +94,6 @@ const TABLE_MODE_ORDINARY: u8 = 0;
 const TABLE_MODE_STRICT: u8 = 1;
 const TABLE_STORAGE_ROWID: u8 = 0;
 const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
-
-const SHORT_NAME_LIMIT: usize = 250;
-const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
 
 /// Maximum number of columns in a single logical index definition.
 pub const MAX_INDEX_COLUMNS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
@@ -2648,7 +2646,8 @@ fn spec_primary_key_ids_from_columns(
 }
 
 pub fn schema_log_key(id: MutationId) -> Key {
-    Key::from_bytes([codes::ROOT, codes::SCHEMA, codes::LOG, id.0.as_slice()])
+    LogicalTarget::SchemaLog { mutation: id }
+        .render()
         .expect("schema log components are bounded and non-empty")
 }
 
@@ -2657,140 +2656,83 @@ pub fn schema_log_key(id: MutationId) -> Key {
 /// SQLite rejects duplicate names across these object kinds, so every
 /// synchronized DDL operation must acquire and release this same cell.
 pub fn schema_object_name_scope_key(name: &SqlName) -> Key {
-    let component = name_component(name.canonical());
-    Key::from_bytes([
-        codes::ROOT,
-        codes::SCHEMA,
-        codes::NAMES,
-        codes::MAIN,
-        component.as_slice(),
-    ])
+    LogicalTarget::SchemaObjectName {
+        canonical: name.canonical().to_vec(),
+    }
+    .render()
     .expect("schema-object name scope components are bounded and non-empty")
 }
 
 pub fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::SCHEMA,
-        revision.0.as_slice(),
-    ])
-    .expect("table schema key is bounded")
+    LogicalTarget::TableSchema { table, revision }
+        .render()
+        .expect("table schema key is bounded")
 }
 
 pub fn column_name_scope_key(table: TableId, name: &SqlName) -> Key {
-    let component = name_component(name.canonical());
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::NAMES,
-        codes::COLUMNS,
-        component.as_slice(),
-    ])
+    LogicalTarget::ColumnName {
+        table,
+        canonical: name.canonical().to_vec(),
+    }
+    .render()
     .expect("column-name scope components are bounded and non-empty")
 }
 
 pub fn column_dependency_prefix(table: TableId, column: ColumnId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::COLUMN_DEPENDENCIES,
-        column.0.as_slice(),
-    ])
-    .expect("column dependency prefix is bounded")
+    LogicalTarget::ColumnDependencyPrefix { table, column }
+        .render()
+        .expect("column dependency prefix is bounded")
 }
 
 pub fn column_index_dependency_key(table: TableId, column: ColumnId, index: IndexId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::COLUMN_DEPENDENCIES,
-        column.0.as_slice(),
-        codes::INDEXES,
-        index.0.as_slice(),
-    ])
+    LogicalTarget::ColumnIndexDependency {
+        table,
+        column,
+        index,
+    }
+    .render()
     .expect("column index dependency key is bounded")
 }
 
 pub fn column_check_dependency_key(table: TableId, column: ColumnId, owner: ColumnId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::COLUMN_DEPENDENCIES,
-        column.0.as_slice(),
-        codes::COLUMNS,
-        owner.0.as_slice(),
-    ])
+    LogicalTarget::ColumnCheckDependency {
+        table,
+        column,
+        owner,
+    }
+    .render()
     .expect("column CHECK dependency key is bounded")
 }
 
 /// Prefix covering every durable schema and row cell owned by one table.
 pub fn table_prefix(table: TableId) -> Key {
-    Key::from_bytes([codes::ROOT, codes::TABLES, table.0.as_slice()])
+    LogicalTarget::TableRoot { table }
+        .render()
         .expect("table prefix is bounded")
 }
 
 pub fn active_primary_index_key(table: TableId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::ACTIVE_PRIMARY_INDEX,
-    ])
-    .expect("active primary index key is bounded")
+    LogicalTarget::ActivePrimaryIndex { table }
+        .render()
+        .expect("active primary index key is bounded")
 }
 
 pub fn active_schema_revision_key(table: TableId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::ACTIVE_SCHEMA_REVISION,
-    ])
-    .expect("active schema revision key is bounded")
+    LogicalTarget::ActiveSchemaRevision { table }
+        .render()
+        .expect("active schema revision key is bounded")
 }
 
 pub fn index_definition_key(table: TableId, index: IndexId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::INDEX_DEFINITIONS,
-        index.0.as_slice(),
-    ])
-    .expect("index definition key is bounded")
+    LogicalTarget::IndexDefinition { table, index }
+        .render()
+        .expect("index definition key is bounded")
 }
 
 pub fn write_revision_key(table: TableId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.0.as_slice(),
-        codes::WRITE_REVISION,
-    ])
-    .expect("write revision key is bounded")
-}
-
-fn name_component(canonical: &[u8]) -> Vec<u8> {
-    if canonical.len() <= SHORT_NAME_LIMIT {
-        let mut component = Vec::with_capacity(5 + canonical.len());
-        component.extend_from_slice(b"name-");
-        component.extend_from_slice(canonical);
-        component
-    } else {
-        let mut hash = Sha256::new();
-        hash.update(TABLE_NAME_HASH_DOMAIN);
-        hash.update(canonical);
-        let mut component = Vec::with_capacity(5 + 32);
-        component.extend_from_slice(b"hash-");
-        component.extend_from_slice(&hash.finalize());
-        component
-    }
+    LogicalTarget::WriteRevision { table }
+        .render()
+        .expect("write revision key is bounded")
 }
 
 fn encode_create_table(table: &CreateTable) -> Vec<u8> {
@@ -4851,14 +4793,7 @@ mod tests {
     }
 
     #[test]
-    fn short_names_are_readable_and_long_names_are_hashed() {
-        let short = name_component("A".repeat(250).as_bytes());
-        assert!(short.starts_with(b"name-"));
-        assert_eq!(short.len(), 255);
-
-        let long = name_component("A".repeat(251).as_bytes());
-        assert!(long.starts_with(b"hash-"));
-        assert_eq!(long.len(), 37);
+    fn schema_object_names_are_case_insensitive() {
         assert_eq!(
             schema_object_name_scope_key(&SqlName::new("Notes".into())),
             schema_object_name_scope_key(&SqlName::new("nOtEs".into()))

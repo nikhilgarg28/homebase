@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
-use super::codes;
+use super::guard::LogicalTarget;
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
     CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
@@ -509,13 +509,12 @@ fn ensure_not_referenced(
 
 fn unique_prefix(table: &CreateTable, index: &NamedIndex) -> Key {
     debug_assert!(index.is_unique());
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TABLES,
-        table.table_id().as_bytes().as_slice(),
-        codes::UNIQUE,
-        index.index_id().as_bytes().as_slice(),
-    ])
+    LogicalTarget::UniqueOwner {
+        table: table.table_id(),
+        index: index.index_id(),
+        images: Vec::new(),
+    }
+    .render()
     .expect("UNIQUE entry prefix is bounded")
 }
 

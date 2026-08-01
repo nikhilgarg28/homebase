@@ -13,6 +13,7 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
+use super::guard::LogicalTarget;
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
     NamedIndex, SchemaRevisionId, SqlName, StrictType, TableId, TableMode, TableStorage,
@@ -2062,17 +2063,12 @@ fn row_prefix(
     primary_index: IndexId,
     images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
-    Key::from_bytes(
-        [
-            codes::ROOT.to_vec(),
-            codes::TABLES.to_vec(),
-            table.as_bytes().to_vec(),
-            codes::ROWS.to_vec(),
-            primary_index.as_bytes().to_vec(),
-        ]
-        .into_iter()
-        .chain(images),
-    )
+    LogicalTarget::Row {
+        table,
+        index: primary_index,
+        images,
+    }
+    .render()
     .map_err(RowCodecError::InvalidKey)
 }
 
@@ -2081,17 +2077,12 @@ fn unique_prefix(
     index: IndexId,
     images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
-    Key::from_bytes(
-        [
-            codes::ROOT.to_vec(),
-            codes::TABLES.to_vec(),
-            table.as_bytes().to_vec(),
-            codes::UNIQUE.to_vec(),
-            index.as_bytes().to_vec(),
-        ]
-        .into_iter()
-        .chain(images),
-    )
+    LogicalTarget::UniqueOwner {
+        table,
+        index,
+        images,
+    }
+    .render()
     .map_err(RowCodecError::InvalidKey)
 }
 
@@ -2107,18 +2098,13 @@ fn foreign_reference_prefix(
     parent_index: IndexId,
     parent_images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
-    Key::from_bytes(
-        [
-            codes::ROOT.to_vec(),
-            codes::TABLES.to_vec(),
-            parent.as_bytes().to_vec(),
-            codes::FOREIGN_REFERENCES.to_vec(),
-            relationship.as_bytes().to_vec(),
-            parent_index.as_bytes().to_vec(),
-        ]
-        .into_iter()
-        .chain(parent_images),
-    )
+    LogicalTarget::ForeignReferencePrefix {
+        parent,
+        relationship,
+        parent_index,
+        parent_images,
+    }
+    .render()
     .map_err(RowCodecError::InvalidKey)
 }
 
@@ -2130,20 +2116,15 @@ fn foreign_reference_key(
     child_primary_index: IndexId,
     child_images: Vec<Vec<u8>>,
 ) -> std::result::Result<Key, RowCodecError> {
-    Key::from_bytes(
-        [
-            codes::ROOT.to_vec(),
-            codes::TABLES.to_vec(),
-            parent.as_bytes().to_vec(),
-            codes::FOREIGN_REFERENCES.to_vec(),
-            relationship.as_bytes().to_vec(),
-            parent_index.as_bytes().to_vec(),
-        ]
-        .into_iter()
-        .chain(parent_images)
-        .chain([child_primary_index.as_bytes().to_vec()])
-        .chain(child_images),
-    )
+    LogicalTarget::ForeignReference {
+        parent,
+        relationship,
+        parent_index,
+        parent_images,
+        child_index: child_primary_index,
+        child_images,
+    }
+    .render()
     .map_err(RowCodecError::InvalidKey)
 }
 

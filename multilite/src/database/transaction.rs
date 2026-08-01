@@ -10,7 +10,9 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 use uuid::{Uuid, Variant, Version};
 
+#[cfg(test)]
 use super::codes;
+use super::guard::LogicalTarget;
 use super::isolation::IsolationLevel;
 use super::operation::{CompiledOperation, MultiliteOp, RejectionEffect};
 use crate::commit::footprint::ConflictFootprint;
@@ -294,13 +296,9 @@ fn transaction_field_too_large() -> Error {
 }
 
 fn transaction_key(id: TransactionId) -> Key {
-    Key::from_bytes([
-        codes::ROOT,
-        codes::TRANSACTIONS,
-        codes::LOG,
-        id.0.as_slice(),
-    ])
-    .expect("transaction manifest key is bounded and non-empty")
+    LogicalTarget::TransactionLog { transaction: id.0 }
+        .render()
+        .expect("transaction manifest key is bounded and non-empty")
 }
 
 fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], TransactionCodecError> {

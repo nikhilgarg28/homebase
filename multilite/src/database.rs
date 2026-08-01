@@ -6,6 +6,7 @@ mod authority;
 pub(crate) mod catalog;
 mod codes;
 mod connection;
+pub(crate) mod guard;
 mod index;
 pub(crate) mod isolation;
 pub(crate) mod operation;
