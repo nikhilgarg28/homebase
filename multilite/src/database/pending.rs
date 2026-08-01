@@ -34,6 +34,7 @@ pub struct PendingTransaction {
 pub struct RejectionRepair {
     pending: Vec<PendingTransaction>,
     writes: Vec<WriteRegion>,
+    effects: Vec<RejectionEffect>,
 }
 
 impl RejectionRepair {
@@ -51,10 +52,7 @@ impl RejectionRepair {
         if load(connection)? != self.pending {
             return Err(Error::StalePushRejection);
         }
-        for pending in self.pending.iter().rev() {
-            let compiled = pending.transaction.clone().compile()?;
-            apply_rejection(connection, compiled.rejection())?;
-        }
+        apply_rejection(connection, &self.effects)?;
         if !self.pending.is_empty() {
             connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
         }
@@ -264,15 +262,23 @@ pub fn prepare_rejection(
     }
 
     let mut writes = BTreeSet::new();
+    let mut compiled = Vec::with_capacity(pending.len());
     for pending in &pending {
-        let compiled = pending.transaction.clone().compile()?;
+        let transaction = pending.transaction.clone().compile()?;
         writes.extend(history::writes_from_mutations(
-            compiled.homebase().mutations(),
+            transaction.homebase().mutations(),
         ));
+        compiled.push(transaction);
     }
+    let effects = compiled
+        .into_iter()
+        .rev()
+        .flat_map(|transaction| transaction.rejection().to_vec())
+        .collect();
     Ok((!pending.is_empty()).then(|| RejectionRepair {
         pending,
         writes: writes.into_iter().collect(),
+        effects,
     }))
 }
 
