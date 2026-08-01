@@ -12,7 +12,7 @@ use uuid::{Uuid, Variant, Version};
 
 #[cfg(test)]
 use super::codes;
-use super::guard::LogicalTarget;
+use super::guard::{GuardPlan, LogicalTarget};
 use super::isolation::IsolationLevel;
 use super::operation::{CompiledOperation, MultiliteOp, RejectionEffect};
 use crate::commit::footprint::ConflictFootprint;
@@ -37,6 +37,7 @@ pub struct MultiliteTransaction {
 pub struct HomebaseTransaction {
     pub mutations: Vec<Mutation>,
     footprint: ConflictFootprint,
+    guards: Box<GuardPlan>,
 }
 
 /// One validated logical transaction and its single deterministic lowering.
@@ -64,6 +65,10 @@ impl HomebaseTransaction {
 
     pub fn footprint(&self) -> &ConflictFootprint {
         &self.footprint
+    }
+
+    pub fn guards(&self) -> &GuardPlan {
+        &self.guards
     }
 
     /// Plan assertions for one isolation level and authority snapshot.
@@ -197,15 +202,19 @@ impl MultiliteTransaction {
             key: transaction_key(self.id),
             value: self.encode()?,
         }];
-        let mut footprint = ConflictFootprint::new();
+        let mut guards = GuardPlan::merged();
         for operation in &self.operations {
-            let (operation_mutations, operation_footprint) = operation.to_homebase()?.into_parts();
+            let (operation_mutations, operation_footprint, operation_guards) =
+                operation.to_homebase()?.into_all_parts();
+            debug_assert_eq!(operation_footprint, operation_guards.footprint());
             mutations.extend(operation_mutations);
-            footprint.extend(operation_footprint);
+            guards.extend(operation_guards);
         }
+        let footprint = guards.footprint();
         Ok(HomebaseTransaction {
             mutations,
             footprint,
+            guards: Box::new(guards),
         })
     }
 
@@ -215,14 +224,15 @@ impl MultiliteTransaction {
     ) -> Result<CompiledTransaction> {
         let mut logical_operations = Vec::with_capacity(operations.len());
         let mut operation_mutations = Vec::new();
-        let mut footprint = ConflictFootprint::new();
+        let mut guards = GuardPlan::merged();
         let mut rejection = Vec::with_capacity(operations.len());
         for operation in operations {
             let (logical, homebase, inverse) = operation.into_parts();
-            let (mutations, operation_footprint) = homebase.into_parts();
+            let (mutations, operation_footprint, operation_guards) = homebase.into_all_parts();
+            debug_assert_eq!(operation_footprint, operation_guards.footprint());
             logical_operations.push(logical);
             operation_mutations.extend(mutations);
-            footprint.extend(operation_footprint);
+            guards.extend(operation_guards);
             rejection.push(inverse);
         }
         rejection.reverse();
@@ -237,11 +247,13 @@ impl MultiliteTransaction {
             value: logical.encode()?,
         });
         mutations.extend(operation_mutations);
+        let footprint = guards.footprint();
         Ok(CompiledTransaction {
             logical,
             homebase: HomebaseTransaction {
                 mutations,
                 footprint,
+                guards: Box::new(guards),
             },
             rejection,
         })

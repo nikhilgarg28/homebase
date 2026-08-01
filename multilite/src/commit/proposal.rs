@@ -250,7 +250,7 @@ impl CommitProposal {
             compiled,
             footprint,
         };
-        body.validate_mandatory_footprint(body.compiled.homebase().footprint())?;
+        body.validate_mandatory_footprint(&body.compiled.homebase().guards().footprint())?;
         Ok(Self {
             id: ProposalId::new(),
             body: ProposalBody::Transaction(body),
@@ -405,9 +405,8 @@ impl CommitProposal {
     /// Cross-check every body-specific invariant that is independent of state.
     pub fn validate(&self) -> Result<()> {
         match &self.body {
-            ProposalBody::Transaction(proposal) => {
-                proposal.validate_mandatory_footprint(proposal.compiled.homebase().footprint())
-            }
+            ProposalBody::Transaction(proposal) => proposal
+                .validate_mandatory_footprint(&proposal.compiled.homebase().guards().footprint()),
             ProposalBody::ApplyAdmissions(proposal) => {
                 if proposal.through < proposal.expected_admits.neck
                     || proposal.through > proposal.expected_admits.tail

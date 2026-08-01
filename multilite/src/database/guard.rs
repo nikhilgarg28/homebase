@@ -5,15 +5,13 @@ use sha2::{Digest, Sha256};
 
 use super::codes;
 use super::schema::{ColumnId, ForeignKeyId, IndexId, MutationId, SchemaRevisionId, TableId};
+use crate::commit::footprint::ConflictFootprint;
+use crate::{Error, Result as MultiliteResult};
 
 const SHORT_NAME_LIMIT: usize = 250;
 const OBJECT_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
 
 /// Finite durable namespaces understood by the operation compiler.
-#[allow(
-    dead_code,
-    reason = "consumed by the reasoned guard audit in the next compiler slice"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TargetFamily {
     SchemaLog,
@@ -30,6 +28,320 @@ pub enum TargetFamily {
     UniqueOwner,
     ForeignReference,
     TransactionLog,
+}
+
+/// Logical operation family whose conflict contract emitted a guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OperationFamily {
+    CreateTable,
+    InsertRows,
+    DeleteRows,
+    UpdateRows,
+    CreateIndex,
+    DropIndex,
+    RenameTable,
+    RenameColumn,
+    AddColumn,
+    DropColumn,
+    TransactionRead,
+}
+
+impl TargetFamily {
+    /// Classify a rendered target back into the compiler's finite vocabulary.
+    pub fn classify(key: &Key) -> Option<Self> {
+        let parts = key.components();
+        if parts.first()?.as_bytes() != codes::ROOT {
+            return None;
+        }
+        let component = |index: usize| parts.get(index).map(|part| part.as_bytes());
+        match component(1)? {
+            value if value == codes::SCHEMA => match (component(2), parts.len()) {
+                (Some(value), 4) if value == codes::LOG => Some(Self::SchemaLog),
+                (Some(value), 5) if value == codes::NAMES && component(3) == Some(codes::MAIN) => {
+                    Some(Self::SchemaObjectName)
+                }
+                _ => None,
+            },
+            value if value == codes::TABLES => {
+                if parts.len() == 3 {
+                    return Some(Self::TableRoot);
+                }
+                match component(3)? {
+                    value if value == codes::SCHEMA && parts.len() == 5 => Some(Self::TableSchema),
+                    value
+                        if value == codes::NAMES
+                            && component(4) == Some(codes::COLUMNS)
+                            && parts.len() == 6 =>
+                    {
+                        Some(Self::ColumnName)
+                    }
+                    value if value == codes::COLUMN_DEPENDENCIES && parts.len() >= 5 => {
+                        Some(Self::ColumnDependency)
+                    }
+                    value if value == codes::ACTIVE_PRIMARY_INDEX && parts.len() == 4 => {
+                        Some(Self::ActivePrimaryIndex)
+                    }
+                    value if value == codes::ACTIVE_SCHEMA_REVISION && parts.len() == 4 => {
+                        Some(Self::ActiveSchemaRevision)
+                    }
+                    value if value == codes::INDEX_DEFINITIONS && parts.len() == 5 => {
+                        Some(Self::IndexDefinition)
+                    }
+                    value if value == codes::WRITE_REVISION && parts.len() == 4 => {
+                        Some(Self::WriteRevision)
+                    }
+                    value if value == codes::ROWS && parts.len() >= 5 => Some(Self::Row),
+                    value if value == codes::UNIQUE && parts.len() >= 5 => Some(Self::UniqueOwner),
+                    value if value == codes::FOREIGN_REFERENCES && parts.len() >= 6 => {
+                        Some(Self::ForeignReference)
+                    }
+                    _ => None,
+                }
+            }
+            value
+                if value == codes::TRANSACTIONS
+                    && component(2) == Some(codes::LOG)
+                    && parts.len() == 4 =>
+            {
+                Some(Self::TransactionLog)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether a guard is mandatory by invariant, selected for write conflicts, or
+/// included only by serializable isolation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardClass {
+    Invariant,
+    Write,
+    SerializableRead,
+}
+
+/// Semantic reason an operation depends on one logical target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardReason {
+    SchemaObjectName,
+    ColumnNameBinding,
+    SchemaRevision,
+    WriteContract,
+    PrimaryIndex,
+    RowIdentity,
+    UniqueOwnership,
+    ForeignReference,
+    ForeignChildren,
+    ColumnDependency,
+    ExistingRows,
+    SerializableRead,
+}
+
+/// One permitted guard shape in the checked compiler contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardContract {
+    operation: OperationFamily,
+    class: GuardClass,
+    reason: GuardReason,
+    target: TargetFamily,
+}
+
+macro_rules! contract {
+    ($operation:ident, $class:ident, $reason:ident, $target:ident) => {
+        GuardContract {
+            operation: OperationFamily::$operation,
+            class: GuardClass::$class,
+            reason: GuardReason::$reason,
+            target: TargetFamily::$target,
+        }
+    };
+}
+
+/// Central allowlist used by lowering, tests, and the generated guard audit.
+pub const GUARD_CONTRACTS: &[GuardContract] = &[
+    contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateTable, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(CreateTable, Write, WriteContract, WriteRevision),
+    contract!(InsertRows, Invariant, RowIdentity, Row),
+    contract!(InsertRows, Write, RowIdentity, Row),
+    contract!(InsertRows, Invariant, UniqueOwnership, UniqueOwner),
+    contract!(InsertRows, Write, UniqueOwnership, UniqueOwner),
+    contract!(InsertRows, Invariant, ForeignReference, ForeignReference),
+    contract!(InsertRows, Write, ForeignReference, ForeignReference),
+    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
+    contract!(DeleteRows, Write, RowIdentity, Row),
+    contract!(DeleteRows, Write, UniqueOwnership, UniqueOwner),
+    contract!(DeleteRows, Write, ForeignReference, ForeignReference),
+    contract!(DeleteRows, Invariant, ForeignChildren, ForeignReference),
+    contract!(DeleteRows, Write, ForeignChildren, ForeignReference),
+    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
+    contract!(UpdateRows, Invariant, RowIdentity, Row),
+    contract!(UpdateRows, Write, RowIdentity, Row),
+    contract!(UpdateRows, Invariant, UniqueOwnership, UniqueOwner),
+    contract!(UpdateRows, Write, UniqueOwnership, UniqueOwner),
+    contract!(UpdateRows, Invariant, ForeignReference, ForeignReference),
+    contract!(UpdateRows, Write, ForeignReference, ForeignReference),
+    contract!(UpdateRows, Invariant, ForeignChildren, ForeignReference),
+    contract!(UpdateRows, Write, ForeignChildren, ForeignReference),
+    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(CreateIndex, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(CreateIndex, Invariant, ColumnNameBinding, ColumnName),
+    contract!(CreateIndex, Invariant, ColumnDependency, ColumnDependency),
+    contract!(CreateIndex, Write, ColumnDependency, ColumnDependency),
+    contract!(CreateIndex, Write, WriteContract, WriteRevision),
+    contract!(CreateIndex, Invariant, ExistingRows, Row),
+    contract!(DropIndex, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(DropIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(DropIndex, Invariant, ColumnDependency, ColumnDependency),
+    contract!(DropIndex, Write, ColumnDependency, ColumnDependency),
+    contract!(DropIndex, Invariant, WriteContract, WriteRevision),
+    contract!(RenameTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Invariant, ColumnDependency, ColumnDependency),
+    contract!(AddColumn, Write, ColumnDependency, ColumnDependency),
+    contract!(AddColumn, Write, WriteContract, WriteRevision),
+    contract!(AddColumn, Invariant, ExistingRows, Row),
+    contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(DropColumn, Invariant, ColumnDependency, ColumnDependency),
+    contract!(DropColumn, Write, ColumnDependency, ColumnDependency),
+    contract!(
+        TransactionRead,
+        SerializableRead,
+        SerializableRead,
+        TableRoot
+    ),
+];
+
+/// One unpruned, reviewable conflict dependency emitted by the compiler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guard {
+    operation: OperationFamily,
+    target: Key,
+    family: TargetFamily,
+    class: GuardClass,
+    reason: GuardReason,
+}
+
+impl Guard {
+    pub fn operation(&self) -> OperationFamily {
+        self.operation
+    }
+
+    pub fn target(&self) -> &Key {
+        &self.target
+    }
+
+    pub fn family(&self) -> TargetFamily {
+        self.family
+    }
+
+    pub fn class(&self) -> GuardClass {
+        self.class
+    }
+
+    pub fn reason(&self) -> GuardReason {
+        self.reason
+    }
+}
+
+/// Unpruned compiler evidence from which the executable footprint is derived.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuardPlan {
+    operation: Option<OperationFamily>,
+    entries: Vec<Guard>,
+}
+
+impl GuardPlan {
+    pub fn for_operation(operation: OperationFamily) -> Self {
+        Self {
+            operation: Some(operation),
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn merged() -> Self {
+        Self::default()
+    }
+
+    pub fn invariant(&mut self, target: Key, reason: GuardReason) -> MultiliteResult<()> {
+        self.insert(target, GuardClass::Invariant, reason)
+    }
+
+    pub fn write(&mut self, target: Key, reason: GuardReason) -> MultiliteResult<()> {
+        self.insert(target, GuardClass::Write, reason)
+    }
+
+    pub fn serializable_read(&mut self, target: Key, reason: GuardReason) -> MultiliteResult<()> {
+        self.insert(target, GuardClass::SerializableRead, reason)
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "exposed to compiler audit tests and diagnostic tooling"
+    )]
+    pub fn entries(&self) -> &[Guard] {
+        &self.entries
+    }
+
+    pub fn footprint(&self) -> ConflictFootprint {
+        let mut footprint = ConflictFootprint::new();
+        for guard in &self.entries {
+            debug_assert!(GUARD_CONTRACTS.iter().any(|contract| {
+                contract.operation == guard.operation()
+                    && contract.class == guard.class()
+                    && contract.reason == guard.reason()
+                    && contract.target == guard.family()
+            }));
+            match guard.class() {
+                GuardClass::Invariant => footprint.add_constraint(guard.target().clone()),
+                GuardClass::Write => footprint.add_write(guard.target().clone()),
+                GuardClass::SerializableRead => footprint.add_read(guard.target().clone()),
+            }
+        }
+        footprint
+    }
+
+    fn insert(
+        &mut self,
+        target: Key,
+        class: GuardClass,
+        reason: GuardReason,
+    ) -> MultiliteResult<()> {
+        let family = TargetFamily::classify(&target).ok_or(Error::CaptureInvariant(
+            "guard target is outside the logical target registry",
+        ))?;
+        let operation = self.operation.ok_or(Error::CaptureInvariant(
+            "guards can only be added to an operation-scoped plan",
+        ))?;
+        if !GUARD_CONTRACTS.iter().any(|contract| {
+            contract.operation == operation
+                && contract.class == class
+                && contract.reason == reason
+                && contract.target == family
+        }) {
+            return Err(Error::CaptureInvariant(
+                "guard is absent from the operation contract",
+            ));
+        }
+        self.entries.push(Guard {
+            operation,
+            target,
+            family,
+            class,
+            reason,
+        });
+        Ok(())
+    }
 }
 
 /// One point or component-prefix address in Multilite's durable Homebase model.
@@ -110,10 +422,6 @@ pub enum LogicalTarget {
 
 impl LogicalTarget {
     /// Durable namespace family used by diagnostics and audit generation.
-    #[allow(
-        dead_code,
-        reason = "consumed by the reasoned guard audit in the next compiler slice"
-    )]
     pub fn family(&self) -> TargetFamily {
         match self {
             Self::SchemaLog { .. } => TargetFamily::SchemaLog,
@@ -138,7 +446,7 @@ impl LogicalTarget {
     }
 
     /// Render the canonical component layout consumed by Homebase.
-    pub fn render(&self) -> Result<Key, KeyError> {
+    pub fn render(&self) -> std::result::Result<Key, KeyError> {
         let components = match self {
             Self::SchemaLog { mutation } => vec![
                 codes::ROOT.to_vec(),
@@ -266,7 +574,9 @@ impl LogicalTarget {
                 transaction.to_vec(),
             ],
         };
-        Key::from_bytes(components)
+        let key = Key::from_bytes(components)?;
+        debug_assert_eq!(TargetFamily::classify(&key), Some(self.family()));
+        Ok(key)
     }
 }
 
@@ -370,5 +680,112 @@ mod tests {
         let long = name_component("A".repeat(251).as_bytes());
         assert!(long.starts_with(b"hash-"));
         assert_eq!(long.len(), 37);
+    }
+
+    #[test]
+    fn reasoned_plan_preserves_raw_evidence_and_derives_pruned_footprint() {
+        let table = id(1, TableId::from_bytes);
+        let index = id(2, IndexId::from_bytes);
+        let row = LogicalTarget::Row {
+            table,
+            index,
+            images: vec![b"row".to_vec()],
+        }
+        .render()
+        .unwrap();
+        let relationship = id(3, ForeignKeyId::from_bytes);
+        let reference_prefix = LogicalTarget::ForeignReferencePrefix {
+            parent: table,
+            relationship,
+            parent_index: index,
+            parent_images: vec![b"parent".to_vec()],
+        }
+        .render()
+        .unwrap();
+        let reference = LogicalTarget::ForeignReference {
+            parent: table,
+            relationship,
+            parent_index: index,
+            parent_images: vec![b"parent".to_vec()],
+            child_index: index,
+            child_images: vec![b"child".to_vec()],
+        }
+        .render()
+        .unwrap();
+        let mut plan = GuardPlan::for_operation(OperationFamily::UpdateRows);
+        plan.write(row, GuardReason::RowIdentity).unwrap();
+        plan.invariant(reference, GuardReason::ForeignChildren)
+            .unwrap();
+        plan.invariant(reference_prefix.clone(), GuardReason::ForeignChildren)
+            .unwrap();
+        let read = LogicalTarget::TableRoot {
+            table: id(4, TableId::from_bytes),
+        }
+        .render()
+        .unwrap();
+        let mut reads = GuardPlan::for_operation(OperationFamily::TransactionRead);
+        reads
+            .serializable_read(read.clone(), GuardReason::SerializableRead)
+            .unwrap();
+        let mut merged = GuardPlan::merged();
+        merged.extend(plan);
+        merged.extend(reads);
+
+        assert_eq!(merged.entries().len(), 4);
+        assert_eq!(merged.entries()[0].operation(), OperationFamily::UpdateRows);
+        assert_eq!(merged.entries()[0].family(), TargetFamily::Row);
+        assert_eq!(merged.entries()[1].class(), GuardClass::Invariant);
+        assert_eq!(merged.entries()[2].reason(), GuardReason::ForeignChildren);
+        assert_eq!(merged.entries()[3].target(), &read);
+        let footprint = merged.footprint();
+        assert_eq!(
+            footprint.constraints(),
+            &std::collections::BTreeSet::from([reference_prefix])
+        );
+        assert_eq!(footprint.writes().len(), 1);
+        assert_eq!(footprint.reads(), &std::collections::BTreeSet::from([read]));
+    }
+
+    #[test]
+    fn reason_vocabulary_is_finite_and_reviewable() {
+        let reasons = [
+            GuardReason::SchemaObjectName,
+            GuardReason::ColumnNameBinding,
+            GuardReason::SchemaRevision,
+            GuardReason::WriteContract,
+            GuardReason::PrimaryIndex,
+            GuardReason::RowIdentity,
+            GuardReason::UniqueOwnership,
+            GuardReason::ForeignReference,
+            GuardReason::ForeignChildren,
+            GuardReason::ColumnDependency,
+            GuardReason::ExistingRows,
+            GuardReason::SerializableRead,
+        ];
+        assert_eq!(reasons.len(), 12);
+    }
+
+    #[test]
+    fn plans_reject_targets_outside_the_registry() {
+        let mut plan = GuardPlan::for_operation(OperationFamily::InsertRows);
+        let unknown = Key::from_bytes([b"other".as_slice(), b"key".as_slice()]).unwrap();
+        assert!(matches!(
+            plan.write(unknown, GuardReason::RowIdentity),
+            Err(Error::CaptureInvariant(
+                "guard target is outside the logical target registry"
+            ))
+        ));
+
+        let registered = LogicalTarget::TableRoot {
+            table: id(1, TableId::from_bytes),
+        }
+        .render()
+        .unwrap();
+        assert!(matches!(
+            plan.write(registered, GuardReason::RowIdentity),
+            Err(Error::CaptureInvariant(
+                "guard is absent from the operation contract"
+            ))
+        ));
     }
 }

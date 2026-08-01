@@ -11,6 +11,7 @@ use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
+use super::guard::{GuardPlan, GuardReason, OperationFamily};
 use super::row::primary_index_prefix;
 use super::schema::{
     ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
@@ -98,6 +99,7 @@ pub struct AlterTableOperation {
 pub struct AlterTableHomebaseOp {
     pub mutations: Vec<Mutation>,
     pub footprint: ConflictFootprint,
+    pub guards: GuardPlan,
 }
 
 impl AlterTableOperation {
@@ -270,13 +272,19 @@ impl AlterTableOperation {
                 let changes_write_contract =
                     matches!(&self.delta, AlterTableDelta::AddColumn { .. })
                         && after.added_column_changes_write_contract(*column);
-                let mut footprint = ConflictFootprint::new();
-                footprint.add_constraint(name_key.clone());
+                let mut guards = GuardPlan::for_operation(match &self.delta {
+                    AlterTableDelta::AddColumn { .. } => OperationFamily::AddColumn,
+                    AlterTableDelta::DropColumn { .. } => OperationFamily::DropColumn,
+                    _ => unreachable!(),
+                });
+                guards.invariant(name_key.clone(), GuardReason::ColumnNameBinding)?;
                 let binding = match &self.delta {
                     AlterTableDelta::AddColumn { .. } => {
                         for dependency in after.added_column_dependencies(*column) {
-                            footprint
-                                .add_constraint(column_name_scope_key(self.table, &dependency));
+                            guards.invariant(
+                                column_name_scope_key(self.table, &dependency),
+                                GuardReason::ColumnNameBinding,
+                            )?;
                         }
                         Mutation::Set {
                             key: name_key,
@@ -301,8 +309,8 @@ impl AlterTableOperation {
                     AlterTableDelta::AddColumn { .. } => {
                         for dependency in after.column_check_dependencies(*column) {
                             let key = column_check_dependency_key(self.table, dependency, *column);
-                            footprint.add_constraint(key.clone());
-                            footprint.add_write(key.clone());
+                            guards.invariant(key.clone(), GuardReason::ColumnDependency)?;
+                            guards.write(key.clone(), GuardReason::ColumnDependency)?;
                             mutations.push(Mutation::Set {
                                 key,
                                 value: column.as_bytes().to_vec(),
@@ -312,13 +320,13 @@ impl AlterTableOperation {
                     AlterTableDelta::DropColumn { .. } => {
                         for dependency in before.column_check_dependencies(*column) {
                             let key = column_check_dependency_key(self.table, dependency, *column);
-                            footprint.add_constraint(key.clone());
-                            footprint.add_write(key.clone());
+                            guards.invariant(key.clone(), GuardReason::ColumnDependency)?;
+                            guards.write(key.clone(), GuardReason::ColumnDependency)?;
                             mutations.push(Mutation::Delete { key });
                         }
                         let dependents = column_dependency_prefix(self.table, *column);
-                        footprint.add_constraint(dependents.clone());
-                        footprint.add_write(dependents.clone());
+                        guards.invariant(dependents.clone(), GuardReason::ColumnDependency)?;
+                        guards.write(dependents.clone(), GuardReason::ColumnDependency)?;
                         mutations.push(Mutation::DeleteRange {
                             range: Range::Prefix(dependents),
                         });
@@ -327,22 +335,26 @@ impl AlterTableOperation {
                 }
                 if changes_write_contract {
                     let write_revision = write_revision_key(self.table);
-                    footprint.add_write(write_revision.clone());
-                    footprint.add_constraint(primary_index_prefix(before));
+                    guards.write(write_revision.clone(), GuardReason::WriteContract)?;
+                    guards.invariant(primary_index_prefix(before), GuardReason::ExistingRows)?;
                     mutations.push(Mutation::Set {
                         key: write_revision,
                         value: self.mutation_id.as_bytes().to_vec(),
                     });
                 }
+                let footprint = guards.footprint();
                 Ok(AlterTableHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 })
             }
             AlterTableDelta::RenameTable { old_name, new_name } => self.rename_homebase(
                 schema_object_name_scope_key(old_name),
                 schema_object_name_scope_key(new_name),
                 self.table.as_bytes().to_vec(),
+                OperationFamily::RenameTable,
+                GuardReason::SchemaObjectName,
             ),
             AlterTableDelta::RenameColumn {
                 column,
@@ -352,6 +364,8 @@ impl AlterTableOperation {
                 column_name_scope_key(self.table, old_name),
                 column_name_scope_key(self.table, new_name),
                 column.as_bytes().to_vec(),
+                OperationFamily::RenameColumn,
+                GuardReason::ColumnNameBinding,
             ),
         }
     }
@@ -540,10 +554,12 @@ impl AlterTableOperation {
         old_name: homebase_core::key::Key,
         new_name: homebase_core::key::Key,
         value: Vec<u8>,
+        operation: OperationFamily,
+        reason: GuardReason,
     ) -> Result<AlterTableHomebaseOp> {
-        let mut footprint = ConflictFootprint::new();
-        footprint.add_constraint(old_name.clone());
-        footprint.add_constraint(new_name.clone());
+        let mut guards = GuardPlan::for_operation(operation);
+        guards.invariant(old_name.clone(), reason)?;
+        guards.invariant(new_name.clone(), reason)?;
         let mutations = vec![
             Mutation::Set {
                 key: schema_log_key(self.mutation_id),
@@ -555,9 +571,11 @@ impl AlterTableOperation {
                 value,
             },
         ];
+        let footprint = guards.footprint();
         Ok(AlterTableHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use sqlite3_parser::ast::Expr;
 use uuid::{Uuid, Variant, Version};
 
-use super::guard::LogicalTarget;
+use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
@@ -827,6 +827,7 @@ pub struct CreateTable {
 pub struct SchemaHomebaseOp {
     pub mutations: Vec<Mutation>,
     pub footprint: ConflictFootprint,
+    pub guards: GuardPlan,
 }
 
 macro_rules! id_accessors {
@@ -1276,16 +1277,19 @@ impl CreateTable {
         let active_primary_index = active_primary_index_key(self.table_id);
         let primary_index = index_definition_key(self.table_id, self.primary_index_id());
         let write_revision = write_revision_key(self.table_id);
-        let mut footprint = ConflictFootprint::new();
-        footprint.add_constraint(name_scope.clone());
-        footprint.add_write(write_revision.clone());
+        let mut guards = GuardPlan::for_operation(OperationFamily::CreateTable);
+        guards.invariant(name_scope.clone(), GuardReason::SchemaObjectName)?;
+        guards.write(write_revision.clone(), GuardReason::WriteContract)?;
         let mut parent_write_revisions = BTreeSet::new();
         for foreign_key in &self.schema.foreign_keys {
             // The schema head guards the referenced logical index definition,
             // whether it is the primary or a UNIQUE index.
-            footprint.add_constraint(active_schema_revision_key(foreign_key.referenced_table));
+            guards.invariant(
+                active_schema_revision_key(foreign_key.referenced_table),
+                GuardReason::SchemaRevision,
+            )?;
             let revision = write_revision_key(foreign_key.referenced_table);
-            footprint.add_write(revision.clone());
+            guards.write(revision.clone(), GuardReason::WriteContract)?;
             parent_write_revisions.insert(revision);
         }
         let mut mutations = vec![
@@ -1335,9 +1339,11 @@ impl CreateTable {
             key,
             value: self.mutation_id.0.to_vec(),
         }));
+        let footprint = guards.footprint();
         Ok(SchemaHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 

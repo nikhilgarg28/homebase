@@ -13,7 +13,7 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
-use super::guard::LogicalTarget;
+use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
     NamedIndex, SchemaRevisionId, SqlName, StrictType, TableId, TableMode, TableStorage,
@@ -236,6 +236,7 @@ pub struct UpdateRows {
 pub struct RowHomebaseOp {
     pub mutations: Vec<Mutation>,
     pub footprint: ConflictFootprint,
+    pub guards: GuardPlan,
 }
 
 /// One durable entry created while a new index scans existing rows.
@@ -331,13 +332,13 @@ impl InsertRows {
         let mut mutations = Vec::with_capacity(
             self.rows.len() * (self.indexes.len() + self.foreign_keys.len() + 1),
         );
-        let mut footprint = ConflictFootprint::new();
+        let mut guards = GuardPlan::for_operation(OperationFamily::InsertRows);
         for row in &self.rows {
             let key = self
                 .row_key(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            footprint.add_constraint(key.clone());
-            footprint.add_write(key.clone());
+            guards.invariant(key.clone(), GuardReason::RowIdentity)?;
+            guards.write(key.clone(), GuardReason::RowIdentity)?;
             mutations.push(Mutation::Set {
                 key,
                 value: self.encode_row(row),
@@ -348,8 +349,8 @@ impl InsertRows {
                 .index_entries(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_constraint(entry.key.clone());
-                footprint.add_write(entry.key.clone());
+                guards.invariant(entry.key.clone(), GuardReason::UniqueOwnership)?;
+                guards.write(entry.key.clone(), GuardReason::UniqueOwnership)?;
                 mutations.push(Mutation::Set {
                     key: entry.key,
                     value: entry.value,
@@ -359,19 +360,24 @@ impl InsertRows {
                 .foreign_references(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_constraint(reference.key.clone());
-                footprint.add_write(reference.key.clone());
+                guards.invariant(reference.key.clone(), GuardReason::ForeignReference)?;
+                guards.write(reference.key.clone(), GuardReason::ForeignReference)?;
                 mutations.push(Mutation::Set {
                     key: reference.key,
                     value: reference.owner,
                 });
             }
         }
-        footprint.add_constraint(active_primary_index_key(self.table));
-        footprint.add_constraint(write_revision_key(self.table));
+        guards.invariant(
+            active_primary_index_key(self.table),
+            GuardReason::PrimaryIndex,
+        )?;
+        guards.invariant(write_revision_key(self.table), GuardReason::WriteContract)?;
+        let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 
@@ -1322,13 +1328,13 @@ impl DeleteRows {
             self.deleted.rows.len()
                 * (self.deleted.indexes.len() + self.deleted.foreign_keys.len() + 1),
         );
-        let mut footprint = ConflictFootprint::new();
+        let mut guards = GuardPlan::for_operation(OperationFamily::DeleteRows);
         for row in &self.deleted.rows {
             let key = self
                 .deleted
                 .row_key(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            footprint.add_write(key.clone());
+            guards.write(key.clone(), GuardReason::RowIdentity)?;
             mutations.push(Mutation::Delete { key });
         }
         for row in &self.deleted.rows {
@@ -1337,7 +1343,7 @@ impl DeleteRows {
                 .index_entries(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_write(entry.key.clone());
+                guards.write(entry.key.clone(), GuardReason::UniqueOwnership)?;
                 mutations.push(Mutation::Delete { key: entry.key });
             }
             for reference in self
@@ -1345,7 +1351,7 @@ impl DeleteRows {
                 .foreign_references(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_write(reference.key.clone());
+                guards.write(reference.key.clone(), GuardReason::ForeignReference)?;
                 mutations.push(Mutation::Delete { key: reference.key });
             }
         }
@@ -1355,18 +1361,26 @@ impl DeleteRows {
                 .incoming_reference_prefixes(row)
                 .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
             {
-                footprint.add_write(reference_prefix.clone());
-                footprint.add_constraint(reference_prefix.clone());
+                guards.write(reference_prefix.clone(), GuardReason::ForeignChildren)?;
+                guards.invariant(reference_prefix.clone(), GuardReason::ForeignChildren)?;
                 mutations.push(Mutation::DeleteRange {
                     range: Range::Prefix(reference_prefix),
                 });
             }
         }
-        footprint.add_constraint(active_primary_index_key(self.deleted.table));
-        footprint.add_constraint(write_revision_key(self.deleted.table));
+        guards.invariant(
+            active_primary_index_key(self.deleted.table),
+            GuardReason::PrimaryIndex,
+        )?;
+        guards.invariant(
+            write_revision_key(self.deleted.table),
+            GuardReason::WriteContract,
+        )?;
+        let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 
@@ -1445,7 +1459,7 @@ impl UpdateRows {
             self.after.rows.len()
                 * (self.after.indexes.len() * 2 + self.after.foreign_keys.len() * 2 + 2),
         );
-        let mut footprint = ConflictFootprint::new();
+        let mut guards = GuardPlan::for_operation(OperationFamily::UpdateRows);
         let keys = self
             .before
             .rows
@@ -1465,10 +1479,10 @@ impl UpdateRows {
         // Remove every moved source before publishing any destination. If one
         // row moves into another row's former key, the later Set must win.
         for (before, after) in &keys {
-            footprint.add_write(before.clone());
-            footprint.add_write(after.clone());
+            guards.write(before.clone(), GuardReason::RowIdentity)?;
+            guards.write(after.clone(), GuardReason::RowIdentity)?;
             if before != after {
-                footprint.add_constraint(after.clone());
+                guards.invariant(after.clone(), GuardReason::RowIdentity)?;
                 mutations.push(Mutation::Delete {
                     key: before.clone(),
                 });
@@ -1484,7 +1498,7 @@ impl UpdateRows {
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         for (key, owner) in &before_unique {
             if after_unique.get(key) != Some(owner) {
-                footprint.add_write(key.clone());
+                guards.write(key.clone(), GuardReason::UniqueOwnership)?;
                 mutations.push(Mutation::Delete { key: key.clone() });
             }
         }
@@ -1498,7 +1512,7 @@ impl UpdateRows {
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         for (key, owner) in &before_references {
             if after_references.get(key) != Some(owner) {
-                footprint.add_write(key.clone());
+                guards.write(key.clone(), GuardReason::ForeignReference)?;
                 mutations.push(Mutation::Delete { key: key.clone() });
             }
         }
@@ -1510,9 +1524,9 @@ impl UpdateRows {
         }
         for (key, owner) in &after_unique {
             if before_unique.get(key) != Some(owner) {
-                footprint.add_write(key.clone());
+                guards.write(key.clone(), GuardReason::UniqueOwnership)?;
                 if is_unique_entry_key(key) {
-                    footprint.add_constraint(key.clone());
+                    guards.invariant(key.clone(), GuardReason::UniqueOwnership)?;
                 }
                 mutations.push(Mutation::Set {
                     key: key.clone(),
@@ -1522,8 +1536,8 @@ impl UpdateRows {
         }
         for (key, owner) in &after_references {
             if before_references.get(key) != Some(owner) {
-                footprint.add_write(key.clone());
-                footprint.add_constraint(key.clone());
+                guards.write(key.clone(), GuardReason::ForeignReference)?;
+                guards.invariant(key.clone(), GuardReason::ForeignReference)?;
                 mutations.push(Mutation::Set {
                     key: key.clone(),
                     value: owner.clone(),
@@ -1539,17 +1553,25 @@ impl UpdateRows {
             .incoming_reference_prefix_set()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         for reference_prefix in before_incoming.difference(&after_incoming) {
-            footprint.add_write(reference_prefix.clone());
-            footprint.add_constraint(reference_prefix.clone());
+            guards.write(reference_prefix.clone(), GuardReason::ForeignChildren)?;
+            guards.invariant(reference_prefix.clone(), GuardReason::ForeignChildren)?;
             mutations.push(Mutation::DeleteRange {
                 range: Range::Prefix(reference_prefix.clone()),
             });
         }
-        footprint.add_constraint(active_primary_index_key(self.after.table));
-        footprint.add_constraint(write_revision_key(self.after.table));
+        guards.invariant(
+            active_primary_index_key(self.after.table),
+            GuardReason::PrimaryIndex,
+        )?;
+        guards.invariant(
+            write_revision_key(self.after.table),
+            GuardReason::WriteContract,
+        )?;
+        let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 

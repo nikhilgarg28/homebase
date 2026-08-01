@@ -10,6 +10,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
 use super::alter::AlterTableOperation;
+use super::guard::{GuardPlan, GuardReason, OperationFamily};
 use super::index::IndexOperation;
 use super::operation::{CompiledOperation, MultiliteOp};
 use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
@@ -339,15 +340,17 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     fn record_operation(&mut self, operation: CompiledOperation) {
         self.footprint
-            .extend(operation.homebase().footprint().clone());
+            .extend(operation.homebase().guards().footprint());
         self.operations.push(operation);
     }
 
     fn into_branch_parts(mut self) -> Result<(Vec<CompiledOperation>, ConflictFootprint)> {
         let reads = self.hooks.read_prefixes()?;
+        let mut read_guards = GuardPlan::for_operation(OperationFamily::TransactionRead);
         for read in reads {
-            self.footprint.add_read(read);
+            read_guards.serializable_read(read, GuardReason::SerializableRead)?;
         }
+        self.footprint.extend(read_guards.footprint());
         Ok((self.operations, self.footprint))
     }
 }

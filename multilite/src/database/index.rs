@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use uuid::{Uuid, Variant, Version};
 
 use super::catalog;
-use super::guard::LogicalTarget;
+use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
     CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
@@ -59,6 +59,7 @@ pub struct IndexOperation {
 pub struct IndexHomebaseOp {
     pub mutations: Vec<Mutation>,
     pub footprint: ConflictFootprint,
+    pub guards: GuardPlan,
 }
 
 impl IndexOperation {
@@ -128,13 +129,19 @@ impl IndexOperation {
         self.validate().map_err(invalid_operation)?;
         let name = schema_object_name_scope_key(self.index.name());
         let schema_head = active_schema_revision_key(self.after.table_id());
-        let mut footprint = ConflictFootprint::new();
-        footprint.add_constraint(name.clone());
-        footprint.add_constraint(schema_head.clone());
-        footprint.add_write(schema_head.clone());
+        let mut guards = GuardPlan::for_operation(match self.action {
+            IndexAction::Create => OperationFamily::CreateIndex,
+            IndexAction::Drop => OperationFamily::DropIndex,
+        });
+        guards.invariant(name.clone(), GuardReason::SchemaObjectName)?;
+        guards.invariant(schema_head.clone(), GuardReason::SchemaRevision)?;
+        guards.write(schema_head.clone(), GuardReason::SchemaRevision)?;
         if self.action == IndexAction::Create {
             for dependency in self.create_dependencies()? {
-                footprint.add_constraint(column_name_scope_key(self.after.table_id(), &dependency));
+                guards.invariant(
+                    column_name_scope_key(self.after.table_id(), &dependency),
+                    GuardReason::ColumnNameBinding,
+                )?;
             }
         }
         let mut mutations = vec![Mutation::Set {
@@ -163,8 +170,8 @@ impl IndexOperation {
                 *dependency,
                 self.index.index_id(),
             );
-            footprint.add_constraint(key.clone());
-            footprint.add_write(key.clone());
+            guards.invariant(key.clone(), GuardReason::ColumnDependency)?;
+            guards.write(key.clone(), GuardReason::ColumnDependency)?;
             mutations.push(match self.action {
                 IndexAction::Create => Mutation::Set {
                     key,
@@ -189,18 +196,26 @@ impl IndexOperation {
                 });
             }
             let write_revision = write_revision_key(self.after.table_id());
-            footprint.add_write(write_revision.clone());
-            footprint.add_constraint(primary_index_prefix(&self.before));
+            guards.write(write_revision.clone(), GuardReason::WriteContract)?;
+            guards.invariant(
+                primary_index_prefix(&self.before),
+                GuardReason::ExistingRows,
+            )?;
             mutations.push(Mutation::Set {
                 key: write_revision,
                 value: self.mutation_id.as_bytes().to_vec(),
             });
         } else if self.action == IndexAction::Drop && self.index.is_unique() {
-            footprint.add_constraint(write_revision_key(self.after.table_id()));
+            guards.invariant(
+                write_revision_key(self.after.table_id()),
+                GuardReason::WriteContract,
+            )?;
         }
+        let footprint = guards.footprint();
         Ok(IndexHomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 

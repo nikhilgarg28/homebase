@@ -9,6 +9,7 @@ use rusqlite::Connection;
 
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
 use super::catalog;
+use super::guard::GuardPlan;
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::CreateTable;
@@ -41,6 +42,7 @@ pub enum MultiliteOp {
 pub struct HomebaseOp {
     pub mutations: Vec<Mutation>,
     footprint: ConflictFootprint,
+    guards: GuardPlan,
 }
 
 /// Local inverse selected while compiling one speculative operation.
@@ -64,12 +66,17 @@ pub struct CompiledOperation {
 
 impl HomebaseOp {
     /// Split deterministic mutations from their logical conflict footprint.
+    #[cfg(test)]
     pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
         (self.mutations, self.footprint)
     }
 
-    pub fn footprint(&self) -> &ConflictFootprint {
-        &self.footprint
+    pub fn guards(&self) -> &GuardPlan {
+        &self.guards
+    }
+
+    pub(super) fn into_all_parts(self) -> (Vec<Mutation>, ConflictFootprint, GuardPlan) {
+        (self.mutations, self.footprint, self.guards)
     }
 }
 
@@ -189,50 +196,56 @@ impl MultiliteOp {
 
     /// Lower this operation to its complete Homebase representation.
     pub fn to_homebase(&self) -> Result<HomebaseOp> {
-        let (mutations, footprint) = match self {
+        let (mutations, footprint, guards) = match self {
             Self::AlterTable(altered) => {
                 let AlterTableHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 } = altered.to_homebase()?;
-                (mutations, footprint)
+                (mutations, footprint, guards)
             }
             Self::CreateTable(created) => {
                 let schema = created.to_homebase()?;
-                (schema.mutations, schema.footprint)
+                (schema.mutations, schema.footprint, schema.guards)
             }
             Self::InsertRows(inserted) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 } = inserted.to_homebase()?;
-                (mutations, footprint)
+                (mutations, footprint, guards)
             }
             Self::DeleteRows(deleted) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 } = deleted.to_homebase()?;
-                (mutations, footprint)
+                (mutations, footprint, guards)
             }
             Self::UpdateRows(updated) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 } = updated.to_homebase()?;
-                (mutations, footprint)
+                (mutations, footprint, guards)
             }
             Self::Index(index) => {
                 let IndexHomebaseOp {
                     mutations,
                     footprint,
+                    guards,
                 } = index.to_homebase()?;
-                (mutations, footprint)
+                (mutations, footprint, guards)
             }
         };
         Ok(HomebaseOp {
             mutations,
             footprint,
+            guards,
         })
     }
 
