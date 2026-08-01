@@ -195,113 +195,30 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 self.record_operation(compiled);
                 Ok(changed)
             }
-            ValidatedExecute::Insert => {
-                let mut captured_operation = None;
-                let (changed, _) = self.hooks.run(
-                    || Ok(self.connection.execute(sql, params)?),
-                    |events| {
-                        let had_events = !events.is_empty();
-                        let captured = std::mem::take(events)
-                            .into_iter()
-                            .map(|event| match event {
-                                CapturedChange::Insert(row) => Ok(row),
-                                CapturedChange::Delete(_) | CapturedChange::Update { .. } => {
-                                    Err(Error::CaptureInvariant(
-                                        "INSERT captured a non-insert application row",
-                                    ))
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        let inserted = InsertRows::from_captured(self.connection, &captured)?;
-                        if inserted.is_none() && had_events {
-                            return Err(Error::UnsupportedSql(
-                                "INSERT target has no synchronized schema identity",
-                            ));
-                        }
-                        if let Some(inserted) = inserted {
-                            captured_operation = Some(MultiliteOp::InsertRows(inserted).compile()?);
-                        }
-                        Ok(())
-                    },
-                )?;
-                if let Some(operation) = captured_operation {
-                    self.record_operation(operation);
-                }
-                Ok(changed)
-            }
-            ValidatedExecute::Delete => {
-                let mut captured_operation = None;
-                let (changed, _) = self.hooks.run(
-                    || Ok(self.connection.execute(sql, params)?),
-                    |events| {
-                        let had_events = !events.is_empty();
-                        let captured = std::mem::take(events)
-                            .into_iter()
-                            .map(|event| match event {
-                                CapturedChange::Delete(row) => Ok(row),
-                                CapturedChange::Insert(_) | CapturedChange::Update { .. } => {
-                                    Err(Error::CaptureInvariant(
-                                        "DELETE captured a non-delete application row",
-                                    ))
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        let deleted = DeleteRows::from_captured(self.connection, &captured)?;
-                        if deleted.is_none() && had_events {
-                            return Err(Error::UnsupportedSql(
-                                "DELETE target has no synchronized schema identity",
-                            ));
-                        }
-                        if let Some(deleted) = deleted {
-                            captured_operation = Some(MultiliteOp::DeleteRows(deleted).compile()?);
-                        }
-                        Ok(())
-                    },
-                )?;
-                if let Some(operation) = captured_operation {
-                    self.record_operation(operation);
-                }
-                Ok(changed)
-            }
-            ValidatedExecute::Update => {
-                let mut captured_operation = None;
-                let (changed, _) = self.hooks.run(
-                    || Ok(self.connection.execute(sql, params)?),
-                    |events| {
-                        let had_events = !events.is_empty();
-                        let captured = std::mem::take(events)
-                            .into_iter()
-                            .map(|event| match event {
-                                CapturedChange::Update { before, after } => Ok((before, after)),
-                                CapturedChange::Insert(_) | CapturedChange::Delete(_) => {
-                                    Err(Error::CaptureInvariant(
-                                        "UPDATE captured a non-update application row",
-                                    ))
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        let updated = UpdateRows::from_captured(self.connection, &captured)?;
-                        if updated.is_none()
-                            && had_events
-                            && let Some((before, _)) = captured.first()
-                            && catalog::by_name(self.connection, &before.table)?.is_none()
-                        {
-                            return Err(Error::UnsupportedSql(
-                                "UPDATE target has no synchronized schema identity",
-                            ));
-                        }
-                        if let Some(updated) = updated {
-                            captured_operation = Some(MultiliteOp::UpdateRows(updated).compile()?);
-                        }
-                        Ok(())
-                    },
-                )?;
-                if let Some(operation) = captured_operation {
-                    self.record_operation(operation);
-                }
-                Ok(changed)
-            }
+            ValidatedExecute::Insert => self.execute_captured(sql, params, compile_insert_changes),
+            ValidatedExecute::Delete => self.execute_captured(sql, params, compile_delete_changes),
+            ValidatedExecute::Update => self.execute_captured(sql, params, compile_update_changes),
         }
+    }
+
+    fn execute_captured<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        compile: impl FnOnce(&Connection, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
+    ) -> Result<usize> {
+        let mut captured_operation = None;
+        let (changed, _) = self.hooks.run(
+            || Ok(self.connection.execute(sql, params)?),
+            |events| {
+                captured_operation = compile(self.connection, std::mem::take(events))?;
+                Ok(())
+            },
+        )?;
+        if let Some(operation) = captured_operation {
+            self.record_operation(operation);
+        }
+        Ok(changed)
     }
 
     fn execute_alter<Q: Params>(
@@ -353,6 +270,85 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         self.footprint.extend(read_guards.footprint());
         Ok((self.operations, self.footprint))
     }
+}
+
+fn compile_insert_changes(
+    connection: &Connection,
+    events: Vec<CapturedChange>,
+) -> Result<Option<CompiledOperation>> {
+    let had_events = !events.is_empty();
+    let captured = events
+        .into_iter()
+        .map(|event| match event {
+            CapturedChange::Insert(row) => Ok(row),
+            CapturedChange::Delete(_) | CapturedChange::Update { .. } => Err(
+                Error::CaptureInvariant("INSERT captured a non-insert application row"),
+            ),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let inserted = InsertRows::from_captured(connection, &captured)?;
+    if inserted.is_none() && had_events {
+        return Err(Error::UnsupportedSql(
+            "INSERT target has no synchronized schema identity",
+        ));
+    }
+    inserted
+        .map(|inserted| MultiliteOp::InsertRows(inserted).compile())
+        .transpose()
+}
+
+fn compile_delete_changes(
+    connection: &Connection,
+    events: Vec<CapturedChange>,
+) -> Result<Option<CompiledOperation>> {
+    let had_events = !events.is_empty();
+    let captured = events
+        .into_iter()
+        .map(|event| match event {
+            CapturedChange::Delete(row) => Ok(row),
+            CapturedChange::Insert(_) | CapturedChange::Update { .. } => Err(
+                Error::CaptureInvariant("DELETE captured a non-delete application row"),
+            ),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let deleted = DeleteRows::from_captured(connection, &captured)?;
+    if deleted.is_none() && had_events {
+        return Err(Error::UnsupportedSql(
+            "DELETE target has no synchronized schema identity",
+        ));
+    }
+    deleted
+        .map(|deleted| MultiliteOp::DeleteRows(deleted).compile())
+        .transpose()
+}
+
+fn compile_update_changes(
+    connection: &Connection,
+    events: Vec<CapturedChange>,
+) -> Result<Option<CompiledOperation>> {
+    let had_events = !events.is_empty();
+    let captured = events
+        .into_iter()
+        .map(|event| match event {
+            CapturedChange::Update { before, after } => Ok((before, after)),
+            CapturedChange::Insert(_) | CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
+                "UPDATE captured a non-update application row",
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let updated = UpdateRows::from_captured(connection, &captured)?;
+    if updated.is_none()
+        && had_events
+        && let Some((before, _)) = captured.first()
+        && catalog::by_name(connection, &before.table)?.is_none()
+    {
+        return Err(Error::UnsupportedSql(
+            "UPDATE target has no synchronized schema identity",
+        ));
+    }
+    updated
+        .map(|updated| MultiliteOp::UpdateRows(updated).compile())
+        .transpose()
 }
 
 #[derive(Default)]
