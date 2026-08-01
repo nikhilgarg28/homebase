@@ -1,6 +1,6 @@
 //! Local lookup index for durable schema identities.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -13,6 +13,87 @@ use crate::{Error, Result};
 const TABLE: &str = "__multilite__schema";
 const COLUMN_TABLE: &str = "__multilite__schema_columns";
 const MAIN_SCHEMA: &str = "main";
+
+/// One validated, immutable view of the logical schema catalog.
+///
+/// Managed transactions retain this value for their branch snapshot and
+/// replace it only after a schema statement succeeds. Row lowering can then
+/// resolve target, parent, and incoming-reference rules without repeatedly
+/// decoding catalog frames from SQLite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogSnapshot {
+    tables: BTreeMap<[u8; 16], CreateTable>,
+    names: BTreeMap<Vec<u8>, [u8; 16]>,
+}
+
+impl CatalogSnapshot {
+    pub fn load(connection: &Connection) -> Result<Self> {
+        let mut statement = connection.prepare(&format!(
+            "SELECT table_name, table_id, definition FROM {TABLE}
+             WHERE schema_name = ?1 ORDER BY table_name"
+        ))?;
+        let rows = statement.query_map([MAIN_SCHEMA], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut tables = BTreeMap::new();
+        let mut names = BTreeMap::new();
+        for row in rows {
+            let (encoded_name, encoded_id, definition) = row?;
+            let name = decode_binding(&encoded_name)?;
+            let created = decode_definition(&definition)?;
+            let id = created.table_id().as_bytes();
+            if name.canonical() != encoded_name
+                || encoded_id.as_slice() != id
+                || tables.insert(id, created).is_some()
+                || names.insert(encoded_name, id).is_some()
+            {
+                return Err(Error::InvalidDatabase(
+                    "schema catalog snapshot contains contradictory bindings",
+                ));
+            }
+        }
+        Ok(Self { tables, names })
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&CreateTable> {
+        let name = SqlName::new(name.to_owned());
+        self.names
+            .get(name.canonical())
+            .and_then(|id| self.tables.get(id))
+    }
+
+    pub fn by_id(&self, table: TableId) -> Option<&CreateTable> {
+        self.tables.get(&table.as_bytes())
+    }
+
+    pub fn table_id_by_name(&self, name: &str) -> Option<TableId> {
+        let name = SqlName::new(name.to_owned());
+        self.names
+            .get(name.canonical())
+            .copied()
+            .map(TableId::from_bytes)
+    }
+
+    pub fn incoming_foreign_keys(
+        &self,
+        parent: TableId,
+    ) -> Vec<(&CreateTable, &ForeignKeyDefinition)> {
+        self.tables
+            .values()
+            .flat_map(|child| {
+                child
+                    .foreign_keys()
+                    .iter()
+                    .filter(move |foreign_key| foreign_key.referenced_table() == parent)
+                    .map(move |foreign_key| (child, foreign_key))
+            })
+            .collect()
+    }
+}
 
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
@@ -780,6 +861,34 @@ mod tests {
             encoded
         );
         validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn catalog_snapshots_are_immutable_and_refresh_to_successful_ddl() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let created = created();
+        insert(&connection, &created).unwrap();
+        let before = CatalogSnapshot::load(&connection).unwrap();
+        let replacement = SqlName::new("archived".into());
+
+        rename_binding(
+            &connection,
+            created.table_id(),
+            created.table_name_identity(),
+            &replacement,
+        )
+        .unwrap();
+        let after = CatalogSnapshot::load(&connection).unwrap();
+
+        assert_eq!(before.table_id_by_name("NOTES"), Some(created.table_id()));
+        assert!(before.by_name("archived").is_none());
+        assert!(after.by_name("notes").is_none());
+        assert_eq!(after.table_id_by_name("ARCHIVED"), Some(created.table_id()));
+        assert_eq!(
+            after.by_id(created.table_id()).unwrap().encode(),
+            created.encode()
+        );
     }
 
     #[test]

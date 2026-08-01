@@ -13,6 +13,7 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
+use super::catalog::CatalogSnapshot;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
@@ -252,6 +253,14 @@ impl InsertRows {
         connection: &Connection,
         captured: &[CapturedRow],
     ) -> Result<Option<Self>> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(super) fn from_catalog(
+        catalog: &CatalogSnapshot,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
         let Some(first) = captured.first() else {
             return Ok(None);
         };
@@ -260,7 +269,7 @@ impl InsertRows {
                 "one row operation changed more than one table",
             ));
         }
-        let Some(created) = catalog::by_name(connection, &first.table)? else {
+        let Some(created) = catalog.by_name(&first.table) else {
             return Ok(None);
         };
         let columns = created.columns();
@@ -277,9 +286,9 @@ impl InsertRows {
                 rowid_alias: created.is_rowid_alias(column.id()),
             })
             .collect::<Vec<_>>();
-        let indexes = index_rules(&created);
-        let foreign_keys = foreign_key_rules(connection, &created)?;
-        let incoming_foreign_keys = incoming_foreign_key_rules(connection, &created)?;
+        let indexes = index_rules(created);
+        let foreign_keys = foreign_key_rules(catalog, created)?;
+        let incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
         let rows = captured
             .iter()
             .map(|captured| {
@@ -323,7 +332,7 @@ impl InsertRows {
             incoming_foreign_keys,
             rows,
         };
-        inserted.validate_against(connection, &created)?;
+        inserted.validate_against_catalog(catalog, created)?;
         Ok(Some(inserted))
     }
 
@@ -747,10 +756,14 @@ impl InsertRows {
     }
 
     fn catalog_definition(&self, connection: &Connection) -> Result<CreateTable> {
-        let created = catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
-            "row operation references an unknown table",
-        ))?;
-        self.validate_against(connection, &created)?;
+        let catalog = CatalogSnapshot::load(connection)?;
+        let created = catalog
+            .by_id(self.table)
+            .cloned()
+            .ok_or(Error::InvalidDatabase(
+                "row operation references an unknown table",
+            ))?;
+        self.validate_against_catalog(&catalog, &created)?;
         Ok(created)
     }
 
@@ -786,7 +799,11 @@ impl InsertRows {
         ))
     }
 
-    fn validate_against(&self, connection: &Connection, created: &CreateTable) -> Result<()> {
+    fn validate_against_catalog(
+        &self,
+        catalog: &CatalogSnapshot,
+        created: &CreateTable,
+    ) -> Result<()> {
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let expected_key_parts = created
@@ -799,8 +816,8 @@ impl InsertRows {
             .collect::<Vec<_>>();
         let expected_indexes = index_rules(created);
         let known_indexes = known_index_rules(created);
-        let expected_foreign_keys = foreign_key_rules(connection, created)?;
-        let expected_incoming_foreign_keys = incoming_foreign_key_rules(connection, created)?;
+        let expected_foreign_keys = foreign_key_rules(catalog, created)?;
+        let expected_incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
         if self.table != created.table_id()
             || self.primary_index != created.primary_index_id()
             || self.storage != created.storage()
@@ -1357,11 +1374,20 @@ fn decode_incoming_foreign_key(
 }
 
 impl DeleteRows {
+    #[cfg(test)]
     pub fn from_captured(
         connection: &Connection,
         captured: &[CapturedRow],
     ) -> Result<Option<Self>> {
-        Ok(InsertRows::from_captured(connection, captured)?.map(|deleted| Self { deleted }))
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(super) fn from_catalog(
+        catalog: &CatalogSnapshot,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        Ok(InsertRows::from_catalog(catalog, captured)?.map(|deleted| Self { deleted }))
     }
 
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
@@ -1455,8 +1481,17 @@ impl DeleteRows {
 }
 
 impl UpdateRows {
+    #[cfg(test)]
     pub fn from_captured(
         connection: &Connection,
+        captured: &[(CapturedRow, CapturedRow)],
+    ) -> Result<Option<Self>> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(super) fn from_catalog(
+        catalog: &CatalogSnapshot,
         captured: &[(CapturedRow, CapturedRow)],
     ) -> Result<Option<Self>> {
         let Some((first_before, first_after)) = captured.first() else {
@@ -1491,10 +1526,10 @@ impl UpdateRows {
             .iter()
             .map(|(_, after)| (*after).clone())
             .collect::<Vec<_>>();
-        let Some(before) = InsertRows::from_captured(connection, &before_rows)? else {
+        let Some(before) = InsertRows::from_catalog(catalog, &before_rows)? else {
             return Ok(None);
         };
-        let after = InsertRows::from_captured(connection, &after_rows)?.ok_or(
+        let after = InsertRows::from_catalog(catalog, &after_rows)?.ok_or(
             Error::CaptureInvariant("UPDATE before and after rows resolved differently"),
         )?;
         let updated = Self { before, after };
@@ -1964,24 +1999,26 @@ fn known_index_rules(created: &CreateTable) -> Vec<IndexRules> {
 }
 
 fn foreign_key_rules(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     created: &CreateTable,
 ) -> Result<Vec<ForeignKeyRules>> {
     created
         .foreign_keys()
         .iter()
-        .map(|foreign_key| foreign_key_rule(connection, created, foreign_key))
+        .map(|foreign_key| foreign_key_rule(catalog, created, foreign_key))
         .collect()
 }
 
 fn foreign_key_rule(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     child: &CreateTable,
     foreign_key: &ForeignKeyDefinition,
 ) -> Result<ForeignKeyRules> {
-    let parent = catalog::by_id(connection, foreign_key.referenced_table())?.ok_or(
-        Error::InvalidDatabase("foreign key references an unknown parent table"),
-    )?;
+    let parent = catalog
+        .by_id(foreign_key.referenced_table())
+        .ok_or(Error::InvalidDatabase(
+            "foreign key references an unknown parent table",
+        ))?;
     let parent_columns = parent
         .foreign_key_target_columns(foreign_key.referenced_index())
         .ok_or(Error::InvalidDatabase(
@@ -2031,14 +2068,14 @@ fn foreign_key_rule(
 }
 
 fn incoming_foreign_key_rules(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     parent: &CreateTable,
 ) -> Result<Vec<IncomingForeignKeyRules>> {
     let mut incoming = Vec::new();
-    for (child, foreign_key) in catalog::incoming_foreign_keys(connection, parent.table_id())? {
+    for (child, foreign_key) in catalog.incoming_foreign_keys(parent.table_id()) {
         // Reuse full relationship validation so corrupt catalog links do not
         // silently weaken parent-side deletion guards.
-        let _ = foreign_key_rule(connection, &child, &foreign_key)?;
+        let _ = foreign_key_rule(catalog, child, foreign_key)?;
         let target = foreign_key.referenced_index();
         let parent_key_parts = parent
             .foreign_key_target_columns(target)
@@ -5016,8 +5053,9 @@ mod tests {
             .find(|(column, _)| *column == count)
             .unwrap()
             .1 = StoredValue::Text(b"invalid".to_vec());
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
         assert!(matches!(
-            invalid.validate_against(&connection, &created),
+            invalid.validate_against_catalog(&catalog, &created),
             Err(Error::InvalidMultiliteOp(message))
                 if message == "row value has an invalid STRICT storage class"
         ));

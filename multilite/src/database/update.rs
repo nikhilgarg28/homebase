@@ -1,6 +1,6 @@
 //! Managed local update execution.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -10,6 +10,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
 use super::alter::AlterTableOperation;
+use super::catalog::CatalogSnapshot;
 use super::guard::{GuardPlan, GuardReason, OperationFamily};
 use super::index::IndexOperation;
 use super::operation::{CompiledOperation, MultiliteOp};
@@ -205,13 +206,15 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         &mut self,
         sql: &str,
         params: Q,
-        compile: impl FnOnce(&Connection, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
+        compile: impl FnOnce(&CatalogSnapshot, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
     ) -> Result<usize> {
         let mut captured_operation = None;
         let (changed, _) = self.hooks.run(
             || Ok(self.connection.execute(sql, params)?),
             |events| {
-                captured_operation = compile(self.connection, std::mem::take(events))?;
+                captured_operation = self
+                    .hooks
+                    .with_catalog(|catalog| compile(catalog, std::mem::take(events)))?;
                 Ok(())
             },
         )?;
@@ -273,7 +276,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 }
 
 fn compile_insert_changes(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     events: Vec<CapturedChange>,
 ) -> Result<Option<CompiledOperation>> {
     let had_events = !events.is_empty();
@@ -286,7 +289,7 @@ fn compile_insert_changes(
             ),
         })
         .collect::<Result<Vec<_>>>()?;
-    let inserted = InsertRows::from_captured(connection, &captured)?;
+    let inserted = InsertRows::from_catalog(catalog, &captured)?;
     if inserted.is_none() && had_events {
         return Err(Error::UnsupportedSql(
             "INSERT target has no synchronized schema identity",
@@ -298,7 +301,7 @@ fn compile_insert_changes(
 }
 
 fn compile_delete_changes(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     events: Vec<CapturedChange>,
 ) -> Result<Option<CompiledOperation>> {
     let had_events = !events.is_empty();
@@ -311,7 +314,7 @@ fn compile_delete_changes(
             ),
         })
         .collect::<Result<Vec<_>>>()?;
-    let deleted = DeleteRows::from_captured(connection, &captured)?;
+    let deleted = DeleteRows::from_catalog(catalog, &captured)?;
     if deleted.is_none() && had_events {
         return Err(Error::UnsupportedSql(
             "DELETE target has no synchronized schema identity",
@@ -323,7 +326,7 @@ fn compile_delete_changes(
 }
 
 fn compile_update_changes(
-    connection: &Connection,
+    catalog: &CatalogSnapshot,
     events: Vec<CapturedChange>,
 ) -> Result<Option<CompiledOperation>> {
     let had_events = !events.is_empty();
@@ -336,11 +339,11 @@ fn compile_update_changes(
             )),
         })
         .collect::<Result<Vec<_>>>()?;
-    let updated = UpdateRows::from_captured(connection, &captured)?;
+    let updated = UpdateRows::from_catalog(catalog, &captured)?;
     if updated.is_none()
         && had_events
         && let Some((before, _)) = captured.first()
-        && catalog::by_name(connection, &before.table)?.is_none()
+        && catalog.by_name(&before.table).is_none()
     {
         return Err(Error::UnsupportedSql(
             "UPDATE target has no synchronized schema identity",
@@ -351,14 +354,13 @@ fn compile_update_changes(
         .transpose()
 }
 
-#[derive(Default)]
 struct BranchHookState {
     events: Vec<CapturedChange>,
     error: Option<Error>,
     internal_depth: usize,
     read_trace_suppression_depth: usize,
     trace_reads: bool,
-    table_bindings: BTreeMap<String, TableId>,
+    catalog: CatalogSnapshot,
     read_tables: BTreeSet<[u8; 16]>,
     unresolved_read_tables: BTreeSet<String>,
 }
@@ -370,11 +372,16 @@ struct BranchHooks<'connection> {
 
 impl<'connection> BranchHooks<'connection> {
     fn install(connection: &'connection Connection, trace_reads: bool) -> Result<Self> {
-        let table_bindings = load_table_bindings(connection)?;
+        let catalog = CatalogSnapshot::load(connection)?;
         let state = Arc::new(Mutex::new(BranchHookState {
+            events: Vec::new(),
+            error: None,
+            internal_depth: 0,
+            read_trace_suppression_depth: 0,
             trace_reads,
-            table_bindings,
-            ..BranchHookState::default()
+            catalog,
+            read_tables: BTreeSet::new(),
+            unresolved_read_tables: BTreeSet::new(),
         }));
 
         let authorizer_state = Arc::clone(&state);
@@ -397,7 +404,7 @@ impl<'connection> BranchHooks<'connection> {
             {
                 let mut canonical = table_name.to_owned();
                 canonical.make_ascii_lowercase();
-                if let Some(table) = state.table_bindings.get(&canonical).copied() {
+                if let Some(table) = state.catalog.table_id_by_name(&canonical) {
                     state.read_tables.insert(table.as_bytes());
                 } else {
                     state.unresolved_read_tables.insert(canonical);
@@ -459,7 +466,7 @@ impl<'connection> BranchHooks<'connection> {
                 let mut events = lock(&self.state).events.split_off(checkpoint);
                 let finalized = self.with_internal(|| finalize(&mut events)).and_then(|_| {
                     if refresh_bindings {
-                        self.with_internal(|| self.refresh_bindings())
+                        self.with_internal(|| self.refresh_catalog())
                     } else {
                         Ok(())
                     }
@@ -500,10 +507,14 @@ impl<'connection> BranchHooks<'connection> {
         preserve_statement_error(statement, self.rollback_statement())
     }
 
-    fn refresh_bindings(&self) -> Result<()> {
-        let bindings = load_table_bindings(self.connection)?;
-        lock(&self.state).table_bindings = bindings;
+    fn refresh_catalog(&self) -> Result<()> {
+        let catalog = CatalogSnapshot::load(self.connection)?;
+        lock(&self.state).catalog = catalog;
         Ok(())
+    }
+
+    fn with_catalog<T>(&self, operation: impl FnOnce(&CatalogSnapshot) -> Result<T>) -> Result<T> {
+        operation(&lock(&self.state).catalog)
     }
 
     fn read_prefixes(&self) -> Result<Vec<Key>> {
@@ -531,19 +542,6 @@ fn preserve_statement_error(statement: Error, rollback: Result<()>) -> Error {
             rollback: Box::new(rollback),
         },
     }
-}
-
-fn load_table_bindings(connection: &Connection) -> Result<BTreeMap<String, TableId>> {
-    catalog::all(connection)?
-        .into_iter()
-        .map(|created| {
-            let table = created.table_id();
-            let name = catalog::name_by_id(connection, table)?.ok_or(Error::InvalidDatabase(
-                "schema catalog table has no current name binding",
-            ))?;
-            Ok((name.value().to_owned(), table))
-        })
-        .collect()
 }
 
 struct BranchInternalGuard {
