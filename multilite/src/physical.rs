@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::catalog;
-use super::schema::{
+use crate::catalog;
+use crate::logical::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
     DefaultDefinition, SqlName, TableId,
 };
-use super::sql::{CreateIndexSpec, CreateIndexTerm, ValidatedExecute};
+use crate::sql::{CreateIndexSpec, CreateIndexTerm, ValidatedExecute};
 use crate::{Error, Result};
 
 const TABLE_MISMATCH: &str = "canonical SQLite table diverges from the schema catalog";
@@ -86,14 +86,14 @@ pub(super) fn verify_table(connection: &Connection, table: TableId) -> Result<()
 }
 
 fn parse_table(sql: &str) -> Result<CreateTableSpec> {
-    match super::sql::validate_execute(sql) {
+    match crate::sql::validate_execute(sql) {
         Ok(ValidatedExecute::CreateTable(spec)) => Ok(spec),
         _ => Err(Error::InvalidDatabase(TABLE_MISMATCH)),
     }
 }
 
 fn parse_index(sql: &str) -> Result<CreateIndexSpec> {
-    match super::sql::validate_execute(sql) {
+    match crate::sql::validate_execute(sql) {
         Ok(ValidatedExecute::CreateIndex(spec)) => Ok(spec),
         _ => Err(Error::InvalidDatabase(INDEX_MISMATCH)),
     }
@@ -251,8 +251,8 @@ fn same_name(actual: &SqlName, expected: &SqlName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::index::IndexOperation;
-    use crate::database::schema::CreateTable;
+    use crate::logical::index::IndexOperation;
+    use crate::logical::schema::CreateTable;
 
     fn table_definition(connection: &Connection) -> CreateTable {
         let sql = "CREATE TABLE Notes (
@@ -262,8 +262,7 @@ mod tests {
             CONSTRAINT tenant_slug UNIQUE (tenant, slug),
             CHECK (length(slug) > 0)
         ) STRICT";
-        let ValidatedExecute::CreateTable(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         CreateTable::prepare(connection, sql, spec).unwrap()
@@ -281,8 +280,7 @@ mod tests {
         verify_table(&connection, table.table_id()).unwrap();
 
         let sql = "CREATE INDEX NotesSearch ON Notes (slug DESC) WHERE tenant <> ''";
-        let ValidatedExecute::CreateIndex(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::CreateIndex(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         connection.execute(sql, ()).unwrap();

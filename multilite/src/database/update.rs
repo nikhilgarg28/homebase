@@ -9,22 +9,22 @@ use homebase_core::key::Key;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
 use rusqlite::{Connection, Row};
 
-use super::alter::AlterTableOperation;
-use super::catalog::CatalogSnapshot;
-use super::guard::{GuardPlan, GuardReason, OperationFamily};
-use super::index::IndexOperation;
-use super::operation::{CompiledOperation, MultiliteOp};
-use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
-use super::schema::{CreateTable, TableId, table_prefix};
-use super::sql::ValidatedExecute;
-use super::transaction::MultiliteTransaction;
 use super::view::TransactionStatement;
 use super::{Database, DatabaseRuntime, IsolationLevel, UpdateOptions, catalog};
 use crate::branch::{OverlayOptions, WritableBranch};
+use crate::catalog::CatalogSnapshot;
 use crate::commit::committer::{CommitSnapshot, HistoryPin};
 use crate::commit::footprint::ConflictFootprint;
 use crate::commit::proposal::CommitProposal;
+use crate::logical::alter::AlterTableOperation;
+use crate::logical::guard::{GuardPlan, GuardReason, OperationFamily};
+use crate::logical::index::IndexOperation;
+use crate::logical::operation::{CompiledOperation, MultiliteOp};
+use crate::logical::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
+use crate::logical::schema::{CreateTable, TableId, table_prefix};
+use crate::logical::transaction::MultiliteTransaction;
 use crate::runtime::ExecutionMode;
+use crate::sql::ValidatedExecute;
 use crate::{Error, Params, Result};
 
 /// One managed update accumulating a single durable transaction.
@@ -59,8 +59,8 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     /// Execute one supported mutating statement inside this update.
     pub fn execute<Q: Params>(&mut self, sql: &str, params: Q) -> Result<usize> {
-        super::sql::validate_managed_statement(sql)?;
-        let validated = super::sql::validate_execute(sql)?;
+        crate::sql::validate_managed_statement(sql)?;
+        let validated = crate::sql::validate_execute(sql)?;
         self.execute_validated(sql, params, validated)
     }
 
@@ -400,7 +400,7 @@ impl<'connection> BranchHooks<'connection> {
                 && let AuthAction::Read { table_name, .. } = context.action
                 && super::is_main(context.database_name)
                 && !super::is_schema_table(table_name)
-                && !super::has_multilite_prefix(table_name)
+                && !crate::sql::has_multilite_prefix(table_name)
             {
                 let mut canonical = table_name.to_owned();
                 canonical.make_ascii_lowercase();

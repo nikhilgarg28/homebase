@@ -9,7 +9,6 @@ use homebase_core::tag::DeviceSeq;
 
 use super::policy::RefreshTransition;
 use super::store::DatabaseMetaStore;
-use super::transaction::MultiliteTransaction;
 use super::update::{BranchUpdate, run_branch_update};
 use super::view::{ViewTransaction, run_branch_view};
 use super::{
@@ -17,6 +16,7 @@ use super::{
     UpdateOptions, UpdateTransaction, sql,
 };
 use crate::commit::proposal::{AdmittedTransaction, CommitProposal, CommitReceipt};
+use crate::logical::transaction::MultiliteTransaction;
 use crate::{Error, Params, Result, blocking};
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {

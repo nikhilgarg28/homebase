@@ -13,8 +13,6 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
-use super::catalog;
-use super::catalog::CatalogSnapshot;
 #[cfg(test)]
 use super::codes;
 #[cfg(test)]
@@ -25,6 +23,8 @@ use super::schema::{
     NamedIndex, SchemaRevisionId, SqlName, StrictType, TableId, TableMode, TableStorage,
     active_primary_index_key, write_revision_key,
 };
+use crate::catalog;
+use crate::catalog::CatalogSnapshot;
 use crate::commit::footprint::ConflictFootprint;
 use crate::sqlite::quote_identifier;
 pub(crate) use crate::value::StoredValue;
@@ -263,7 +263,7 @@ impl InsertRows {
         Self::from_catalog(&catalog, captured)
     }
 
-    pub(super) fn from_catalog(
+    pub(crate) fn from_catalog(
         catalog: &CatalogSnapshot,
         captured: &[CapturedRow],
     ) -> Result<Option<Self>> {
@@ -1376,7 +1376,7 @@ impl DeleteRows {
         Self::from_catalog(&catalog, captured)
     }
 
-    pub(super) fn from_catalog(
+    pub(crate) fn from_catalog(
         catalog: &CatalogSnapshot,
         captured: &[CapturedRow],
     ) -> Result<Option<Self>> {
@@ -1483,7 +1483,7 @@ impl UpdateRows {
         Self::from_catalog(&catalog, captured)
     }
 
-    pub(super) fn from_catalog(
+    pub(crate) fn from_catalog(
         catalog: &CatalogSnapshot,
         captured: &[(CapturedRow, CapturedRow)],
     ) -> Result<Option<Self>> {
@@ -2199,7 +2199,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
 }
 
 #[cfg(test)]
-pub(super) fn expected_materialized_cells(
+pub(crate) fn expected_materialized_cells(
     connection: &Connection,
 ) -> Result<BTreeMap<Key, Vec<u8>>> {
     let catalog = CatalogSnapshot::load(connection)?;
@@ -2226,7 +2226,7 @@ pub(super) fn expected_materialized_cells(
 }
 
 #[cfg(test)]
-pub(super) fn validate_materialized_cells(
+pub(crate) fn validate_materialized_cells(
     expected: &BTreeMap<Key, Vec<u8>>,
     actual: &BTreeMap<Key, Vec<u8>>,
 ) -> Result<()> {
@@ -2638,9 +2638,9 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
-    use crate::database::alter::AlterTableOperation;
-    use crate::database::index::IndexOperation;
-    use crate::database::schema::{
+    use crate::logical::alter::AlterTableOperation;
+    use crate::logical::index::IndexOperation;
+    use crate::logical::schema::{
         CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
     };
 
@@ -2650,7 +2650,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -2694,8 +2694,8 @@ mod tests {
     }
 
     fn add_index(connection: &Connection, sql: &str) {
-        let super::super::sql::ValidatedExecute::CreateIndex(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateIndex(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -2705,11 +2705,11 @@ mod tests {
     }
 
     fn alter_table(connection: &Connection, sql: &str) {
-        let operation = match super::super::sql::validate_execute(sql).unwrap() {
-            super::super::sql::ValidatedExecute::AddColumn(spec) => {
+        let operation = match crate::sql::validate_execute(sql).unwrap() {
+            crate::sql::ValidatedExecute::AddColumn(spec) => {
                 AlterTableOperation::prepare_add_column(connection, sql, &spec).unwrap()
             }
-            super::super::sql::ValidatedExecute::DropColumn(spec) => {
+            crate::sql::ValidatedExecute::DropColumn(spec) => {
                 AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
             }
             _ => unreachable!(),
@@ -2724,8 +2724,8 @@ mod tests {
             body TEXT,
             PRIMARY KEY (member, tenant)
         ) WITHOUT ROWID";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -2743,7 +2743,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("accounts".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -2797,7 +2797,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("profiles".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -2905,8 +2905,8 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let parent_sql = "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT)";
-        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
-            super::super::sql::validate_execute(parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -2919,8 +2919,8 @@ mod tests {
             parent INTEGER REFERENCES parents(id),
             body TEXT
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
-            super::super::sql::validate_execute(child_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };
@@ -2939,8 +2939,8 @@ mod tests {
             email TEXT,
             UNIQUE (tenant, email)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
-            super::super::sql::validate_execute(parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -2954,8 +2954,8 @@ mod tests {
             recipient TEXT,
             FOREIGN KEY (tenant, recipient) REFERENCES accounts (tenant, email)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
-            super::super::sql::validate_execute(child_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };
@@ -3567,8 +3567,8 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let parent_sql = "CREATE TABLE people (id INTEGER PRIMARY KEY)";
-        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
-            super::super::sql::validate_execute(parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -3581,8 +3581,8 @@ mod tests {
             mother INTEGER REFERENCES people(id),
             father INTEGER REFERENCES people(id)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
-            super::super::sql::validate_execute(child_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };
@@ -4109,8 +4109,8 @@ mod tests {
     #[test]
     fn integer_affinity_does_not_imply_a_rowid_alias() {
         let sql = "CREATE TABLE aliases (id INTEGER PRIMARY KEY, body TEXT)";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4122,12 +4122,12 @@ mod tests {
         );
 
         assert!(matches!(
-            super::super::sql::validate_execute(
+            crate::sql::validate_execute(
                 "CREATE TABLE aliases (id INT NOT NULL PRIMARY KEY, body TEXT)"
             ),
             Err(Error::UnsupportedSql(_))
         ));
-        super::super::sql::validate_execute(
+        crate::sql::validate_execute(
             "CREATE TABLE aliases (id INT NOT NULL PRIMARY KEY, body TEXT) WITHOUT ROWID",
         )
         .unwrap();
@@ -4975,7 +4975,7 @@ mod tests {
             &connection,
             created.table_id(),
             created.table_name_identity(),
-            &super::super::schema::SqlName::new("archived_notes".into()),
+            &crate::logical::schema::SqlName::new("archived_notes".into()),
         )
         .unwrap();
 
@@ -5070,8 +5070,8 @@ mod tests {
             payload BLOB,
             ratio DOUBLE
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -5125,8 +5125,8 @@ mod tests {
             payload BLOB,
             anything ANY UNIQUE
         ) STRICT";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };

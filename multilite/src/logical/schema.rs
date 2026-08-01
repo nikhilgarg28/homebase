@@ -19,8 +19,9 @@ use sha2::{Digest, Sha256};
 use sqlite3_parser::ast::Expr;
 use uuid::{Uuid, Variant, Version};
 
+use super::codes;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
-use super::{catalog, codes};
+use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
 use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
@@ -120,7 +121,7 @@ impl SqlName {
         &self.canonical
     }
 
-    pub(super) fn from_sqlite_token(token: &str) -> Result<Self> {
+    pub(crate) fn from_sqlite_token(token: &str) -> Result<Self> {
         let bytes = token.as_bytes();
         let value = match bytes {
             [b'"', middle @ .., b'"'] => unescape_identifier(middle, b'"'),
@@ -407,11 +408,11 @@ pub struct DefaultDefinition {
 pub struct SqlExpression(Box<Expr>);
 
 impl SqlExpression {
-    pub(super) fn new(expression: Expr) -> Self {
+    pub(crate) fn new(expression: Expr) -> Self {
         Self(Box::new(expression))
     }
 
-    pub(super) fn referenced_columns(&self) -> Vec<SqlName> {
+    pub(crate) fn referenced_columns(&self) -> Vec<SqlName> {
         let mut columns = BTreeMap::new();
         collect_expression_columns(&self.0, &mut columns);
         columns.into_values().collect()
@@ -1233,7 +1234,7 @@ impl CreateTable {
         Ok(created)
     }
 
-    pub(super) fn validate_ir(&self) -> std::result::Result<(), SchemaInvariantError> {
+    pub(crate) fn validate_ir(&self) -> std::result::Result<(), SchemaInvariantError> {
         self.schema.validate_for(self.table_id)?;
         compiler::validate_create_table(self)
     }
@@ -1456,7 +1457,7 @@ impl CreateTable {
     pub fn prepare_named_index(
         &self,
         connection: &Connection,
-        spec: &super::sql::CreateIndexSpec,
+        spec: &crate::sql::CreateIndexSpec,
     ) -> Result<NamedIndex> {
         let (columns, terms, dependencies) = self.resolve_index_terms(connection, spec)?;
         if spec.unique {
@@ -1474,7 +1475,7 @@ impl CreateTable {
     pub fn named_index_matches_spec(
         &self,
         index: &NamedIndex,
-        spec: &super::sql::CreateIndexSpec,
+        spec: &crate::sql::CreateIndexSpec,
     ) -> bool {
         if spec.name != *index.name() || spec.unique != index.is_unique() {
             return false;
@@ -1489,7 +1490,7 @@ impl CreateTable {
                     .iter()
                     .zip(&spec.terms)
                     .all(|(encoded, term)| {
-                        let super::sql::CreateIndexTerm::Column {
+                        let crate::sql::CreateIndexTerm::Column {
                             name,
                             collation: None,
                             order: None,
@@ -1516,7 +1517,7 @@ impl CreateTable {
                                 collation: encoded_collation,
                                 order: encoded_order,
                             },
-                            super::sql::CreateIndexTerm::Column {
+                            crate::sql::CreateIndexTerm::Column {
                                 name: parsed_name,
                                 collation: parsed_collation,
                                 order: parsed_order,
@@ -1534,7 +1535,7 @@ impl CreateTable {
                                 expression: encoded_expression,
                                 order: encoded_order,
                             },
-                            super::sql::CreateIndexTerm::Expression {
+                            crate::sql::CreateIndexTerm::Expression {
                                 expression: parsed_expression,
                                 order: parsed_order,
                             },
@@ -1549,14 +1550,14 @@ impl CreateTable {
     fn resolve_index_terms(
         &self,
         connection: &Connection,
-        spec: &super::sql::CreateIndexSpec,
+        spec: &crate::sql::CreateIndexSpec,
     ) -> Result<(Vec<ColumnId>, Vec<IndexTerm>, Vec<ColumnId>)> {
         let mut columns = Vec::new();
         let mut terms = Vec::new();
         let mut dependencies = BTreeSet::new();
         for term in &spec.terms {
             match term {
-                super::sql::CreateIndexTerm::Column {
+                crate::sql::CreateIndexTerm::Column {
                     name,
                     collation,
                     order,
@@ -1581,7 +1582,7 @@ impl CreateTable {
                         });
                     }
                 }
-                super::sql::CreateIndexTerm::Expression { expression, order } => {
+                crate::sql::CreateIndexTerm::Expression { expression, order } => {
                     if spec.unique {
                         return Err(Error::UnsupportedSql(
                             "UNIQUE index expressions are not supported",
@@ -2404,7 +2405,7 @@ fn foreign_reference_key_fits(parent_key_parts: usize, child_key_parts: usize) -
 }
 
 /// Validate links whose correctness depends on more than one catalog row.
-pub(super) fn validate_foreign_key_graph(tables: &[CreateTable]) -> Result<()> {
+pub(crate) fn validate_foreign_key_graph(tables: &[CreateTable]) -> Result<()> {
     let mut relationships = BTreeSet::new();
     for child in tables {
         for foreign_key in child.foreign_keys() {
@@ -3346,7 +3347,7 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
                 let expression = std::str::from_utf8(value)
                     .map_err(|_| SchemaCodecError::InvalidUtf8)
                     .and_then(|expression| {
-                        super::sql::parse_schema_expression(expression)
+                        crate::sql::parse_schema_expression(expression)
                             .map_err(|_| SchemaCodecError::InvalidSql)
                     })?;
                 set_once(&mut predicate, expression)?;
@@ -3387,7 +3388,7 @@ fn decode_index_term(frame: &[u8]) -> std::result::Result<IndexTerm, SchemaCodec
             TAG_INDEX_TERM_EXPRESSION => {
                 let encoded =
                     std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
-                let parsed = super::sql::parse_schema_expression(encoded)
+                let parsed = crate::sql::parse_schema_expression(encoded)
                     .map_err(|_| SchemaCodecError::InvalidSql)?;
                 set_once(&mut expression, parsed)?;
             }
@@ -3493,7 +3494,7 @@ fn decode_default(frame: &[u8]) -> std::result::Result<DefaultDefinition, Schema
                     std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
                 set_once(
                     &mut expression,
-                    super::sql::parse_schema_expression(encoded)
+                    crate::sql::parse_schema_expression(encoded)
                         .map_err(|_| SchemaCodecError::InvalidSql)?,
                 )?;
             }
@@ -3523,7 +3524,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
                     std::str::from_utf8(value).map_err(|_| SchemaCodecError::InvalidUtf8)?;
                 set_once(
                     &mut expression,
-                    super::sql::parse_schema_expression(encoded)
+                    crate::sql::parse_schema_expression(encoded)
                         .map_err(|_| SchemaCodecError::InvalidSql)?,
                 )?;
             }
@@ -3584,7 +3585,7 @@ fn type_declaration_roundtrips(declaration: &TypeDeclaration) -> bool {
         )",
         declaration.to_sql()
     );
-    let Ok(super::sql::ValidatedExecute::CreateTable(spec)) = super::sql::validate_execute(&sql)
+    let Ok(crate::sql::ValidatedExecute::CreateTable(spec)) = crate::sql::validate_execute(&sql)
     else {
         return false;
     };
@@ -3826,8 +3827,8 @@ fn column_name(created: &CreateTable, id: ColumnId) -> Option<SqlName> {
 }
 
 fn parse_create_table(sql: &str) -> std::result::Result<CreateTableSpec, SchemaCodecError> {
-    let super::sql::ValidatedExecute::CreateTable(parsed) =
-        super::sql::validate_execute(sql).map_err(|_| SchemaCodecError::InvalidSql)?
+    let crate::sql::ValidatedExecute::CreateTable(parsed) =
+        crate::sql::validate_execute(sql).map_err(|_| SchemaCodecError::InvalidSql)?
     else {
         return Err(SchemaCodecError::InvalidSql);
     };
@@ -4248,8 +4249,8 @@ mod tests {
             CONSTRAINT account_pk PRIMARY KEY (id),
             CONSTRAINT score_check CHECK (score IS NULL OR score >= 0)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4296,8 +4297,8 @@ mod tests {
             body TEXT,
             summary TEXT CHECK (body IS NULL OR length(body) > 0)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4345,11 +4346,9 @@ mod tests {
     #[test]
     fn index_provenance_binds_sql_column_order_to_stable_ids() {
         let created = deterministic_create("notes");
-        let super::super::sql::ValidatedExecute::CreateIndex(spec) =
-            super::super::sql::validate_execute(
-                "CREATE UNIQUE INDEX notes_identity ON notes (id, body)",
-            )
-            .unwrap()
+        let crate::sql::ValidatedExecute::CreateIndex(spec) =
+            crate::sql::validate_execute("CREATE UNIQUE INDEX notes_identity ON notes (id, body)")
+                .unwrap()
         else {
             unreachable!()
         };
@@ -4376,8 +4375,8 @@ mod tests {
             score REAL,
             CONSTRAINT score_check CHECK (score >= 0)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4431,8 +4430,8 @@ mod tests {
             parent INTEGER,
             CONSTRAINT parent_fk FOREIGN KEY (parent) REFERENCES parents (id)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4494,8 +4493,8 @@ mod tests {
             email TEXT NOT NULL,
             UNIQUE (tenant, email)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
-            super::super::sql::validate_execute(parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -4507,8 +4506,8 @@ mod tests {
             recipient TEXT,
             FOREIGN KEY (tenant, recipient) REFERENCES accounts (tenant, email)
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(child_spec) =
-            super::super::sql::validate_execute(child_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };
@@ -4609,8 +4608,8 @@ mod tests {
             "CREATE TABLE parent ({}, PRIMARY KEY ({parent_primary_key})) WITHOUT ROWID",
             parent_columns.join(", ")
         );
-        let super::super::sql::ValidatedExecute::CreateTable(parent_spec) =
-            super::super::sql::validate_execute(&parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(&parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -4649,8 +4648,8 @@ mod tests {
                     parent INTEGER REFERENCES parents(id)
                 )"
             );
-            let super::super::sql::ValidatedExecute::CreateTable(spec) =
-                super::super::sql::validate_execute(&sql).unwrap()
+            let crate::sql::ValidatedExecute::CreateTable(spec) =
+                crate::sql::validate_execute(&sql).unwrap()
             else {
                 unreachable!()
             };
@@ -4879,8 +4878,8 @@ mod tests {
             amount DECIMAL(10, 2),
             enabled BOOLEAN
         )";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4917,8 +4916,8 @@ mod tests {
             payload BLOB,
             anything ANY UNIQUE
         ) STRICT";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -4971,8 +4970,8 @@ mod tests {
             UNIQUE (tenant, body),
             PRIMARY KEY (member, tenant)
         ) WITHOUT ROWID";
-        let super::super::sql::ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };

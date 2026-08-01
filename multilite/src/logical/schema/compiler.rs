@@ -257,8 +257,8 @@ fn has_duplicates<T: PartialEq>(values: &[T]) -> bool {
 mod tests {
     use super::*;
     use crate::Error;
-    use crate::database::schema::{CreateColumn, CreateTable, TypeDeclaration};
-    use crate::database::sql::{ValidatedExecute, validate_execute};
+    use crate::logical::schema::{CreateColumn, CreateTable, TypeDeclaration};
+    use crate::sql::{ValidatedExecute, validate_execute};
     use uuid::Uuid;
 
     fn table() -> CreateTable {

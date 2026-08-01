@@ -325,7 +325,7 @@ components: [
 
 /* ---- multilite: SQL surface & capture ---- */
 { id:"sqlgate", layer:"multilite", band:"SQL surface & capture", name:"SQL gate",
-  files:["multilite/src/database/sql.rs","multilite/SQL_GRAMMAR.md"],
+  files:["multilite/src/sql.rs","multilite/SQL_GRAMMAR.md"],
   summary:"Parser-based (sqlite3_parser AST) classification of every incoming statement: read vs execute vs rejected, with tight shape allowlists per statement family.",
   behavior:[
     "Single-statement enforcement; default-reject catch-all for unknown statement kinds.",
@@ -338,23 +338,24 @@ components: [
   health:[
     {sev:"low", text:"Argument-less PRAGMA classified as a read but always denied at runtime \u2014 dead grammar, mislabeled."}],
   snippets:[
-    {title:"Reserved-name checks dequote first, reject unknown token shapes", file:"database/sql.rs", code:
+    {title:"Reserved-name checks dequote first, reject unknown token shapes", file:"sql.rs", code:
 `fn name_reads_reserved(name: &Name) -> bool {
     SqlName::from_sqlite_token(&name.0)
-        .map(|name| super::has_multilite_prefix(name.value()))
+        .map(|name| has_multilite_prefix(name.value()))
         // The parser should only produce valid SQLite identifier tokens. If a
         // future parser shape violates that contract, reject conservatively.
         .unwrap_or(true)
 }`},
-    {title:"UPDATE gate: every fenced clause is an explicit typed rejection", file:"database/sql.rs", code:
-`if with.is_some() {
-    return Err(Error::UnsupportedSql("UPDATE WITH is not supported"));
+    {title:"UPDATE gate: every fenced clause is an explicit typed rejection", file:"sql.rs", code:
+`if or_conflict.is_some() {
+    return Err(Error::UnsupportedSql(
+        "UPDATE conflict clauses are not supported",
+    ));
 }
-if from.is_some() {
-    return Err(Error::UnsupportedSql("UPDATE FROM is not supported"));
-}
-// ... OR-conflict, INDEXED BY, RETURNING, ORDER BY / LIMIT ...
-if sets.iter().any(|set| expression_reads_reserved(&set.expr))
+validate_index_hint(indexed.as_ref())?;
+if with_reads_reserved(with.as_ref())
+    || sets.iter().any(|set| expression_reads_reserved(&set.expr))
+    || from.as_ref().is_some_and(from_reads_reserved)
     || where_clause.as_ref().is_some_and(expression_reads_reserved)
 {
     return Err(Error::UnsupportedSql(
@@ -362,7 +363,7 @@ if sets.iter().any(|set| expression_reads_reserved(&set.expr))
     ));
 }
 Ok(ValidatedExecute::Update)`},
-    {title:"Transaction control is never user SQL", file:"database/sql.rs", code:
+    {title:"Transaction control is never user SQL", file:"sql.rs", code:
 `Cmd::Stmt(
     Stmt::Begin(..) | Stmt::Commit(..) | Stmt::Rollback { .. }
     | Stmt::Savepoint(..) | Stmt::Release(..),
@@ -420,9 +421,10 @@ pub(crate) fn run<T>(
 
 /* ---- multilite: compiler ---- */
 { id:"operation", layer:"multilite", band:"Logical operation compiler", name:"Operation compiler",
-  files:["multilite/src/database/operation.rs","multilite/src/database/transaction.rs"],
+  files:["multilite/src/logical/operation.rs","multilite/src/logical/transaction.rs"],
   summary:"MultiliteOp::compile() derives every deterministic artifact once: Homebase mutations, guard plan, conflict footprint, and the rejection inverse.",
   behavior:[
+    "The durable schema/row/DDL model lives under src/logical, outside database lifecycle and authority orchestration; commit proposals depend on this layer directly rather than importing database internals.",
     "Compile-once: CompiledOperation carries logical op + lowering + inverse; transactions assemble them without re-lowering.",
     "Admitted foreign batches are authenticated by decode + re-lower + byte-identical mutation comparison.",
     "verify_materialized cross-checks canonical SQLite against branch-captured images (debug builds only).",
@@ -430,7 +432,7 @@ pub(crate) fn run<T>(
   invariants:["validate_mutations / validate_rejection reject any output outside the declared contract tables."],
   health:[{sev:"low", text:"Differential branch-vs-canonical verification is #[cfg(debug_assertions)]-only; production never runs it. Consider sampling or per-table checksums in release."}],
   snippets:[
-    {title:"compile(): the rejection inverse is derived with the operation, not later", file:"database/operation.rs", code:
+    {title:"compile(): the rejection inverse is derived with the operation, not later", file:"logical/operation.rs", code:
 `/// Validate and derive every deterministic artifact for this operation.
 pub fn compile(self) -> Result<CompiledOperation> {
     let homebase = self.to_homebase()?;
@@ -452,7 +454,7 @@ pub fn compile(self) -> Result<CompiledOperation> {
     // lowering + guard plan are checked against the contract tables here
 }`}] },
 { id:"rowops", layer:"multilite", band:"Logical operation compiler", name:"Row lowering",
-  files:["multilite/src/database/row.rs"],
+  files:["multilite/src/logical/row.rs"],
   summary:"Captured rows \u2192 Insert/Delete/UpdateRows with key images, unique-owner cells, and foreign-reference handshake cells.",
   behavior:[
     "Key images are order-preserving per class; integral REALs normalize onto the integer image so 1 == 1.0.",
@@ -465,7 +467,7 @@ pub fn compile(self) -> Result<CompiledOperation> {
     {sev:"low", text:"is_unique_entry_key sniffs raw key layout (component 3) and is currently always-true; if key shape changes it silently drops the uniqueness guard."},
     {sev:"low", text:"Cross-class ordering (int vs non-integral real) still diverges from SQLite numeric order \u2014 latent; nothing scans ordered ranges today."}] },
 { id:"schemaops", layer:"multilite", band:"Logical operation compiler", name:"Schema IR & DDL",
-  files:["multilite/src/database/schema.rs","multilite/src/database/schema/compiler.rs","multilite/src/database/alter.rs","multilite/src/database/index.rs"],
+  files:["multilite/src/logical/schema.rs","multilite/src/logical/schema/compiler.rs","multilite/src/logical/alter.rs","multilite/src/logical/index.rs"],
   summary:"Validated schema IR with stable UUIDs for tables/columns/indexes/FKs; CREATE/ALTER/INDEX operations with content-addressed revisions.",
   behavior:[
     "One validator (validate_table_schema) guards freshly resolved and decoded schemas identically.",
@@ -477,7 +479,7 @@ pub fn compile(self) -> Result<CompiledOperation> {
   health:[
     {sev:"med", text:"DROP INDEX leaves unique-owner cells and the index-definition cell in place \u2014 acknowledged in TODO.md as needing an explicit retirement/GC protocol, but unbounded garbage accrues meanwhile.", known:true}],
   snippets:[
-    {title:"Catalog index IR must not carry executable provenance SQL (locked by test)", file:"database/index.rs", code:
+    {title:"Catalog index IR must not carry executable provenance SQL (locked by test)", file:"logical/index.rs", code:
 `assert!(
     !definition
         .windows(sql.len())
@@ -485,7 +487,7 @@ pub fn compile(self) -> Result<CompiledOperation> {
     "catalog index IR must not duplicate executable provenance SQL"
 );`}] },
 { id:"guard", layer:"multilite", band:"Logical operation compiler", name:"Guard contracts",
-  files:["multilite/src/database/guard.rs","multilite/GUARDS.md"],
+  files:["multilite/src/logical/guard.rs","multilite/GUARDS.md"],
   summary:"The compiler's checked vocabulary: finite LogicalTarget families, allowlisted (operation \u00d7 mutation \u00d7 target) and (operation \u00d7 guard-class \u00d7 reason \u00d7 target) contracts, rejection-inverse table.",
   behavior:[
     "render() and classify() are inverse maps between typed targets and durable keys.",
@@ -495,7 +497,7 @@ pub fn compile(self) -> Result<CompiledOperation> {
   invariants:["Every mutation and guard the compiler emits must appear in the contract tables, and every required guard must be present (release-mode check)."],
   health:[],
   snippets:[
-    {title:"Required guards: the allowlist gained a floor", file:"database/guard.rs", code:
+    {title:"Required guards: the allowlist gained a floor", file:"logical/guard.rs", code:
 `/// Guards that every operation in a family must emit at least once.
 pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
@@ -770,9 +772,11 @@ pub(super) fn run_scheduled_push(self: &Arc<Self>) -> Result<()> {
     "Fails hard if submissions are pending \u2014 rebase never interleaves with an unshipped local suffix."],
   invariants:["Rebase applies an exact captured admission interval or nothing."], health:[] },
 { id:"catalog", layer:"multilite", band:"Sync, journal & metadata", name:"Schema catalog",
-  files:["multilite/src/database/catalog.rs","multilite/src/database/physical.rs"],
+  files:["multilite/src/catalog.rs","multilite/src/physical.rs"],
   summary:"Local index of durable schema identities; snapshot loads give hooks O(log n) name/id lookup; physical.rs cross-checks catalog vs real SQLite structure.",
-  behavior:["Validated on every reopen; every DDL apply updates it in the same transaction as the SQLite change."],
+  behavior:[
+    "Catalog and debug physical verification are SQLite adapters shared by logical materialization and database orchestration; neither belongs to database identity/lifecycle.",
+    "Validated on every reopen; every DDL apply updates it in the same transaction as the SQLite change."],
   invariants:["Catalog and sqlite_schema must describe the same tables (structural equivalence checks)."],
   health:[{sev:"low", text:"CatalogSnapshot::load re-parses every column's type declaration per transaction open \u2014 parser-bound; definitions are immutable by revision and cacheable.", known:true}] },
 { id:"mlmeta", layer:"multilite", band:"Sync, journal & metadata", name:"Metastore bridge",

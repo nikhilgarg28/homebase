@@ -7,7 +7,7 @@ use homebase_core::messages::RangeAssert;
 use homebase_core::tag::AdmissionSeq;
 
 use crate::commit::history::WriteRegion;
-use crate::database::isolation::IsolationLevel;
+use crate::logical::isolation::IsolationLevel;
 
 /// Logical conflicts accumulated by one Multilite transaction.
 ///

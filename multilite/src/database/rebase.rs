@@ -13,14 +13,14 @@ use rusqlite::Connection;
 
 #[cfg(test)]
 use super::store::DatabaseMetaStore;
-#[cfg(test)]
-use super::transaction::MultiliteTransaction;
 use super::{Database, DatabaseRuntime};
 #[cfg(test)]
 use crate::Error;
 use crate::Result;
 #[cfg(test)]
 use crate::commit::proposal::{AdmittedTransaction, CommitProposal};
+#[cfg(test)]
+use crate::logical::transaction::MultiliteTransaction;
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) fn rebase(self: &Arc<Self>, runtime: &DatabaseRuntime) -> Result<()> {
@@ -117,10 +117,10 @@ fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::catalog;
-    use crate::database::operation::MultiliteOp;
-    use crate::database::row::{CapturedRow, InsertRows, StoredValue};
-    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
+    use crate::catalog;
+    use crate::logical::operation::MultiliteOp;
+    use crate::logical::row::{CapturedRow, InsertRows, StoredValue};
+    use crate::logical::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     #[test]
     fn foreign_mixed_transaction_applies_operations_in_manifest_order() {
@@ -129,7 +129,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),

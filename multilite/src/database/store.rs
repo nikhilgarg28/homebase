@@ -329,11 +329,11 @@ mod tests {
     use homebase_core::tag::{CipherEpoch, DeviceEntry, DeviceId, DeviceTag, OpaqueValue};
 
     use super::*;
-    use crate::database::catalog;
-    use crate::database::operation::MultiliteOp;
-    use crate::database::schema::CreateTable;
-    use crate::database::sql::ValidatedExecute;
-    use crate::database::transaction::MultiliteTransaction;
+    use crate::catalog;
+    use crate::logical::operation::MultiliteOp;
+    use crate::logical::schema::CreateTable;
+    use crate::logical::transaction::MultiliteTransaction;
+    use crate::sql::ValidatedExecute;
 
     #[test]
     fn joined_store_passes_homebase_conformance() {
@@ -355,8 +355,7 @@ mod tests {
             let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
             let space = SpaceId([7; 16]);
             let sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY)";
-            let ValidatedExecute::CreateTable(spec) =
-                super::super::sql::validate_execute(sql).unwrap()
+            let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(sql).unwrap()
             else {
                 unreachable!()
             };

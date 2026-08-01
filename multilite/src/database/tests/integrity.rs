@@ -9,7 +9,8 @@ use homebase_core::range::Range;
 use homebase_core::tag::{AdmissionSeq, Mutation};
 
 use super::*;
-use crate::database::guard::TargetFamily;
+use crate::logical::codes;
+use crate::logical::guard::TargetFamily;
 
 const SEEDS: &[u64] = &[0x5eed_0001, 0x5eed_0002, 0x5eed_0003];
 const ROUNDS: usize = 12;
@@ -469,7 +470,7 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
         let first_state = audit(&first);
         let second_state = audit(&second);
         assert_eq!(first_state, second_state, "replicas diverged: {context}");
-        crate::database::row::validate_materialized_cells(
+        crate::logical::row::validate_materialized_cells(
             &first_state.materialized_cells,
             &authority_materialized_cells(&first),
         )
@@ -564,7 +565,7 @@ where
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         let materialized_cells =
-            crate::database::row::expected_materialized_cells(connection).unwrap();
+            crate::logical::row::expected_materialized_cells(connection).unwrap();
         MaterializedState {
             schema,
             parents,

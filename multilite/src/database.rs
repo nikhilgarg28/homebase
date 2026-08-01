@@ -1,26 +1,13 @@
 //! General Multilite database identity and Homebase lifecycle.
 
-mod alter;
 mod async_api;
 mod authority;
 mod commit_backend;
-pub(crate) mod catalog;
-mod codes;
 mod connection;
-pub(crate) mod guard;
-mod index;
-pub(crate) mod isolation;
-pub(crate) mod operation;
 mod pending;
-#[cfg(debug_assertions)]
-mod physical;
 mod policy;
 mod rebase;
-pub(crate) mod row;
-pub(crate) mod schema;
-mod sql;
 mod store;
-pub(crate) mod transaction;
 mod update;
 mod view;
 
@@ -44,22 +31,23 @@ use crate::commit::committer::{CommitHistory, CommitSnapshot, Committer, WeakCom
 use crate::commit::history;
 use crate::commit::proposal::{CommitProposal, CommitReceipt};
 use crate::connection::ConnectionOwner;
+use crate::logical::row::{CapturedChange, CapturedRow, StoredValue};
 use crate::metastore::SqliteOrderedStore;
 use crate::rowid;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
+use crate::{catalog, sql};
 
 use self::authority::Authority;
 use self::commit_backend::DatabaseCommitBackend;
 use self::policy::PolicyActor;
-use self::row::{CapturedChange, CapturedRow, StoredValue};
 use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
 
 pub use self::connection::Connection;
-pub use self::isolation::{IsolationLevel, UpdateOptions};
 pub use self::policy::SyncPolicy;
 pub use self::update::UpdateTransaction;
 pub use self::view::{TransactionStatement, ViewTransaction};
+pub use crate::logical::isolation::{IsolationLevel, UpdateOptions};
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -308,7 +296,7 @@ fn capture_change(
     if mode != ExecutionMode::Public
         || database != "main"
         || is_schema_table(table)
-        || has_multilite_prefix(table)
+        || sql::has_multilite_prefix(table)
     {
         return Ok(None);
     }
@@ -584,11 +572,14 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         | AuthAction::DropIndex {
             index_name,
             table_name,
-        } if !has_multilite_prefix(index_name) && !is_sqlite_internal_table(index_name) => {
+        } if !sql::has_multilite_prefix(index_name)
+            && !sql::is_sqlite_internal_table(index_name) =>
+        {
             authorize_user_table(context.database_name, table_name)
         }
         AuthAction::Reindex { index_name }
-            if !has_multilite_prefix(index_name) && !is_sqlite_internal_table(index_name) =>
+            if !sql::has_multilite_prefix(index_name)
+                && !sql::is_sqlite_internal_table(index_name) =>
         {
             authorize_main(context.database_name)
         }
@@ -637,7 +628,10 @@ fn authorize_read(database: Option<&str>, table: &str) -> Authorization {
 }
 
 fn authorize_user_table(database: Option<&str>, table: &str) -> Authorization {
-    if is_main(database) && !has_multilite_prefix(table) && !is_sqlite_internal_table(table) {
+    if is_main(database)
+        && !sql::has_multilite_prefix(table)
+        && !sql::is_sqlite_internal_table(table)
+    {
         Authorization::Allow
     } else {
         Authorization::Deny
@@ -669,18 +663,6 @@ fn is_schema_table(table: &str) -> bool {
         || table.eq_ignore_ascii_case("sqlite_schema")
         || table.eq_ignore_ascii_case("sqlite_temp_master")
         || table.eq_ignore_ascii_case("sqlite_temp_schema")
-}
-
-fn is_sqlite_internal_table(table: &str) -> bool {
-    table
-        .get(.."sqlite_".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
-}
-
-fn has_multilite_prefix(table: &str) -> bool {
-    table
-        .get(.."__multilite__".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
 }
 
 /// A validated prepared statement owned by a Multilite database.
@@ -983,7 +965,7 @@ fn validate_user_table_shapes(connection: &SqliteConnection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (table, kind, without_rowid) in tables {
-        if table.starts_with("sqlite_") || has_multilite_prefix(&table) {
+        if table.starts_with("sqlite_") || sql::has_multilite_prefix(&table) {
             continue;
         }
         if kind != "table" {

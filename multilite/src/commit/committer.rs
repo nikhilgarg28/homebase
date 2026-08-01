@@ -390,12 +390,12 @@ mod tests {
     use super::*;
     use crate::branch::snapshot::SnapshotCache;
     use crate::commit::snapshot::SnapshotDescriptor;
-    use crate::database::isolation::IsolationLevel;
-    use crate::database::operation::MultiliteOp;
-    use crate::database::schema::{
+    use crate::logical::isolation::IsolationLevel;
+    use crate::logical::operation::MultiliteOp;
+    use crate::logical::schema::{
         CreateColumn, CreateTable, CreateTableSpec, SqlName, TypeDeclaration,
     };
-    use crate::database::transaction::MultiliteTransaction;
+    use crate::logical::transaction::MultiliteTransaction;
 
     struct TestBackend {
         groups: Mutex<Vec<Vec<String>>>,
@@ -491,7 +491,7 @@ mod tests {
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
                     mode: Default::default(),
-                    storage: crate::database::schema::TableStorage::Rowid,
+                    storage: crate::logical::schema::TableStorage::Rowid,
                     columns: vec![CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),

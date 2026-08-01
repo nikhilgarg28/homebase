@@ -670,7 +670,7 @@ fn audit_markdown() -> String {
 
     let mut audit = String::from(
         "# Multilite Operation Contracts\n\n\
-         This file is generated from the checked contracts in `src/database/guard.rs`. \
+         This file is generated from the checked contracts in `src/logical/guard.rs`. \
          The compiler rejects mutations, guards, and rejection repairs absent from these tables.\n\n\
          Guard classes have distinct semantics: `Invariant` is mandatory at every isolation level, \
          `Write` participates in write/write validation, and `SerializableRead` is added only for \

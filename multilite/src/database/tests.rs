@@ -25,13 +25,14 @@ use homebase_core::tag::{DeviceChecksum, DeviceSeq, Mutation};
 use rusqlite::OptionalExtension;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
-use super::operation::MultiliteOp;
-use super::transaction::MultiliteTransaction;
 use super::*;
 use crate::commit::committer::{CommitBackend, CommitHistory};
 use crate::commit::history;
 use crate::commit::proposal::CommitDisposition;
 use crate::commit::snapshot::SnapshotDescriptor;
+use crate::logical::operation::MultiliteOp;
+use crate::logical::schema;
+use crate::logical::transaction::MultiliteTransaction;
 
 mod integrity;
 
@@ -239,7 +240,7 @@ fn create_operation(name: &str) -> MultiliteOp {
         schema::CreateTableSpec {
             name: schema::SqlName::new(name.into()),
             mode: Default::default(),
-            storage: crate::database::schema::TableStorage::Rowid,
+            storage: crate::logical::schema::TableStorage::Rowid,
             columns: vec![schema::CreateColumn {
                 name: schema::SqlName::new("id".into()),
                 declared_type: schema::TypeDeclaration::integer(),
@@ -1465,7 +1466,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     assert_eq!(pending[0].seq, DeviceSeq(1));
     assert!(matches!(
         pending[0].rejection().unwrap().as_slice(),
-        [super::operation::RejectionEffect::DropTable { created }]
+        [crate::logical::operation::RejectionEffect::DropTable { created }]
             if created.table_name() == "notes"
     ));
 
@@ -2913,7 +2914,7 @@ fn multi_row_insert_is_one_durable_pending_operation() {
     ));
     assert!(matches!(
         pending[1].rejection().unwrap().as_slice(),
-        [super::operation::RejectionEffect::DeleteRows { .. }]
+        [crate::logical::operation::RejectionEffect::DeleteRows { .. }]
     ));
     database.with_connection(|connection| {
         assert_eq!(

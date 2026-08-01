@@ -369,9 +369,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::database::catalog;
-    use crate::database::row::{CapturedRow, InsertRows, StoredValue};
-    use crate::database::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
+    use crate::catalog;
+    use crate::logical::row::{CapturedRow, InsertRows, StoredValue};
+    use crate::logical::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     fn create_operation() -> MultiliteOp {
         MultiliteOp::create_table(
@@ -379,7 +379,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),

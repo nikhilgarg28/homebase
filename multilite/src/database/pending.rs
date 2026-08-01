@@ -9,10 +9,10 @@ use homebase_core::tag::DeviceSeq;
 use homebase_core::writer::Writer;
 use rusqlite::{Connection, params};
 
-use super::catalog;
-use super::operation::RejectionEffect;
-use super::transaction::MultiliteTransaction;
+use crate::catalog;
 use crate::commit::history::{self, WriteRegion};
+use crate::logical::operation::RejectionEffect;
+use crate::logical::transaction::MultiliteTransaction;
 use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
@@ -388,10 +388,10 @@ mod tests {
     use homebase_client::meta::{DeviceOp, SubmitMode};
 
     use super::*;
-    use crate::database::alter::AlterTableOperation;
-    use crate::database::operation::{MultiliteOp, RejectionEffect};
-    use crate::database::row::{CapturedRow, DeleteRows, InsertRows, StoredValue, UpdateRows};
-    use crate::database::schema::{
+    use crate::logical::alter::AlterTableOperation;
+    use crate::logical::operation::{MultiliteOp, RejectionEffect};
+    use crate::logical::row::{CapturedRow, DeleteRows, InsertRows, StoredValue, UpdateRows};
+    use crate::logical::schema::{
         CreateColumn, CreateTable, CreateTableSpec, SqlName, TypeDeclaration,
     };
 
@@ -401,7 +401,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new(name.into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),
@@ -454,7 +454,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("notes".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
@@ -517,8 +517,8 @@ mod tests {
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
         let sql = "ALTER TABLE notes RENAME TO archived_notes";
-        let super::super::sql::ValidatedExecute::RenameTable(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let crate::sql::ValidatedExecute::RenameTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -774,7 +774,7 @@ mod tests {
             &connection,
             original.table_id(),
             original.table_name_identity(),
-            &super::super::schema::SqlName::new("archived_notes".into()),
+            &crate::logical::schema::SqlName::new("archived_notes".into()),
         )
         .unwrap();
         let MultiliteOp::CreateTable(replacement) = operation("notes") else {

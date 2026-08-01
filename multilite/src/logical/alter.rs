@@ -10,7 +10,6 @@ use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
-use super::catalog;
 use super::guard::{GuardPlan, GuardReason, OperationFamily};
 use super::row::primary_index_prefix;
 use super::schema::{
@@ -18,8 +17,9 @@ use super::schema::{
     column_check_dependency_key, column_dependency_prefix, column_name_scope_key, schema_log_key,
     schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
-use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
+use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
+use crate::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::sqlite::quote_identifier;
 use crate::value::StoredValue;
 use crate::{Error, Result};
@@ -211,7 +211,7 @@ impl AlterTableOperation {
     pub fn prepare_drop_column(
         connection: &Connection,
         sql: &str,
-        spec: &super::sql::DropColumnSpec,
+        spec: &crate::sql::DropColumnSpec,
     ) -> Result<Self> {
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
             Error::UnsupportedSql("ALTER TABLE target has no synchronized schema identity"),
@@ -379,7 +379,7 @@ impl AlterTableOperation {
             "ALTER TABLE identity is missing from the schema catalog",
         ))?;
         let sql = match &self.delta {
-            AlterTableDelta::AddColumn { .. } => super::sql::render_alter_table(&self.sql, &table)?,
+            AlterTableDelta::AddColumn { .. } => crate::sql::render_alter_table(&self.sql, &table)?,
             AlterTableDelta::DropColumn { .. } => {
                 unreachable!("DROP COLUMN materializes through table rebuild")
             }
@@ -769,7 +769,7 @@ impl AlterTableOperation {
     }
 
     fn validate(&self) -> std::result::Result<(), AlterTableCodecError> {
-        let validated = super::sql::validate_execute(&self.sql)
+        let validated = crate::sql::validate_execute(&self.sql)
             .map_err(|_| AlterTableCodecError::InvalidSql)?;
         match (&self.delta, validated) {
             (
@@ -992,7 +992,7 @@ fn rebuild_table_if_needed(
     let source_sql = table.materialization_sql(connection)?;
     let dependent_sql = materialized_dependents(connection, &table_name)?;
     let temporary = SqlName::new(format!("__multilite__rebuild_{}", Uuid::new_v4().simple()));
-    let create_sql = super::sql::render_create_table_name(&source_sql, &temporary)?;
+    let create_sql = crate::sql::render_create_table_name(&source_sql, &temporary)?;
 
     let copied = desired
         .iter()
@@ -1385,7 +1385,7 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
-    use crate::database::schema::{
+    use crate::logical::schema::{
         CreateColumn, CreateTable, CreateTableSpec, TableMode, TableStorage, TypeDeclaration,
     };
 
@@ -1420,8 +1420,7 @@ mod tests {
     fn connection_with(sql: &str) -> (Connection, CreateTable) {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
-        let ValidatedExecute::CreateTable(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         let created = CreateTable::new(sql, spec);
@@ -1431,8 +1430,7 @@ mod tests {
     }
 
     fn prepare_drop(connection: &Connection, sql: &str) -> AlterTableOperation {
-        let ValidatedExecute::DropColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::DropColumn(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
@@ -1440,8 +1438,7 @@ mod tests {
 
     fn operation(connection: &Connection) -> AlterTableOperation {
         let sql = "ALTER TABLE notes RENAME TO \"Archived Notes\"";
-        let ValidatedExecute::RenameTable(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::RenameTable(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         AlterTableOperation::prepare_rename_table(connection, sql, &spec).unwrap()
@@ -1449,8 +1446,7 @@ mod tests {
 
     fn column_operation(connection: &Connection) -> AlterTableOperation {
         let sql = "ALTER TABLE notes RENAME COLUMN id TO note_id";
-        let ValidatedExecute::RenameColumn(spec) =
-            super::super::sql::validate_execute(sql).unwrap()
+        let ValidatedExecute::RenameColumn(spec) = crate::sql::validate_execute(sql).unwrap()
         else {
             unreachable!()
         };
@@ -1460,8 +1456,7 @@ mod tests {
     fn add_operation(connection: &Connection) -> AlterTableOperation {
         let sql = "ALTER TABLE notes ADD COLUMN body TEXT DEFAULT 'empty'
                    CHECK (id > 0 AND length(body) > 0)";
-        let ValidatedExecute::AddColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::AddColumn(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         AlterTableOperation::prepare_add_column(connection, sql, &spec).unwrap()
@@ -1469,8 +1464,7 @@ mod tests {
 
     fn simple_add_operation(connection: &Connection) -> AlterTableOperation {
         let sql = "ALTER TABLE notes ADD COLUMN body TEXT DEFAULT 'empty'";
-        let ValidatedExecute::AddColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::AddColumn(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         AlterTableOperation::prepare_add_column(connection, sql, &spec).unwrap()
@@ -1478,8 +1472,7 @@ mod tests {
 
     fn drop_operation(connection: &Connection) -> AlterTableOperation {
         let sql = "ALTER TABLE notes DROP COLUMN body";
-        let ValidatedExecute::DropColumn(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::DropColumn(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
@@ -1946,8 +1939,7 @@ mod tests {
             FOREIGN KEY (parent_id) REFERENCES parents(id)
                 ON UPDATE NO ACTION ON DELETE NO ACTION
         )";
-        let ValidatedExecute::CreateTable(spec) =
-            super::super::sql::validate_execute(child_sql).unwrap()
+        let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };

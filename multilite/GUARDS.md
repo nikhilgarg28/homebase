@@ -1,6 +1,6 @@
 # Multilite Operation Contracts
 
-This file is generated from the checked contracts in `src/database/guard.rs`. The compiler rejects mutations, guards, and rejection repairs absent from these tables.
+This file is generated from the checked contracts in `src/logical/guard.rs`. The compiler rejects mutations, guards, and rejection repairs absent from these tables.
 
 Guard classes have distinct semantics: `Invariant` is mandatory at every isolation level, `Write` participates in write/write validation, and `SerializableRead` is added only for serializable transactions. Repeated runtime guards are retained for auditability before the executable footprint is prefix-pruned.
 

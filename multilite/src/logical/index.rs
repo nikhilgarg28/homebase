@@ -10,7 +10,6 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 use uuid::{Uuid, Variant, Version};
 
-use super::catalog;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
@@ -18,8 +17,9 @@ use super::schema::{
     column_index_dependency_key, column_name_scope_key, index_definition_key, schema_log_key,
     schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
-use super::sql::{CreateIndexSpec, CreateIndexTerm, DropIndexSpec, ValidatedExecute};
+use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
+use crate::sql::{CreateIndexSpec, CreateIndexTerm, DropIndexSpec, ValidatedExecute};
 use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
@@ -310,7 +310,7 @@ impl IndexOperation {
     }
 
     fn create_dependencies(&self) -> Result<Vec<super::schema::SqlName>> {
-        let ValidatedExecute::CreateIndex(spec) = super::sql::validate_execute(&self.sql)? else {
+        let ValidatedExecute::CreateIndex(spec) = crate::sql::validate_execute(&self.sql)? else {
             return Err(Error::InvalidMultiliteOp(
                 "CREATE index operation has invalid SQL provenance".into(),
             ));
@@ -445,7 +445,7 @@ impl IndexOperation {
         match self.action {
             IndexAction::Create => {
                 let ValidatedExecute::CreateIndex(spec) =
-                    super::sql::validate_execute(&self.sql)
+                    crate::sql::validate_execute(&self.sql)
                         .map_err(|_| IndexCodecError::InvalidSql)?
                 else {
                     return Err(IndexCodecError::InvalidSql);
@@ -478,7 +478,7 @@ impl IndexOperation {
                 }
             }
             IndexAction::Drop => {
-                let ValidatedExecute::DropIndex(spec) = super::sql::validate_execute(&self.sql)
+                let ValidatedExecute::DropIndex(spec) = crate::sql::validate_execute(&self.sql)
                     .map_err(|_| IndexCodecError::InvalidSql)?
                 else {
                     return Err(IndexCodecError::InvalidSql);
@@ -627,21 +627,21 @@ mod tests {
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
-    use crate::database::schema::{
+    use crate::logical::schema::{
         CreateColumn, CreateTableSpec, IndexOrder, IndexTerm, TableStorage, TypeDeclaration,
     };
-    use crate::database::sql::CreateIndexTerm;
+    use crate::sql::CreateIndexTerm;
 
     fn table() -> CreateTable {
         CreateTable::new(
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, tenant TEXT, slug TEXT)",
             CreateTableSpec {
-                name: super::super::schema::SqlName::new("notes".into()),
+                name: crate::logical::schema::SqlName::new("notes".into()),
                 mode: Default::default(),
                 storage: TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
-                        name: super::super::schema::SqlName::new("id".into()),
+                        name: crate::logical::schema::SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         not_null_name: None,
@@ -649,7 +649,7 @@ mod tests {
                         primary_key: Some(0),
                     },
                     CreateColumn {
-                        name: super::super::schema::SqlName::new("tenant".into()),
+                        name: crate::logical::schema::SqlName::new("tenant".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
@@ -657,7 +657,7 @@ mod tests {
                         primary_key: None,
                     },
                     CreateColumn {
-                        name: super::super::schema::SqlName::new("slug".into()),
+                        name: crate::logical::schema::SqlName::new("slug".into()),
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
@@ -692,16 +692,16 @@ mod tests {
     fn create_spec() -> CreateIndexSpec {
         CreateIndexSpec {
             unique: true,
-            name: super::super::schema::SqlName::new("notes_tenant_slug".into()),
-            table: super::super::schema::SqlName::new("notes".into()),
+            name: crate::logical::schema::SqlName::new("notes_tenant_slug".into()),
+            table: crate::logical::schema::SqlName::new("notes".into()),
             terms: vec![
                 CreateIndexTerm::Column {
-                    name: super::super::schema::SqlName::new("tenant".into()),
+                    name: crate::logical::schema::SqlName::new("tenant".into()),
                     collation: None,
                     order: None,
                 },
                 CreateIndexTerm::Column {
-                    name: super::super::schema::SqlName::new("slug".into()),
+                    name: crate::logical::schema::SqlName::new("slug".into()),
                     collation: None,
                     order: None,
                 },
@@ -713,16 +713,16 @@ mod tests {
     fn secondary_spec() -> CreateIndexSpec {
         CreateIndexSpec {
             unique: false,
-            name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
-            table: super::super::schema::SqlName::new("notes".into()),
+            name: crate::logical::schema::SqlName::new("notes_tenant_slug_lookup".into()),
+            table: crate::logical::schema::SqlName::new("notes".into()),
             terms: vec![
                 CreateIndexTerm::Column {
-                    name: super::super::schema::SqlName::new("tenant".into()),
+                    name: crate::logical::schema::SqlName::new("tenant".into()),
                     collation: None,
                     order: None,
                 },
                 CreateIndexTerm::Column {
-                    name: super::super::schema::SqlName::new("slug".into()),
+                    name: crate::logical::schema::SqlName::new("slug".into()),
                     collation: None,
                     order: None,
                 },
@@ -752,11 +752,11 @@ mod tests {
                 primary_index_prefix(&before),
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("tenant".into()),
+                    &crate::logical::schema::SqlName::new("tenant".into()),
                 ),
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("slug".into()),
+                    &crate::logical::schema::SqlName::new("slug".into()),
                 ),
                 column_index_dependency_key(
                     before.table_id(),
@@ -837,11 +837,11 @@ mod tests {
                 active_schema_revision_key(before.table_id()),
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("tenant".into()),
+                    &crate::logical::schema::SqlName::new("tenant".into()),
                 ),
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("slug".into()),
+                    &crate::logical::schema::SqlName::new("slug".into()),
                 ),
                 column_index_dependency_key(
                     before.table_id(),
@@ -898,7 +898,7 @@ mod tests {
             &target,
             before.table_id(),
             before.table_name_identity(),
-            &super::super::schema::SqlName::new("archived_notes".into()),
+            &crate::logical::schema::SqlName::new("archived_notes".into()),
         )
         .unwrap();
 
@@ -921,7 +921,7 @@ mod tests {
             &target,
             drop_sql,
             &DropIndexSpec {
-                name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
+                name: crate::logical::schema::SqlName::new("notes_tenant_slug_lookup".into()),
             },
         )
         .unwrap();
@@ -950,8 +950,7 @@ mod tests {
             lower(slug) ASC,
             tenant
         ) WHERE tenant IS NOT NULL AND length(slug) > 0";
-        let ValidatedExecute::CreateIndex(spec) = super::super::sql::validate_execute(sql).unwrap()
-        else {
+        let ValidatedExecute::CreateIndex(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         connection.execute(sql, ()).unwrap();
@@ -964,10 +963,10 @@ mod tests {
             operation.index.terms()[0],
             IndexTerm::Column {
                 column: before
-                    .column_named(&super::super::schema::SqlName::new("tenant".into()))
+                    .column_named(&crate::logical::schema::SqlName::new("tenant".into()))
                     .unwrap()
                     .id(),
-                collation: Some(super::super::schema::SqlName::new("NOCASE".into())),
+                collation: Some(crate::logical::schema::SqlName::new("NOCASE".into())),
                 order: Some(IndexOrder::Desc),
             }
         );
@@ -989,11 +988,11 @@ mod tests {
             &[
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("tenant".into()),
+                    &crate::logical::schema::SqlName::new("tenant".into()),
                 ),
                 column_name_scope_key(
                     before.table_id(),
-                    &super::super::schema::SqlName::new("slug".into()),
+                    &crate::logical::schema::SqlName::new("slug".into()),
                 ),
             ],
         );
@@ -1043,7 +1042,7 @@ mod tests {
         let catalog_index = catalog::by_name(&connection, "notes")
             .unwrap()
             .unwrap()
-            .index_named(&super::super::schema::SqlName::new("notes_search".into()))
+            .index_named(&crate::logical::schema::SqlName::new("notes_search".into()))
             .unwrap()
             .clone();
         assert_eq!(catalog_index, operation.index);
@@ -1057,7 +1056,7 @@ mod tests {
         let create_sql =
             "CREATE INDEX notes_search ON notes (lower(\"slug\")) WHERE \"slug\" IS NOT NULL";
         let ValidatedExecute::CreateIndex(create_spec) =
-            super::super::sql::validate_execute(create_sql).unwrap()
+            crate::sql::validate_execute(create_sql).unwrap()
         else {
             unreachable!()
         };
@@ -1067,7 +1066,7 @@ mod tests {
 
         let rename_sql = "ALTER TABLE notes RENAME COLUMN slug TO contents";
         let ValidatedExecute::RenameColumn(rename_spec) =
-            super::super::sql::validate_execute(rename_sql).unwrap()
+            crate::sql::validate_execute(rename_sql).unwrap()
         else {
             unreachable!()
         };
@@ -1085,7 +1084,7 @@ mod tests {
             &connection,
             drop_sql,
             &DropIndexSpec {
-                name: super::super::schema::SqlName::new("notes_search".into()),
+                name: crate::logical::schema::SqlName::new("notes_search".into()),
             },
         )
         .unwrap();
@@ -1125,7 +1124,7 @@ mod tests {
             &connection,
             drop_sql,
             &DropIndexSpec {
-                name: super::super::schema::SqlName::new("notes_tenant_slug_lookup".into()),
+                name: crate::logical::schema::SqlName::new("notes_tenant_slug_lookup".into()),
             },
         )
         .unwrap();
@@ -1167,7 +1166,7 @@ mod tests {
             &connection,
             drop_sql,
             &DropIndexSpec {
-                name: super::super::schema::SqlName::new("notes_tenant_slug".into()),
+                name: crate::logical::schema::SqlName::new("notes_tenant_slug".into()),
             },
         )
         .unwrap();

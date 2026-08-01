@@ -1,4 +1,4 @@
-//! SQLite-AST checks for the database's current public SQL surface.
+//! SQLite AST front end for the current public logical-operation compiler.
 
 use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
@@ -10,12 +10,24 @@ use sqlite3_parser::ast::{
 };
 use sqlite3_parser::lexer::sql::Parser;
 
-use super::schema::{
+use crate::logical::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
     DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode,
     TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
+
+pub(crate) fn is_sqlite_internal_table(table: &str) -> bool {
+    table
+        .get(.."sqlite_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
+}
+
+pub(crate) fn has_multilite_prefix(table: &str) -> bool {
+    table
+        .get(.."__multilite__".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__multilite__"))
+}
 
 #[derive(Clone)]
 pub enum ValidatedExecute {
@@ -103,10 +115,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             let table = identifier(&table.name)?;
             let new_name = identifier(&new_name)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-                || super::has_multilite_prefix(new_name.value())
-                || super::is_sqlite_internal_table(new_name.value())
+            if has_multilite_prefix(table.value())
+                || is_sqlite_internal_table(table.value())
+                || has_multilite_prefix(new_name.value())
+                || is_sqlite_internal_table(new_name.value())
             {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
@@ -131,9 +143,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             let table = identifier(&table.name)?;
             let old_name = identifier(&old)?;
             let new_name = identifier(&new)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -156,9 +166,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             let table = identifier(&table.name)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -233,9 +241,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             let table = identifier(&table.name)?;
             let column = identifier(&column)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -273,10 +279,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             let name = identifier(&idx_name.name)?;
             let table = identifier(&tbl_name)?;
-            if super::has_multilite_prefix(name.value())
-                || super::is_sqlite_internal_table(name.value())
-                || super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
+            if has_multilite_prefix(name.value())
+                || is_sqlite_internal_table(name.value())
+                || has_multilite_prefix(table.value())
+                || is_sqlite_internal_table(table.value())
             {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite names are not supported",
@@ -375,9 +381,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             let name = identifier(&idx_name.name)?;
-            if super::has_multilite_prefix(name.value())
-                || super::is_sqlite_internal_table(name.value())
-            {
+            if has_multilite_prefix(name.value()) || is_sqlite_internal_table(name.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite index names are not supported",
                 ));
@@ -407,9 +411,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             let table = identifier(&tbl_name.name)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -444,9 +446,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             let table = identifier(&tbl_name.name)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -492,9 +492,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             let table = identifier(&tbl_name.name)?;
-            if super::has_multilite_prefix(table.value())
-                || super::is_sqlite_internal_table(table.value())
-            {
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
                 return Err(Error::UnsupportedSql(
                     "reserved SQLite and Multilite table names are not supported",
                 ));
@@ -680,7 +678,7 @@ fn validate_index_hint(indexed: Option<&Indexed>) -> Result<()> {
         return Ok(());
     };
     let name = identifier(name)?;
-    if super::has_multilite_prefix(name.value()) || super::is_sqlite_internal_table(name.value()) {
+    if has_multilite_prefix(name.value()) || is_sqlite_internal_table(name.value()) {
         return Err(Error::UnsupportedSql(
             "reserved SQLite and Multilite index names are not supported",
         ));
@@ -794,7 +792,7 @@ fn expression_reads_reserved(expression: &Expr) -> bool {
 
 fn name_reads_reserved(name: &Name) -> bool {
     SqlName::from_sqlite_token(&name.0)
-        .map(|name| super::has_multilite_prefix(name.value()))
+        .map(|name| has_multilite_prefix(name.value()))
         // The parser should only produce valid SQLite identifier tokens. If a
         // future parser shape violates that contract, reject conservatively.
         .unwrap_or(true)
@@ -972,7 +970,7 @@ fn parse_one_command(sql: &str) -> Result<Cmd> {
 }
 
 fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<ValidatedExecute> {
-    if super::has_multilite_prefix(name.value()) {
+    if has_multilite_prefix(name.value()) {
         return Err(Error::UnsupportedSql(
             "reserved Multilite table names are not supported",
         ));
@@ -1642,7 +1640,7 @@ fn identifier(name: &Name) -> Result<SqlName> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::schema::Affinity;
+    use crate::logical::schema::Affinity;
 
     fn assert_unsupported(sql: &str) {
         assert!(
@@ -2353,22 +2351,22 @@ mod tests {
                 .map(|column| column.declared_type.strict_type())
                 .collect::<Vec<_>>(),
             [
-                Some(super::super::schema::StrictType::Integer),
-                Some(super::super::schema::StrictType::Integer),
-                Some(super::super::schema::StrictType::Integer),
-                Some(super::super::schema::StrictType::Real),
-                Some(super::super::schema::StrictType::Text),
-                Some(super::super::schema::StrictType::Blob),
-                Some(super::super::schema::StrictType::Any),
+                Some(crate::logical::schema::StrictType::Integer),
+                Some(crate::logical::schema::StrictType::Integer),
+                Some(crate::logical::schema::StrictType::Integer),
+                Some(crate::logical::schema::StrictType::Real),
+                Some(crate::logical::schema::StrictType::Text),
+                Some(crate::logical::schema::StrictType::Blob),
+                Some(crate::logical::schema::StrictType::Any),
             ]
         );
         assert_eq!(
             spec.columns[6].declared_type.affinity_for(spec.mode),
-            super::super::schema::Affinity::Blob
+            crate::logical::schema::Affinity::Blob
         );
         assert_eq!(
             TypeDeclaration::new("ANY".into(), Vec::new()).affinity_for(TableMode::Ordinary),
-            super::super::schema::Affinity::Numeric
+            crate::logical::schema::Affinity::Numeric
         );
     }
 

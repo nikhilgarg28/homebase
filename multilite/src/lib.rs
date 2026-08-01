@@ -4,13 +4,18 @@
 
 mod blocking;
 mod branch;
+mod catalog;
 mod commit;
 mod connection;
 mod database;
 mod error;
+mod logical;
 mod metastore;
+#[cfg(debug_assertions)]
+mod physical;
 mod rowid;
 mod runtime;
+mod sql;
 mod sqlite;
 mod value;
 

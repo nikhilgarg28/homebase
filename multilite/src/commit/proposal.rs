@@ -32,10 +32,10 @@ use crate::commit::footprint::ConflictFootprint;
 use crate::commit::history::{self, WriteRegion};
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::with_savepoint;
-use crate::database::isolation::IsolationLevel;
-use crate::database::operation::MultiliteOp;
-use crate::database::row::{CapturedRow, InsertRows};
-use crate::database::transaction::{CompiledTransaction, MultiliteTransaction};
+use crate::logical::isolation::IsolationLevel;
+use crate::logical::operation::MultiliteOp;
+use crate::logical::row::{CapturedRow, InsertRows};
+use crate::logical::transaction::{CompiledTransaction, MultiliteTransaction};
 use crate::{Error, Result};
 
 const PROPOSAL_FRAME_VERSION: u8 = 4;
@@ -1420,10 +1420,10 @@ mod tests {
     use crate::branch::changeset::ChangesetCapture;
     use crate::branch::snapshot::PinnedSnapshot;
     use crate::branch::{OverlayOptions, WritableBranch};
+    use crate::catalog;
     use crate::commit::history;
     use crate::commit::snapshot::CommitSeq;
-    use crate::database::catalog;
-    use crate::database::schema::{
+    use crate::logical::schema::{
         CreateColumn, CreateTable, CreateTableSpec, SqlName, TypeDeclaration,
     };
 
@@ -1445,7 +1445,7 @@ mod tests {
                 CreateTableSpec {
                     name: SqlName::new("notes".into()),
                     mode: Default::default(),
-                    storage: crate::database::schema::TableStorage::Rowid,
+                    storage: crate::logical::schema::TableStorage::Rowid,
                     columns: vec![
                         CreateColumn {
                             name: SqlName::new("id".into()),
@@ -1533,7 +1533,7 @@ mod tests {
                 CreateTableSpec {
                     name: SqlName::new(name.into()),
                     mode: Default::default(),
-                    storage: crate::database::schema::TableStorage::Rowid,
+                    storage: crate::logical::schema::TableStorage::Rowid,
                     columns: vec![CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),

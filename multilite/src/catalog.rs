@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::schema::{
+use crate::logical::schema::{
     ColumnId, CreateTable, ForeignKeyDefinition, NamedIndex, SqlName, TableId,
     validate_foreign_key_graph,
 };
@@ -779,7 +779,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::database::schema::{CreateColumn, CreateTableSpec, TypeDeclaration};
+    use crate::logical::schema::{CreateColumn, CreateTableSpec, TypeDeclaration};
 
     fn created() -> CreateTable {
         CreateTable::new(
@@ -787,7 +787,7 @@ mod tests {
             CreateTableSpec {
                 name: SqlName::new("Notes".into()),
                 mode: Default::default(),
-                storage: crate::database::schema::TableStorage::Rowid,
+                storage: crate::logical::schema::TableStorage::Rowid,
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),

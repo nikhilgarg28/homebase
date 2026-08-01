@@ -8,7 +8,6 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
-use super::catalog;
 use super::guard::{GuardPlan, RejectionKind, validate_compiled_output, validate_rejection};
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
@@ -16,6 +15,7 @@ use super::schema::CreateTable;
 #[cfg(test)]
 use super::schema::{CreateTableSpec, write_revision_key};
 use crate::Result;
+use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
 
 const OPERATION_FRAME_VERSION: u8 = 1;
@@ -309,12 +309,12 @@ impl MultiliteOp {
             Self::DeleteRows(deleted) => deleted.verify_materialized(connection),
             Self::UpdateRows(updated) => updated.verify_materialized(connection),
             Self::AlterTable(altered) => {
-                super::physical::verify_table(connection, altered.table_id())
+                crate::physical::verify_table(connection, altered.table_id())
             }
             Self::CreateTable(created) => {
-                super::physical::verify_table(connection, created.table_id())
+                crate::physical::verify_table(connection, created.table_id())
             }
-            Self::Index(index) => super::physical::verify_table(connection, index.table_id()),
+            Self::Index(index) => crate::physical::verify_table(connection, index.table_id()),
         }
     }
 }
@@ -346,15 +346,15 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::database::catalog;
-    use crate::database::row::{CapturedRow, DeleteRows, StoredValue, UpdateRows};
-    use crate::database::schema::{CreateColumn, SqlName, TypeDeclaration};
+    use crate::catalog;
+    use crate::logical::row::{CapturedRow, DeleteRows, StoredValue, UpdateRows};
+    use crate::logical::schema::{CreateColumn, SqlName, TypeDeclaration};
 
     fn table() -> CreateTableSpec {
         CreateTableSpec {
             name: SqlName::new("notes".into()),
             mode: Default::default(),
-            storage: crate::database::schema::TableStorage::Rowid,
+            storage: crate::logical::schema::TableStorage::Rowid,
             columns: vec![CreateColumn {
                 name: SqlName::new("id".into()),
                 declared_type: TypeDeclaration::integer(),
@@ -455,7 +455,7 @@ mod tests {
         let update_spec = CreateTableSpec {
             name: SqlName::new("updates".into()),
             mode: Default::default(),
-            storage: crate::database::schema::TableStorage::Rowid,
+            storage: crate::logical::schema::TableStorage::Rowid,
             columns: vec![
                 CreateColumn {
                     name: SqlName::new("id".into()),
@@ -521,8 +521,8 @@ mod tests {
         let source = Connection::open_in_memory().unwrap();
         catalog::initialize(&source).unwrap();
         let parent_sql = "CREATE TABLE parents (id INTEGER PRIMARY KEY)";
-        let crate::database::sql::ValidatedExecute::CreateTable(parent_spec) =
-            crate::database::sql::validate_execute(parent_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
         else {
             unreachable!()
         };
@@ -533,8 +533,8 @@ mod tests {
             id INTEGER PRIMARY KEY,
             parent_id INTEGER REFERENCES parents(id)
         )";
-        let crate::database::sql::ValidatedExecute::CreateTable(child_spec) =
-            crate::database::sql::validate_execute(child_sql).unwrap()
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
         else {
             unreachable!()
         };
