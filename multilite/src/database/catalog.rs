@@ -70,6 +70,11 @@ impl CatalogSnapshot {
         self.tables.get(&table.as_bytes())
     }
 
+    #[cfg(test)]
+    pub(super) fn tables(&self) -> impl Iterator<Item = &CreateTable> {
+        self.tables.values()
+    }
+
     pub fn table_id_by_name(&self, name: &str) -> Option<TableId> {
         let name = SqlName::new(name.to_owned());
         self.names

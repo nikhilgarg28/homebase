@@ -13,21 +13,69 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
-- Table rename now preserves all table-owned UUIDs and immutable DDL
-  definitions; physical SQLite SQL is rendered from current UUID-to-name
-  bindings when an operation is applied. Before adding column
-  rename/add/drop, define projection rules for old row frames, defaults and
-  generated values, retired columns, key-definition changes, and dependent
-  index/relationship evolution. Treat name-only changes as identity
-  preserving; mint a replacement table identity when primary-key identity
-  changes.
+- Keep synchronized uniqueness intentionally narrower than SQLite's complete
+  index grammar. Plain column tuples, with column order preserved, are the
+  durable product boundary
+  for primary and UNIQUE ownership unless Multilite can delegate exact key
+  images to SQLite itself. Do not grow a parallel evaluator for expression,
+  partial, custom-collation, or otherwise decorated UNIQUE indexes. Rich
+  non-UNIQUE indexes remain synchronized schema and physical access paths only.
 
-- Add a randomized, two-replica integrity-audit simulation. Generate parent
-  and child inserts, retargets, primary-key moves, and deletes; vary
-  push/pull/rebase/restart order; then require converged SQLite rows, a valid
-  schema relationship graph, an empty `PRAGMA foreign_key_check`, and exact
-  agreement between materialized rows and reverse-reference cells. Generalize
-  the resulting checker into a broader explicit database integrity audit.
+- Keep conflict clauses, `REPLACE`, UPSERT, triggers, and mutating foreign-key
+  actions outside the grammar until capture has one statement-delta compiler.
+  That compiler must normalize mixed and repeated preupdate events into one
+  deterministic ordered net effect, derive guards for every affected table,
+  materialize procedural effects exactly once, and produce an exact inverse.
+  Specify OCC behavior independently for each conflict mode before admitting it.
+
+- Make every durable operation encoder fallible and enforce one deterministic
+  capture budget across row count, row bytes, key components, operation bytes,
+  transaction bytes, DELETE repair, DROP COLUMN repair, and UNIQUE backfill.
+  Oversized statements must roll back atomically with stable typed errors.
+  Large values may later use chunked or sidecar storage, but must never reach an
+  allocation failure or `u32` conversion panic.
+
+- Column rename/add/drop now preserve stable table and column identities and
+  project old row frames through the folded catalog. DROP COLUMN still captures
+  every removed value in its replicated operation frame. Bound and canonically
+  order that capture immediately, then separate replicated logical DDL from the
+  originating replica's local repair payload. Consider withdrawing destructive
+  DDL until that protocol exists; an online/empty-submit barrier alone is not
+  sufficient because authority may still reject the operation.
+
+- A seeded two-replica integrity simulation now covers parent/child inserts,
+  retargets, primary-key moves, deletes, UNIQUE conflicts, mixed DDL/DML,
+  reordered pushes, rejection repair, and restarts under both isolation levels.
+  Every round requires converged schema and rows, valid catalog metadata, clean
+  `integrity_check`/`foreign_key_check`, and exact agreement between
+  materialized rows and live authority reverse-reference cells. Evolve this
+  scenario simulation into a proper deterministic simulation test with a
+  seeded scheduler; injected authority delay, loss, duplication, and partition;
+  injected VFS/disk short reads, short writes, I/O failures, and corruption; and
+  process/power-loss crash points around WAL, pending-journal, cursor, and
+  metadata transitions. Every seed must be reproducible through reopen and
+  recovery. Also broaden the audit across pull/rebase/restart boundaries,
+  relationship shapes, and multiple simultaneous foreign keys. The current
+  restart cases occur only between completed operations and are not crash
+  injection.
+
+- Formalize adoption as explicit per-table promotion, not automatic arbitrary-
+  file conversion. A future promotion operation may accept only schemas that
+  pass the same compiler, capture their rows under deterministic size limits,
+  and submit schema plus backfill atomically. Unsupported adopted tables remain
+  readable and unsynchronized until an explicit migration makes them eligible.
+
+- Preserve suffix-forfeit as the explicit rejection contract: never attempt to
+  rebase stale logical operations automatically. Before rollback discards an
+  offline suffix, provide a crash-safe archive/export of its logical
+  transactions. Make accepted-prefix retirement a direct indexed delete rather
+  than decoding the complete pending journal for every acknowledgement.
+
+- Design authenticated Homebase checkpoints before dense admission history
+  becomes the only bootstrap path. The trust object must bind one materialized
+  space state to an admission sequence and the existing device/space lineage so
+  a new replica can verify a checkpoint and replay only its dense suffix. This
+  is a Homebase protocol primitive, not a Multilite-specific SQLite snapshot.
 
 - Exact reverse-reference assertions, parent prefix range fences, and parent
   targets backed by primary or explicit UNIQUE indexes have landed. A
@@ -43,7 +91,9 @@ multilite
 - Foreign-writer tolerance after the SI Branch VFS is stable. The normal mode
   remains one cooperating Multilite committer per file. The WAL-derived map,
   cold-parse == incremental-parse invariant, and per-snapshot companion SQLite
-  reader pins have landed. Remaining work is to fence committer apply against an
+  reader pins have landed. Enforce process-level file ownership first unless
+  cooperating cross-process writers become an explicit near-term requirement.
+  Remaining work is to fence committer apply against an
   unexpected WAL tip while holding SQLite's real write lock, poison stale
   writable branches, and rebuild after salt rotation. Treat another Multilite
   writer as a retryable all-range conflict. Detect stock-SQLite commits with a

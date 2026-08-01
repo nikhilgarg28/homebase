@@ -33,6 +33,8 @@ use crate::commit::history;
 use crate::commit::proposal::CommitDisposition;
 use crate::commit::snapshot::SnapshotDescriptor;
 
+mod integrity;
+
 struct ThreadSpawner;
 
 impl Spawner for ThreadSpawner {

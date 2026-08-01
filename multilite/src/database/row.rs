@@ -2174,6 +2174,31 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+pub(super) fn expected_foreign_reference_cells(
+    connection: &Connection,
+) -> Result<BTreeMap<Key, Vec<u8>>> {
+    let catalog = CatalogSnapshot::load(connection)?;
+    let mut expected = BTreeMap::new();
+    for created in catalog.tables() {
+        let captured = capture_table(connection, created)?;
+        let Some(rows) = InsertRows::from_catalog(&catalog, &captured)? else {
+            continue;
+        };
+        let references = rows
+            .foreign_reference_map()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        for (key, owner) in references {
+            if expected.insert(key, owner).is_some() {
+                return Err(Error::CaptureInvariant(
+                    "materialized rows produce duplicate foreign-reference cells",
+                ));
+            }
+        }
+    }
+    Ok(expected)
+}
+
 fn row_prefix(
     table: TableId,
     primary_index: IndexId,
