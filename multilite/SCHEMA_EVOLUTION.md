@@ -75,6 +75,34 @@ Rejection performs the same operation in reverse after checking
 `TableId -> new_name`. Multiple speculative renames unwind in reverse manifest
 order.
 
+### ALTER TABLE RENAME COLUMN
+
+The operation resolves the source spelling once to a stable `ColumnId`, then
+moves its catalog binding. Rows, primary keys, UNIQUE ownership, foreign keys,
+CHECK dependencies, and index terms continue to refer to that identity. SQLite
+DDL is rendered against current bindings, and the folded catalog receives a new
+content-addressed structural revision so one revision UUID never denotes two
+encoded definitions.
+
+### ALTER TABLE ADD COLUMN
+
+SQLite's one-column ADD form is supported for declared types with optional
+NOT NULL, DEFAULT, and CHECK constraints. The operation mints a `ColumnId`,
+records its predecessor for ordered concurrent folding, and retains before and
+after structural definitions for deterministic apply and repair. Historical
+rows project a missing value through the admitted default or NULL rules. A
+column that changes valid row lowering advances the write contract; compatible
+additions use narrower schema and dependency cells.
+
+### ALTER TABLE DROP COLUMN
+
+DROP resolves and retires one `ColumnId`; identities are never reused. The
+compiler rejects active primary-key, index, CHECK, relationship, or referenced
+parent dependencies that make retirement unsafe. Materialized values are
+captured for rejection repair, so a non-final physical column can be restored
+at its original logical position. Historical row frames may retain the retired
+value because current-schema projection ignores inactive identities.
+
 ## Conflict Rules
 
 - Two renames of the same current table conflict through the old name cell.
@@ -90,31 +118,6 @@ order.
   promise strict real-time namespace consistency to an offline stale device.
 
 ## Future Grammar
-
-### Column Rename
-
-Column names can follow the same binding rule only after row apply, index
-rendering, CHECK/default/generated-expression handling, and foreign-key DDL all
-resolve `ColumnId` to current names. A column rename must not change storage or
-key images, but expressions that preserve identifier tokens require a structured
-AST renderer rather than string substitution.
-
-### ADD COLUMN
-
-Adding a nullable column or a column with a deterministic captured default may
-be compatible with older row frames if canonical apply projects a missing
-`ColumnId` according to the admitted schema operation. NOT NULL, generated
-columns, CHECK constraints, UNIQUE participation, and relationship participation
-can require write-contract advancement and backfill.
-
-### DROP COLUMN
-
-Dropped column identities must remain retired rather than reused. Old row frames
-may carry harmless extra values only if apply can prove that no active key,
-constraint, generated expression, or relationship consumes the column.
-Otherwise the write contract rejects them. Physical DROP needs a rejection
-strategy based on a shadow table or complete logical restoration, not inverse
-SQL alone.
 
 ### DROP TABLE
 

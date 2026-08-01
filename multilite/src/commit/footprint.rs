@@ -1,8 +1,6 @@
 //! Typed logical conflict footprints shared by local and authority validation.
 
 use std::collections::BTreeSet;
-#[cfg(test)]
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use homebase_core::key::Key;
 use homebase_core::messages::RangeAssert;
@@ -21,32 +19,6 @@ pub struct ConflictFootprint {
     writes: PrefixAntichain,
     constraints: PrefixAntichain,
     reads: PrefixAntichain,
-}
-
-/// Shared read-prefix sink for every statement in one managed update.
-///
-/// The vtable layer will clone this handle into prepared statements and record
-/// logical ranges as SQLite executes them. Keeping this read-only by type
-/// prevents statement execution from contributing mandatory write guards.
-#[derive(Clone, Debug, Default)]
-#[cfg(test)]
-pub struct ReadTrace {
-    footprint: Arc<Mutex<ConflictFootprint>>,
-}
-
-#[cfg(test)]
-impl ReadTrace {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record(&self, key: Key) {
-        lock(&self.footprint).add_read(key);
-    }
-
-    pub fn footprint(&self) -> ConflictFootprint {
-        lock(&self.footprint).clone()
-    }
 }
 
 impl ConflictFootprint {
@@ -176,13 +148,6 @@ pub(crate) fn assert_explicit_range_assertions(footprint: &ConflictFootprint, ex
             );
         }
     }
-}
-
-#[cfg(test)]
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Minimal component-prefix antichain used to emit conflict assertions.
@@ -328,18 +293,6 @@ mod tests {
         footprint.add_write(table.clone());
 
         assert_eq!(footprint.writes(), &BTreeSet::from([table]));
-    }
-
-    #[test]
-    fn cloned_read_traces_share_one_eagerly_pruned_antichain() {
-        let trace = ReadTrace::new();
-        let statement_trace = trace.clone();
-        let table = key(&[b"tables", b"one", b"rows"]);
-        statement_trace.record(key(&[b"tables", b"one", b"rows", b"7"]));
-        statement_trace.record(key(&[b"tables", b"one", b"rows", b"9"]));
-        statement_trace.record(table.clone());
-
-        assert_eq!(trace.footprint().reads(), &BTreeSet::from([table]));
     }
 
     #[test]

@@ -2,7 +2,10 @@
 
 Multi-writer SQLite with end-to-end encrypted sync, built on the homebase coordination kernel.
 
-**Not ready for production use.** APIs are unstable. This monorepo currently contains the Homebase kernel and reserved Multilite package shells; the SQL layer has not landed yet.
+**Not ready for production use.** APIs and durable formats are unstable. This
+monorepo contains the Homebase kernel and an executable Multilite SQL layer for
+a deliberately restricted SQLite grammar. See [`multilite/README.md`](./multilite/README.md)
+for the currently implemented surface and limitations.
 
 ## Layout
 
@@ -24,7 +27,8 @@ Multi-writer SQLite with end-to-end encrypted sync, built on the homebase coordi
 
 ## Current Multilite Surface
 
-The first executable layer is a small, rusqlite-shaped connection wrapper:
+Multilite exposes a rusqlite-shaped connection wrapper plus managed snapshot
+and update transactions:
 
 ```rust
 use multilite::MultiliteConnection;
@@ -37,8 +41,10 @@ let values = statement.query_map((), |row| row.get::<_, i64>(0))?;
 ```
 
 Prepared statements are read-only and query results are eagerly collected.
-Schema ownership, mutation capture, metadata, and synchronization land in the
-subsequent V1 batches.
+Managed updates execute native SQLite SQL on private branches, then send owned
+logical proposals through one canonical committer. The current grammar includes
+restricted table and index DDL plus INSERT, DELETE, and UPDATE. Homebase push,
+pull, rebase, and rejection repair are implemented for that surface.
 
 ## Publish (maintainers)
 

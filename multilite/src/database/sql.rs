@@ -7,8 +7,6 @@ use sqlite3_parser::ast::{
     OneSelect, Over, RefAct, RefArg, ResultColumn, Select, SelectTable, SortedColumn, Stmt,
     TabFlags, TableConstraint, Type, TypeSize, UnaryOperator, Window,
 };
-#[cfg(test)]
-use sqlite3_parser::ast::{As, Operator};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::schema::{
@@ -88,122 +86,6 @@ pub struct DropIndexSpec {
 pub enum ValidatedStatement {
     Read,
     Execute(Box<ValidatedExecute>),
-}
-
-/// Validate the initial transaction-read grammar and rewrite its sources.
-#[cfg(test)]
-pub fn rewrite_managed_read(
-    sql: &str,
-    mut resolve_source: impl FnMut(&str) -> Result<String>,
-) -> Result<Option<String>> {
-    let command = parse_one_command(sql)?;
-    let Cmd::Stmt(Stmt::Select(mut select)) = command else {
-        return Err(Error::UnsupportedSql(
-            "managed update queries accept only SELECT",
-        ));
-    };
-    if select.with.is_some() || select.body.compounds.is_some() {
-        return Err(unsupported_managed_read());
-    }
-    let OneSelect::Select {
-        columns,
-        from,
-        where_clause,
-        group_by,
-        having,
-        window_clause,
-        ..
-    } = &mut select.body.select
-    else {
-        return Err(unsupported_managed_read());
-    };
-    validate_result_columns(columns)?;
-    if group_by.is_some() || having.is_some() || window_clause.is_some() {
-        return Err(unsupported_managed_read());
-    }
-    if let Some(where_clause) = where_clause {
-        validate_read_expression(where_clause)?;
-    }
-    if let Some(order_by) = &select.order_by {
-        for column in order_by {
-            validate_read_expression(&column.expr)?;
-        }
-    }
-    if let Some(limit) = &select.limit {
-        validate_read_expression(&limit.expr)?;
-        if let Some(offset) = &limit.offset {
-            validate_read_expression(offset)?;
-        }
-    }
-
-    let Some(from) = from else {
-        return Ok(None);
-    };
-    if from.joins.is_some() {
-        return Err(unsupported_managed_read());
-    }
-    let Some(source) = from.select.as_deref_mut() else {
-        return Err(unsupported_managed_read());
-    };
-    let SelectTable::Table(name, alias, indexed) = source else {
-        return Err(unsupported_managed_read());
-    };
-    if name.db_name.is_some() || name.alias.is_some() || indexed.is_some() {
-        return Err(unsupported_managed_read());
-    }
-    let table = identifier(&name.name)?;
-    if super::is_schema_table(table.value()) {
-        return Ok(None);
-    }
-    if super::has_multilite_prefix(table.value()) {
-        return Err(Error::UnsupportedSql(
-            "reserved Multilite tables are not supported",
-        ));
-    }
-    if alias.is_none() {
-        *alias = Some(As::As(name.name.clone()));
-    }
-    name.name = Name(resolve_source(table.value())?.into());
-
-    Ok(Some(Cmd::Stmt(Stmt::Select(select)).to_string()))
-}
-
-#[cfg(test)]
-fn validate_result_columns(columns: &[ResultColumn]) -> Result<()> {
-    for column in columns {
-        match column {
-            ResultColumn::Star | ResultColumn::TableStar(_) => {}
-            ResultColumn::Expr(expression, _) => validate_read_expression(expression)?,
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn validate_read_expression(expression: &Expr) -> Result<()> {
-    match expression {
-        Expr::Id(_) | Expr::Name(_) | Expr::Qualified(_, _) | Expr::Variable(_) => Ok(()),
-        Expr::Literal(_) => Ok(()),
-        Expr::FunctionCallStar {
-            name,
-            filter_over: None,
-        } if name.0.eq_ignore_ascii_case("count") => Ok(()),
-        Expr::Binary(left, Operator::Equals | Operator::And, right) => {
-            validate_read_expression(left)?;
-            validate_read_expression(right)
-        }
-        Expr::Parenthesized(expressions) if expressions.len() == 1 => {
-            validate_read_expression(&expressions[0])
-        }
-        _ => Err(unsupported_managed_read()),
-    }
-}
-
-#[cfg(test)]
-fn unsupported_managed_read() -> Error {
-    Error::UnsupportedSql(
-        "managed update SELECT supports one table with simple equality predicates",
-    )
 }
 
 pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
@@ -2576,43 +2458,6 @@ mod tests {
             "INSERT INTO notes VALUES (1)",
         ] {
             validate_managed_statement(sql).unwrap();
-        }
-    }
-
-    #[test]
-    fn managed_reads_rewrite_one_source_and_leave_constant_selects_direct() {
-        let rewritten = rewrite_managed_read(
-            "SELECT count(*) FROM notes WHERE day = ?1 ORDER BY id",
-            |_| Ok("__multilite__source_test".into()),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(rewritten.contains("__multilite__source_test"));
-        assert!(rewritten.contains("notes"));
-        assert!(
-            rewrite_managed_read("SELECT 1", |_| unreachable!())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn managed_reads_reject_sources_outside_the_initial_sql_slice() {
-        for sql in [
-            "SELECT * FROM notes JOIN tasks USING (id)",
-            "SELECT * FROM (SELECT * FROM notes)",
-            "SELECT * FROM notes WHERE id = 1 OR id = 2",
-            "SELECT EXISTS(SELECT 1 FROM notes)",
-            "WITH values AS (SELECT 1) SELECT * FROM values",
-            "SELECT * FROM __multilite__vtab",
-        ] {
-            assert!(
-                matches!(
-                    rewrite_managed_read(sql, |_| Ok("__multilite__source_test".into())),
-                    Err(Error::UnsupportedSql(_))
-                ),
-                "managed read was accepted: {sql}"
-            );
         }
     }
 }

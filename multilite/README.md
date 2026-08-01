@@ -3,6 +3,9 @@
 Rust library for multi-writer SQLite with end-to-end encrypted sync, built on
 the Homebase coordination kernel.
 
+The accepted SQL surface and the completion gate for future grammar are tracked
+in [`SQL_GRAMMAR.md`](./SQL_GRAMMAR.md).
+
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits a restricted persistent
@@ -161,14 +164,13 @@ arrive within each typed set. The final planner merges the selected antichains,
 prunes cross-category overlap, and binds every range assertion to the
 transaction's authority frontier. Snapshot isolation always includes writes
 and mandatory constraints and executes reads directly against SQLite.
-Serializable isolation also includes traced application reads. Its currently
-supported single-table reads run through a transaction-local virtual-table
-facade: full scans and non-primary predicates conservatively trace the table's
-active primary index, while primary-key equality traces one exact row key. The
-facade is refreshed before each execution, so a reusable prepared statement
-sees earlier writes in the same managed update without querying SQLite
-recursively from a vtable callback. Broader joins, subqueries, and index-prefix
-reads remain future precision work and do not block snapshot updates.
+Serializable isolation also includes traced application reads. Production
+tracking currently uses SQLite's authorizer to resolve every application table
+read to its stable table UUID and records that table's complete Homebase root.
+This deliberately coarse prefix covers joins, subqueries, trigger reads, and
+write predicates without changing native SQLite execution. Exact primary-key
+and index-prefix tracing remain future precision work; unsupported precision
+always widens to the table root rather than omitting a dependency.
 
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an

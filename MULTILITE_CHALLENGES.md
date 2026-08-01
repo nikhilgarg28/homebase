@@ -1,5 +1,12 @@
 # multilite — vtable architecture: design sketch + challenge inventory
 
+> **Historical design record.** This document predates the native Branch VFS
+> execution model and is not a statement of current behavior. Production
+> Multilite executes reads and writes natively, uses authorizer-based coarse
+> serializable read tracking, and does not ship the virtual-table facade
+> explored below. See [`DESIGN.md`](./DESIGN.md) and
+> [`multilite/README.md`](./multilite/README.md) for the current architecture.
+
 *Working document · July 2026 · Companion to [DESIGN.md](./DESIGN.md) (single-file doctrine,
 witness compiler, launch claims) and the admission/rollback v2 kernel plan.*
 

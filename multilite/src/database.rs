@@ -19,8 +19,6 @@ mod store;
 pub(crate) mod transaction;
 mod update;
 mod view;
-#[cfg(test)]
-mod vtab;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
