@@ -1,5 +1,6 @@
 //! Runtime-neutral bounded execution for filesystem and SQLite work.
 
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::OnceLock;
 
@@ -18,6 +19,10 @@ struct BlockingPool {
     outbox: Sender<Job>,
 }
 
+thread_local! {
+    static ON_BLOCKING_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
 static POOL: OnceLock<std::result::Result<BlockingPool, String>> = OnceLock::new();
 
 /// Run one owned blocking operation without occupying the caller's executor.
@@ -29,6 +34,19 @@ where
     T: Send + 'static,
 {
     let pool = pool()?;
+    run_on(pool, operation).await
+}
+
+async fn run_on<T>(
+    pool: BlockingPool,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    if ON_BLOCKING_WORKER.get() {
+        return operation();
+    }
     let (reply, response) = oneshot::channel();
     pool.outbox
         .send(Box::new(move || {
@@ -52,11 +70,15 @@ fn pool() -> Result<BlockingPool> {
 
 impl BlockingPool {
     fn start() -> std::result::Result<Self, String> {
-        let (outbox, inbox) = async_channel::bounded(INBOX_CAPACITY);
         let workers = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
             .clamp(1, MAX_WORKERS);
+        Self::start_with_workers(workers)
+    }
+
+    fn start_with_workers(workers: usize) -> std::result::Result<Self, String> {
+        let (outbox, inbox) = async_channel::bounded(INBOX_CAPACITY);
         for index in 0..workers {
             let inbox = inbox.clone();
             std::thread::Builder::new()
@@ -69,6 +91,7 @@ impl BlockingPool {
 }
 
 fn worker(inbox: Receiver<Job>) {
+    ON_BLOCKING_WORKER.set(true);
     while let Ok(job) = inbox.recv_blocking() {
         job();
     }
@@ -81,7 +104,7 @@ fn unavailable() -> Error {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -126,5 +149,43 @@ mod tests {
             .is_err()
         );
         assert_eq!(pollster::block_on(run(|| Ok(7))).unwrap(), 7);
+    }
+
+    #[test]
+    fn saturated_workers_execute_nested_jobs_inline() {
+        const WORKERS: usize = 4;
+
+        let pool = BlockingPool::start_with_workers(WORKERS).unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let (finished, completions) = mpsc::channel();
+        let mut callers = Vec::new();
+        for value in 0..WORKERS {
+            let pool = pool.clone();
+            let nested_pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            let finished = finished.clone();
+            callers.push(std::thread::spawn(move || {
+                let result = pollster::block_on(run_on(pool, move || {
+                    barrier.wait();
+                    pollster::block_on(run_on(nested_pool, move || Ok(value)))
+                }));
+                finished.send(result).unwrap();
+            }));
+        }
+        drop(finished);
+
+        let mut values = (0..WORKERS)
+            .map(|_| {
+                completions
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("nested blocking work deadlocked")
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, (0..WORKERS).collect::<Vec<_>>());
+        for caller in callers {
+            caller.join().unwrap();
+        }
     }
 }
