@@ -344,6 +344,32 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     ),
 ];
 
+/// Guards that every operation in a family must emit at least once.
+///
+/// Exact guards coupled to individual mutations are checked separately by
+/// [`validate_compiled_output`]. These requirements cover dependencies which
+/// have no one-to-one mutation, such as a row operation's active key contract.
+pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
+    contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateTable, Write, WriteContract, WriteRevision),
+    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
+    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
+    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(CreateIndex, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(DropIndex, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(DropIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(RenameTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
+];
+
 /// One unpruned, reviewable conflict dependency emitted by the compiler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Guard {
@@ -506,6 +532,121 @@ pub fn validate_mutations(
     Ok(())
 }
 
+/// Reject compiler output that omits a mandatory operation or mutation guard.
+pub fn validate_compiled_output(
+    operation: OperationFamily,
+    mutations: &[Mutation],
+    guards: &GuardPlan,
+) -> MultiliteResult<()> {
+    validate_mutations(operation, mutations)?;
+    if guards.operation != Some(operation) {
+        return Err(Error::CaptureInvariant(
+            "compiled guard plan has the wrong operation family",
+        ));
+    }
+
+    for required in REQUIRED_GUARD_CONTRACTS
+        .iter()
+        .filter(|required| required.operation == operation)
+    {
+        if !guards.entries.iter().any(|guard| {
+            guard.class == required.class
+                && guard.reason == required.reason
+                && guard.family == required.target
+        }) {
+            return Err(Error::CaptureInvariant(
+                "compiler omitted a required operation guard",
+            ));
+        }
+    }
+
+    for mutation in mutations {
+        let (kind, key) = mutation_kind_and_key(mutation)?;
+        let family = TargetFamily::classify(key).ok_or(Error::CaptureInvariant(
+            "mutation target is outside the logical target registry",
+        ))?;
+        for (class, reason) in mutation_guard_requirements(operation, kind, family) {
+            if !guards.entries.iter().any(|guard| {
+                guard.target == *key && guard.class == *class && guard.reason == *reason
+            }) {
+                return Err(Error::CaptureInvariant(
+                    "compiler omitted a guard required by a mutation",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mutation_kind_and_key(mutation: &Mutation) -> MultiliteResult<(MutationKind, &Key)> {
+    match mutation {
+        Mutation::Set { key, .. } => Ok((MutationKind::Set, key)),
+        Mutation::Delete { key } => Ok((MutationKind::Delete, key)),
+        Mutation::DeleteRange {
+            range: Range::Prefix(prefix),
+        } => Ok((MutationKind::DeletePrefix, prefix)),
+        Mutation::DeleteRange { range: Range::Full } => Err(Error::CaptureInvariant(
+            "Multilite operations cannot delete the full Homebase keyspace",
+        )),
+    }
+}
+
+fn mutation_guard_requirements(
+    operation: OperationFamily,
+    kind: MutationKind,
+    family: TargetFamily,
+) -> &'static [(GuardClass, GuardReason)] {
+    use GuardClass::{Invariant, Write};
+    use GuardReason::{
+        ColumnDependency, ColumnNameBinding, ForeignChildren, ForeignReference, RowIdentity,
+        SchemaObjectName, SchemaRevision, UniqueOwnership, WriteContract,
+    };
+    use MutationKind::{Delete, DeletePrefix, Set};
+    use OperationFamily::{
+        AddColumn, CreateIndex, CreateTable, DeleteRows, DropColumn, DropIndex, InsertRows,
+        RenameColumn, RenameTable, UpdateRows,
+    };
+    use TargetFamily::{
+        ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
+        ForeignReference as ForeignReferenceTarget, Row,
+        SchemaObjectName as SchemaObjectNameTarget, UniqueOwner, WriteRevision,
+    };
+
+    match (operation, kind, family) {
+        (CreateTable, Set, SchemaObjectNameTarget)
+        | (RenameTable, Set | Delete, SchemaObjectNameTarget)
+        | (CreateIndex, Set, SchemaObjectNameTarget)
+        | (DropIndex, Delete, SchemaObjectNameTarget) => &[(Invariant, SchemaObjectName)],
+        (RenameColumn, Set | Delete, ColumnName)
+        | (AddColumn, Set, ColumnName)
+        | (DropColumn, Delete, ColumnName) => &[(Invariant, ColumnNameBinding)],
+        (CreateIndex | DropIndex, Set, ActiveSchemaRevision) => {
+            &[(Invariant, SchemaRevision), (Write, SchemaRevision)]
+        }
+        (CreateTable | CreateIndex | AddColumn, Set, WriteRevision) => &[(Write, WriteContract)],
+        (CreateIndex | AddColumn, Set, ColumnDependencyTarget)
+        | (DropIndex | DropColumn, Delete | DeletePrefix, ColumnDependencyTarget) => {
+            &[(Invariant, ColumnDependency), (Write, ColumnDependency)]
+        }
+        (InsertRows, Set, Row) | (UpdateRows, Set, Row) => {
+            &[(Invariant, RowIdentity), (Write, RowIdentity)]
+        }
+        (DeleteRows | UpdateRows, Delete, Row) => &[(Write, RowIdentity)],
+        (InsertRows | UpdateRows, Set, UniqueOwner) => {
+            &[(Invariant, UniqueOwnership), (Write, UniqueOwnership)]
+        }
+        (DeleteRows | UpdateRows, Delete, UniqueOwner) => &[(Write, UniqueOwnership)],
+        (InsertRows | UpdateRows, Set, ForeignReferenceTarget) => {
+            &[(Invariant, ForeignReference), (Write, ForeignReference)]
+        }
+        (DeleteRows | UpdateRows, Delete, ForeignReferenceTarget) => &[(Write, ForeignReference)],
+        (DeleteRows | UpdateRows, DeletePrefix, ForeignReferenceTarget) => {
+            &[(Invariant, ForeignChildren), (Write, ForeignChildren)]
+        }
+        _ => &[],
+    }
+}
+
 /// Reject an inverse that does not match its operation's declared repair.
 pub fn validate_rejection(
     operation: OperationFamily,
@@ -570,6 +711,21 @@ fn audit_markdown() -> String {
             audit,
             "| `{:?}` | `{:?}` |",
             contract.operation, contract.rejection
+        )
+        .unwrap();
+    }
+    audit.push_str(
+        "\n## Required Guards\n\n\
+         These family-level guards must occur at least once. In addition, the compiler requires \
+         exact guards for every mutation whose safety depends on its rendered target.\n\n\
+         | Operation | Class | Reason | Target family |\n\
+         | --- | --- | --- | --- |\n",
+    );
+    for contract in REQUIRED_GUARD_CONTRACTS {
+        writeln!(
+            audit,
+            "| `{:?}` | `{:?}` | `{:?}` | `{:?}` |",
+            contract.operation, contract.class, contract.reason, contract.target
         )
         .unwrap();
     }
@@ -1068,6 +1224,56 @@ mod tests {
     }
 
     #[test]
+    fn compiled_output_rejects_missing_global_and_exact_mutation_guards() {
+        let table = id(1, TableId::from_bytes);
+        let index = id(2, IndexId::from_bytes);
+        let row = LogicalTarget::Row {
+            table,
+            index,
+            images: vec![b"row".to_vec()],
+        }
+        .render()
+        .unwrap();
+        let mutations = [Mutation::Set {
+            key: row.clone(),
+            value: Vec::new(),
+        }];
+        let mut guards = GuardPlan::for_operation(OperationFamily::InsertRows);
+
+        assert!(matches!(
+            validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards),
+            Err(Error::CaptureInvariant(
+                "compiler omitted a required operation guard"
+            ))
+        ));
+
+        guards
+            .invariant(
+                LogicalTarget::ActivePrimaryIndex { table }
+                    .render()
+                    .unwrap(),
+                GuardReason::PrimaryIndex,
+            )
+            .unwrap();
+        guards
+            .invariant(
+                LogicalTarget::WriteRevision { table }.render().unwrap(),
+                GuardReason::WriteContract,
+            )
+            .unwrap();
+        guards.write(row.clone(), GuardReason::RowIdentity).unwrap();
+        assert!(matches!(
+            validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards),
+            Err(Error::CaptureInvariant(
+                "compiler omitted a guard required by a mutation"
+            ))
+        ));
+
+        guards.invariant(row, GuardReason::RowIdentity).unwrap();
+        validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards).unwrap();
+    }
+
+    #[test]
     fn central_contract_tables_are_duplicate_free_and_cover_every_operation() {
         use std::collections::BTreeSet;
 
@@ -1088,6 +1294,11 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(guards.len(), GUARD_CONTRACTS.len());
+        assert!(
+            REQUIRED_GUARD_CONTRACTS
+                .iter()
+                .all(|required| { GUARD_CONTRACTS.iter().any(|allowed| allowed == required) })
+        );
         let rejections = REJECTION_CONTRACTS
             .iter()
             .map(|contract| (contract.operation, contract.rejection))

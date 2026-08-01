@@ -13,14 +13,16 @@ use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
+use super::catalog;
 use super::catalog::CatalogSnapshot;
+#[cfg(test)]
+use super::codes;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
     NamedIndex, SchemaRevisionId, SqlName, StrictType, TableId, TableMode, TableStorage,
     active_primary_index_key, write_revision_key,
 };
-use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::sqlite::quote_identifier;
 pub(crate) use crate::value::StoredValue;
@@ -1535,8 +1537,8 @@ impl UpdateRows {
         for (before, after) in &keys {
             guards.write(before.clone(), GuardReason::RowIdentity)?;
             guards.write(after.clone(), GuardReason::RowIdentity)?;
+            guards.invariant(after.clone(), GuardReason::RowIdentity)?;
             if before != after {
-                guards.invariant(after.clone(), GuardReason::RowIdentity)?;
                 mutations.push(Mutation::Delete {
                     key: before.clone(),
                 });
@@ -1579,9 +1581,7 @@ impl UpdateRows {
         for (key, owner) in &after_unique {
             if before_unique.get(key) != Some(owner) {
                 guards.write(key.clone(), GuardReason::UniqueOwnership)?;
-                if is_unique_entry_key(key) {
-                    guards.invariant(key.clone(), GuardReason::UniqueOwnership)?;
-                }
+                guards.invariant(key.clone(), GuardReason::UniqueOwnership)?;
                 mutations.push(Mutation::Set {
                     key: key.clone(),
                     value: owner.clone(),
@@ -2225,12 +2225,6 @@ fn unique_prefix(
     }
     .render()
     .map_err(RowCodecError::InvalidKey)
-}
-
-fn is_unique_entry_key(key: &Key) -> bool {
-    key.components()
-        .get(3)
-        .is_some_and(|component| component.as_bytes() == codes::UNIQUE)
 }
 
 fn foreign_reference_prefix(
@@ -4189,12 +4183,14 @@ mod tests {
                 .all(|mutation| matches!(mutation, Mutation::Set { .. }))
         );
         assert_eq!(lowered.footprint.writes().len(), 2);
-        assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 4);
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
                 active_primary_index_key(created.table_id()),
                 write_revision_key(created.table_id()),
+                updated.before.row_key(&updated.before.rows[0]).unwrap(),
+                updated.before.row_key(&updated.before.rows[1]).unwrap(),
             ],
         );
 

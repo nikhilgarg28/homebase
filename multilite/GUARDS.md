@@ -133,3 +133,28 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameColumn` | `RevertAlterTable` |
 | `AddColumn` | `RevertAlterTable` |
 | `DropColumn` | `RevertAlterTable` |
+
+## Required Guards
+
+These family-level guards must occur at least once. In addition, the compiler requires exact guards for every mutation whose safety depends on its rendered target.
+
+| Operation | Class | Reason | Target family |
+| --- | --- | --- | --- |
+| `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
+| `InsertRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
+| `InsertRows` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `DeleteRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
+| `DeleteRows` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `UpdateRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
+| `UpdateRows` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `CreateIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `CreateIndex` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `CreateIndex` | `Write` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `DropIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `DropIndex` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `DropIndex` | `Write` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `RenameTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `DropColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |

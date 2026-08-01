@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
 use super::catalog;
-use super::guard::{GuardPlan, RejectionKind, validate_mutations, validate_rejection};
+use super::guard::{GuardPlan, RejectionKind, validate_compiled_output, validate_rejection};
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::CreateTable;
@@ -269,12 +269,15 @@ impl MultiliteOp {
                 (mutations, footprint, guards)
             }
         };
-        validate_mutations(
-            guards.operation().ok_or(crate::Error::CaptureInvariant(
-                "operation lowering produced an unscoped guard plan",
-            ))?,
-            &mutations,
-        )?;
+        let operation = guards.operation().ok_or(crate::Error::CaptureInvariant(
+            "operation lowering produced an unscoped guard plan",
+        ))?;
+        validate_compiled_output(operation, &mutations, &guards)?;
+        if footprint != guards.footprint() {
+            return Err(crate::Error::CaptureInvariant(
+                "operation footprint contradicts its guard plan",
+            ));
+        }
         Ok(HomebaseOp {
             mutations,
             footprint,
