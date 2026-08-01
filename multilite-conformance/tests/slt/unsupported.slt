@@ -1,0 +1,5 @@
+statement ok
+CREATE TABLE notes (id INTEGER PRIMARY KEY)
+
+statement ok
+DROP TABLE notes

@@ -1826,8 +1826,10 @@ dependencies = [
 name = "multilite-conformance"
 version = "0.0.1"
 dependencies = [
+ "fallible-iterator",
  "multilite",
  "rusqlite",
+ "sqlite3-parser",
  "sqllogictest",
  "tempfile",
 ]

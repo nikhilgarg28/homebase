@@ -1,0 +1,1589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homebase / Multilite Atlas</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --bg2: #151a22;
+    --card: #1b2230;
+    --card-hi: #232d40;
+    --line: #2a3447;
+    --text: #d7dee9;
+    --muted: #8a97ab;
+    --accent: #5aa9ff;
+    --accent2: #9d7bff;
+    --ok: #43c77c;
+    --warn: #e3b341;
+    --bad: #f0655a;
+    --info: #5aa9ff;
+    --fence: #9d7bff;
+    --never: #566072;
+    --radius: 10px;
+    font-size: 15px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 50; background: rgba(14,17,22,.92);
+    backdrop-filter: blur(8px); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 24px; padding: 10px 22px;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  nav { display: flex; gap: 4px; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--muted); font-size: 14px;
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font-weight: 550;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active { background: var(--card); color: var(--text); border-color: var(--line); }
+  .stamp { margin-left: auto; color: var(--muted); font-size: 12.5px; }
+
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ============ SYSTEM VIEW ============ */
+  #view-system { display: none; }
+  #view-system.active { display: flex; align-items: flex-start; }
+  #flow-rail {
+    width: 250px; flex: 0 0 250px; padding: 16px 12px 16px 18px; position: sticky; top: 54px;
+    max-height: calc(100vh - 54px); overflow-y: auto;
+  }
+  #flow-rail h3, #drawer h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); margin: 18px 0 8px; }
+  #flow-rail h3:first-child { margin-top: 0; }
+  .flow-btn {
+    display: block; width: 100%; text-align: left; background: var(--bg2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; margin-bottom: 6px;
+    cursor: pointer; font-size: 13.5px; line-height: 1.3;
+  }
+  .flow-btn small { color: var(--muted); display: block; font-size: 11.5px; margin-top: 2px; }
+  .flow-btn:hover { border-color: var(--accent); }
+  .flow-btn.active { border-color: var(--accent); background: #17273c; }
+  #flow-steps { margin-top: 10px; }
+  .flow-step { display: flex; gap: 9px; padding: 7px 8px; border-radius: 7px; cursor: default;
+    font-size: 12.8px; line-height: 1.45; color: var(--text); }
+  .flow-step:hover { background: var(--card); }
+  .flow-step b.n { flex: 0 0 20px; height: 20px; border-radius: 50%; background: var(--accent);
+    color: #08111f; font-size: 11.5px; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+  .flow-step .who { color: var(--accent); font-weight: 600; }
+  .rail-note { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 6px 2px; }
+  .rail-toggle { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted);
+    margin: 4px 2px 10px; cursor: pointer; user-select: none; }
+
+  #map-wrap { flex: 1 1 auto; min-width: 0; padding: 18px 8px 60px 8px; position: relative; }
+  #map { position: relative; }
+  #edge-svg { position: absolute; inset: 0; pointer-events: none; z-index: 5; overflow: visible; }
+  .layer {
+    border: 1px solid var(--line); border-radius: 14px; margin-bottom: 14px;
+    background: linear-gradient(180deg, var(--bg2), rgba(21,26,34,.6));
+    padding: 10px 14px 12px;
+  }
+  .layer > .lhead { display: flex; align-items: baseline; gap: 12px; margin: 2px 2px 9px; }
+  .layer > .lhead .lname { font-weight: 700; font-size: 14px; letter-spacing: .3px; }
+  .layer > .lhead .lblurb { color: var(--muted); font-size: 12px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 8px; }
+  .subband { border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 9px; }
+  .subband:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
+  .subband .sbname { font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--muted); margin: 0 2px 7px; }
+  .comp {
+    position: relative; z-index: 6;
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 8px 12px 9px; cursor: pointer; min-width: 130px; max-width: 220px;
+    transition: border-color .12s, transform .12s, opacity .2s;
+  }
+  .comp:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .comp.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--card-hi); }
+  .comp.dimmed { opacity: .22; }
+  .comp .cname { font-size: 13.5px; font-weight: 620; line-height: 1.25; }
+  .comp .cfiles { font-size: 10.5px; color: var(--muted); margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+  .dots { position: absolute; top: -5px; right: -4px; display: flex; gap: 3px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--bg2); }
+  .dot.high { background: var(--bad); } .dot.med { background: var(--warn); }
+  .dot.low { background: #d8d26a; } .dot.info { background: var(--info); }
+  .stepnum {
+    position: absolute; top: -9px; left: -9px; z-index: 7; width: 21px; height: 21px; border-radius: 50%;
+    background: var(--accent); color: #08111f; font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; border: 2px solid var(--bg);
+  }
+
+  #drawer {
+    width: 380px; flex: 0 0 380px; border-left: 1px solid var(--line); padding: 18px 20px 40px;
+    position: sticky; top: 54px; max-height: calc(100vh - 54px); overflow-y: auto; background: var(--bg2);
+    display: none;
+  }
+  #drawer.open { display: block; }
+  #drawer .dclose { float: right; background: none; border: none; color: var(--muted); font-size: 19px; cursor: pointer; }
+  #drawer h2 { margin: 0 0 2px; font-size: 18px; }
+  #drawer .dlayer { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+  #drawer .dfiles { font-size: 12px; color: var(--accent); font-family: ui-monospace, Menlo, monospace;
+    margin-bottom: 12px; line-height: 1.6; word-break: break-all; }
+  #drawer p.dsummary { font-size: 13.8px; line-height: 1.55; margin: 0 0 6px; }
+  #drawer ul { margin: 4px 0 0; padding-left: 18px; }
+  #drawer li { font-size: 13.2px; line-height: 1.5; margin-bottom: 6px; }
+  .sev { display: inline-block; font-size: 10px; font-weight: 700; padding: 1.5px 7px; border-radius: 20px;
+    margin-right: 6px; vertical-align: 1px; letter-spacing: .04em; }
+  .sev.high { background: #4a201d; color: #ff9a91; } .sev.med { background: #453718; color: #ffd479; }
+  .sev.low { background: #3f3d1d; color: #e8e08a; } .sev.info { background: #17324e; color: #8ec5ff; }
+  .known { color: var(--muted); font-size: 11.5px; font-style: italic; }
+  .linklike { color: var(--accent); cursor: pointer; }
+  .linklike:hover { text-decoration: underline; }
+  .conn-row { display: flex; gap: 7px; font-size: 12.8px; margin-bottom: 5px; align-items: baseline; }
+  .conn-row .dir { color: var(--muted); flex: 0 0 28px; font-size: 11px; }
+  details.snip { margin-bottom: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+  details.snip summary { cursor: pointer; padding: 7px 11px; font-size: 12.6px; font-weight: 600; color: var(--accent);
+    list-style: none; display: flex; justify-content: space-between; gap: 8px; }
+  details.snip summary::after { content: "+"; color: var(--muted); font-weight: 400; }
+  details.snip[open] summary::after { content: "\2212"; }
+  details.snip summary small { color: var(--muted); font-weight: 400; font-family: ui-monospace, Menlo, monospace;
+    font-size: 10.5px; align-self: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  details.snip pre { margin: 0; padding: 10px 12px; overflow-x: auto; border-top: 1px solid var(--line);
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.3px; line-height: 1.5; color: #c7d3e3;
+    tab-size: 4; }
+  details.snip pre .cm { color: #6b7a91; }
+
+  /* ============ GRAMMAR VIEW ============ */
+  #view-grammar { max-width: 1100px; margin: 0 auto; padding: 26px 24px 80px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 4px 0 22px; font-size: 12.5px; color: var(--muted); }
+  .legend .key { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+  .gfam { border: 1px solid var(--line); border-radius: 12px; background: var(--bg2); padding: 14px 18px; margin-bottom: 14px; }
+  .gfam .ghead { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+  .gfam .ghead h3 { margin: 0; font-size: 15px; flex: 0 0 auto; }
+  .gbar { flex: 1 1 auto; height: 9px; border-radius: 6px; overflow: hidden; display: flex; background: var(--card); }
+  .gbar div { height: 100%; }
+  .gstat { flex: 0 0 auto; color: var(--muted); font-size: 12px; min-width: 90px; text-align: right; }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip { font-size: 12.5px; padding: 4.5px 11px; border-radius: 20px; cursor: pointer;
+    border: 1px solid transparent; user-select: none; }
+  .chip:hover { filter: brightness(1.25); }
+  .chip.s-supported { background: #173425; color: #7fe0a7; }
+  .chip.s-partial   { background: #3a2f14; color: #ffd479; }
+  .chip.s-fenced    { background: #2c2347; color: #c4aaff; }
+  .chip.s-future    { background: #172a3e; color: #8ec5ff; }
+  .chip.s-never     { background: #232936; color: #7f8ba0; text-decoration: line-through; }
+  .gnote { border-left: 3px solid var(--line); background: var(--card); border-radius: 0 8px 8px 0;
+    margin: 10px 0 4px; padding: 9px 13px; font-size: 13px; line-height: 1.5; color: var(--text); display: none; }
+  .gnote b { color: var(--accent); }
+  .gintro { color: var(--muted); font-size: 13.5px; line-height: 1.6; max-width: 850px; margin-bottom: 8px; }
+
+  /* ============ ROADMAP VIEW ============ */
+  #view-roadmap { max-width: 1280px; margin: 0 auto; padding: 24px 24px 80px; }
+  .rm-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 18px; }
+  .rm-controls select, .rm-controls input {
+    background: var(--bg2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+  .rm-controls input { width: 210px; }
+  .fchip { font-size: 12px; padding: 4px 11px; border-radius: 18px; cursor: pointer; user-select: none;
+    border: 1px solid var(--line); background: var(--bg2); color: var(--muted); }
+  .fchip.on { color: #08111f; font-weight: 650; }
+  .board { display: flex; gap: 14px; align-items: flex-start; overflow-x: auto; padding-bottom: 20px; }
+  .col { flex: 0 0 300px; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 10px 12px; }
+  .col h4 { margin: 2px 4px 10px; font-size: 13px; display: flex; justify-content: space-between; }
+  .col h4 span { color: var(--muted); font-weight: 400; }
+  .rmcard { background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+    padding: 9px 11px; margin-bottom: 8px; cursor: pointer; }
+  .rmcard:hover { border-color: var(--accent); }
+  .rmcard .rt { font-size: 13.2px; font-weight: 600; line-height: 1.35; }
+  .rmcard .rd { font-size: 12.4px; color: var(--muted); line-height: 1.5; margin-top: 6px; display: none; }
+  .rmcard.open .rd { display: block; }
+  .rmtags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .tag { font-size: 10px; padding: 1.5px 7px; border-radius: 12px; letter-spacing: .03em; font-weight: 600; }
+  .t-correctness { background: #442020; color: #ff9a91; } .t-performance { background: #164033; color: #7fe0a7; }
+  .t-security { background: #3c2c10; color: #ffce6b; } .t-deployment { background: #17324e; color: #8ec5ff; }
+  .t-ecosystem { background: #3a234f; color: #d4aaff; } .t-protocol { background: #123c40; color: #7adfe6; }
+  .tag.lay { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+  .tag.hz { background: none; border: 1px dashed var(--line); color: var(--muted); }
+  #heat { border-collapse: collapse; margin-top: 6px; }
+  #heat th, #heat td { border: 1px solid var(--line); padding: 8px 14px; font-size: 13px; text-align: center; }
+  #heat th { color: var(--muted); font-weight: 600; background: var(--bg2); }
+  #heat td.hot { cursor: pointer; }
+  .rm-note { color: var(--muted); font-size: 12.5px; margin: 4px 0 14px; max-width: 900px; line-height: 1.55; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Homebase / Multilite <span>Atlas</span></h1>
+  <nav>
+    <button data-view="system" class="active">System &amp; Flows</button>
+    <button data-view="grammar">SQL Grammar</button>
+    <button data-view="roadmap">Roadmap</button>
+  </nav>
+  <div class="stamp">curated snapshot &middot; Aug 1, 2026 &middot; main @ 8212653</div>
+</header>
+
+<!-- ==================== SYSTEM ==================== -->
+<div id="view-system" class="view active">
+  <aside id="flow-rail">
+    <h3>Behavior flows</h3>
+    <div class="rail-note">Select a flow to trace one story through the system. Everything else dims; steps are numbered on the map.</div>
+    <div id="flow-btns"></div>
+    <label class="rail-toggle"><input type="checkbox" id="all-edges"> show all connections</label>
+    <div id="flow-steps"></div>
+  </aside>
+  <div id="map-wrap">
+    <div id="map"><svg id="edge-svg"></svg></div>
+  </div>
+  <aside id="drawer"></aside>
+</div>
+
+<!-- ==================== GRAMMAR ==================== -->
+<div id="view-grammar" class="view">
+  <p class="gintro">The grammar is <b>frozen by policy</b> (see <code>multilite/SQL_GRAMMAR.md</code>): a feature counts as done only when it clears the nine-point completion gate (validated logical op, round-tripping codecs, contract-checked guards, convergence tests, bounded failure). So "incomplete" cells split into two very different things: <span style="color:#c4aaff">deliberately fenced out</span> (a decision, with a reason) versus <span style="color:#8ec5ff">future work</span>. Click any chip for the why.</p>
+  <div class="legend">
+    <span class="key"><span class="swatch" style="background:#2f9e63"></span> supported</span>
+    <span class="key"><span class="swatch" style="background:#e3b341"></span> partial / caveats</span>
+    <span class="key"><span class="swatch" style="background:#9d7bff"></span> fenced out deliberately</span>
+    <span class="key"><span class="swatch" style="background:#5aa9ff"></span> future</span>
+    <span class="key"><span class="swatch" style="background:#566072"></span> never (product boundary)</span>
+  </div>
+  <div id="gfams"></div>
+</div>
+
+<!-- ==================== ROADMAP ==================== -->
+<div id="view-roadmap" class="view">
+  <p class="rm-note">Restructured from <code>TODO.md</code> plus open review findings (Aug&nbsp;2026). Cards are tagged by <b>theme</b>, <b>layer</b>, and <b>horizon</b> (<i>now</i> = blocks near-term correctness/launch, <i>next</i> = queued design or implementation, <i>later</i> = real but not urgent, <i>research</i> = needs a design first, <i>boundary</i> = a standing decision, not a task). Click a card to expand.</p>
+  <div class="rm-controls">
+    <select id="rm-group">
+      <option value="theme">Group by theme</option>
+      <option value="layer">Group by layer</option>
+      <option value="horizon">Group by horizon</option>
+    </select>
+    <select id="rm-horizon">
+      <option value="">All horizons</option>
+      <option value="now">now</option><option value="next">next</option>
+      <option value="later">later</option><option value="research">research</option>
+      <option value="boundary">boundary</option>
+    </select>
+    <select id="rm-layer">
+      <option value="">All layers</option>
+      <option value="core">core</option><option value="client">client</option>
+      <option value="server">server</option><option value="multilite">multilite</option>
+      <option value="sim">sim / testing</option><option value="bindings">bindings</option>
+    </select>
+    <input id="rm-search" placeholder="search cards&hellip;">
+    <span class="fchip" data-mode="board">board</span>
+    <span class="fchip" data-mode="heat">theme &times; layer grid</span>
+  </div>
+  <div id="rm-board" class="board"></div>
+  <table id="heat" style="display:none"></table>
+</div>
+
+<script>
+/* ================================================================
+   DATA — curated snapshot of the repo (edit freely; the shell below
+   renders whatever is here). One object, no build step.
+   ================================================================ */
+const DATA = {
+
+layers: [
+  { id:"surface",  name:"Surface & bindings", blurb:"public APIs, language bindings, external test corpora" },
+  { id:"multilite",name:"Multilite", blurb:"SQLite \u2192 logical operations \u2192 Homebase; the sync-aware database engine" },
+  { id:"hbclient", name:"Homebase client", blurb:"one device's local-first, encrypted view of many spaces" },
+  { id:"hbcore",   name:"Homebase core", blurb:"shared vocabulary: keys, entries, leases, verbs, codecs" },
+  { id:"hbserver", name:"Homebase server", blurb:"the kernel: admission, leases, ordered durable log" },
+  { id:"substrate",name:"Substrate", blurb:"storage engines, vendored SQLite, deterministic simulation" },
+],
+
+components: [
+/* ---- surface ---- */
+{ id:"api", layer:"surface", name:"Async Rust API",
+  files:["multilite/src/database/connection.rs","multilite/src/database/async_api.rs","multilite/src/blocking.rs"],
+  summary:"The public SQLite-shaped connection. Runtime-neutral futures over open, prepare, execute, query/view, update, push, pull, rebase, rollback.",
+  behavior:[
+    "Owned SQLite work runs on a bounded process-wide blocking pool; only owned mapped rows cross the boundary.",
+    "Nested blocking::run calls execute inline via a thread-local worker flag, so the pool cannot self-deadlock.",
+    "Managed update closures stay synchronous while they borrow the thread-bound branch connection."],
+  invariants:["No public path executes application SQL without the Public-mode authorizer installed."],
+  health:[] },
+{ id:"npm", layer:"surface", name:"npm binding", files:["npm/index.js"],
+  summary:"JavaScript binding (early).",
+  behavior:["Thin wrapper today; the API surface is still forming."],
+  invariants:[],
+  health:[{sev:"med", text:"Rowids from the device-scoped allocator exceed 2^53 for almost every device tag; a JS client reading ids as Number silently corrupts them. Mandate BigInt (or re-budget the tag/slot bits below 2^53)."}] },
+{ id:"python", layer:"surface", name:"Python binding", files:["python/multilite/"],
+  summary:"Python binding (early).",
+  behavior:["Python ints are arbitrary precision, so the 2^53 hazard does not apply; keep parity tests with the Rust API."], invariants:[], health:[] },
+{ id:"conformance", layer:"surface", name:"Conformance suites",
+  files:["multilite-conformance/","third_party/sql-logic-test/"],
+  summary:"External SQL conformance corpora (sql-logic-test) plus the crate's own conformance harness.",
+  behavior:[
+    "Measures the managed SQL surface against stock SQLite behavior on the accepted grammar.",
+    "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape."],
+  invariants:["Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures."],
+  health:[{sev:"low", text:"Single-engine parity is landed; multi-replica convergence corpora, sharding, progress, and historical coverage tracking remain roadmap work.", known:true}] },
+
+/* ---- multilite: SQL surface & capture ---- */
+{ id:"sqlgate", layer:"multilite", band:"SQL surface & capture", name:"SQL gate",
+  files:["multilite/src/database/sql.rs","multilite/SQL_GRAMMAR.md"],
+  summary:"Parser-based (sqlite3_parser AST) classification of every incoming statement: read vs execute vs rejected, with tight shape allowlists per statement family.",
+  behavior:[
+    "Single-statement enforcement; default-reject catch-all for unknown statement kinds.",
+    "All names \u2014 write targets and read positions \u2014 are dequoted via SqlName::from_sqlite_token before reserved-name checks (closed Aug 1, commit 26bee3d).",
+    "Every expression position is walked for reserved reads, including DML CTEs, UPDATE FROM sources, DELETE WHERE, and UPDATE SET/WHERE.",
+    "Captured DML admits WITH-prefixed UPDATE/DELETE, UPDATE FROM, tuple assignments, and safe INDEXED BY / NOT INDEXED hints without adding durable operation variants.",
+    "CREATE TABLE resolves to a validated spec (columns, PK, uniques, FKs, checks) before anything executes.",
+    "It is a classifier and UX layer \u2014 the runtime authorizer is the actual security boundary."],
+  invariants:["Accepting a statement never implies every SQLite spelling of it is supported; every extension must clear SQL_GRAMMAR.md's completion gate."],
+  health:[
+    {sev:"low", text:"Argument-less PRAGMA classified as a read but always denied at runtime \u2014 dead grammar, mislabeled."}],
+  snippets:[
+    {title:"Reserved-name checks dequote first, reject unknown token shapes", file:"database/sql.rs", code:
+`fn name_reads_reserved(name: &Name) -> bool {
+    SqlName::from_sqlite_token(&name.0)
+        .map(|name| super::has_multilite_prefix(name.value()))
+        // The parser should only produce valid SQLite identifier tokens. If a
+        // future parser shape violates that contract, reject conservatively.
+        .unwrap_or(true)
+}`},
+    {title:"UPDATE gate: every fenced clause is an explicit typed rejection", file:"database/sql.rs", code:
+`if with.is_some() {
+    return Err(Error::UnsupportedSql("UPDATE WITH is not supported"));
+}
+if from.is_some() {
+    return Err(Error::UnsupportedSql("UPDATE FROM is not supported"));
+}
+// ... OR-conflict, INDEXED BY, RETURNING, ORDER BY / LIMIT ...
+if sets.iter().any(|set| expression_reads_reserved(&set.expr))
+    || where_clause.as_ref().is_some_and(expression_reads_reserved)
+{
+    return Err(Error::UnsupportedSql(
+        "UPDATE cannot read reserved Multilite tables",
+    ));
+}
+Ok(ValidatedExecute::Update)`},
+    {title:"Transaction control is never user SQL", file:"database/sql.rs", code:
+`Cmd::Stmt(
+    Stmt::Begin(..) | Stmt::Commit(..) | Stmt::Rollback { .. }
+    | Stmt::Savepoint(..) | Stmt::Release(..),
+) => Err(Error::UnsupportedSql(
+    "transaction control is owned by the managed closure",
+)),
+Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(Error::UnsupportedSql(
+    "EXPLAIN is supported only for SELECT",
+)),`}] },
+{ id:"update", layer:"multilite", band:"SQL surface & capture", name:"Managed updates",
+  files:["multilite/src/database/update.rs"],
+  summary:"Runs a user update closure on a private writable branch, then turns everything it did into one compiled proposal.",
+  behavior:[
+    "Loads one catalog snapshot per transaction; hooks resolve names through it (refreshed only after DDL).",
+    "Serializable isolation records one stable table UUID per table read (coarse, deliberate) via the authorizer.",
+    "into_branch_parts assembles compiled operations + merged guard plan into footprint and proposal."],
+  invariants:["A branch update either becomes exactly one CommitProposal or leaves no durable trace."], health:[] },
+{ id:"view", layer:"multilite", band:"SQL surface & capture", name:"Managed reads",
+  files:["multilite/src/database/view.rs"],
+  summary:"Read snapshots and transaction-bound prepared statements over pinned canonical readers.",
+  behavior:["Reads never touch the live connection: they run on generation-pinned readers from the snapshot pool, guarded by the public authorizer."], invariants:[], health:[] },
+{ id:"runtime", layer:"multilite", band:"SQL surface & capture", name:"Hook runtime",
+  files:["multilite/src/runtime.rs","multilite/src/value.rs"],
+  summary:"Preupdate-hook capture of full row images plus authorizer policy, shared across execution modes.",
+  behavior:[
+    "Preupdate hook is authoritative for row capture \u2014 evaluated values, so nondeterministic SQL (CURRENT_TIMESTAMP, random()) is captured, not re-evaluated.",
+    "Trigger-depth public writes are rejected: captured effects must be materializable exactly once.",
+    "StoredValue preserves SQLite's native storage classes losslessly."],
+  invariants:["Every mutation SQLite performs on a managed table is observed or the transaction aborts."], health:[],
+  snippets:[
+    {title:"The preupdate hook: capture or poison, never drop", file:"runtime.rs", code:
+`connection.preupdate_hook(Some(
+    move |_action, database: &str, table: &str, update: &PreUpdateCase| {
+        let mut state = lock(&preupdate_state);
+        if state.callback_error.is_some() {
+            return; // a poisoned unit captures nothing further
+        }
+        let mode = state.mode();
+        match state.policy.preupdate(mode, database, table, update) {
+            Ok(Some(event)) => state.events.push(event),
+            Ok(None) => {}
+            Err(error) => state.callback_error = Some(error),
+        }
+    },
+))`},
+    {title:"Execution modes nest LIFO; events are attributed per unit", file:"runtime.rs", code:
+`/// Run one atomic unit and return only the events captured by that unit.
+pub(crate) fn run<T>(
+    &self,
+    mode: ExecutionMode,
+    operation: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(T, Vec<P::Event>)> {
+    self.run_captured(mode, operation, |_connection, _events| Ok(()))
+}`}] },
+
+/* ---- multilite: compiler ---- */
+{ id:"operation", layer:"multilite", band:"Logical operation compiler", name:"Operation compiler",
+  files:["multilite/src/database/operation.rs","multilite/src/database/transaction.rs"],
+  summary:"MultiliteOp::compile() derives every deterministic artifact once: Homebase mutations, guard plan, conflict footprint, and the rejection inverse.",
+  behavior:[
+    "Compile-once: CompiledOperation carries logical op + lowering + inverse; transactions assemble them without re-lowering.",
+    "Admitted foreign batches are authenticated by decode + re-lower + byte-identical mutation comparison.",
+    "verify_materialized cross-checks canonical SQLite against branch-captured images (debug builds only).",
+    "Versioned tag codecs; unknown versions rejected, unknown tags skipped within a version."],
+  invariants:["validate_mutations / validate_rejection reject any output outside the declared contract tables."],
+  health:[{sev:"low", text:"Differential branch-vs-canonical verification is #[cfg(debug_assertions)]-only; production never runs it. Consider sampling or per-table checksums in release."}],
+  snippets:[
+    {title:"compile(): the rejection inverse is derived with the operation, not later", file:"database/operation.rs", code:
+`/// Validate and derive every deterministic artifact for this operation.
+pub fn compile(self) -> Result<CompiledOperation> {
+    let homebase = self.to_homebase()?;
+    let (rejection, rejection_kind) = match &self {
+        Self::CreateTable(created) => (
+            RejectionEffect::DropTable { created: created.clone() },
+            RejectionKind::DropTable,
+        ),
+        Self::InsertRows(inserted) => (
+            RejectionEffect::DeleteRows { inserted: inserted.clone() },
+            RejectionKind::DeleteRows,
+        ),
+        Self::DeleteRows(deleted) => (
+            RejectionEffect::RestoreRows { deleted: deleted.clone() },
+            RejectionKind::RestoreRows,
+        ),
+        // ... UpdateRows, AlterTable, Index ...
+    };
+    // lowering + guard plan are checked against the contract tables here
+}`}] },
+{ id:"rowops", layer:"multilite", band:"Logical operation compiler", name:"Row lowering",
+  files:["multilite/src/database/row.rs"],
+  summary:"Captured rows \u2192 Insert/Delete/UpdateRows with key images, unique-owner cells, and foreign-reference handshake cells.",
+  behavior:[
+    "Key images are order-preserving per class; integral REALs normalize onto the integer image so 1 == 1.0.",
+    "Incoming FK reference prefixes are diffed operation-wide (multi-row parent-key rotations are safe).",
+    "Row cells are compact: version + schema revision id + values \u2014 rules live once on the operation.",
+    "UpdateRows orders deletes of moved sources before destination sets."],
+  invariants:["Every emitted guard/mutation must classify into the finite LogicalTarget registry."],
+  health:[
+    {sev:"med", text:"Rules are derived then instantly re-derived for validation 3\u20135\u00d7 per statement (each incoming-FK derivation walks the whole catalog). Keep the deep check for decodes; share one derivation locally."},
+    {sev:"low", text:"is_unique_entry_key sniffs raw key layout (component 3) and is currently always-true; if key shape changes it silently drops the uniqueness guard."},
+    {sev:"low", text:"Cross-class ordering (int vs non-integral real) still diverges from SQLite numeric order \u2014 latent; nothing scans ordered ranges today."}] },
+{ id:"schemaops", layer:"multilite", band:"Logical operation compiler", name:"Schema IR & DDL",
+  files:["multilite/src/database/schema.rs","multilite/src/database/schema/compiler.rs","multilite/src/database/alter.rs","multilite/src/database/index.rs"],
+  summary:"Validated schema IR with stable UUIDs for tables/columns/indexes/FKs; CREATE/ALTER/INDEX operations with content-addressed revisions.",
+  behavior:[
+    "One validator (validate_table_schema) guards freshly resolved and decoded schemas identically.",
+    "bind_expression resolves every CHECK/index expression column to a stable ColumnId \u2014 DDL conflicts happen on identity, not spelling.",
+    "SchemaRevisionId is a content fingerprint of the complete encoded table IR, recomputed at decode \u2014 a structural edit cannot retain the old revision. Folded (commuting) revisions are local fold fingerprints; Homebase keeps only the immutable before/after snapshots each DDL op publishes (settled Aug 1, commit 06243d1).",
+    "Catalog snapshots store only typed index IR; CREATE/DROP/rejection render SQL from that IR against current bindings \u2014 historical SQL is never a second executable source (same commit).",
+    "Independent column renames commute; add/drop project historical rows through the folded catalog."],
+  invariants:["Schema identities are never reused (validate_create_table); type declarations must round-trip the real parser."],
+  health:[
+    {sev:"med", text:"DROP INDEX leaves unique-owner cells and the index-definition cell in place \u2014 acknowledged in TODO.md as needing an explicit retirement/GC protocol, but unbounded garbage accrues meanwhile.", known:true}],
+  snippets:[
+    {title:"Catalog index IR must not carry executable provenance SQL (locked by test)", file:"database/index.rs", code:
+`assert!(
+    !definition
+        .windows(sql.len())
+        .any(|window| window == sql.as_bytes()),
+    "catalog index IR must not duplicate executable provenance SQL"
+);`}] },
+{ id:"guard", layer:"multilite", band:"Logical operation compiler", name:"Guard contracts",
+  files:["multilite/src/database/guard.rs","multilite/GUARDS.md"],
+  summary:"The compiler's checked vocabulary: finite LogicalTarget families, allowlisted (operation \u00d7 mutation \u00d7 target) and (operation \u00d7 guard-class \u00d7 reason \u00d7 target) contracts, rejection-inverse table.",
+  behavior:[
+    "render() and classify() are inverse maps between typed targets and durable keys.",
+    "GUARDS.md is generated from the tables and locked by a test \u2014 it cannot drift.",
+    "Guard classes: Invariant (all isolation levels), Write (write/write OCC), SerializableRead (serializable only).",
+    "REQUIRED_GUARD_CONTRACTS + validate_compiled_output now enforce guard minimums both ways: an omitted mandatory guard is rejected, not just an extra one (closed Aug 1, commit 282df71)."],
+  invariants:["Every mutation and guard the compiler emits must appear in the contract tables, and every required guard must be present (release-mode check)."],
+  health:[],
+  snippets:[
+    {title:"Required guards: the allowlist gained a floor", file:"database/guard.rs", code:
+`/// Guards that every operation in a family must emit at least once.
+pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
+    contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateTable, Write, WriteContract, WriteRevision),
+    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
+    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
+    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(DropIndex, Write, SchemaRevision, ActiveSchemaRevision),
+    contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
+    // ... RenameTable, AddColumn, DropColumn ...
+];`}] },
+{ id:"footprint", layer:"multilite", band:"Logical operation compiler", name:"Conflict footprints",
+  files:["multilite/src/commit/footprint.rs"],
+  summary:"Typed prefix sets (writes / constraints / reads) derived from guard plans; pruned via a prefix antichain; planned into RangeAsserts.",
+  behavior:[
+    "Footprints are derived from guards \u2014 one source of truth since the compile-once refactor.",
+    "Serializable reads collapse to one table-root prefix per table read.",
+    "plan() emits one RangeAssert per surviving key at the snapshot's authority frontier."],
+  invariants:["A descendant of a present prefix is never separately asserted."],
+  health:[{sev:"med", text:"Write/constraint assertions remain strictly per-row: a whole-table DELETE ships one mutation and one RangeAssert per row. A table-prefix assertion would be strictly stronger and O(1). Scalability cliff for bulk DML.", known:true}],
+  snippets:[
+    {title:"The prefix antichain: ancestors absorb descendants", file:"commit/footprint.rs", code:
+`fn insert(&mut self, key: Key) {
+    if self.keys.range(..=&key).next_back()
+        .is_some_and(|prefix| key.starts_with(prefix))
+    {
+        return; // an existing ancestor already covers this key
+    }
+    let descendants = self.keys.range(key.clone()..)
+        .take_while(|candidate| candidate.starts_with(&key))
+        .cloned().collect::<Vec<_>>();
+    for descendant in descendants {
+        self.keys.remove(&descendant);
+    }
+    self.keys.insert(key);
+}`},
+    {title:"plan(): reads only count under serializable", file:"commit/footprint.rs", code:
+`/// Merge typed antichains and bind them to one authority frontier.
+pub fn plan(self, isolation: IsolationLevel, upto: AdmissionSeq) -> Vec<RangeAssert> {
+    let mut selected = self.writes;
+    selected.extend(self.constraints);
+    if isolation == IsolationLevel::Serializable {
+        selected.extend(self.reads);
+    }
+    selected.into_keys().into_iter()
+        .map(|prefix| RangeAssert { prefix, upto })
+        .collect()
+}`}] },
+
+/* ---- multilite: branch & snapshot ---- */
+{ id:"snapshot", layer:"multilite", band:"Branch & snapshot engine", name:"Pinned snapshots",
+  files:["multilite/src/branch/snapshot.rs"],
+  summary:"Immutable physical SQLite images from incremental WAL parsing \u2014 no file copies.",
+  behavior:[
+    "Committer streams appended WAL frames into a snapshot cache; the page map uses structurally shared 256-page chunks.",
+    "A reader pool reuses generation-pinned SQLite readers; cold-parse == incremental-parse is an invariant.",
+    "Passive checkpoints above 64 MiB; new snapshots refused above 256 MiB when live readers block cleanup."],
+  invariants:["A pinned snapshot never observes bytes written after its commit position."], health:[] },
+{ id:"branchvfs", layer:"multilite", band:"Branch & snapshot engine", name:"Writable branches",
+  files:["multilite/src/branch/mod.rs","multilite/src/branch/changeset.rs"],
+  summary:"Private writable SQLite connections over a snapshot via a custom overlay VFS.",
+  behavior:[
+    "Copy-on-write overlay: branch writes never touch the canonical file.",
+    "The old hidden rowid-replay state (baseline connection pair) was deleted once the durable allocator landed."],
+  invariants:["One cooperating Multilite committer per file (foreign-writer tolerance is future work)."],
+  health:[{sev:"low", text:"Per-branch VFS registration; a process-wide routing VFS is on the roadmap for startup overhead.", known:true}] },
+{ id:"rowid", layer:"multilite", band:"Branch & snapshot engine", name:"Rowid allocator",
+  files:["multilite/src/rowid.rs","vendor/libsqlite3-sys/ (OP_NewRowid hook)"],
+  summary:"Durable, device-scoped allocation of omitted INTEGER PRIMARY KEYs: 16-bit device tag | 27-bit random slot | 20-bit offset, leased 1024 at a time.",
+  behavior:[
+    "The vendored SQLite consults a connection-local callback only where OP_NewRowid would run; SQLite still probes uniqueness and retries.",
+    "Leases are burned on restart, never reused; used slots are recorded forever; slots rotate at 2^20 capacity.",
+    "Lease durability is serialized through the committer actor \u2014 1-in-1024 inserts pay the round trip."],
+  invariants:["Explicit rowids, WITHOUT ROWID, AUTOINCREMENT, and internal tables keep stock SQLite behavior."],
+  health:[
+    {sev:"med", text:"Composed rowids exceed 2^53 \u2014 JS Number corruption hazard for the npm binding (see npm)."},
+    {sev:"low", text:"16-bit hashed device tag births a collision at ~300 devices/space; the backstop (admission constraint fencing) is sound but the math and recovery path are undocumented."},
+    {sev:"low", text:"The sqlcipher copy of the amalgamation is unpatched \u2014 building that feature would fail to link the new symbol."}],
+  snippets:[
+    {title:"The 63-bit layout: 16-bit device tag | 27-bit random slot | 20-bit offset", file:"rowid.rs", code:
+`const DEVICE_TAG_BITS: u32 = 16;
+const RANDOM_SLOT_BITS: u32 = 27;
+const OFFSET_BITS: u32 = 20;
+const SLOT_CAPACITY: u32 = 1 << OFFSET_BITS;
+const LEASE_SIZE: u32 = 1 << 10; // 1024 ids per durable lease
+
+fn compose(slot: u64, offset: u32) -> i64 {
+    debug_assert!(slot > 0 && slot <= MAX_SLOT);
+    debug_assert!(offset < SLOT_CAPACITY);
+    i64::try_from((slot << OFFSET_BITS) | u64::from(offset))
+        .expect("43-bit slot plus 20-bit offset is a positive i64")
+}`},
+    {title:"The C-side callback: internal tables opt out, SQLite keeps probing", file:"rowid.rs", code:
+`unsafe extern "C" fn allocate(
+    context: *mut c_void,
+    _connection: *mut ffi::sqlite3,
+    schema: *const c_char,
+    table: *const c_char,
+    rowid: *mut ffi::sqlite3_int64,
+) -> c_int {
+    let allocator = unsafe { &mut *context.cast::<RowidAllocator>() };
+    let schema = unsafe { CStr::from_ptr(schema) }.to_bytes();
+    let table = unsafe { CStr::from_ptr(table) }.to_bytes();
+    if !schema.eq_ignore_ascii_case(b"main") || has_internal_prefix(table) {
+        return ffi::SQLITE_NOTFOUND; // stock SQLite behavior
+    }
+    // ... draw from the durable lease, retry slots on exhaustion ...
+}`},
+    {title:"Device tags are domain-separated hashes, never zero", file:"rowid.rs", code:
+`fn device_tag(device: DeviceId) -> u16 {
+    for counter in 0_u32.. {
+        let mut hash = Sha256::new();
+        hash.update(DEVICE_TAG_DOMAIN);
+        hash.update(device.0);
+        hash.update(counter.to_be_bytes());
+        let digest = hash.finalize();
+        let tag = u16::from_be_bytes([digest[0], digest[1]]);
+        if tag != 0 { return tag; }
+    }
+    unreachable!("a SHA-256 prefix eventually differs from zero")
+}`}] },
+
+/* ---- multilite: commit spine ---- */
+{ id:"committer", layer:"multilite", band:"Commit spine", name:"Committer actor",
+  files:["multilite/src/commit/committer.rs","multilite/src/commit/checkpoint.rs"],
+  summary:"Typed FIFO serialization of every canonical transition: transaction proposals, admission applies, accept/reject transitions, snapshot capture, rowid leases.",
+  behavior:[
+    "Batches compatible requests into commit groups; snapshot/lease requests act as group boundaries.",
+    "catch_unwind around every group; panics become typed errors for all waiters.",
+    "Owns WAL growth control (checkpoint policy) after commits."],
+  invariants:["The committer never waits on the authority actor or its workflow permit (acyclic ownership rule)."],
+  health:[{sev:"low", text:"Post-commit maintenance (reader invalidation, checkpoint) runs inside the result-determination window: a panic there reports a durably committed group as failed."}],
+  snippets:[
+    {title:"Every group is panic-fenced; waiters always get a typed answer", file:"commit/committer.rs", code:
+`let results = catch_unwind(AssertUnwindSafe(|| backend.commit_group(&proposals)));
+match results {
+    Ok(Ok(results)) if results.len() == group.len() => {
+        for ((_, reply), result) in group.into_iter().zip(results) {
+            let _ = reply.send(result);
+        }
+    }
+    Ok(Ok(_)) => fail_group(group,
+        Error::Committer("committer returned the wrong result count".into())),
+    Ok(Err(error)) => fail_group(group, error),
+    Err(_) => fail_group(group, Error::Committer("commit group panicked".into())),
+}`},
+    {title:"The backend trait: four verbs, all serialized on one thread", file:"commit/committer.rs", code:
+`/// Canonical database work owned by the committer thread.
+pub trait CommitBackend: Send + Sync + 'static {
+    /// Prepare and atomically finalize one bounded FIFO proposal group.
+    fn commit_group(&self, proposals: &[&CommitProposal])
+        -> Result<Vec<Result<CommitReceipt>>>;
+    /// Capture one physical and logical snapshot at this exact queue position.
+    fn capture_snapshot(&self, writable: bool) -> Result<CommitSnapshot>;
+    /// Capture one read-only physical snapshot at this exact queue position.
+    fn capture_view(&self) -> Result<PinnedReader>;
+    /// Durably reserve one range from the replica's rowid allocator.
+    fn lease_rowids(&self) -> Result<RowidLease>;
+}`}] },
+{ id:"backend", layer:"multilite", band:"Commit spine", name:"Commit backend",
+  files:["multilite/src/database/backend.rs"],
+  summary:"Canonical SQLite commit execution: replay, OCC validation, cursor re-checks, pending journal, receipts \u2014 all inside one group savepoint.",
+  behavior:[
+    "prepare() replays logical ops onto canonical SQLite and validates the footprint against local commit history and earlier group members.",
+    "Every proposal type re-validates its expected cursors inside the savepoint \u2014 TOCTOU races collapse into typed errors.",
+    "Duplicate proposal ids resolve idempotently via durable receipts (hash-checked)."],
+  invariants:["A proposal is applied at most once; a receipt exists iff its group finalized."], health:[],
+  snippets:[
+    {title:"Group commit: nested savepoints, duplicate ids resolved by payload hash", file:"database/backend.rs", code:
+`self.owner.with_savepoint("__multilite__commit_group", |connection| {
+    let mut accepted_writes = BTreeSet::new();
+    for proposal in proposals {
+        let encoded = proposal.encode()?;
+        if let Some(previous) = seen.get(&proposal.id()) {
+            if previous.encoded != encoded {
+                // same id, different payload: typed rejection, never absorbed
+                slots.push(GroupSlot::Complete(Err(Error::InvalidCommitProposal(
+                    "one proposal id names different commit payloads".into()))));
+            } // ... identical duplicate resolves to the same receipt ...
+            continue;
+        }
+        // each member gets its own savepoint; a failed member
+        // rolls back alone, the group continues
+        let outcome = self.owner.with_savepoint("__multilite__commit_member",
+            |connection| self.prepare_commit_proposal(
+                connection, proposal, &accepted_writes));
+        // ... prepared members accumulate accepted_writes for
+        //     intra-group OCC visibility ...
+    }
+})`}] },
+{ id:"proposal", layer:"multilite", band:"Commit spine", name:"Proposals & history",
+  files:["multilite/src/commit/proposal.rs","multilite/src/commit/history.rs","multilite/src/commit/snapshot.rs"],
+  summary:"Typed proposal bodies for every canonical transition (Transaction, ApplyAdmissions, Reject/Accept-Submissions, AppendAdmissions) with deterministic transition-scoped ids, plus the durable write-region history OCC validates against.",
+  behavior:[
+    "Transaction proposals carry the compiled transaction; to_homebase() re-derives nothing.",
+    "Non-transaction proposals derive their id from the transition content \u2014 replays deduplicate naturally.",
+    "history_after(snapshot_seq) supplies the write regions for local conflict checks."],
+  invariants:["Same proposal id with a different payload hash is rejected, never silently absorbed."], health:[] },
+
+/* ---- multilite: sync/journal/meta ---- */
+{ id:"policy", layer:"multilite", band:"Sync, journal & metadata", name:"Policy actor",
+  files:["multilite/src/database/policy.rs"],
+  summary:"Single-owner state machine for sync intent (LocalOnly / LocalFirst / Remote): freshness bookkeeping, exclusive refresh leases, delayed push scheduling with backoff.",
+  behavior:[
+    "All freshness state lives on one thread; refreshes are serialized by drop-safe leases; coalesced waiters re-check freshness at grant time.",
+    "Pulled/Rebased transitions ensure reads only count a pull as fresh once it has been applied.",
+    "Scheduled pushes run on a dedicated multilite-policy-workflow thread; the mailbox never blocks on the network, and push/refresh-lease are mutually exclusive so a push cannot race an active workflow (closed Aug 1, commit 17531e0).",
+    "A rejected background push repairs itself: rollback + one immediate re-push; a second rejection surfaces as a typed error into bounded backoff (same commit).",
+    "One retained push deadline per commit group; exponential backoff on failure."],
+  invariants:["Only the lease holder may run an authority workflow, and pushes count as workflows."],
+  health:[
+    {sev:"med", text:"push\u2192pull\u2192rebase inside a refresh has no retry: a concurrent local write between steps surfaces as RefreshPushRejected/RebasePendingSubmissions to the reader instead of retrying the drain."}],
+  snippets:[
+    {title:"Push and refresh lease mutually exclude \u2014 by construction", file:"database/policy.rs", code:
+`fn grant_next(&mut self, sender: &Sender<Command>) {
+    if self.active.is_some() || self.push_pending || self.push_in_flight {
+        return; // never grant a refresh lease while a push owns the workflow
+    }
+    // ...
+}
+
+fn take_push_job(&mut self) -> bool {
+    if !self.push_pending || self.push_in_flight || self.active.is_some() {
+        return false; // never start a push while a lease is out
+    }
+    self.push_pending = false;
+    self.push_in_flight = true;
+    true
+}`},
+    {title:"A rejected scheduled push repairs and retries once", file:"database/async_api.rs", code:
+`/// Run one delayed LocalFirst push while the policy actor owns the workflow.
+pub(super) fn run_scheduled_push(self: &Arc<Self>) -> Result<()> {
+    pollster::block_on(async {
+        match self.push_via_authority_async(None).await? {
+            PushOutcome::Drained => Ok(()),
+            PushOutcome::Rejected(rejection) => {
+                self.rollback_locked_async(rejection).await?;
+                match self.push_via_authority_async(None).await? {
+                    PushOutcome::Drained => Ok(()),
+                    PushOutcome::Rejected(rejection) => {
+                        Err(Error::AuthorityRejected(rejection.error))
+                    }
+                }
+            }
+        }
+    })
+}`}] },
+{ id:"authority", layer:"multilite", band:"Sync, journal & metadata", name:"Authority actor",
+  files:["multilite/src/database/authority.rs"],
+  summary:"Single-owner network I/O: all pushes and pulls to Homebase authority run on this thread with typed replies.",
+  behavior:[
+    "Exact per-submission targeting with typed completion; workflows submit checked completion proposals back to the committer and wait.",
+    "Coalescing, retry/backoff, and cancellation-independent completion are roadmap items."],
+  invariants:["May wait on the committer; the committer never waits on it."], health:[] },
+{ id:"pending", layer:"multilite", band:"Sync, journal & metadata", name:"Pending journal",
+  files:["multilite/src/database/pending.rs"],
+  summary:"Durable record of speculative transactions awaiting authority: frames carry only device-seq + logical transaction; rejection inverses are derived, not stored.",
+  behavior:[
+    "Insertion is atomic with the oplog commit; acceptance retires the acknowledged prefix; rejection compiles a RejectionRepair plan from the logical transaction.",
+    "Suffix-forfeit contract: rejection discards the offline suffix rather than auto-rebasing stale operations."],
+  invariants:["Every active submit-log entry has exactly one journal row (validated at reopen against the neck)."],
+  health:[{sev:"med", text:"accept_through decodes every pending record (full transaction payloads) per ack just to gate a DELETE \u2014 O(journal\u00b2) per drain cycle, inside the commit savepoint. TODO.md already calls for an indexed delete.", known:true}] },
+{ id:"rebase", layer:"multilite", band:"Sync, journal & metadata", name:"Rebase",
+  files:["multilite/src/database/rebase.rs"],
+  summary:"Atomic application of fetched foreign operations after local pushes drain.",
+  behavior:[
+    "Foreign transactions are authenticated (decode + exact re-lower), then applied through the same MultiliteOp::apply used locally.",
+    "Fails hard if submissions are pending \u2014 rebase never interleaves with an unshipped local suffix."],
+  invariants:["Rebase applies an exact captured admission interval or nothing."], health:[] },
+{ id:"catalog", layer:"multilite", band:"Sync, journal & metadata", name:"Schema catalog",
+  files:["multilite/src/database/catalog.rs","multilite/src/database/physical.rs"],
+  summary:"Local index of durable schema identities; snapshot loads give hooks O(log n) name/id lookup; physical.rs cross-checks catalog vs real SQLite structure.",
+  behavior:["Validated on every reopen; every DDL apply updates it in the same transaction as the SQLite change."],
+  invariants:["Catalog and sqlite_schema must describe the same tables (structural equivalence checks)."],
+  health:[{sev:"low", text:"CatalogSnapshot::load re-parses every column's type declaration per transaction open \u2014 parser-bound; definitions are immutable by revision and cacheable.", known:true}] },
+{ id:"mlmeta", layer:"multilite", band:"Sync, journal & metadata", name:"Metastore bridge",
+  files:["multilite/src/metastore.rs","multilite/src/database/store.rs"],
+  summary:"Homebase client metadata stored inside Multilite's own SQLite file; store.rs joins metadata transitions to the local disposition log.",
+  behavior:[
+    "Panic-safe savepoints (drop-guard rollback) around every metadata batch.",
+    "Sink-less rollback/ack paths join the pending journal atomically \u2014 open-time transitions cannot strand speculative state."],
+  invariants:["Client durable truth and Multilite disposition state move in one SQLite transaction."],
+  health:[{sev:"low", text:"Hot paths re-format and re-prepare SQL per call; prepare_cached appears nowhere in the crate."}],
+  snippets:[
+    {title:"One panic-safe savepoint shape for the whole crate", file:"connection.rs", code:
+`/// Run one operation inside a panic-safe SQLite savepoint.
+pub(crate) fn with_savepoint<T, E>(
+    connection: &Connection,
+    name: impl Into<String>,
+    operation: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    let savepoint = ConnectionSavepoint::begin(connection, name.into())?;
+    match operation() {
+        Ok(value) => { savepoint.release()?; Ok(value) }
+        Err(error) => match savepoint.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback.into()),
+        },
+    }
+    // ConnectionSavepoint's Drop rolls back if a panic unwinds through here
+}`}] },
+
+/* ---- hb client ---- */
+{ id:"client", layer:"hbclient", name:"Device client",
+  files:["client/src/client.rs"],
+  summary:"One device's local-first view of many spaces: durable device identity, oplog, admission state.",
+  behavior:[
+    "Device id persists in the store; a passed-in id is used only when no record exists yet.",
+    "Buffers writes durably offline; push/pull reconcile with authority when a transport exists."],
+  invariants:["An unexpected DeviceSeq regression is fork evidence \u2192 re-mint and resync."], health:[] },
+{ id:"spaceops", layer:"hbclient", name:"Space operations",
+  files:["client/src/space.rs"],
+  summary:"Per-space submit, pull, and lease operations: sealing entries, encoding range asserts, validating admitted batches.",
+  behavior:["prepare/commit of submissions is a local durable transition; the network round trip is separate and idempotent."], invariants:[], health:[] },
+{ id:"coordination", layer:"hbclient", name:"Coordination loop",
+  files:["client/src/coordination.rs"],
+  summary:"Runtime-independent client coordination: drives push/pull workflows without owning a runtime.",
+  behavior:["Small worker pool for crypto; callers bring their own executor."], invariants:[], health:[] },
+{ id:"cipher", layer:"hbclient", name:"Cipher & seal",
+  files:["client/src/cipher.rs","core/src/seal.rs"],
+  summary:"Client-side E2EE: key/value encryption with client-computed AEAD seal metadata. The server is honest-but-dumb.",
+  behavior:["Key hierarchy: name key \u2192 space commitments; KeyEpoch reserved (permanently 0 in v1, no cryptographic revocation)."],
+  invariants:["The server never sees plaintext keys or values."], health:[] },
+{ id:"clientmeta", layer:"hbclient", name:"Durable client meta",
+  files:["client/src/meta.rs"],
+  summary:"Client durable truth \u2014 the transition contract (2 of 3) every store backend must satisfy.",
+  behavior:["Cursor windows (oplog neck/tail, admit neck/tail) advance only through checked transitions."], invariants:[], health:[] },
+{ id:"serverview", layer:"hbclient", name:"Server verbs view",
+  files:["client/src/server.rs"],
+  summary:"The client's typed view of the kernel verbs, space-qualified: submit, pull, lease acquire/renew/release.",
+  behavior:["Transport-agnostic; the sim and real transports implement the same trait."], invariants:[], health:[] },
+
+/* ---- hb core ---- */
+{ id:"keymodel", layer:"hbcore", name:"Keys & ranges",
+  files:["core/src/key.rs","core/src/range.rs"],
+  summary:"Tuple keys with order-preserving flat encoding; component-wise ranges shared by reads, assertions, and mutations.",
+  behavior:[
+    "Everything above (rows, schema cells, FK handshakes) is spelled in this vocabulary.",
+    "Three property-tested guarantees: roundtrip, order preservation (encode(a) < encode(b) \u27fa a < b), and prefix correspondence (tuple prefix \u27fa byte prefix)."],
+  invariants:["Prefix means component-wise prefix: [\"db\",\"pay\"] never covers [\"db\",\"payroll\"]."], health:[],
+  snippets:[
+    {title:"The escape scheme that makes byte order equal tuple order", file:"core/src/key.rs", code:
+`// Each component escapes 0x00 as 0x00 0x01 and ends with 0x00 0x00.
+pub fn encode_components(components: &[KeyComponent]) -> Vec<u8> {
+    let cap = encoded_components_len(components);
+    let mut out = Vec::with_capacity(cap);
+    for component in components {
+        for &b in &component.0 {
+            if b == 0x00 {
+                out.extend_from_slice(&[0x00, 0x01]);
+            } else {
+                out.push(b);
+            }
+        }
+        out.extend_from_slice(&[0x00, 0x00]);
+    }
+    out
+}
+
+// The classic collision under single-byte terminators, encoded distinctly:
+// ["a\\x00"] vs ["a", "\\xff"]  =>  order preserved, prefix-safe`}] },
+{ id:"tags", layer:"hbcore", name:"Entries & mutations",
+  files:["core/src/tag.rs"],
+  summary:"Device-authored and admitted entries: DeviceSeq, AdmissionSeq, mutations (Set/Delete/DeleteRange), checksums.",
+  behavior:["The admitted log is the single total order every replica converges on."], invariants:[], health:[] },
+{ id:"leases", layer:"hbcore", name:"Leases",
+  files:["core/src/lease.rs"],
+  summary:"Lease primitives: time-bounded write reservations over key prefixes.",
+  behavior:["Back range-assert coverage for checked submissions."],
+  health:[{sev:"med", text:"Checked-unlease replacement coverage bug (TODO): a usable lease can be removed in favor of a live replacement whose barrier has not applied, then the replacement removed too. Needs regression tests.", known:true}] },
+{ id:"spacecontract", layer:"hbcore", name:"Space verb contract",
+  files:["core/src/space.rs","core/src/messages.rs"],
+  summary:"The unit of isolation and the client-facing verb contract; request/response messages plus KernelError.",
+  behavior:["Both client and server implement against this one contract; the sim exercises it exhaustively."], invariants:[], health:[] },
+{ id:"codecs", layer:"hbcore", name:"Codecs",
+  files:["core/src/writer.rs","core/src/reader.rs"],
+  summary:"Bounds-checked construction and reading of encoded byte records.",
+  behavior:["Newer code uses Writer/Reader; legacy core/client/server codecs still await mechanical migration (byte-for-byte fixtures required)."], invariants:[], health:[] },
+{ id:"storageabs", layer:"hbcore", name:"OrderedStore & clock",
+  files:["core/src/storage.rs","core/src/clock.rs"],
+  summary:"The ordered-map storage abstraction both sides of the wire build on, plus millisecond clocks.",
+  behavior:["SQLite (multilite metastore), SlateDB (server), and the sim's fault stores all implement it."], invariants:[], health:[] },
+
+/* ---- hb server ---- */
+{ id:"actor", layer:"hbserver", name:"Space actor",
+  files:["server/src/actor.rs"],
+  summary:"The runtime shell that makes one Space machine live: mailbox, scheduling, isolation per space.",
+  behavior:["One actor per space; verbs execute serially against the space state machine."], invariants:[], health:[] },
+{ id:"spacemachine", layer:"hbserver", name:"Space state machine",
+  files:["server/src/space/mod.rs","server/src/space/data.rs","server/src/space/lease.rs"],
+  summary:"The complete server verb state machine: admit (with range-assert checks), the three read verbs, lease acquire/renew/release.",
+  behavior:[
+    "Admission appends device entries to the ordered admit log after validating leases and range assertions at the current frontier.",
+    "Rejections are semantic (KernelError), never silent."],
+  invariants:["The admit log is dense and append-only per space."],
+  snippets:[
+    {title:"Admission re-confirms exact device history before any new suffix", file:"server/src/space/data.rs", code:
+`// 1. Confirm the exact device history before validating a new suffix.
+// A lost acknowledgement must remain reconcilable even if leases or
+// reservation conflicts changed after the already-admitted write.
+let device_record = device(space, store, req.device).await?;
+let mut last_device_seq = device_record.map_or(DeviceSeq(0), |r| r.last_seq);
+let current_checksum = device_record.map_or(DeviceChecksum::EMPTY, |r| r.checksum);
+if req.expected_checksum != current_checksum {
+    return Err(KernelError::DeviceChecksumMismatch {
+        current_seq: last_device_seq,
+        current: current_checksum,
+    }.into());
+}
+for client_batch in &req.batches {
+    if client_batch.device_seq <= last_device_seq {
+        return Err(KernelError::DeviceSeqRegression {
+            current: last_device_seq,
+            attempted: client_batch.device_seq,
+        }.into());
+    }
+    // ... dense-suffix check, lease + range-assert validation, append ...
+}`}],
+  health:[{sev:"med", text:"Lease-barrier scope is ambiguous: code records the space-global admission high-water at grant, older design text says prefix-local. Decide, document, align (TODO).", known:true}] },
+{ id:"shardschema", layer:"hbserver", name:"Shard keyspace",
+  files:["server/src/schema.rs"],
+  summary:"How spaces, leases, data, and metadata map onto the shard's ordered keyspace.",
+  behavior:["One vocabulary for everything the server persists."], invariants:[], health:[] },
+{ id:"serverstorage", layer:"hbserver", name:"Server storage",
+  files:["server/src/storage.rs","server/src/storage/slate.rs"],
+  summary:"OrderedStore for the server; SlateDB-backed in production (always object-store mode).",
+  behavior:["Storage faults are typed separately from semantic kernel rejections."], invariants:[], health:[] },
+
+/* ---- substrate ---- */
+{ id:"slatedb", layer:"substrate", name:"SlateDB / object store",
+  files:["(dependency)"],
+  summary:"LSM over object storage \u2014 the server's durable substrate.",
+  behavior:["Sim layer 3 injects faults at the object-store boundary and tortures slatedb open/reopen through power loss."],
+  health:[{sev:"med", text:"DST does not yet work seamlessly with SlateDB including the local disk cache (top TODO).", known:true}] },
+{ id:"vsqlite", layer:"substrate", name:"Vendored SQLite 3.51.3",
+  files:["vendor/libsqlite3-sys/"],
+  summary:"libsqlite3-sys 0.37 vendored via [patch.crates-io] with one connection-local extension: sqlite3_multilite_set_rowid_allocator.",
+  behavior:[
+    "The hook fires only where OP_NewRowid would run for an ordinary rowid table with omitted/NULL IPK; SQLite retains uniqueness probing and retry.",
+    "Upgrade procedure documented in MULTILITE.md with a dedicated boundary test."],
+  invariants:["Allocation policy changed; correctness semantics remain upstream SQLite's."],
+  health:[{sev:"low", text:"Keep the patch as a .patch against pristine upstream so version bumps are mechanical (currently: hunt for multilite markers in a 270k-line file)."}] },
+{ id:"sim", layer:"substrate", name:"Deterministic simulation",
+  files:["sim/src/"],
+  summary:"Seeded single-threaded stepper, fault-injecting stores, crash-restart torture, brute-force invariant oracles over (possibly crash-recovered) state.",
+  behavior:[
+    "Layer 1: in-memory store faults. Layer 3: object-store faults under real slatedb with power-loss reopen.",
+    "Multilite's seeded two-replica integrity simulation landed Aug 1 (tests/integrity.rs): parent/child inserts, retargets, PK moves, UNIQUE conflicts, mixed DDL/DML, reordered pushes, rejection repair, and restarts. Every round checks converged rows, catalog validity, integrity_check/foreign_key_check, an empty pending journal, projected authority row frames, and exact UNIQUE/FK cells.",
+    "Full DST integration (seeded scheduler, fault injection, crash points) is the next step \u2014 current restarts occur only between completed operations."],
+  invariants:["Every seed reproducible through reopen and recovery."], health:[] },
+],
+
+edges: [
+  { from:"npm", to:"api", label:"binds", spine:false },
+  { from:"python", to:"api", label:"binds", spine:false },
+  { from:"conformance", to:"api", label:"exercises", spine:false },
+  { from:"api", to:"sqlgate", label:"every statement", spine:true },
+  { from:"api", to:"update", label:"update()", spine:true },
+  { from:"api", to:"view", label:"query()/view()", spine:false },
+  { from:"sqlgate", to:"update", label:"validated plans", spine:false },
+  { from:"update", to:"branchvfs", label:"opens branch", spine:true },
+  { from:"branchvfs", to:"snapshot", label:"overlays", spine:true },
+  { from:"view", to:"snapshot", label:"pinned readers", spine:false },
+  { from:"update", to:"runtime", label:"installs hooks", spine:false },
+  { from:"rowid", to:"branchvfs", label:"IPK allocation", spine:false },
+  { from:"rowid", to:"committer", label:"durable leases", spine:false },
+  { from:"runtime", to:"rowops", label:"captured rows", spine:true },
+  { from:"sqlgate", to:"schemaops", label:"DDL specs", spine:false },
+  { from:"rowops", to:"operation", label:"row ops", spine:true },
+  { from:"schemaops", to:"operation", label:"schema ops", spine:false },
+  { from:"operation", to:"guard", label:"contract checks", spine:false },
+  { from:"guard", to:"footprint", label:"derives", spine:false },
+  { from:"operation", to:"proposal", label:"compiled txn", spine:true },
+  { from:"footprint", to:"proposal", label:"asserts", spine:false },
+  { from:"proposal", to:"committer", label:"propose", spine:true },
+  { from:"committer", to:"backend", label:"executes groups", spine:true },
+  { from:"backend", to:"pending", label:"journals", spine:true },
+  { from:"backend", to:"mlmeta", label:"cursor transitions", spine:false },
+  { from:"schemaops", to:"catalog", label:"identities", spine:false },
+  { from:"policy", to:"authority", label:"schedules work", spine:true },
+  { from:"authority", to:"spaceops", label:"push / pull", spine:true },
+  { from:"authority", to:"committer", label:"completion proposals", spine:false },
+  { from:"rebase", to:"backend", label:"apply admissions", spine:false },
+  { from:"pending", to:"rebase", label:"gates on drain", spine:false },
+  { from:"mlmeta", to:"clientmeta", label:"implements", spine:true },
+  { from:"spaceops", to:"cipher", label:"seals", spine:false },
+  { from:"spaceops", to:"serverview", label:"kernel verbs", spine:true },
+  { from:"client", to:"spaceops", label:"per-space", spine:false },
+  { from:"client", to:"clientmeta", label:"durable truth", spine:false },
+  { from:"serverview", to:"spacecontract", label:"contract", spine:false },
+  { from:"serverview", to:"actor", label:"transport", spine:true },
+  { from:"actor", to:"spacemachine", label:"verbs", spine:true },
+  { from:"spacemachine", to:"leases", label:"lease rules", spine:false },
+  { from:"spacemachine", to:"shardschema", label:"key layout", spine:false },
+  { from:"spacemachine", to:"serverstorage", label:"persists", spine:true },
+  { from:"serverstorage", to:"slatedb", label:"LSM", spine:true },
+  { from:"mlmeta", to:"storageabs", label:"OrderedStore", spine:false },
+  { from:"serverstorage", to:"storageabs", label:"OrderedStore", spine:false },
+  { from:"rowops", to:"keymodel", label:"key images", spine:false },
+  { from:"branchvfs", to:"vsqlite", label:"VFS + hooks", spine:false },
+  { from:"sim", to:"spacemachine", label:"tortures", spine:false },
+  { from:"sim", to:"slatedb", label:"fault-injects", spine:false },
+],
+
+flows: [
+{ id:"write", name:"Local write", blurb:"update() \u2192 compiled proposal \u2192 canonical commit",
+  steps:[
+    { comp:"api", text:"update() passes the policy freshness gate, then asks the committer for a snapshot." },
+    { comp:"committer", text:"Captures a pinned physical WAL snapshot at the current commit seq." },
+    { comp:"branchvfs", text:"A private writable branch opens over the snapshot via the overlay VFS; the rowid allocator is installed on the connection." },
+    { comp:"sqlgate", text:"Each statement is parsed, classified, and shape-checked before it may execute." },
+    { comp:"runtime", text:"The preupdate hook captures full row images; the authorizer records read table roots (serializable) and blocks reserved names." },
+    { comp:"rowid", text:"Omitted INTEGER PRIMARY KEYs draw from a durable device-scoped lease (fetched through the committer, 1024 at a time)." },
+    { comp:"rowops", text:"Captured rows resolve against the catalog snapshot: key images, unique-owner cells, FK handshake cells." },
+    { comp:"operation", text:"Each operation compiles once \u2014 mutations + guard plan + rejection inverse \u2014 checked against the contract tables." },
+    { comp:"proposal", text:"The compiled transaction, footprint, and snapshot descriptor become one CommitProposal." },
+    { comp:"backend", text:"The committer group replays the logical ops onto canonical SQLite in one savepoint, validates OCC against history, journals pending effects, records a receipt." },
+    { comp:"pending", text:"The speculative transaction is journaled (device-seq + logical frame) atomically with the oplog commit." },
+    { comp:"policy", text:"LocalFirst schedules a delayed push for the commit group." }] },
+{ id:"push", name:"Push / admission", blurb:"buffered writes reach authority",
+  steps:[
+    { comp:"policy", text:"The write-delay deadline fires (or a read refresh forces a drain)." },
+    { comp:"authority", text:"The push workflow takes the single authority permit and reads queued submissions." },
+    { comp:"spaceops", text:"The client space seals entries and encodes the footprint's range assertions." },
+    { comp:"serverview", text:"Kernel verbs cross the transport, space-qualified." },
+    { comp:"actor", text:"The space actor serializes the verb onto the space machine." },
+    { comp:"spacemachine", text:"Admission validates leases and range asserts at the current frontier, then appends to the dense admit log." },
+    { comp:"authority", text:"A typed completion returns; an accept (or reject) proposal is submitted back to the committer." },
+    { comp:"backend", text:"accept_submissions retires the acknowledged prefix; the matching pending-journal rows are deleted." }] },
+{ id:"pull", name:"Pull / rebase", blurb:"foreign admissions materialize locally",
+  steps:[
+    { comp:"policy", text:"A stale read acquires the exclusive refresh lease (concurrent stale reads coalesce behind it)." },
+    { comp:"authority", text:"Local pushes drain first; then pulls page admitted batches after the local admit tail." },
+    { comp:"spaceops", text:"Pull pages are validated dense and authenticated." },
+    { comp:"proposal", text:"append_admissions extends the durable admit log with expected-cursor checks." },
+    { comp:"rebase", text:"apply_admissions: each foreign transaction is decoded, re-lowered, and must reproduce byte-identical mutations." },
+    { comp:"operation", text:"Each authenticated op's apply() materializes rows and DDL onto canonical SQLite." },
+    { comp:"backend", text:"One savepoint; cursors re-checked inside it; commit seq advances; readers invalidated." },
+    { comp:"policy", text:"The lease completes Pulled\u2192Rebased; only then do readers count the state fresh." }] },
+{ id:"reject", name:"Rejection repair", blurb:"authority says no; local state rolls back",
+  steps:[
+    { comp:"spacemachine", text:"Admission fails a range assert or lease check; the server returns a semantic rejection." },
+    { comp:"authority", text:"The typed rejection identifies the failed device-seq head." },
+    { comp:"backend", text:"A reject_submissions proposal validates the failed head against the submit cursors inside the savepoint." },
+    { comp:"pending", text:"The journal decodes the logical transaction and compiles its inverse (RejectionRepair) \u2014 inverses are derived, never stored." },
+    { comp:"rowops", text:"Inverse operations restore before-images, delete speculative inserts, drop created tables." },
+    { comp:"backend", text:"Repair applies atomically; the entire suffix after the failure is forfeited (suffix-forfeit contract)." }] },
+{ id:"read", name:"Snapshot read", blurb:"queries never block writers",
+  steps:[
+    { comp:"api", text:"view()/query() requests a read." },
+    { comp:"policy", text:"Freshness check: LocalOnly serves immediately; LocalFirst serves within the staleness bound; Remote refreshes first." },
+    { comp:"committer", text:"capture_view pins a canonical reader at the exact queue position." },
+    { comp:"snapshot", text:"The reader pool reuses a generation-pinned SQLite reader \u2014 no file copy, no writer contention." },
+    { comp:"sqlgate", text:"The statement is classified as a pure read." },
+    { comp:"view", text:"Runs read-only under the public authorizer (reserved namespaces denied)." }] },
+{ id:"open", name:"Cold open / recovery", blurb:"one savepoint from file to live database",
+  steps:[
+    { comp:"api", text:"Connection::open (or reopen after crash)." },
+    { comp:"mlmeta", text:"One open savepoint wraps every durable transition \u2014 a mid-open failure rolls back metadata and journal together." },
+    { comp:"catalog", text:"Schema identities validate against actual SQLite structure." },
+    { comp:"pending", text:"The active journal window validates against the submit-log neck." },
+    { comp:"rowid", text:"Allocator tables validate; the stored device identity is cross-checked." },
+    { comp:"client", text:"The Homebase client opens with its durable device id and attaches the space envelope." },
+    { comp:"committer", text:"Committer, authority, and policy actors start; a backlog of unpushed groups schedules an immediate push." }] },
+],
+
+grammar: [
+{ family:"CREATE TABLE", items:[
+  { name:"column defs with mandatory declared types", status:"supported", note:"Gate: \u201cevery column must declare a type\u201d; \u201cempty column types are not supported\u201d; type size arguments must be numeric literals; the declaration must round-trip the real parser (blocks smuggled SQL)." },
+  { name:"INTEGER PRIMARY KEY (rowid alias)", status:"supported", note:"Required for rowid tables: \u201crowid tables require a single INTEGER PRIMARY KEY; other primary keys require WITHOUT ROWID.\u201d Omitted/NULL IPKs are allocated by the durable device-scoped allocator." },
+  { name:"WITHOUT ROWID + composite PRIMARY KEY", status:"supported", note:"Exactly one PRIMARY KEY per table (duplicates rejected); composite PKs move as one logical identity; PK ordering clauses rejected." },
+  { name:"STRICT tables", status:"supported", note:"Gate: \u201cSTRICT columns must use INT, INTEGER, REAL, TEXT, BLOB, or ANY without size arguments.\u201d" },
+  { name:"NOT NULL / DEFAULT (incl. non-deterministic)", status:"supported", note:"Duplicate NOT NULL/DEFAULT constraints rejected; NULL/NOT NULL conflict clauses rejected. CURRENT_TIMESTAMP / random() defaults work because the preupdate hook captures evaluated values \u2014 replicas replay values, not expressions." },
+  { name:"UNIQUE (plain column tuples)", status:"supported", note:"Distributed uniqueness via owner cells + OCC constraints. \u201cUNIQUE expressions and collations are not supported\u201d; conflict clauses rejected. Column tuples only \u2014 the durable product boundary." },
+  { name:"CHECK constraints", status:"supported", note:"Expressions bound to stable ColumnIds; \u201cCHECK constraints reference unknown table columns\u201d is a typed error; conflict clauses rejected." },
+  { name:"FOREIGN KEY \u2026 REFERENCES (simple & composite, immediate, NO ACTION)", status:"supported", note:"Reverse-reference handshake cells + parent range fences. Gate rejects: actions other than NO ACTION, MATCH and ON INSERT clauses, deferred FKs, FK collations/ordering, and mismatched child/parent column counts." },
+  { name:"column constraint set: PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK, REFERENCES", status:"supported", note:"The exact allowlist \u2014 \u201conly PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK, and REFERENCES column constraints are supported.\u201d COLLATE and GENERATED are therefore out (below)." },
+  { name:"ON CONFLICT clauses (PK / UNIQUE / NOT NULL / CHECK)", status:"fenced", note:"Every conflict-clause position is individually rejected. Each conflict mode needs its own OCC spec and the statement-delta compiler first." },
+  { name:"AUTOINCREMENT", status:"never", note:"\u201cAUTOINCREMENT is not supported\u201d \u2014 replaced by the device-scoped allocator; max+1 semantics cannot converge across devices." },
+  { name:"COLLATE on columns", status:"never", note:"Key images must exactly match SQLite comparison semantics; no parallel collation evaluator will be grown (product boundary)." },
+  { name:"generated columns (GENERATED ALWAYS AS)", status:"future", note:"Not in the constraint allowlist yet." },
+  { name:"self-referential / cyclic FKs", status:"fenced", note:"Rejected at IR construction; makes fencing-delete ordering provably safe. Revisit with FK evolution." },
+  { name:"cascading / mutating FK actions (CASCADE, SET NULL, SET DEFAULT, RESTRICT)", status:"fenced", note:"Only NO ACTION passes. Blocked on the statement-delta compiler normalizing mixed preupdate events into one deterministic net effect with an exact inverse." },
+  { name:"DEFERRABLE INITIALLY DEFERRED", status:"future", note:"\u201cdeferred foreign keys are not supported\u201d; queued behind FK evolution." },
+  { name:"CREATE TABLE IF NOT EXISTS", status:"fenced", note:"Explicitly rejected \u2014 idempotent DDL would blur schema-identity minting." },
+  { name:"CREATE TABLE \u2026 AS SELECT", status:"fenced", note:"Explicitly rejected \u2014 schema must be declared, not inferred." },
+  { name:"TEMPORARY / TEMP tables", status:"fenced", note:"\u201ctemporary tables are not supported\u201d on the public surface." },
+  { name:"qualified names (db.table)", status:"future", note:"Rejected everywhere today; unlocks with ATTACH/multi-schema work." } ] },
+{ family:"ALTER TABLE \u2014 all four SQLite forms are gated in", items:[
+  { name:"RENAME TO new_table", status:"supported", note:"Name-scope key swap in Homebase; stable TableId unchanged; rows untouched. Must change the table's case-insensitive identity; reserved and qualified names rejected." },
+  { name:"RENAME COLUMN old TO new", status:"supported", note:"Independent renames commute; CHECK/index expressions fold; the recomputed content-hashed revision is a local fold fingerprint, authenticated at decode (settled by commit 06243d1). Must change the column's case-insensitive identity." },
+  { name:"ADD COLUMN (NOT NULL / DEFAULT / CHECK only)", status:"supported", note:"Gate: \u201cADD COLUMN supports NOT NULL, DEFAULT, and CHECK constraints\u201d \u2014 so ADD COLUMN with UNIQUE, PRIMARY KEY, or REFERENCES is rejected. Historical rows project through the folded catalog." },
+  { name:"DROP COLUMN", status:"partial", note:"Works, but captures every removed value in the replicated operation frame. TODO: bound the capture and split replicated DDL from originating-replica repair; possibly withdraw until that protocol exists." },
+  { name:"(that's it \u2014 SQLite has no other ALTER forms)", status:"supported", note:"SQLite's complete ALTER TABLE grammar is RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN, and all four are admitted with the caveats above. Anything else (type changes, constraint edits) requires a table rebuild in stock SQLite too." } ] },
+{ family:"INDEX DDL", items:[
+  { name:"CREATE INDEX on columns (ASC/DESC, COLLATE)", status:"supported", note:"Local access paths + synchronized schema; converges with no row-level Homebase cells and no write-revision churn." },
+  { name:"CREATE INDEX on expressions", status:"supported", note:"Expressions bind to stable ColumnIds, but \u201cindex expressions cannot contain parameters, subqueries, qualified columns, aggregates, or window clauses.\u201d Term count is bounded." },
+  { name:"CREATE INDEX \u2026 WHERE (partial indexes)", status:"supported", note:"Non-unique partial predicates are synchronized schema; same expression restrictions apply." },
+  { name:"CREATE UNIQUE INDEX (distinct plain columns)", status:"supported", note:"Backfills one owner cell per existing row under OCC. Gate: \u201cUNIQUE index columns must be distinct\u201d; backfill size limits still TODO." },
+  { name:"UNIQUE with expressions / collations / ordering / predicates", status:"never", note:"\u201cUNIQUE index expressions, collations, ordering, and predicates are not supported\u201d \u2014 the product boundary: uniqueness ownership only for plain column tuples unless SQLite itself can delegate exact key images." },
+  { name:"NULLS FIRST / NULLS LAST", status:"fenced", note:"Explicitly rejected in index term ordering." },
+  { name:"DROP INDEX", status:"partial", note:"Schema head advances; retired owner cells stay inert by design \u2014 GC needs an explicit device/frontier retirement protocol (TODO)." },
+  { name:"dropping a referenced unique index", status:"fenced", note:"A parent index backing FK fences cannot be dropped until relationship retirement exists." },
+  { name:"IF NOT EXISTS / IF EXISTS", status:"fenced", note:"Both \u201cCREATE INDEX IF NOT EXISTS\u201d and \u201cDROP INDEX IF EXISTS\u201d are rejected \u2014 idempotent DDL blurs identity minting." } ] },
+{ family:"INSERT", items:[
+  { name:"INSERT INTO t [(cols)] VALUES \u2026 (single & multi-row)", status:"supported", note:"Full row images captured per row via the preupdate hook; rules stored once per operation." },
+  { name:"omitted / NULL INTEGER PRIMARY KEY", status:"supported", note:"Durable allocator supplies collision-partitioned ids; SQLite still probes uniqueness and retries." },
+  { name:"INSERT \u2026 SELECT", status:"supported", note:"The SELECT body and any CTEs are walked for reserved reads. Worth a boundary test that vendored SQLite's xfer optimization cannot bypass the rowid hook." },
+  { name:"WITH \u2026 INSERT (CTE prefix)", status:"supported", note:"CTE selects are reserved-read checked like the body." },
+  { name:"DEFAULT VALUES", status:"supported", note:"" },
+  { name:"INSERT OR REPLACE / IGNORE / ABORT / FAIL / ROLLBACK, REPLACE INTO", status:"fenced", note:"\u201cINSERT conflict clauses and REPLACE are not supported\u201d \u2014 blocked on the statement-delta compiler; each conflict mode needs its own OCC spec." },
+  { name:"UPSERT (ON CONFLICT DO \u2026)", status:"fenced", note:"Same rejection and same prerequisite as conflict clauses." },
+  { name:"RETURNING", status:"fenced", note:"\u201cINSERT RETURNING is not supported.\u201d" },
+  { name:"qualified / aliased targets (db.t, t AS a)", status:"fenced", note:"\u201cqualified and aliased INSERT targets are not supported.\u201d" } ] },
+{ family:"UPDATE / DELETE", items:[
+  { name:"UPDATE t SET col = expr \u2026 WHERE \u2026 (subqueries allowed)", status:"supported", note:"Full before/after row capture; subqueries run against the branch snapshot; SET, FROM, CTE, and WHERE expressions are reserved-read checked." },
+  { name:"primary-key moves via UPDATE", status:"supported", note:"Declared PK moves are atomic; multi-row key rotations diff operation-wide, so parent-key swaps are safe." },
+  { name:"DELETE FROM t WHERE \u2026 (subqueries allowed)", status:"supported", note:"Every old row image buffered for rejection repair; WHERE is reserved-read checked (commit 26bee3d)." },
+  { name:"unbounded bulk DELETE / UPDATE", status:"partial", note:"Semantically correct but O(rows) memory, mutations, and range asserts. Deterministic capture budgets + possible DeleteRange lowering are TODO." },
+  { name:"tuple assignment SET (a,b) = (\u2026)", status:"supported", note:"SQLite evaluates the tuple on the private branch; the preupdate hook captures the final before/after image, so no parallel expression evaluator is needed." },
+  { name:"UPDATE \u2026 FROM", status:"supported", note:"FROM sources participate in reserved-read checks and serializable table-root tracing; final rows lower through ordinary UpdateRows." },
+  { name:"UPDATE OR ABORT / FAIL / IGNORE / REPLACE / ROLLBACK", status:"fenced", note:"\u201cUPDATE conflict clauses are not supported\u201d \u2014 same statement-delta-compiler prerequisite." },
+  { name:"WITH \u2026 DELETE / WITH \u2026 UPDATE (CTE prefixes)", status:"supported", note:"Every CTE SELECT is traversed for reserved sources; execution and capture use the same row operation families as unprefixed DML." },
+  { name:"ORDER BY / LIMIT forms", status:"fenced", note:"\u201cDELETE ORDER BY and LIMIT\u201d / \u201cUPDATE ORDER BY and LIMIT\u201d are rejected." },
+  { name:"INDEXED BY / NOT INDEXED", status:"supported", note:"Planner hints do not enter the durable operation. Reserved SQLite/Multilite index names are rejected; ordinary named indexes and NOT INDEXED are accepted." },
+  { name:"RETURNING", status:"fenced", note:"Rejected on both statements." },
+  { name:"qualified / aliased targets", status:"fenced", note:"\u201cqualified and aliased DELETE/UPDATE targets are not supported.\u201d" } ] },
+{ family:"SELECT / reads", items:[
+  { name:"full SELECT grammar: joins, subqueries, CTEs, compounds, window functions", status:"supported", note:"Reads are full SQLite against pinned snapshot readers; the gate walks every subquery, CTE, compound, ORDER BY, and expression position for reserved names (now dequoted); the authorizer enforces at runtime." },
+  { name:"EXPLAIN SELECT / EXPLAIN QUERY PLAN SELECT", status:"supported", note:"\u201cEXPLAIN is supported only for SELECT\u201d \u2014 explain over writes is rejected. Undocumented in SQL_GRAMMAR.md." },
+  { name:"sqlite_schema / sqlite_master introspection", status:"partial", note:"Allowed deliberately; leaks reserved table names/DDL (not contents). Should be documented as a design decision." },
+  { name:"reads of __multilite__* tables", status:"never", note:"\u201creserved Multilite tables are not readable\u201d \u2014 gate and authorizer both enforce." },
+  { name:"PRAGMA name (argument-less)", status:"fenced", note:"Classified as a read by the gate but denied by the authorizer at runtime (except quick_check) \u2014 dead grammar, mislabeled; flagged in review." },
+  { name:"PRAGMA name = value", status:"fenced", note:"Falls to the execute gate's default rejection." } ] },
+{ family:"Transactions & scope", items:[
+  { name:"managed update / view closures", status:"supported", note:"The only transaction surface: one closure = one branch = one proposal." },
+  { name:"BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE", status:"fenced", note:"\u201ctransaction control is owned by the managed closure\u201d \u2014 all five statement kinds rejected; speculative capture requires owning the boundary." },
+  { name:"CREATE TRIGGER + trigger-generated public writes", status:"fenced", note:"Cannot be created, and trigger-depth writes on managed tables abort the statement; procedural effects must be materialized exactly once before this can open." },
+  { name:"CREATE / DROP VIEW", status:"future", note:"Not gated in; falls to the execute gate's default rejection." },
+  { name:"DROP TABLE", status:"future", note:"Documented as absent in SCHEMA_EVOLUTION.md; destructive-DDL repair protocol first." },
+  { name:"ATTACH / DETACH / multi-schema", status:"future", note:"Roadmap item; today every qualified name (db.table) is rejected at the gate." },
+  { name:"VACUUM / ANALYZE / REINDEX", status:"fenced", note:"Fall to the default rejection: \u201cexecute accepts only supported schema changes, INSERT, DELETE, and UPDATE.\u201d" },
+  { name:"multiple statements per call", status:"fenced", note:"\u201cmultiple statements are not supported\u201d \u2014 one statement per prepare, always." } ] },
+],
+
+roadmap: [
+/* correctness / launch-blocking */
+{ id:"r1", title:"DST \u00d7 SlateDB (incl. local disk cache)", themes:["correctness","deployment"], layers:["sim","server"], horizon:"now",
+  detail:"Make deterministic simulation work seamlessly with SlateDB including its local disk cache, so layer-3 torture covers the production storage path end to end." },
+{ id:"r2", title:"Checked-unlease replacement coverage bug", themes:["correctness"], layers:["client"], horizon:"now",
+  detail:"unlease_checked can remove a usable lease in favor of a live replacement whose barrier hasn't applied, then permit removing the replacement too. Preserve a live usable covering reservation across replacement/refresh/repair/expiry/crash; add regression tests for the two-step removal." },
+{ id:"r3", title:"Deterministic capture budgets everywhere", themes:["correctness"], layers:["multilite"], horizon:"now",
+  detail:"Make every durable operation encoder fallible; one budget across row count, row bytes, key components, operation/transaction bytes, DELETE repair, DROP COLUMN repair, UNIQUE backfill. Oversized statements roll back atomically with stable typed errors \u2014 never a u32 panic." },
+{ id:"r4", title:"Two-replica integrity sim \u2192 full DST", themes:["correctness"], layers:["multilite","sim"], horizon:"now",
+  detail:"The seeded two-replica scenario now audits projected authority row frames, UNIQUE/FK cells, pending cleanup, SQLite integrity, and convergence. Next: a proper deterministic scheduler; authority delay/loss/duplication/partition; VFS short reads/writes, I/O failure, corruption; and crash points around WAL, pending-journal, cursor, and metadata transitions." },
+{ id:"r5", title:"Bounded speculative DELETE capture", themes:["correctness","performance"], layers:["multilite"], horizon:"now",
+  detail:"DELETE buffers every old row image in memory. Enforce per-statement row/byte limits with atomic rollback first; later evaluate spilling restoration images, chunking, and lowering eligible predicates to Homebase DeleteRange (must preserve rollback data and footprints)." },
+{ id:"r6", title:"Empty key-component validation", themes:["correctness"], layers:["core"], horizon:"now",
+  detail:"Ensure key components cannot be empty; prefixes may be empty but keys may not." },
+{ id:"r7", title:"Refresh workflow: retry the push\u2192pull\u2192rebase drain", themes:["correctness"], layers:["multilite"], horizon:"next",
+  detail:"The rest of the Aug 1 review's policy findings landed in commit 17531e0 (push off the mailbox, lease mutual exclusion, rejection auto-repair). Remaining: a concurrent local write between refresh steps still surfaces as RefreshPushRejected / RebasePendingSubmissions to the reader instead of retrying the drain with a bound." },
+{ id:"r10", title:"Destructive DDL: split replicated op from local repair", themes:["correctness"], layers:["multilite"], horizon:"next",
+  detail:"DROP COLUMN captures every removed value in the replicated frame. Bound and canonically order that capture, then separate replicated logical DDL from the originating replica's repair payload. Consider withdrawing destructive DDL until the protocol exists \u2014 authority can still reject the op." },
+{ id:"r11", title:"Foreign-writer detection & quarantine", themes:["correctness"], layers:["multilite"], horizon:"later",
+  detail:"Broad foreign-writer program: enforce process/file ownership; fence committer apply against unexpected WAL tips under SQLite's real write lock; poison stale branches; distinguish cooperating Multilite writers from stock-SQLite commits using data_version, WAL epoch, schema cookie, and commit markers; quarantine unrepresented writes; define recovery/import UX; test out-of-band triggers, FK actions, checkpoints, and process crashes." },
+{ id:"r12", title:"Centralized physical-schema generation validation", themes:["correctness"], layers:["multilite"], horizon:"next",
+  detail:"Have the committer maintain and validate one physical schema/catalog generation at snapshot issue and canonical apply; a mismatch enters the externally-modified/quarantine path." },
+{ id:"r13", title:"Authenticated fold checkpoint protocol (if ever needed)", themes:["protocol"], layers:["multilite"], horizon:"research",
+  detail:"New TODO from commit 06243d1: schema revision UUIDs now authenticate complete folded table IR, and Homebase retains only immutable before/after snapshots per DDL op. If bootstrap later needs random access to every derived commuting fold rather than replaying the immutable schema log, add an explicit authenticated fold checkpoint protocol \u2014 do not reinterpret the active-schema conflict cell as that checkpoint." },
+{ id:"r15", title:"Device identity vs file copies (fork detection)", themes:["correctness","protocol"], layers:["client"], horizon:"next",
+  detail:"Direction set: random in-file id + DeviceSeq-regression-as-fork-proof \u2192 re-mint & resync. Remaining: early-warning heuristics (inode/host, incarnation lease) and whether retired-id ledger prefixes migrate or coexist." },
+{ id:"r16", title:"Push/lease recovery cleanup", themes:["correctness"], layers:["client"], horizon:"next",
+  detail:"Distinguish lease-plane recoverable failures (NotCovered, LeaseInvalid, Fenced) from semantic write failures (VerRegression); add a retry path using lease for queued head keys; rollback stays manual for bad commits." },
+{ id:"r17", title:"Admit-log level checksum", themes:["correctness"], layers:["server","core"], horizon:"research",
+  detail:"Whole-space cumulative checksum as a sync/snapshot integrity layer \u2014 validatable only with every intervening batch or a compact proof; design alongside changelog retention, snapshot manifests, and the per-prefix Merkle idea." },
+
+/* protocol design */
+{ id:"r18", title:"Lease-barrier scope: global vs prefix-local", themes:["protocol","correctness"], layers:["server"], horizon:"next",
+  detail:"Server records the space-global admission high-water at grant; older design text says prefix-local. Decide, document, and remove the contradiction everywhere." },
+{ id:"r19", title:"Authenticated checkpoints for bootstrap", themes:["protocol"], layers:["core","client"], horizon:"next",
+  detail:"Before dense admission history becomes the only bootstrap path: a trust object binding one materialized space state to an admission seq and device/space lineage, so a new replica verifies a checkpoint and replays only the dense suffix. A Homebase primitive, not a Multilite snapshot." },
+{ id:"r20", title:"FK evolution: retirement, retargeting, coercion", themes:["protocol"], layers:["multilite"], horizon:"later",
+  detail:"Define retirement/GC for dropped relationships before widening the grammar; then durable retargeting/removal, affinity/collation coercion, self-references and cycles, deferred constraints, mutating actions, add/drop relationship evolution." },
+{ id:"r21", title:"Statement-delta compiler (conflict clauses, triggers)", themes:["protocol","correctness"], layers:["multilite"], horizon:"later",
+  detail:"One compiler that normalizes mixed/repeated preupdate events into a deterministic ordered net effect, derives guards for every affected table, materializes procedural effects exactly once, and produces an exact inverse. Prerequisite for REPLACE/UPSERT/triggers/mutating FK actions \u2014 each conflict mode needs its own OCC spec." },
+{ id:"r22", title:"Serverless-born clients acquiring authority later", themes:["protocol"], layers:["client"], horizon:"research",
+  detail:"How does an oplog accumulated without leases acquire authority and ship? Device-scoped-prefix/ledger pattern may make it safe." },
+{ id:"r23", title:"Adopt an existing SQLite file", themes:["protocol","ecosystem"], layers:["multilite"], horizon:"next",
+  detail:"Broad adoption program: inspect an existing file without mutating it; classify tables and schema features; explicitly promote eligible tables through the same schema compiler; capture rows under deterministic budgets; submit schema+backfill atomically; preserve unsupported tables as readable/local; provide dry-run diagnostics, resumable migration, rollback, progress, and stock-SQLite compatibility tests." },
+{ id:"r24", title:"Rejection: crash-safe suffix archive", themes:["protocol","correctness"], layers:["multilite"], horizon:"next",
+  detail:"Suffix-forfeit stays the contract (never auto-rebase stale ops), but before rollback discards an offline suffix, provide a crash-safe archive/export of its logical transactions." },
+{ id:"r25", title:"Device fencing", themes:["protocol"], layers:["core","server"], horizon:"later", detail:"Support fencing a device out of a space." },
+{ id:"r26", title:"More lease kinds (forever, oneshot)", themes:["protocol"], layers:["core"], horizon:"later", detail:"" },
+{ id:"r27", title:"Clock lineage / incarnation tracking", themes:["protocol"], layers:["core"], horizon:"later", detail:"Track lineage so incarnation keys survive process restart." },
+{ id:"r28", title:"Client \u2192 Device naming reconciliation", themes:["protocol"], layers:["client"], horizon:"later", detail:"Should client be renamed device, or device machinery (ID, seqnum) mapped to ClientID?" },
+{ id:"r29", title:"Admission-seq smuggling codec", themes:["protocol"], layers:["core"], horizon:"research", detail:"Keep 64 random seqs, use trailing zeros to decide, etc." },
+{ id:"r30", title:"Range-assert failures return ops / global seq", themes:["protocol"], layers:["server"], horizon:"later", detail:"Many responses should return the global seqnum, or return the conflicting ops when a range assert fails \u2014 turns blind retries into informed rebases." },
+
+/* security / crypto */
+{ id:"r31", title:"Threat-model doc (launch artifact)", themes:["security","deployment"], layers:["client","server"], horizon:"now",
+  detail:"Crypto design largely written (DESIGN.md honest-but-dumb + key hierarchy). Must include the minter-needs-name-key tension: hosted auth can mint partition-scoped claims only if the tenant shares the name key." },
+{ id:"r32", title:"Rotation \u00d7 push-pipeline ordering", themes:["security","correctness"], layers:["client"], horizon:"next",
+  detail:"Can an eager re-key generation boundary occur while unshipped oplog entries sit under the old key_epoch? Likely: drain the oplog before the generation rewrite; lazy prefixes unaffected. v1 has no cryptographic revocation." },
+{ id:"r33", title:"Device vs account key layers; Link \u2192 Account?", themes:["security","protocol"], layers:["client"], horizon:"next",
+  detail:"Per-device keypairs beneath the Link would enable device-granular revocation, device pairing without password entry, per-device envelope wraps \u2014 vs v1's single link_priv via password-derived KEK. Naming decision before the vocabulary freezes." },
+{ id:"r34", title:"Client identity-spec reconciliation", themes:["security","protocol"], layers:["client"], horizon:"next",
+  detail:"Enclave/KeyBundle/bootstrap-record \u2192 SpaceEnvelope + identity module; SystemRecord::Bootstrap \u2192 Envelope; delete derive_space_id (ids are HKDF(name_key) commitments); drop rotate_secret/rotate_space_key from v1 (KeyEpoch stays, permanently 0)." },
+{ id:"r35", title:"Bucketing / padding before encryption", themes:["security"], layers:["client","core"], horizon:"later", detail:"Pad key components & values to buckets before sealing (size-leak hygiene)." },
+{ id:"r36", title:"UUID indirection for key components", themes:["security","protocol"], layers:["core"], horizon:"research", detail:"Better rotation via indirection." },
+
+/* performance */
+{ id:"r37", title:"unlease_checked cost", themes:["performance"], layers:["client"], horizon:"later",
+  detail:"Currently scans the active oplog re-evaluating coverage per checked assertion. Index checked assertions by covering lease/prefix so cost is proportional to affected guards." },
+{ id:"r38", title:"Indexed pending-journal retirement", themes:["performance"], layers:["multilite"], horizon:"next",
+  detail:"accept_through decodes the complete journal per acknowledgement (inside the commit savepoint). Make accepted-prefix retirement a direct indexed delete." },
+{ id:"r39", title:"Bulk-DML footprint collapse", themes:["performance"], layers:["multilite"], horizon:"next",
+  detail:"Whole-table DELETE ships one RangeAssert per row. A table-prefix assertion is strictly stronger and O(1); range lowering must preserve rollback data and footprints." },
+{ id:"r40", title:"Snapshot & branch startup overhead", themes:["performance"], layers:["multilite"], horizon:"next",
+  detail:"Benchmark large DBs and long-lived snapshots; process-wide routing VFS instead of per-branch registration; cache decoded catalog/schema metadata (parser-bound today); measure group-commit throughput; a proven reset/rebind protocol before reusing branch handles." },
+{ id:"r41", title:"DML compile-path de-duplication", themes:["performance"], layers:["multilite"], horizon:"next",
+  detail:"From review: rules derived then re-derived 3\u20135\u00d7 per statement; incoming-FK derivation walks the whole catalog each time. Share one derivation on the local path; keep the deep check for untrusted decodes." },
+{ id:"r42", title:"UNIQUE backfill bounds", themes:["performance","correctness"], layers:["multilite"], horizon:"next",
+  detail:"Bound CREATE UNIQUE INDEX backfills by rows/bytes before accepting unbounded tables; later chunk/spill while preserving one logical op and one atomic SQLite transaction." },
+{ id:"r43", title:"Authority actor: coalescing, backoff, cancellation", themes:["performance"], layers:["multilite"], horizon:"next",
+  detail:"Add transport request coalescing, retry/backoff, cancellation-independent completion. Preserve the acyclic ownership rule." },
+{ id:"r44", title:"Lamport ver per 2^16 hash bucket", themes:["performance"], layers:["core","server"], horizon:"later", detail:"Key ver is a global lamport today; shard it per hash bucket." },
+{ id:"r45", title:"Secondary-index conflict projection (optional)", themes:["performance"], layers:["multilite"], horizon:"research",
+  detail:"Keep serializable tracing coarse until measurements justify a projection; if added, define activation/backfill lifecycle so SI writes don't pay permanent overhead for access-path indexes." },
+{ id:"r46", title:"i64 split into components for finer range asserts", themes:["performance"], layers:["core"], horizon:"research", detail:"Idea: split i64 keys into 8 components to make range locking finer." },
+{ id:"r47", title:"prepare_cached in metastore/pending/rowid hot paths", themes:["performance"], layers:["multilite"], horizon:"later",
+  detail:"From review: SQL re-formatted and re-prepared per call throughout; cheap steady-state win." },
+
+/* deployment / ecosystem */
+{ id:"r48", title:"crates.io naming transition", themes:["deployment","ecosystem"], layers:["core","client","server"], horizon:"now",
+  detail:"Repurpose 'homebase' from old client SDK to the server package; publish client as homebase-client; retire/deprecate homebase-server and homebased." },
+{ id:"r49", title:"Client disk store backend (redb)", themes:["deployment"], layers:["client"], horizon:"next",
+  detail:"Pick and implement the directory-tied OrderedStore backend; revisit local at-rest encryption as a store-level wrapper." },
+{ id:"r50", title:"Client slatedb on single-threaded tokio", themes:["deployment"], layers:["client"], horizon:"later", detail:"" },
+{ id:"r51", title:"Legacy codec migration to Writer/Reader", themes:["deployment"], layers:["core","client","server"], horizon:"later",
+  detail:"Mechanical commit; byte-for-byte fixtures for every stable format so cleanup can't change durable/wire encodings." },
+{ id:"r52", title:"BigInt-safe rowids in JS binding", themes:["ecosystem","correctness"], layers:["bindings"], horizon:"now",
+  detail:"From review: allocator rowids exceed 2^53 for nearly all device tags. Mandate BigInt in npm (or re-budget tag/slot bits)." },
+{ id:"r53", title:"Live queries / db.watch", themes:["ecosystem"], layers:["multilite"], horizon:"later", detail:"Reactive query subscriptions over the commit stream." },
+{ id:"r54", title:"Conformance, compatibility & convergence suites", themes:["ecosystem","correctness"], layers:["multilite","sim","bindings"], horizon:"next",
+  detail:"Grow sql-logic-test coverage with unsupported-vs-wrong classification and statement-shape history; add SQLite-oracle fixtures, two/many-replica convergence and rejection cases, isolation/policy matrices, reopen/crash runs, per-binding parity, corpus sharding, and CI trend artifacts." },
+{ id:"r55", title:"Multi-schema / ATTACH", themes:["ecosystem"], layers:["multilite"], horizon:"research", detail:"" },
+{ id:"r56", title:"Async API follow-ups", themes:["ecosystem"], layers:["multilite"], horizon:"later",
+  detail:"Configurable worker sizing/shutdown; streaming owned-row APIs if adapters demand; cancellation/stress telemetry." },
+{ id:"r57", title:"Single metadata table as namespace/key/value triples", themes:["deployment"], layers:["multilite"], horizon:"later", detail:"" },
+{ id:"r58", title:"Take the gem name for multilite", themes:["ecosystem"], layers:["bindings"], horizon:"later", detail:"" },
+{ id:"r59", title:"Name-component encoding cleanup", themes:["protocol"], layers:["multilite"], horizon:"later",
+  detail:"Change column keys from name-{name} to <name> or <name>\u2026[hash]." },
+{ id:"r63", title:"Multilite CLI mirroring the sqlite3 binary", themes:["ecosystem","deployment"], layers:["multilite","bindings"], horizon:"next",
+  detail:"Build a multilite binary with familiar sqlite3-style open/execute/query, dot commands, import/export, schema inspection, policy/isolation flags, push/pull/rebase/rollback status, invitations, diagnostics, non-interactive scripting, exit codes, and compatibility tests against common sqlite3 CLI workflows." },
+{ id:"r64", title:"Distribution: npm, Python, Ruby, Homebrew & release artifacts", themes:["ecosystem","deployment"], layers:["bindings","client","server"], horizon:"next",
+  detail:"Define the release matrix and automation: crates.io, npm with BigInt-safe rowids, Python wheels, Ruby gem, Homebrew formula, signed/checksummed CLI binaries, supported OS/architecture targets, version compatibility, reproducible builds, install smoke tests, upgrade policy, and release notes." },
+{ id:"r65", title:"Benchmark suite and performance budgets", themes:["performance","correctness"], layers:["multilite","sim"], horizon:"next",
+  detail:"Build reproducible benchmarks against stock SQLite for point/range reads, inserts/updates/deletes, DDL and UNIQUE/FK work, branch/snapshot/connection startup, commit/group-commit, push/pull/rebase, rejection repair, reopen, WAL/checkpoint pressure, database size, concurrency, and memory/bytes written. Track baselines and regression budgets in CI." },
+
+/* standing decisions */
+{ id:"r60", title:"Uniqueness = plain column tuples, period", themes:["protocol"], layers:["multilite"], horizon:"boundary",
+  detail:"Synchronized uniqueness stays narrower than SQLite's index grammar: plain column tuples with order preserved, unless SQLite itself can delegate exact key images. No parallel evaluator for expression/partial/collated UNIQUE. Rich non-UNIQUE indexes stay local access paths + synchronized schema only." },
+{ id:"r61", title:"Grammar growth stays behind the nine-point completion gate", themes:["protocol","correctness"], layers:["multilite"], horizon:"boundary",
+  detail:"The compiler freeze is lifted, but every new family or syntax extension still requires validated logical meaning, codec/provenance checks, deterministic authenticated lowering, declared contracts, branch/canonical equivalence, atomic rejection restore, convergence tests, and bounded failure." },
+{ id:"r62", title:"Serializable reads stay coarse until measured", themes:["performance","protocol"], layers:["multilite"], horizon:"boundary",
+  detail:"Table-root prefixes cover joins/subqueries/trigger reads/write predicates. Precision is an optimization after correctness; a statement may be conservative but never omit a dependency." },
+],
+};
+
+/* ================================================================
+   SHELL — rendering + interaction. No dependencies.
+   ================================================================ */
+(function(){
+  const $ = (s, r) => (r||document).querySelector(s);
+  const $$ = (s, r) => Array.from((r||document).querySelectorAll(s));
+  const escapeHtml = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const byId = Object.fromEntries(DATA.components.map(c => [c.id, c]));
+  const cardTitle = Object.fromEntries(DATA.roadmap.map(r => [r.id, r.title]));
+
+  /* ---------- tabs ---------- */
+  $$("nav button").forEach(b => b.addEventListener("click", () => {
+    $$("nav button").forEach(x => x.classList.toggle("active", x === b));
+    $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + b.dataset.view));
+    if (b.dataset.view === "system") requestAnimationFrame(drawEdges);
+  }));
+
+  /* ---------- system map ---------- */
+  const map = $("#map");
+  const svg = $("#edge-svg");
+  let selected = null, activeFlow = null;
+
+  function healthDots(c) {
+    if (!c.health || !c.health.length) return "";
+    const sevs = [...new Set(c.health.map(h => h.sev))];
+    return `<span class="dots">${sevs.map(s => `<span class="dot ${s}" title="${s}"></span>`).join("")}</span>`;
+  }
+
+  function buildMap() {
+    DATA.layers.forEach(layer => {
+      const el = document.createElement("div");
+      el.className = "layer"; el.dataset.layer = layer.id;
+      el.innerHTML = `<div class="lhead"><span class="lname">${layer.name}</span><span class="lblurb">${layer.blurb}</span></div>`;
+      const comps = DATA.components.filter(c => c.layer === layer.id);
+      const bands = [...new Set(comps.map(c => c.band).filter(Boolean))];
+      if (bands.length) {
+        bands.forEach(band => {
+          const sb = document.createElement("div"); sb.className = "subband";
+          sb.innerHTML = `<div class="sbname">${band}</div>`;
+          const cc = document.createElement("div"); cc.className = "cards";
+          comps.filter(c => c.band === band).forEach(c => cc.appendChild(compEl(c)));
+          sb.appendChild(cc); el.appendChild(sb);
+        });
+      } else {
+        const cc = document.createElement("div"); cc.className = "cards";
+        comps.forEach(c => cc.appendChild(compEl(c)));
+        el.appendChild(cc);
+      }
+      map.appendChild(el);
+    });
+  }
+  function compEl(c) {
+    const d = document.createElement("div");
+    d.className = "comp"; d.dataset.id = c.id;
+    d.innerHTML = `${healthDots(c)}<div class="cname">${c.name}</div>
+      <div class="cfiles">${(c.files && c.files[0]) || ""}</div>`;
+    d.addEventListener("click", e => { e.stopPropagation(); select(c.id); });
+    return d;
+  }
+
+  /* ---------- edges ---------- */
+  function anchor(el) {
+    const m = map.getBoundingClientRect(), r = el.getBoundingClientRect();
+    return { x: r.left - m.left + r.width/2, top: r.top - m.top, bottom: r.top - m.top + r.height,
+             left: r.left - m.left, right: r.left - m.left + r.width, cy: r.top - m.top + r.height/2 };
+  }
+  function edgePath(a, b) {
+    // vertical-ish connection: bottom of upper to top of lower (or side-to-side within a band)
+    if (Math.abs(a.cy - b.cy) < 30) {
+      const x1 = a.right, x2 = b.left;
+      return `M ${x1} ${a.cy} C ${x1+30} ${a.cy}, ${x2-30} ${b.cy}, ${x2} ${b.cy}`;
+    }
+    const down = b.cy > a.cy;
+    const y1 = down ? a.bottom : a.top, y2 = down ? b.top : b.bottom;
+    const dy = Math.max(24, Math.abs(y2 - y1) / 2);
+    return `M ${a.x} ${y1} C ${a.x} ${y1 + (down?dy:-dy)}, ${b.x} ${y2 - (down?dy:-dy)}, ${b.x} ${y2}`;
+  }
+  function drawEdges() {
+    svg.innerHTML = "";
+    svg.setAttribute("width", map.scrollWidth); svg.setAttribute("height", map.scrollHeight);
+    const defs = document.createElementNS("http://www.w3.org/2000/svg","defs");
+    defs.innerHTML = `<marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker>`;
+    svg.appendChild(defs);
+    const showAll = $("#all-edges").checked;
+    let edges = [];
+    if (activeFlow) {
+      const f = DATA.flows.find(f => f.id === activeFlow);
+      for (let i = 0; i < f.steps.length - 1; i++) {
+        if (f.steps[i].comp !== f.steps[i+1].comp)
+          edges.push({ from: f.steps[i].comp, to: f.steps[i+1].comp, kind: "flow" });
+      }
+      if (selected) {
+        DATA.edges.filter(e => e.from === selected || e.to === selected)
+          .forEach(e => edges.push({...e, kind: "sel"}));
+      }
+    } else if (selected) {
+      edges = DATA.edges.filter(e => e.from === selected || e.to === selected).map(e => ({...e, kind:"sel"}));
+    } else {
+      edges = DATA.edges.filter(e => showAll || e.spine).map(e => ({...e, kind: e.spine ? "spine" : "minor"}));
+    }
+    edges.forEach(e => {
+      const fe = map.querySelector(`.comp[data-id="${e.from}"]`), te = map.querySelector(`.comp[data-id="${e.to}"]`);
+      if (!fe || !te) return;
+      const p = document.createElementNS("http://www.w3.org/2000/svg","path");
+      p.setAttribute("d", edgePath(anchor(fe), anchor(te)));
+      p.setAttribute("fill","none"); p.setAttribute("marker-end","url(#arr)");
+      const style = { flow:["#5aa9ff",2.2,1], sel:["#5aa9ff",1.8,.9], spine:["#3d4c66",1.6,.8], minor:["#2c374a",1.2,.55] }[e.kind];
+      p.setAttribute("stroke", style[0]); p.setAttribute("stroke-width", style[1]); p.setAttribute("opacity", style[2]);
+      svg.appendChild(p);
+      if (e.label && (e.kind === "sel")) {
+        const fa = anchor(fe), ta = anchor(te);
+        const t = document.createElementNS("http://www.w3.org/2000/svg","text");
+        t.setAttribute("x",(fa.x+ta.x)/2); t.setAttribute("y",(fa.cy+ta.cy)/2 - 4);
+        t.setAttribute("fill","#8a97ab"); t.setAttribute("font-size","10.5"); t.setAttribute("text-anchor","middle");
+        t.textContent = e.label; svg.appendChild(t);
+      }
+    });
+  }
+
+  /* ---------- selection & drawer ---------- */
+  function select(id) {
+    selected = (selected === id) ? null : id;
+    if (activeFlow) {
+      // Keep the flow trace (dimming, step badges, arrows); just mark the
+      // selection and open its drawer on top of it.
+      $$(".comp").forEach(el => el.classList.toggle("selected", el.dataset.id === selected));
+    } else {
+      $$(".comp").forEach(el => {
+        el.classList.toggle("selected", el.dataset.id === selected);
+        const related = selected && (el.dataset.id === selected ||
+          DATA.edges.some(e => (e.from === selected && e.to === el.dataset.id) || (e.to === selected && e.from === el.dataset.id)));
+        el.classList.toggle("dimmed", !!selected && !related);
+      });
+    }
+    drawEdges();
+    renderDrawer();
+  }
+  function renderDrawer() {
+    const dr = $("#drawer");
+    if (!selected) { dr.classList.remove("open"); return; }
+    const c = byId[selected];
+    const relTodos = DATA.roadmap.filter(r =>
+      (c.layer === "multilite" && r.layers.includes("multilite") && (r.detail + r.title).toLowerCase().includes(c.name.split(" ")[0].toLowerCase())) );
+    const conns = DATA.edges.filter(e => e.from === c.id || e.to === c.id);
+    dr.innerHTML = `
+      <button class="dclose">&times;</button>
+      <h2>${c.name}</h2>
+      <div class="dlayer">${DATA.layers.find(l => l.id === c.layer).name}${c.band ? " \u203a " + c.band : ""}</div>
+      <div class="dfiles">${(c.files||[]).join("<br>")}</div>
+      <p class="dsummary">${c.summary}</p>
+      ${c.behavior && c.behavior.length ? `<h3>How it behaves</h3><ul>${c.behavior.map(b=>`<li>${b}</li>`).join("")}</ul>` : ""}
+      ${c.invariants && c.invariants.length ? `<h3>Invariants</h3><ul>${c.invariants.map(b=>`<li>${b}</li>`).join("")}</ul>` : ""}
+      ${c.health && c.health.length ? `<h3>Health (Aug 2026 review)</h3><ul>${c.health.map(h =>
+        `<li><span class="sev ${h.sev}">${h.sev}</span>${h.text}${h.known ? ' <span class="known">\u2014 acknowledged in TODO.md</span>' : ""}</li>`).join("")}</ul>` : ""}
+      ${c.snippets && c.snippets.length ? `<h3>Key code</h3>${c.snippets.map(s =>
+        `<details class="snip"><summary>${s.title} <small>${s.file}</small></summary><pre>${escapeHtml(s.code)}</pre></details>`).join("")}` : ""}
+      ${conns.length ? `<h3>Connections</h3>${conns.map(e => {
+        const other = e.from === c.id ? e.to : e.from;
+        return `<div class="conn-row"><span class="dir">${e.from === c.id ? "\u2192" : "\u2190"}</span>
+          <span class="linklike" data-goto="${other}">${byId[other].name}</span>
+          <span style="color:var(--muted)">${e.label||""}</span></div>`; }).join("")}` : ""}
+      ${relTodos.length ? `<h3>Related roadmap</h3><ul>${relTodos.map(r=>`<li>${r.title}</li>`).join("")}</ul>` : ""}
+    `;
+    dr.classList.add("open");
+    $(".dclose", dr).addEventListener("click", () => select(selected));
+    $$("[data-goto]", dr).forEach(el => el.addEventListener("click", () => select(el.dataset.goto)));
+    requestAnimationFrame(drawEdges);
+  }
+
+  /* ---------- flows ---------- */
+  function buildFlowRail() {
+    const box = $("#flow-btns");
+    DATA.flows.forEach(f => {
+      const b = document.createElement("button");
+      b.className = "flow-btn"; b.dataset.flow = f.id;
+      b.innerHTML = `${f.name}<small>${f.blurb}</small>`;
+      b.addEventListener("click", () => activeFlow === f.id ? clearFlow(true) : setFlow(f.id));
+      box.appendChild(b);
+    });
+  }
+  function setFlow(id) {
+    selected = null; activeFlow = id; renderDrawer();
+    $$(".flow-btn").forEach(b => b.classList.toggle("active", b.dataset.flow === id));
+    const f = DATA.flows.find(f => f.id === id);
+    const members = new Map(); // comp -> first step number
+    f.steps.forEach((s, i) => { if (!members.has(s.comp)) members.set(s.comp, i + 1); });
+    $$(".comp").forEach(el => {
+      el.classList.remove("selected");
+      el.classList.toggle("dimmed", !members.has(el.dataset.id));
+      const old = el.querySelector(".stepnum"); if (old) old.remove();
+      if (members.has(el.dataset.id)) {
+        const n = document.createElement("span"); n.className = "stepnum"; n.textContent = members.get(el.dataset.id);
+        el.appendChild(n);
+      }
+    });
+    $("#flow-steps").innerHTML = `<h3>${f.name}</h3>` + f.steps.map((s, i) =>
+      `<div class="flow-step"><b class="n">${i+1}</b><span><span class="who">${byId[s.comp].name}</span> \u2014 ${s.text}</span></div>`).join("");
+    drawEdges();
+  }
+  function clearFlow(redraw) {
+    activeFlow = null;
+    $$(".flow-btn").forEach(b => b.classList.remove("active"));
+    $$(".comp .stepnum").forEach(n => n.remove());
+    $$(".comp").forEach(el => {
+      const related = selected && (el.dataset.id === selected ||
+        DATA.edges.some(e => (e.from === selected && e.to === el.dataset.id) || (e.to === selected && e.from === el.dataset.id)));
+      el.classList.toggle("dimmed", !!selected && !related);
+    });
+    $("#flow-steps").innerHTML = "";
+    if (redraw) drawEdges();
+  }
+  $("#all-edges").addEventListener("change", drawEdges);
+  document.addEventListener("click", e => {
+    if (e.target.closest("#drawer") || e.target.closest(".comp") || e.target.closest("#flow-rail")) return;
+    if (selected) select(selected);
+  });
+  window.addEventListener("resize", () => { if ($("#view-system").classList.contains("active")) drawEdges(); });
+
+  /* ---------- grammar ---------- */
+  const STATUS_COLORS = { supported:"#2f9e63", partial:"#e3b341", fenced:"#9d7bff", future:"#5aa9ff", never:"#566072" };
+  function buildGrammar() {
+    const host = $("#gfams");
+    DATA.grammar.forEach(f => {
+      const counts = {};
+      f.items.forEach(i => counts[i.status] = (counts[i.status]||0) + 1);
+      const scored = f.items.filter(i => i.status !== "never");
+      const done = f.items.filter(i => i.status === "supported").length + 0.5 * f.items.filter(i => i.status === "partial").length;
+      const pct = scored.length ? Math.round(100 * done / scored.length) : 100;
+      const el = document.createElement("div"); el.className = "gfam";
+      el.innerHTML = `<div class="ghead"><h3>${f.family}</h3>
+        <div class="gbar">${["supported","partial","fenced","future","never"].map(s =>
+          counts[s] ? `<div style="flex:${counts[s]};background:${STATUS_COLORS[s]}"></div>` : "").join("")}</div>
+        <div class="gstat">${pct}% of in-scope</div></div>
+        <div class="chips">${f.items.map((i, idx) =>
+          `<span class="chip s-${i.status}" data-f="${f.family}" data-i="${idx}">${i.name}</span>`).join("")}</div>
+        <div class="gnote"></div>`;
+      host.appendChild(el);
+      $$(".chip", el).forEach(ch => ch.addEventListener("click", () => {
+        const item = f.items[+ch.dataset.i];
+        const note = $(".gnote", el);
+        const already = note.style.display === "block" && note.dataset.cur === ch.dataset.i;
+        note.style.display = already ? "none" : "block";
+        note.dataset.cur = ch.dataset.i;
+        note.innerHTML = `<b>${item.name}</b> \u2014 <i>${item.status}</i>${item.note ? ". " + item.note : ""}`;
+      }));
+    });
+  }
+
+  /* ---------- roadmap ---------- */
+  const THEMES = ["correctness","performance","security","protocol","deployment","ecosystem"];
+  const HORIZON_ORDER = { now:0, next:1, later:2, research:3, boundary:4 };
+  let rmMode = "board";
+  function rmFiltered() {
+    const hz = $("#rm-horizon").value, ly = $("#rm-layer").value, q = $("#rm-search").value.toLowerCase();
+    return DATA.roadmap.filter(r =>
+      (!hz || r.horizon === hz) && (!ly || r.layers.includes(ly)) &&
+      (!q || (r.title + " " + (r.detail||"")).toLowerCase().includes(q)));
+  }
+  function rmCard(r) {
+    const d = document.createElement("div"); d.className = "rmcard";
+    d.innerHTML = `<div class="rt">${r.title}</div>
+      ${r.detail ? `<div class="rd">${r.detail}</div>` : ""}
+      <div class="rmtags">${r.themes.map(t=>`<span class="tag t-${t}">${t}</span>`).join("")}
+        ${r.layers.map(l=>`<span class="tag lay">${l}</span>`).join("")}
+        <span class="tag hz">${r.horizon}</span></div>`;
+    d.addEventListener("click", () => d.classList.toggle("open"));
+    return d;
+  }
+  function renderRoadmap() {
+    const board = $("#rm-board"), heat = $("#heat");
+    const items = rmFiltered();
+    if (rmMode === "heat") {
+      board.style.display = "none"; heat.style.display = "table";
+      const layers = ["core","client","server","multilite","sim","bindings"];
+      let html = `<tr><th></th>${layers.map(l=>`<th>${l}</th>`).join("")}<th>total</th></tr>`;
+      THEMES.forEach(t => {
+        const row = layers.map(l => items.filter(r => r.themes.includes(t) && r.layers.includes(l)).length);
+        const tot = items.filter(r => r.themes.includes(t)).length;
+        html += `<tr><th style="text-align:left">${t}</th>${row.map(n =>
+          `<td style="background:${n ? `rgba(90,169,255,${Math.min(.14*n,.65)})` : "transparent"}">${n||""}</td>`).join("")}<td><b>${tot}</b></td></tr>`;
+      });
+      heat.innerHTML = html;
+      return;
+    }
+    heat.style.display = "none"; board.style.display = "flex";
+    board.innerHTML = "";
+    const groupBy = $("#rm-group").value;
+    let groups;
+    if (groupBy === "theme") groups = THEMES.map(t => [t, items.filter(r => r.themes.includes(t))]);
+    else if (groupBy === "layer") groups = ["core","client","server","multilite","sim","bindings"].map(l => [l, items.filter(r => r.layers.includes(l))]);
+    else groups = ["now","next","later","research","boundary"].map(h => [h, items.filter(r => r.horizon === h)]);
+    groups.forEach(([name, list]) => {
+      if (!list.length) return;
+      list.sort((a,b) => HORIZON_ORDER[a.horizon] - HORIZON_ORDER[b.horizon]);
+      const col = document.createElement("div"); col.className = "col";
+      col.innerHTML = `<h4>${name} <span>${list.length}</span></h4>`;
+      list.forEach(r => col.appendChild(rmCard(r)));
+      board.appendChild(col);
+    });
+  }
+  ["rm-group","rm-horizon","rm-layer"].forEach(id => $("#"+id).addEventListener("change", renderRoadmap));
+  $("#rm-search").addEventListener("input", renderRoadmap);
+  $$(".fchip").forEach(ch => ch.addEventListener("click", () => {
+    rmMode = ch.dataset.mode;
+    $$(".fchip").forEach(x => { x.classList.toggle("on", x === ch); x.style.background = x === ch ? "var(--accent)" : ""; });
+    renderRoadmap();
+  }));
+
+  /* ---------- init ---------- */
+  buildMap(); buildFlowRail(); buildGrammar(); renderRoadmap();
+  $$(".fchip")[0].click();
+  requestAnimationFrame(drawEdges);
+  setTimeout(drawEdges, 250); // after fonts settle
+})();
+</script>
+</body>
+</html>

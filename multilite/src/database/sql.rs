@@ -3,9 +3,10 @@
 use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, FrameBound,
-    FunctionCallOrder, FunctionTail, IndexedColumn, InsertBody, JoinConstraint, Literal, Name,
-    OneSelect, Over, RefAct, RefArg, ResultColumn, Select, SelectTable, SortedColumn, Stmt,
-    TabFlags, TableConstraint, Type, TypeSize, UnaryOperator, Window,
+    FromClause, FunctionCallOrder, FunctionTail, Indexed, IndexedColumn, InsertBody,
+    JoinConstraint, Literal, Name, OneSelect, Over, RefAct, RefArg, ResultColumn, Select,
+    SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
+    Window, With,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -437,9 +438,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             order_by,
             limit,
         } => {
-            if with.is_some() {
-                return Err(Error::UnsupportedSql("DELETE WITH is not supported"));
-            }
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified and aliased DELETE targets are not supported",
@@ -453,11 +451,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "reserved SQLite and Multilite table names are not supported",
                 ));
             }
-            if indexed.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "DELETE index selection is not supported",
-                ));
-            }
+            validate_index_hint(indexed.as_ref())?;
             if returning.is_some() {
                 return Err(Error::UnsupportedSql("DELETE RETURNING is not supported"));
             }
@@ -466,7 +460,9 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "DELETE ORDER BY and LIMIT are not supported",
                 ));
             }
-            if where_clause.as_ref().is_some_and(expression_reads_reserved) {
+            if with_reads_reserved(with.as_ref())
+                || where_clause.as_ref().is_some_and(expression_reads_reserved)
+            {
                 return Err(Error::UnsupportedSql(
                     "DELETE cannot read reserved Multilite tables",
                 ));
@@ -485,9 +481,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             order_by,
             limit,
         } => {
-            if with.is_some() {
-                return Err(Error::UnsupportedSql("UPDATE WITH is not supported"));
-            }
             if or_conflict.is_some() {
                 return Err(Error::UnsupportedSql(
                     "UPDATE conflict clauses are not supported",
@@ -506,19 +499,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "reserved SQLite and Multilite table names are not supported",
                 ));
             }
-            if indexed.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "UPDATE index selection is not supported",
-                ));
-            }
-            if sets.iter().any(|set| set.col_names.len() != 1) {
-                return Err(Error::UnsupportedSql(
-                    "UPDATE tuple assignments are not supported",
-                ));
-            }
-            if from.is_some() {
-                return Err(Error::UnsupportedSql("UPDATE FROM is not supported"));
-            }
+            validate_index_hint(indexed.as_ref())?;
             if returning.is_some() {
                 return Err(Error::UnsupportedSql("UPDATE RETURNING is not supported"));
             }
@@ -527,7 +508,9 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "UPDATE ORDER BY and LIMIT are not supported",
                 ));
             }
-            if sets.iter().any(|set| expression_reads_reserved(&set.expr))
+            if with_reads_reserved(with.as_ref())
+                || sets.iter().any(|set| expression_reads_reserved(&set.expr))
+                || from.as_ref().is_some_and(from_reads_reserved)
                 || where_clause.as_ref().is_some_and(expression_reads_reserved)
             {
                 return Err(Error::UnsupportedSql(
@@ -622,11 +605,7 @@ pub fn validate_read_statement(sql: &str) -> Result<()> {
 }
 
 fn select_reads_reserved(select: &Select) -> bool {
-    select
-        .with
-        .iter()
-        .flat_map(|with| &with.ctes)
-        .any(|cte| select_reads_reserved(&cte.select))
+    with_reads_reserved(select.with.as_ref())
         || one_select_reads_reserved(&select.body.select)
         || select
             .body
@@ -659,21 +638,10 @@ fn one_select_reads_reserved(select: &OneSelect) -> bool {
             columns.iter().any(|column| match column {
                 ResultColumn::Expr(expression, _) => expression_reads_reserved(expression),
                 ResultColumn::Star | ResultColumn::TableStar(_) => false,
-            }) || from.as_ref().is_some_and(|from| {
-                from.select
-                    .iter()
-                    .any(|table| select_table_reads_reserved(table))
-                    || from.joins.iter().flatten().any(|join| {
-                        select_table_reads_reserved(&join.table)
-                            || matches!(
-                                &join.constraint,
-                                Some(JoinConstraint::On(expression))
-                                    if expression_reads_reserved(expression)
-                            )
-                    })
-            }) || where_clause
-                .as_ref()
-                .is_some_and(|expression| expression_reads_reserved(expression))
+            }) || from.as_ref().is_some_and(from_reads_reserved)
+                || where_clause
+                    .as_ref()
+                    .is_some_and(|expression| expression_reads_reserved(expression))
                 || group_by.iter().flatten().any(expression_reads_reserved)
                 || having
                     .as_ref()
@@ -685,6 +653,39 @@ fn one_select_reads_reserved(select: &OneSelect) -> bool {
         }
         OneSelect::Values(rows) => rows.iter().flatten().any(expression_reads_reserved),
     }
+}
+
+fn with_reads_reserved(with: Option<&With>) -> bool {
+    with.iter()
+        .flat_map(|with| &with.ctes)
+        .any(|cte| select_reads_reserved(&cte.select))
+}
+
+fn from_reads_reserved(from: &FromClause) -> bool {
+    from.select
+        .iter()
+        .any(|table| select_table_reads_reserved(table))
+        || from.joins.iter().flatten().any(|join| {
+            select_table_reads_reserved(&join.table)
+                || matches!(
+                    &join.constraint,
+                    Some(JoinConstraint::On(expression))
+                        if expression_reads_reserved(expression)
+                )
+        })
+}
+
+fn validate_index_hint(indexed: Option<&Indexed>) -> Result<()> {
+    let Some(Indexed::IndexedBy(name)) = indexed else {
+        return Ok(());
+    };
+    let name = identifier(name)?;
+    if super::has_multilite_prefix(name.value()) || super::is_sqlite_internal_table(name.value()) {
+        return Err(Error::UnsupportedSql(
+            "reserved SQLite and Multilite index names are not supported",
+        ));
+    }
+    Ok(())
 }
 
 fn select_table_reads_reserved(table: &SelectTable) -> bool {
@@ -1915,6 +1916,8 @@ mod tests {
     #[test]
     fn mutating_predicates_and_assignments_cannot_read_reserved_tables() {
         for sql in [
+            "WITH hidden AS (SELECT value FROM __multilite__meta)
+             DELETE FROM notes WHERE id IN (SELECT value FROM hidden)",
             "DELETE FROM notes WHERE EXISTS (
                 SELECT 1 FROM __multilite__meta
              )",
@@ -1927,14 +1930,26 @@ mod tests {
             "UPDATE notes SET body = 'x' WHERE EXISTS (
                 SELECT 1 FROM `__multilite__meta`
              )",
+            "WITH hidden AS (SELECT value FROM __multilite__meta)
+             UPDATE notes SET body = (SELECT value FROM hidden LIMIT 1)",
+            "UPDATE notes SET body = hidden.value
+             FROM __multilite__meta AS hidden",
+            "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",
+            "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
         ] {
             assert_unsupported(sql);
         }
 
         for sql in [
             "DELETE FROM notes WHERE EXISTS (SELECT 1 FROM archived)",
+            "WITH doomed AS (SELECT id FROM archived)
+             DELETE FROM notes NOT INDEXED WHERE id IN (SELECT id FROM doomed)",
             "UPDATE notes SET body = (SELECT body FROM archived LIMIT 1)",
             "UPDATE notes SET body = 'x' WHERE id IN (SELECT id FROM archived)",
+            "WITH replacement AS (SELECT id, body FROM archived)
+             UPDATE notes INDEXED BY notes_id
+             SET (body, payload) = (replacement.body, x'00')
+             FROM replacement WHERE replacement.id = notes.id",
         ] {
             validate_execute(sql).unwrap();
         }
@@ -2413,13 +2428,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_extensions_outside_the_initial_slice() {
+    fn accepts_captured_delete_and_update_extensions() {
         for sql in [
-            "WITH old AS (SELECT 1) DELETE FROM notes WHERE id IN old",
+            "WITH old AS (SELECT 1 AS id) DELETE FROM notes WHERE id IN old",
+            "DELETE FROM notes INDEXED BY notes_id WHERE id = 1",
+            "DELETE FROM notes NOT INDEXED WHERE id = 1",
+            "WITH replacement AS (SELECT 1 AS id, 'x' AS body)
+             UPDATE notes SET (body, payload) = (replacement.body, x'00')
+             FROM replacement WHERE replacement.id = notes.id",
+            "UPDATE notes INDEXED BY notes_id SET body = 'x'",
+            "UPDATE notes NOT INDEXED SET body = 'x'",
+        ] {
+            validate_execute(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_delete_extensions_without_owned_semantics() {
+        for sql in [
             "DELETE FROM main.notes",
             "DELETE FROM notes AS old",
-            "DELETE FROM notes INDEXED BY notes_id",
-            "DELETE FROM notes NOT INDEXED",
+            "DELETE FROM notes INDEXED BY __multilite__internal",
+            "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
             "DELETE FROM notes RETURNING id",
             "DELETE FROM notes ORDER BY id LIMIT 1",
             "DELETE FROM __multilite__pending",
@@ -2429,16 +2459,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_update_extensions_outside_the_initial_slice() {
+    fn rejects_update_extensions_without_owned_semantics() {
         for sql in [
-            "WITH old AS (SELECT 1) UPDATE notes SET body = 'x'",
             "UPDATE OR REPLACE notes SET body = 'x'",
             "UPDATE main.notes SET body = 'x'",
             "UPDATE notes AS old SET body = 'x'",
-            "UPDATE notes INDEXED BY notes_id SET body = 'x'",
-            "UPDATE notes NOT INDEXED SET body = 'x'",
-            "UPDATE notes SET (body, payload) = ('x', x'00')",
-            "UPDATE notes SET body = archived.body FROM archived WHERE archived.id = notes.id",
+            "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",
+            "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
             "UPDATE notes SET body = 'x' RETURNING id",
             "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
             "UPDATE __multilite__pending SET record = x''",

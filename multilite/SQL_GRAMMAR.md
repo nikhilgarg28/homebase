@@ -1,11 +1,17 @@
 # Multilite SQL Grammar
 
-Multilite's SQL grammar is intentionally frozen while the logical-operation
-compiler and verifier are consolidated. The current executable families are
+Multilite's SQL grammar grows only through the completion gate below. The
+logical-operation compiler, verifier, and guard registry are now the stable
+path for admitting compatible syntax. The current executable families are
 restricted `CREATE TABLE`, `ALTER TABLE` rename/add/drop forms,
 `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `SELECT`, `INSERT`, `DELETE`, and
 `UPDATE`. Exact accepted forms are defined by tests and the parser; accepting a
 SQLite statement does not imply that every SQLite spelling is supported.
+
+Captured UPDATE and DELETE syntax includes CTE prefixes, `UPDATE ... FROM`,
+tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These forms compile to the
+same row-image operations as simpler DML. Conflict clauses, `RETURNING`, and
+`ORDER BY` / `LIMIT` remain outside the managed write surface.
 
 ## Completion Gate
 

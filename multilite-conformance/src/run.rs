@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use sqllogictest::{Control, DefaultColumnType, Record, ResultMode, Runner};
+use fallible_iterator::FallibleIterator as _;
+use sqlite3_parser::ast::{Cmd, Stmt};
+use sqlite3_parser::lexer::sql::Parser;
+use sqllogictest::{Control, DefaultColumnType, Record, ResultMode, Runner, TestErrorKind};
 
-use crate::drivers::{MultiliteDriver, SqliteDriver};
+use crate::drivers::{DriverError, MultiliteDriver, SqliteDriver};
 use crate::report::{ConformanceReport, FileReport, RecordReport, RecordStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,42 +127,41 @@ fn run_both(path: &Path, max_records: Option<usize>) -> FileReport {
     for index in 0..max_records {
         let reference = sqlite.records.get(index);
         let candidate = multilite.records.get(index);
-        match (reference, candidate) {
+        let shape = candidate
+            .and_then(|record| record.shape.clone())
+            .or_else(|| reference.and_then(|record| record.shape.clone()));
+        let combined = match (reference, candidate) {
             (Some(reference), Some(candidate))
                 if reference.status == RecordStatus::Passed
                     && candidate.status == RecordStatus::Passed =>
             {
-                report.records.push(RecordReport::passed(index));
+                RecordReport::passed(index)
             }
             (Some(reference), _) if reference.status != RecordStatus::Passed => {
-                report.records.push(RecordReport::reference_failed(
-                    index,
-                    reference.detail.clone(),
-                ));
+                RecordReport::reference_failed(index, reference.detail.clone())
+            }
+            (Some(_), Some(candidate)) if candidate.status == RecordStatus::Unsupported => {
+                RecordReport::unsupported(index, candidate.detail.clone())
             }
             (Some(_), Some(candidate)) if candidate.status != RecordStatus::Passed => {
-                report.records.push(RecordReport::candidate_failed(
-                    index,
-                    candidate.detail.clone(),
-                ));
+                RecordReport::candidate_failed(index, candidate.detail.clone())
             }
-            (Some(reference), Some(candidate)) => report.records.push(RecordReport::diverged(
+            (Some(reference), Some(candidate)) => RecordReport::diverged(
                 index,
                 format!(
                     "reference status {} ({}) differed from candidate status {} ({})",
                     reference.status, reference.detail, candidate.status, candidate.detail
                 ),
-            )),
-            (Some(_), None) => report.records.push(RecordReport::diverged(
-                index,
-                "candidate did not produce a record report",
-            )),
-            (None, Some(_)) => report.records.push(RecordReport::diverged(
-                index,
-                "reference did not produce a record report",
-            )),
-            (None, None) => {}
-        }
+            ),
+            (Some(_), None) => {
+                RecordReport::diverged(index, "candidate did not produce a record report")
+            }
+            (None, Some(_)) => {
+                RecordReport::diverged(index, "reference did not produce a record report")
+            }
+            (None, None) => continue,
+        };
+        report.records.push(combined.with_shape(shape));
     }
     report
 }
@@ -189,11 +191,17 @@ where
                 if matches!(record, Record::Halt { .. }) {
                     break;
                 }
+                let shape = record_shape(&record);
                 match runner.run(record) {
-                    Ok(_) => report.records.push(RecordReport::passed(index)),
+                    Ok(_) => report
+                        .records
+                        .push(RecordReport::passed(index).with_shape(shape)),
+                    Err(error) if is_unsupported(&error.kind()) => report.records.push(
+                        RecordReport::unsupported(index, error.to_string()).with_shape(shape),
+                    ),
                     Err(error) => report
                         .records
-                        .push(RecordReport::failed(index, error.to_string())),
+                        .push(RecordReport::failed(index, error.to_string()).with_shape(shape)),
                 }
             }
         }
@@ -202,6 +210,61 @@ where
             .push(RecordReport::parse_error(format!("parse error: {error}"))),
     }
     report
+}
+
+fn is_unsupported(error: &TestErrorKind) -> bool {
+    let driver_error = match error {
+        TestErrorKind::Fail { err, .. } | TestErrorKind::ErrorMismatch { err, .. } => {
+            err.downcast_ref::<DriverError>()
+        }
+        _ => None,
+    };
+    driver_error.is_some_and(DriverError::is_unsupported)
+}
+
+fn record_shape(record: &Record<DefaultColumnType>) -> Option<String> {
+    let sql = match record {
+        Record::Statement { sql, .. } | Record::Query { sql, .. } | Record::Let { sql, .. } => sql,
+        _ => return None,
+    };
+    let mut parser = Parser::new(sql.as_bytes());
+    let command = parser.next().ok().flatten()?;
+    let statement = match command {
+        Cmd::Stmt(statement) | Cmd::Explain(statement) | Cmd::ExplainQueryPlan(statement) => {
+            statement
+        }
+    };
+    Some(
+        match statement {
+            Stmt::AlterTable(..) => "alter_table",
+            Stmt::Analyze(..) => "analyze",
+            Stmt::Attach { .. } => "attach",
+            Stmt::Begin(..) => "begin",
+            Stmt::Commit(..) => "commit",
+            Stmt::CreateIndex { unique: true, .. } => "create_unique_index",
+            Stmt::CreateIndex { .. } => "create_index",
+            Stmt::CreateTable { .. } => "create_table",
+            Stmt::CreateTrigger { .. } => "create_trigger",
+            Stmt::CreateView { .. } => "create_view",
+            Stmt::CreateVirtualTable { .. } => "create_virtual_table",
+            Stmt::Delete { .. } => "delete",
+            Stmt::Detach(..) => "detach",
+            Stmt::DropIndex { .. } => "drop_index",
+            Stmt::DropTable { .. } => "drop_table",
+            Stmt::DropTrigger { .. } => "drop_trigger",
+            Stmt::DropView { .. } => "drop_view",
+            Stmt::Insert { .. } => "insert",
+            Stmt::Pragma(..) => "pragma",
+            Stmt::Reindex { .. } => "reindex",
+            Stmt::Release(..) => "release",
+            Stmt::Rollback { .. } => "rollback",
+            Stmt::Savepoint(..) => "savepoint",
+            Stmt::Select(..) => "select",
+            Stmt::Update { .. } => "update",
+            Stmt::Vacuum(..) => "vacuum",
+        }
+        .to_owned(),
+    )
 }
 
 fn parse_compat_file(
@@ -219,12 +282,12 @@ fn strip_legacy_directive_comments(script: &str) -> String {
     let mut rewritten = String::with_capacity(script.len());
     for line in script.lines() {
         let trimmed = line.trim_start();
-        if is_directive_line(trimmed) {
-            if let Some((prefix, _comment)) = line.split_once(" #") {
-                rewritten.push_str(prefix.trim_end());
-                rewritten.push('\n');
-                continue;
-            }
+        if is_directive_line(trimmed)
+            && let Some((prefix, _comment)) = line.split_once(" #")
+        {
+            rewritten.push_str(prefix.trim_end());
+            rewritten.push('\n');
+            continue;
         }
         rewritten.push_str(line);
         rewritten.push('\n');

@@ -9,6 +9,8 @@ Current scope:
 - run one or more `.slt`/`.test` files against vanilla SQLite;
 - run the same file shape against Multilite;
 - emit a small JSON report suitable for later CI artifacts;
+- classify unsupported Multilite grammar separately from behavioral failures;
+- summarize records by parsed SQLite statement shape;
 - keep the crate out of the workspace default members so normal workspace tests
   do not have to run a large external corpus.
 
@@ -73,7 +75,9 @@ expects integer-ish rendering.
 
 Near-term next steps:
 
-- classify unsupported records separately from actual failures;
 - add progress output and sharding for long corpus runs;
 - normalize or classify legacy SQLite SLT type-rendering differences;
+- add two-replica convergence fixtures for accepted mutating records, not only
+  single-file behavioral parity;
+- retain historical coverage reports so grammar growth is measurable by shape;
 - add a Tcl extractor only after the sqllogictest corpus is useful.

@@ -13,6 +13,12 @@ pub enum DriverError {
     InvalidQueryShape(&'static str),
 }
 
+impl DriverError {
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Multilite(multilite::Error::UnsupportedSql(_)))
+    }
+}
+
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

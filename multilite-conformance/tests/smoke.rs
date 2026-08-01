@@ -75,6 +75,27 @@ fn defaults_and_checks_fixture_matches_sqlite() {
 }
 
 #[test]
+fn both_mode_classifies_unsupported_grammar_as_coverage_not_divergence() {
+    let report = run_file(
+        "tests/slt/unsupported.slt",
+        &RunOptions {
+            engine: multilite_conformance::Engine::Both,
+            max_records: None,
+        },
+    );
+
+    assert_eq!(report.record_count(), 2);
+    assert_eq!(report.unsupported_count(), 1);
+    assert_eq!(report.failed_count(), 0);
+    let shapes = multilite_conformance::ConformanceReport {
+        files: vec![report],
+    }
+    .statement_shapes();
+    assert_eq!(shapes["create_table"].passed, 1);
+    assert_eq!(shapes["drop_table"].unsupported, 1);
+}
+
+#[test]
 fn corpus_walker_discovers_sqllogictest_files() {
     let paths = vec![PathBuf::from("tests/slt")];
     let files = collect_test_files(&paths);
@@ -86,6 +107,7 @@ fn corpus_walker_discovers_sqllogictest_files() {
             .iter()
             .any(|file| file.ends_with("defaults-and-checks.slt"))
     );
+    assert!(files.iter().any(|file| file.ends_with("unsupported.slt")));
 
     let report = run_paths(&paths, &RunOptions::sqlite());
     assert!(report.record_count() >= 10);

@@ -172,6 +172,121 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn richer_captured_dml_repairs_conflicts_and_converges() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory.path().join("richer-first.sqlite"),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join("richer-second.sqlite"),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE notes (
+                        id INTEGER PRIMARY KEY,
+                        body TEXT NOT NULL,
+                        score INTEGER NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute("CREATE INDEX notes_by_body ON notes (body)", ())?;
+                transaction.execute(
+                    "CREATE TABLE replacements (
+                        id INTEGER PRIMARY KEY,
+                        body TEXT NOT NULL,
+                        score INTEGER NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO notes VALUES (1, 'one', 10), (2, 'two', 20)",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO replacements VALUES (1, 'winner', 11), (2, 'gone', 22)",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "WITH selected AS (
+                    SELECT id, body, score FROM replacements WHERE id = 1
+                 )
+                 UPDATE notes INDEXED BY notes_by_body
+                 SET (body, score) = (selected.body, selected.score)
+                 FROM selected WHERE selected.id = notes.id",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "WITH doomed AS (SELECT 1 AS id)
+                 DELETE FROM notes NOT INDEXED
+                 WHERE id IN (SELECT id FROM doomed)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-row rich DML did not conflict under {isolation:?}")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        second
+            .execute(
+                "WITH doomed AS (SELECT id FROM replacements WHERE id = 2)
+                 DELETE FROM notes WHERE id IN (SELECT id FROM doomed)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+
+        let expected = [(1, String::from("winner"), 11)];
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, body, score FROM notes ORDER BY id", (), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn captured_defaults_and_checks_converge_without_remote_reevaluation() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

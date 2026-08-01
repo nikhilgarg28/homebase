@@ -935,6 +935,79 @@ fn update_uses_sqlite_expressions_subqueries_and_complete_row_capture() {
 }
 
 #[test]
+fn captured_dml_supports_ctes_update_from_tuples_and_index_hints() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("richer-dml.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL,
+                score INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("CREATE INDEX notes_by_body ON notes (body)", ())?;
+        transaction.execute(
+            "CREATE TABLE replacements (
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL,
+                score INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO notes VALUES
+                (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO replacements VALUES
+                (1, 'ONE', 11), (2, 'TWO', 22)",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "WITH selected AS (
+                SELECT id, body, score FROM replacements WHERE score > 10
+             )
+             UPDATE notes INDEXED BY notes_by_body
+             SET (body, score) = (selected.body, selected.score)
+             FROM selected
+             WHERE selected.id = notes.id",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.execute(
+            "WITH doomed AS (SELECT id FROM replacements WHERE score >= 20)
+             DELETE FROM notes NOT INDEXED
+             WHERE id IN (SELECT id FROM doomed)",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT id, body, score FROM notes ORDER BY id", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(1, "ONE".into(), 11), (3, "three".into(), 30)]
+    );
+}
+
+#[test]
 fn update_moves_declared_primary_keys_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("update-identity.sqlite")).unwrap();
@@ -1368,14 +1441,10 @@ fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
         .unwrap();
 
     for sql in [
-        "WITH old AS (SELECT 1) UPDATE notes SET body = 'x'",
         "UPDATE OR REPLACE notes SET body = 'x'",
         "UPDATE main.notes SET body = 'x'",
         "UPDATE notes AS old SET body = 'x'",
         "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
-        "UPDATE notes NOT INDEXED SET body = 'x'",
-        "UPDATE notes SET (id, body) = (2, 'x')",
-        "UPDATE notes SET body = source.body FROM notes AS source",
         "UPDATE notes SET body = 'x' RETURNING id",
         "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
         "UPDATE __multilite__pending SET record = x''",
@@ -1399,11 +1468,9 @@ fn delete_extensions_and_reserved_targets_are_rejected_without_mutation() {
         .unwrap();
 
     for sql in [
-        "WITH old AS (SELECT 1) DELETE FROM notes WHERE id IN old",
         "DELETE FROM main.notes",
         "DELETE FROM notes AS old",
         "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
-        "DELETE FROM notes NOT INDEXED",
         "DELETE FROM notes RETURNING id",
         "DELETE FROM notes ORDER BY id LIMIT 1",
         "DELETE FROM __multilite__pending",

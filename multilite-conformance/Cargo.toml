@@ -8,7 +8,9 @@ description = "SQLite compatibility and conformance harness for Multilite"
 publish = false
 
 [dependencies]
+fallible-iterator.workspace = true
 multilite = { path = "../multilite" }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 sqllogictest.workspace = true
+sqlite3-parser.workspace = true
 tempfile.workspace = true
