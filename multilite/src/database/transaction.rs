@@ -78,18 +78,18 @@ impl MultiliteTransaction {
     }
 
     /// Encode the immutable transaction manifest.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = Writer::new();
         writer.u8(TRANSACTION_FRAME_VERSION);
         writer
             .field(TAG_TRANSACTION_ID, &self.id.0)
-            .expect("transaction field length fits in u32");
+            .map_err(|_| transaction_field_too_large())?;
         for operation in &self.operations {
             writer
                 .field(TAG_OPERATION, &operation.encode())
-                .expect("transaction field length fits in u32");
+                .map_err(|_| transaction_field_too_large())?;
         }
-        writer.finish()
+        Ok(writer.finish())
     }
 
     /// Decode one complete immutable transaction manifest.
@@ -133,7 +133,7 @@ impl MultiliteTransaction {
     pub fn to_homebase(&self) -> Result<HomebaseTransaction> {
         let mut mutations = vec![Mutation::Set {
             key: transaction_key(self.id),
-            value: self.encode(),
+            value: self.encode()?,
         }];
         let mut footprint = ConflictFootprint::new();
         for operation in &self.operations {
@@ -189,6 +189,10 @@ impl MultiliteTransaction {
         }
         Ok(transaction)
     }
+}
+
+fn transaction_field_too_large() -> Error {
+    Error::InvalidMultiliteTransaction("transaction field is too large".into())
 }
 
 fn transaction_key(id: TransactionId) -> Key {
@@ -348,10 +352,8 @@ mod tests {
     #[test]
     fn manifest_and_homebase_batch_roundtrip_ordered_operations() {
         let transaction = mixed_transaction();
-        assert_eq!(
-            MultiliteTransaction::decode(&transaction.encode()).unwrap(),
-            transaction
-        );
+        let encoded = transaction.encode().unwrap();
+        assert_eq!(MultiliteTransaction::decode(&encoded).unwrap(), transaction);
 
         let lowered = transaction.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 10);
@@ -362,7 +364,7 @@ mod tests {
             panic!("manifest was not a set")
         };
         assert_eq!(key.components()[1].as_bytes(), codes::TRANSACTIONS);
-        assert_eq!(value, &transaction.encode());
+        assert_eq!(value, &encoded);
         assert_eq!(
             MultiliteTransaction::from_homebase(&admitted(lowered.mutations)).unwrap(),
             transaction

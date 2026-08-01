@@ -1013,7 +1013,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         }
         let cursors = self.admit_cursors(space).await?;
         if from < cursors.head || through >= cursors.tail {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "admit read [{from:?}, {through:?}] outside retained window [{:?}, {:?})",
                 cursors.head, cursors.tail
             )));
@@ -1036,21 +1036,21 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         }
         let expected_len = through.0 - from.0 + 1;
         if u64::try_from(out.len()).ok() != Some(expected_len) {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "admit read expected {expected_len} dense batches, found {}",
                 out.len()
             )));
         }
         for (offset, admitted) in out.iter().enumerate() {
             let offset = u64::try_from(offset)
-                .map_err(|_| StorageError("admit read sequence overflow".into()))?;
+                .map_err(|_| StorageError::new("admit read sequence overflow"))?;
             let expected = AdmissionSeq(
                 from.0
                     .checked_add(offset)
-                    .ok_or_else(|| StorageError("admit read sequence overflow".into()))?,
+                    .ok_or_else(|| StorageError::new("admit read sequence overflow"))?,
             );
             if admitted.admission_seq != expected {
-                return Err(StorageError(format!(
+                return Err(StorageError::new(format!(
                     "admit read expected {expected:?}, found {:?}",
                     admitted.admission_seq
                 )));
@@ -1129,8 +1129,8 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
         entries: Vec<DeviceEntry>,
     ) -> Result<Committed, StorageError> {
         if entries.len() != reserved.versions.len() {
-            return Err(StorageError(
-                "commit entry count does not match reservation".into(),
+            return Err(StorageError::new(
+                "commit entry count does not match reservation",
             ));
         }
         let entries_len = entries.len() as u64;
@@ -1139,7 +1139,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             .0
             .checked_sub(entries_len)
             .ok_or_else(|| {
-                StorageError("malformed commit reservation: ver high below entry count".into())
+                StorageError::new("malformed commit reservation: ver high below entry count")
             })?);
         let current_cursors = match self.store.get(&cursors_key(space)).await? {
             Some(bytes) => OplogCursors::decode(&bytes).expect("undecodable oplog cursors"),
@@ -1154,8 +1154,8 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             None => Ver(0),
         };
         if current_cursors.tail != reserved.seq || current_high != expected_high {
-            return Err(StorageError(
-                "stale commit reservation: counters advanced before commit".into(),
+            return Err(StorageError::new(
+                "stale commit reservation: counters advanced before commit",
             ));
         }
 
@@ -1204,8 +1204,8 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             None => DeviceChecksum::EMPTY,
         };
         if through < cursors.neck && checksum != confirmed {
-            return Err(StorageError(
-                "re-acknowledgement attempted to change the confirmed checksum".into(),
+            return Err(StorageError::new(
+                "re-acknowledgement attempted to change the confirmed checksum",
             ));
         }
         let queued = collect_scan(self.store.scan_prefix(&oplog_scan(space))).await?;
@@ -1260,7 +1260,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             }
         }
         if to < cursors.neck || to >= cursors.tail {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "rollback target {to:?} outside active window [{:?}, {:?})",
                 cursors.neck, cursors.tail
             )));
@@ -1270,7 +1270,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                 .tail
                 .0
                 .checked_add(1)
-                .ok_or_else(|| StorageError("oplog tail overflow during rollback".into()))?,
+                .ok_or_else(|| StorageError::new("oplog tail overflow during rollback"))?,
         );
         let mut batch = WriteBatch::new();
         batch.put(
@@ -1301,14 +1301,14 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
             .0
             .checked_add(1)
             .map(DeviceSeq)
-            .ok_or_else(|| StorageError("oplog tail overflow during guarded rollback".into()))?;
+            .ok_or_else(|| StorageError::new("oplog tail overflow during guarded rollback"))?;
         let completed = OplogCursors {
             head: expected.head,
             neck: expected.tail,
             tail: completed_tail,
         };
         if current != expected && current != completed {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "rollback window changed: expected {expected:?}, found {current:?}"
             )));
         }
@@ -1322,17 +1322,17 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     ) -> Result<(), StorageError> {
         response
             .validate_dense()
-            .map_err(|err| StorageError(err.to_string()))?;
+            .map_err(|err| StorageError::new(err.to_string()))?;
         let cursors = self.admit_cursors(space).await?;
         let expected_after = AdmissionSeq(
             cursors
                 .tail
                 .0
                 .checked_sub(1)
-                .ok_or_else(|| StorageError("admit tail cannot be zero".into()))?,
+                .ok_or_else(|| StorageError::new("admit tail cannot be zero"))?,
         );
         if response.after != expected_after {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "pull starts after {:?}, but admit tail expects {:?}",
                 response.after, expected_after
             )));
@@ -1345,7 +1345,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
                 .through
                 .0
                 .checked_add(1)
-                .ok_or_else(|| StorageError("admit tail overflow".into()))?,
+                .ok_or_else(|| StorageError::new("admit tail overflow"))?,
         );
         let high = self.store.get(&ver_key(space)).await?.map(|bytes| {
             VerHighRecord::decode(&bytes)
@@ -1393,7 +1393,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     ) -> Result<(), StorageError> {
         let cursors = self.admit_cursors(space).await?;
         if to < cursors.neck || to > cursors.tail {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "admit apply target {to:?} outside [{:?}, {:?}]",
                 cursors.neck, cursors.tail
             )));
@@ -1416,7 +1416,7 @@ impl<S: OrderedStore + Sync> MetaStore for OrderedMetaStore<S> {
     async fn trim_admits(&self, space: SpaceId, to: AdmissionSeq) -> Result<(), StorageError> {
         let cursors = self.admit_cursors(space).await?;
         if to < cursors.head || to > cursors.neck {
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "admit trim target {to:?} outside [{:?}, {:?}]",
                 cursors.head, cursors.neck
             )));

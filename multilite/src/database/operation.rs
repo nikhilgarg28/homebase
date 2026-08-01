@@ -14,8 +14,8 @@ use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::CreateTable;
 #[cfg(test)]
 use super::schema::{CreateTableSpec, write_revision_key};
+use crate::Result;
 use crate::commit::footprint::ConflictFootprint;
-use crate::{Error, Result};
 
 const OPERATION_FRAME_VERSION: u8 = 1;
 const CREATE_TABLE_OPERATION: u8 = 1;
@@ -138,27 +138,21 @@ impl MultiliteOp {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
-                } = inserted
-                    .to_homebase()
-                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                } = inserted.to_homebase()?;
                 (mutations, footprint)
             }
             Self::DeleteRows(deleted) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
-                } = deleted
-                    .to_homebase()
-                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                } = deleted.to_homebase()?;
                 (mutations, footprint)
             }
             Self::UpdateRows(updated) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
-                } = updated
-                    .to_homebase()
-                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                } = updated.to_homebase()?;
                 (mutations, footprint)
             }
             Self::Index(index) => {

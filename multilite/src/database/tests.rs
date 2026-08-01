@@ -4044,7 +4044,8 @@ fn failed_general_bootstrap_rolls_back_all_metadata() {
     };
     assert!(matches!(
         error,
-        Error::Client(homebase_client::ClientError::Store(_))
+        Error::Client(error)
+            if matches!(error.as_ref(), homebase_client::ClientError::Store(_))
     ));
     assert_eq!(metadata_inserts.load(Ordering::Relaxed), 2);
     owner.with_connection(|connection| {

@@ -103,26 +103,26 @@ impl PendingTransaction {
 struct PendingCodec;
 
 impl PendingCodec {
-    fn encode(pending: &PendingTransaction) -> Vec<u8> {
+    fn encode(pending: &PendingTransaction) -> Result<Vec<u8>> {
         let mut writer = Writer::new();
         writer.u8(PENDING_FRAME_VERSION);
         writer
             .field(TAG_DEVICE_SEQ, &pending.seq.0.to_be_bytes())
-            .expect("pending field length must fit in u32");
+            .map_err(|_| pending_field_too_large())?;
         writer
-            .field(TAG_TRANSACTION, &pending.transaction.encode())
-            .expect("pending field length must fit in u32");
+            .field(TAG_TRANSACTION, &pending.transaction.encode()?)
+            .map_err(|_| pending_field_too_large())?;
         for effect in &pending.on_accept {
             writer
                 .field(TAG_ACCEPT_EFFECT, &Self::encode_effect(effect))
-                .expect("pending field length must fit in u32");
+                .map_err(|_| pending_field_too_large())?;
         }
         for effect in &pending.on_reject {
             writer
                 .field(TAG_REJECT_EFFECT, &Self::encode_effect(effect))
-                .expect("pending field length must fit in u32");
+                .map_err(|_| pending_field_too_large())?;
         }
-        writer.finish()
+        Ok(writer.finish())
     }
 
     fn decode(frame: &[u8]) -> std::result::Result<PendingTransaction, PendingCodecError> {
@@ -232,6 +232,10 @@ impl PendingCodec {
     }
 }
 
+fn pending_field_too_large() -> Error {
+    Error::InvalidMultiliteTransaction("pending record field is too large".into())
+}
+
 pub fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(&format!(
         "CREATE TABLE {TABLE} (
@@ -308,7 +312,7 @@ pub fn insert(
         &format!("INSERT INTO {TABLE} (device_seq, record) VALUES (?1, ?2)"),
         params![
             seq.0.to_be_bytes().as_slice(),
-            PendingCodec::encode(&pending),
+            PendingCodec::encode(&pending)?,
         ],
     )?;
     Ok(())
@@ -733,7 +737,7 @@ mod tests {
     #[test]
     fn codec_roundtrips_and_rejects_unknown_or_truncated_versions() {
         let pending = PendingTransaction::new(DeviceSeq(7), transaction(operation("notes")));
-        let encoded = PendingCodec::encode(&pending);
+        let encoded = PendingCodec::encode(&pending).unwrap();
         assert_eq!(PendingCodec::decode(&encoded).unwrap(), pending);
         assert_eq!(PendingCodec::decode(&[]), Err(PendingCodecError::Truncated));
         assert_eq!(
@@ -765,7 +769,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            PendingCodec::decode(&PendingCodec::encode(&pending).unwrap()).unwrap(),
             pending
         );
 
@@ -791,7 +795,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            PendingCodec::decode(&PendingCodec::encode(&pending).unwrap()).unwrap(),
             pending
         );
         assert_eq!(
@@ -816,7 +820,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            PendingCodec::decode(&PendingCodec::encode(&pending).unwrap()).unwrap(),
             pending
         );
 
@@ -842,7 +846,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            PendingCodec::decode(&PendingCodec::encode(&pending)).unwrap(),
+            PendingCodec::decode(&PendingCodec::encode(&pending).unwrap()).unwrap(),
             pending
         );
 
@@ -1049,7 +1053,7 @@ mod tests {
         };
 
         assert_eq!(
-            PendingCodec::decode(&PendingCodec::encode(&pending)),
+            PendingCodec::decode(&PendingCodec::encode(&pending).unwrap()),
             Err(PendingCodecError::EffectsMismatch)
         );
     }
@@ -1061,7 +1065,8 @@ mod tests {
         let record = PendingCodec::encode(&PendingTransaction::new(
             DeviceSeq(2),
             transaction(operation("notes")),
-        ));
+        ))
+        .unwrap();
         connection
             .execute(
                 &format!("INSERT INTO {TABLE} (device_seq, record) VALUES (?1, ?2)"),

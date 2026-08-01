@@ -273,11 +273,17 @@ fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
 }
 
 fn storage_error(error: rusqlite::Error) -> StorageError {
-    StorageError(format!("SQLite metadata store: {error}"))
+    let message = format!("SQLite metadata store: {error}");
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            StorageError::busy(message)
+        }
+        _ => StorageError::new(message),
+    }
 }
 
 fn multilite_storage_error(error: crate::Error) -> StorageError {
-    StorageError(format!("SQLite metadata store: {error}"))
+    StorageError::new(format!("SQLite metadata store: {error}"))
 }
 
 struct SqliteScan {
@@ -326,8 +332,8 @@ impl OrderedStore for SqliteSnapshotStore<'_> {
     }
 
     fn apply(&self, _batch: WriteBatch) -> impl Future<Output = StoreResult<()>> + Send {
-        ready(Err(StorageError(
-            "SQLite snapshot metadata store is read-only".into(),
+        ready(Err(StorageError::new(
+            "SQLite snapshot metadata store is read-only",
         )))
     }
 }
@@ -374,6 +380,18 @@ mod tests {
         block_on(storage::conformance::run_all(|| {
             SqliteOrderedStore::open_in_memory().unwrap()
         }));
+    }
+
+    #[test]
+    fn sqlite_busy_remains_a_retryable_storage_error() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is busy".into()),
+        );
+        let error = storage_error(busy);
+
+        assert_eq!(error.kind(), homebase_core::storage::StorageErrorKind::Busy);
+        assert!(error.message().contains("database is busy"));
     }
 
     #[test]

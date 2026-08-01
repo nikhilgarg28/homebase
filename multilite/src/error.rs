@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use homebase_client::ClientError;
 use homebase_core::messages::KernelError;
@@ -7,10 +8,17 @@ use homebase_core::storage::StorageError;
 use crate::database::PushRejection;
 
 /// An error returned by Multilite's SQLite-facing API.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Error {
     /// SQLite rejected an operation. The original error is retained intact.
-    Sqlite(rusqlite::Error),
+    Sqlite(Arc<rusqlite::Error>),
+    /// A failed statement could not be rolled back cleanly.
+    StatementRollback {
+        /// The statement or capture-finalization error.
+        statement: Box<Error>,
+        /// The error encountered while rolling its savepoint back.
+        rollback: Box<Error>,
+    },
     /// A prepared statement was used through the wrong execution mode.
     PreparedWrite,
     /// The statement uses SQL outside Multilite's current public surface.
@@ -61,13 +69,20 @@ pub enum Error {
     /// A push rejection belongs to another replica or an obsolete submit window.
     StalePushRejection,
     /// The embedded Homebase client failed to initialize.
-    Client(ClientError),
+    Client(Arc<ClientError>),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlite(error) => write!(f, "sqlite error: {error}"),
+            Self::StatementRollback {
+                statement,
+                rollback,
+            } => write!(
+                f,
+                "statement failed ({statement}) and its rollback also failed ({rollback})"
+            ),
             Self::PreparedWrite => {
                 f.write_str("prepared statement execution mode does not match its SQL")
             }
@@ -130,7 +145,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sqlite(error) => Some(error),
+            Self::Sqlite(error) => Some(error.as_ref()),
+            Self::StatementRollback { statement, .. } => Some(statement.as_ref()),
             Self::PreparedWrite
             | Self::UnsupportedSql(_)
             | Self::AuthorityRequired(_)
@@ -153,14 +169,14 @@ impl std::error::Error for Error {
             | Self::RebasePendingSubmissions
             | Self::RebaseStateChanged
             | Self::StalePushRejection => None,
-            Self::Client(error) => Some(error),
+            Self::Client(error) => Some(error.as_ref()),
         }
     }
 }
 
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Sqlite(error)
+        Self::Sqlite(Arc::new(error))
     }
 }
 
@@ -172,7 +188,7 @@ impl From<StorageError> for Error {
 
 impl From<ClientError> for Error {
     fn from(error: ClientError) -> Self {
-        Self::Client(error)
+        Self::Client(Arc::new(error))
     }
 }
 

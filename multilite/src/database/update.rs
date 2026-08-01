@@ -475,8 +475,7 @@ impl<'connection> BranchHooks<'connection> {
                     }
                 });
                 if let Err(error) = finalized {
-                    self.rollback_statement()?;
-                    return Err(error);
+                    return Err(self.rollback_statement_error(error));
                 }
                 self.with_internal(|| {
                     self.connection
@@ -487,8 +486,7 @@ impl<'connection> BranchHooks<'connection> {
             }
             Err(error) => {
                 lock(&self.state).events.truncate(checkpoint);
-                self.rollback_statement()?;
-                Err(error)
+                Err(self.rollback_statement_error(error))
             }
         }
     }
@@ -506,6 +504,10 @@ impl<'connection> BranchHooks<'connection> {
             )?;
             Ok(())
         })
+    }
+
+    fn rollback_statement_error(&self, statement: Error) -> Error {
+        preserve_statement_error(statement, self.rollback_statement())
     }
 
     fn refresh_bindings(&self) -> Result<()> {
@@ -528,6 +530,16 @@ impl<'connection> BranchHooks<'connection> {
             .map(TableId::from_bytes)
             .map(table_prefix)
             .collect())
+    }
+}
+
+fn preserve_statement_error(statement: Error, rollback: Result<()>) -> Error {
+    match rollback {
+        Ok(()) => statement,
+        Err(rollback) => Error::StatementRollback {
+            statement: Box::new(statement),
+            rollback: Box::new(rollback),
+        },
     }
 }
 
@@ -697,5 +709,42 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         receipt: crate::commit::proposal::CommitReceipt,
     ) -> Result<()> {
         pollster::block_on(self.finish_branch_write_async(receipt))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failure_preserves_both_errors() {
+        let error = preserve_statement_error(
+            Error::CaptureInvariant("statement failed"),
+            Err(Error::CaptureInvariant("rollback failed")),
+        );
+
+        let Error::StatementRollback {
+            statement,
+            rollback,
+        } = error
+        else {
+            panic!("expected a compound rollback error");
+        };
+        assert!(matches!(
+            *statement,
+            Error::CaptureInvariant("statement failed")
+        ));
+        assert!(matches!(
+            *rollback,
+            Error::CaptureInvariant("rollback failed")
+        ));
+    }
+
+    #[test]
+    fn successful_rollback_returns_the_original_error_unchanged() {
+        assert!(matches!(
+            preserve_statement_error(Error::CommitConflict("stale".into()), Ok(())),
+            Error::CommitConflict(message) if message == "stale"
+        ));
     }
 }

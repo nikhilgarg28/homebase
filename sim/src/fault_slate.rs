@@ -54,7 +54,7 @@ mod imp {
                 return Ok(());
             }
             let this = Arc::try_unwrap(self)
-                .map_err(|_| StorageError("outstanding FaultSlateStore clones".into()))?;
+                .map_err(|_| StorageError::new("outstanding FaultSlateStore clones"))?;
             match Arc::try_unwrap(this.inner) {
                 Ok(slate) => slate.close().await,
                 Err(_) => Ok(()),
@@ -80,7 +80,7 @@ mod imp {
                 tokio::task::yield_now().await;
             }
             if fail {
-                Err(StorageError(format!("injected {op} fault")))
+                Err(StorageError::new(format!("injected {op} fault")))
             } else {
                 Ok(())
             }

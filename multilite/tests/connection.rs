@@ -99,13 +99,20 @@ fn sqlite_constraint_error_retains_extended_detail() {
     let error = db
         .execute("INSERT INTO values_v1 (id) VALUES (1)", ())
         .unwrap_err();
-    let Error::Sqlite(rusqlite::Error::SqliteFailure(code, message)) = error else {
+    let Error::Sqlite(error) = error else {
         panic!("unexpected error shape: {error:?}");
+    };
+    let rusqlite::Error::SqliteFailure(code, message) = error.as_ref() else {
+        panic!("unexpected sqlite error shape: {error:?}");
     };
 
     assert_eq!(code.code, ErrorCode::ConstraintViolation);
     assert!(code.extended_code > code.code as i32);
-    assert!(message.is_some_and(|message| message.contains("UNIQUE constraint failed")));
+    assert!(
+        message
+            .as_ref()
+            .is_some_and(|message| message.contains("UNIQUE constraint failed"))
+    );
 }
 
 #[test]
@@ -142,8 +149,9 @@ fn overlapping_unique_constraint_failures_are_atomic_and_recoverable() {
         .unwrap_err();
     assert!(matches!(
         insert_error,
-        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == ErrorCode::ConstraintViolation
+        Error::Sqlite(error)
+            if matches!(error.as_ref(), rusqlite::Error::SqliteFailure(code, _)
+                if code.code == ErrorCode::ConstraintViolation)
     ));
     assert_eq!(
         db.query("SELECT id FROM profiles ORDER BY id", (), |row| {
@@ -161,8 +169,9 @@ fn overlapping_unique_constraint_failures_are_atomic_and_recoverable() {
         .unwrap_err();
     assert!(matches!(
         update_error,
-        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == ErrorCode::ConstraintViolation
+        Error::Sqlite(error)
+            if matches!(error.as_ref(), rusqlite::Error::SqliteFailure(code, _)
+                if code.code == ErrorCode::ConstraintViolation)
     ));
     assert_eq!(
         db.query("SELECT id, username FROM profiles ORDER BY id", (), |row| {
@@ -212,7 +221,8 @@ fn query_conversion_error_remains_a_sqlite_error() {
 
     assert!(matches!(
         error,
-        Error::Sqlite(rusqlite::Error::InvalidColumnType(..))
+        Error::Sqlite(error)
+            if matches!(error.as_ref(), rusqlite::Error::InvalidColumnType(..))
     ));
 }
 

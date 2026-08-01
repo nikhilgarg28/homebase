@@ -469,7 +469,7 @@ impl CommitProposal {
                     field(TAG_KIND, &[TRANSACTION_PROPOSAL])?;
                     field(TAG_SNAPSHOT, &proposal.snapshot.encode())?;
                     field(TAG_ISOLATION, &[encode_isolation(proposal.isolation)])?;
-                    field(TAG_TRANSACTION, &proposal.transaction.encode())?;
+                    field(TAG_TRANSACTION, &proposal.transaction.encode()?)?;
                     for key in proposal.footprint.writes() {
                         field(TAG_WRITE, &key.encode())?;
                     }
@@ -877,11 +877,19 @@ pub fn prepare(
     transaction
         .transaction()
         .apply(connection)
-        .map_err(|error| match error {
-            Error::Sqlite(error) => Error::CommitConflict(error.to_string()),
-            error => error,
-        })?;
+        .map_err(classify_replay_error)?;
     Ok(PrepareOutcome::Prepared(proposal.prepare_receipt(writes)?))
+}
+
+fn classify_replay_error(error: Error) -> Error {
+    match error {
+        Error::Sqlite(sqlite)
+            if sqlite.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+        {
+            Error::CommitConflict(sqlite.to_string())
+        }
+        error => error,
+    }
 }
 
 /// Publish one canonical visibility transition and all proposal receipts.
@@ -1034,7 +1042,7 @@ fn decode_cursors(frame: &[u8]) -> std::result::Result<[u64; 3], ProposalCodecEr
 }
 
 fn encode_admitted_transaction(transaction: &AdmittedTransaction) -> Result<Vec<u8>> {
-    let encoded = transaction.transaction.encode();
+    let encoded = transaction.transaction.encode()?;
     let mut frame = Vec::with_capacity(16 + encoded.len());
     frame.extend_from_slice(&transaction.device.0);
     frame.extend_from_slice(&encoded);
@@ -2074,6 +2082,28 @@ mod tests {
         assert!(matches!(
             apply(&fixture.writer, &impostor),
             Err(Error::InvalidCommitProposal(message)) if message.contains("another payload")
+        ));
+    }
+
+    #[test]
+    fn replay_classifies_constraints_but_preserves_busy_errors() {
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("injected constraint".into()),
+        );
+        assert!(matches!(
+            classify_replay_error(constraint.into()),
+            Error::CommitConflict(message) if message.contains("injected constraint")
+        ));
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("injected busy".into()),
+        );
+        assert!(matches!(
+            classify_replay_error(busy.into()),
+            Error::Sqlite(error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
         ));
     }
 }

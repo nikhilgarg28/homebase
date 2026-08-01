@@ -168,7 +168,7 @@ impl OrderedStore for SimStore {
             remaining: self.draw_yields(),
             op: move || {
                 if fail {
-                    return Err(StorageError("injected get fault".into()));
+                    return Err(StorageError::new("injected get fault"));
                 }
                 Ok(this.inner.lock().unwrap().current.get(&key).cloned())
             },
@@ -205,7 +205,7 @@ impl OrderedStore for SimStore {
             op: move || {
                 if fail {
                     // Before any mutation: an errored apply leaves no trace.
-                    return Err(StorageError("injected apply fault".into()));
+                    return Err(StorageError::new("injected apply fault"));
                 }
                 let mut inner = this.inner.lock().unwrap();
                 for op in batch.take().expect("apply future polled after Ready").ops {

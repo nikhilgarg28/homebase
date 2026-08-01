@@ -319,12 +319,13 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
                         }
                     }
                     Ok(Ok(_)) => {
-                        fail_group(group, "committer returned the wrong result count");
+                        fail_group(
+                            group,
+                            Error::Committer("committer returned the wrong result count".into()),
+                        );
                     }
-                    Ok(Err(error)) => {
-                        fail_group(group, &format!("commit group aborted: {error}"));
-                    }
-                    Err(_) => fail_group(group, "commit group panicked"),
+                    Ok(Err(error)) => fail_group(group, error),
+                    Err(_) => fail_group(group, Error::Committer("commit group panicked".into())),
                 }
             }
             Request::CaptureSnapshot { writable, reply } => {
@@ -346,9 +347,9 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
     }
 }
 
-fn fail_group(group: Vec<(CommitProposal, oneshot::Sender<Result<CommitReceipt>>)>, message: &str) {
+fn fail_group(group: Vec<(CommitProposal, oneshot::Sender<Result<CommitReceipt>>)>, error: Error) {
     for (_, reply) in group {
-        let _ = reply.send(Err(Error::Committer(message.to_owned())));
+        let _ = reply.send(Err(error.clone()));
     }
 }
 
@@ -389,6 +390,7 @@ mod tests {
 
     struct TestBackend {
         groups: Mutex<Vec<Vec<String>>>,
+        failure: Mutex<Option<Error>>,
         snapshot: AtomicU64,
         _directory: tempfile::TempDir,
         database_path: PathBuf,
@@ -400,6 +402,9 @@ mod tests {
             &self,
             proposals: &[&CommitProposal],
         ) -> Result<Vec<Result<CommitReceipt>>> {
+            if let Some(error) = self.failure.lock().take() {
+                return Err(error);
+            }
             self.groups.lock().push(
                 proposals
                     .iter()
@@ -462,6 +467,7 @@ mod tests {
         drop(connection);
         Arc::new(TestBackend {
             groups: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
             snapshot: AtomicU64::new(0),
             _directory: directory,
             database_path,
@@ -535,6 +541,38 @@ mod tests {
             .collect::<Vec<_>>();
         committed.sort();
         assert_eq!(committed, ["one", "two"]);
+    }
+
+    #[test]
+    fn group_failures_keep_their_error_classification() {
+        let backend = backend();
+        *backend.failure.lock() = Some(Error::CommitConflict("injected conflict".into()));
+        let committer = Committer::new(Arc::clone(&backend)).unwrap();
+
+        assert!(matches!(
+            committer.propose_blocking(proposal("one")),
+            Err(Error::CommitConflict(message)) if message == "injected conflict"
+        ));
+    }
+
+    #[test]
+    fn one_typed_group_failure_reaches_every_waiter() {
+        let (first_reply, first_response) = oneshot::channel();
+        let (second_reply, second_response) = oneshot::channel();
+        fail_group(
+            vec![
+                (proposal("one"), first_reply),
+                (proposal("two"), second_reply),
+            ],
+            Error::CommitConflict("shared conflict".into()),
+        );
+
+        for response in [first_response, second_response] {
+            assert!(matches!(
+                pollster::block_on(response).unwrap(),
+                Err(Error::CommitConflict(message)) if message == "shared conflict"
+            ));
+        }
     }
 
     #[test]

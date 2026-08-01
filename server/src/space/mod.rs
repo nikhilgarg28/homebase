@@ -293,7 +293,7 @@ mod tests {
 
         async fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
             if self.fail_next_apply.swap(false, Ordering::SeqCst) {
-                return Err(StorageError("injected apply failure".into()));
+                return Err(StorageError::new("injected apply failure"));
             }
             self.inner.apply(batch).await
         }

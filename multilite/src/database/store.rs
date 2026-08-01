@@ -317,7 +317,7 @@ impl MetaStore for DatabaseMetaStore {
 fn storage_error(error: Error) -> StorageError {
     match error {
         Error::Storage(error) => error,
-        other => StorageError(format!("Multilite metadata transition: {other}")),
+        other => StorageError::new(format!("Multilite metadata transition: {other}")),
     }
 }
 

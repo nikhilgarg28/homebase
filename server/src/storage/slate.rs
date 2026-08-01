@@ -36,10 +36,10 @@ impl SlateOpenOptions {
 /// Local NVMe / dev stand-in: an object store rooted at `root`.
 pub fn local_object_store(root: impl AsRef<Path>) -> Result<Arc<LocalFileSystem>, StorageError> {
     let root = root.as_ref();
-    std::fs::create_dir_all(root).map_err(|e| StorageError(e.to_string()))?;
+    std::fs::create_dir_all(root).map_err(|e| StorageError::new(e.to_string()))?;
     LocalFileSystem::new_with_prefix(root)
         .map(Arc::new)
-        .map_err(|e| StorageError(e.to_string()))
+        .map_err(|e| StorageError::new(e.to_string()))
 }
 
 /// A SlateDB shard store.
@@ -70,7 +70,7 @@ impl SlateStore {
             .with_settings(settings)
             .build()
             .await
-            .map_err(|e| StorageError(e.to_string()))?;
+            .map_err(|e| StorageError::new(e.to_string()))?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -80,16 +80,16 @@ impl SlateStore {
         self.db
             .flush()
             .await
-            .map_err(|e| StorageError(e.to_string()))
+            .map_err(|e| StorageError::new(e.to_string()))
     }
 
     /// Closes the database cleanly. Fails if other clones still exist.
     pub async fn close(self) -> Result<(), StorageError> {
         Arc::try_unwrap(self.db)
-            .map_err(|_| StorageError("outstanding SlateStore clones".into()))?
+            .map_err(|_| StorageError::new("outstanding SlateStore clones"))?
             .close()
             .await
-            .map_err(|e| StorageError(e.to_string()))
+            .map_err(|e| StorageError::new(e.to_string()))
     }
 }
 
@@ -118,14 +118,18 @@ async fn collect_range(
         Some(end) => db
             .scan(start..end)
             .await
-            .map_err(|e| StorageError(e.to_string()))?,
+            .map_err(|e| StorageError::new(e.to_string()))?,
         None => db
             .scan(start..)
             .await
-            .map_err(|e| StorageError(e.to_string()))?,
+            .map_err(|e| StorageError::new(e.to_string()))?,
     };
     let mut out = Vec::new();
-    while let Some(kv) = iter.next().await.map_err(|e| StorageError(e.to_string()))? {
+    while let Some(kv) = iter
+        .next()
+        .await
+        .map_err(|e| StorageError::new(e.to_string()))?
+    {
         out.push((kv.key.to_vec(), kv.value.to_vec()));
     }
     Ok(out)
@@ -212,7 +216,7 @@ impl OrderedStore for SlateStore {
             match db
                 .get(&key)
                 .await
-                .map_err(|e| StorageError(e.to_string()))?
+                .map_err(|e| StorageError::new(e.to_string()))?
             {
                 Some(bytes) => Ok(Some(bytes.to_vec())),
                 None => Ok(None),
@@ -241,7 +245,7 @@ impl OrderedStore for SlateStore {
                 },
             )
             .await
-            .map_err(|e| StorageError(e.to_string()))?;
+            .map_err(|e| StorageError::new(e.to_string()))?;
             Ok(())
         }
     }

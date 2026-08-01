@@ -32,12 +32,51 @@ use std::sync::RwLock;
 /// A storage-backend failure (object store IO, corruption, …). Distinct from
 /// [`KernelError`](crate::messages::KernelError): kernel errors are
 /// semantic rejections, storage errors are infrastructure faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageErrorKind {
+    /// The backend is temporarily busy and the operation may be retried.
+    Busy,
+    /// A storage failure without a more specific portable classification.
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StorageError(pub String);
+pub struct StorageError {
+    kind: StorageErrorKind,
+    message: String,
+}
+
+impl StorageError {
+    /// Construct an unclassified storage failure.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            kind: StorageErrorKind::Other,
+            message: message.into(),
+        }
+    }
+
+    /// Construct a retryable backend-busy failure.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self {
+            kind: StorageErrorKind::Busy,
+            message: message.into(),
+        }
+    }
+
+    /// Portable classification retained across client and adapter boundaries.
+    pub fn kind(&self) -> StorageErrorKind {
+        self.kind
+    }
+
+    /// Backend-provided diagnostic without the display prefix.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "storage error: {}", self.0)
+        write!(f, "storage error: {}", self.message)
     }
 }
 
@@ -480,6 +519,17 @@ mod tests {
         assert_eq!(prefix_successor(&[0x01, 0xff]), Some(vec![0x02]));
         assert_eq!(prefix_successor(&[0xff, 0xff]), None);
         assert_eq!(prefix_successor(&[]), None);
+    }
+
+    #[test]
+    fn storage_errors_retain_portable_classification() {
+        let busy = StorageError::busy("locked");
+        assert_eq!(busy.kind(), StorageErrorKind::Busy);
+        assert_eq!(busy.message(), "locked");
+
+        let other = StorageError::new("disk failed");
+        assert_eq!(other.kind(), StorageErrorKind::Other);
+        assert_eq!(other.message(), "disk failed");
     }
 
     #[test]
