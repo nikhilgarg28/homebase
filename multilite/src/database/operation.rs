@@ -43,10 +43,51 @@ pub struct HomebaseOp {
     footprint: ConflictFootprint,
 }
 
+/// Local inverse selected while compiling one speculative operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RejectionEffect {
+    RevertAlterTable { operation: AlterTableOperation },
+    DropTable { created: CreateTable },
+    DeleteRows { inserted: InsertRows },
+    RestoreRows { deleted: DeleteRows },
+    RestoreUpdatedRows { updated: UpdateRows },
+    RevertIndex { operation: IndexOperation },
+}
+
+/// One logical operation and every deterministic artifact derived from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledOperation {
+    logical: MultiliteOp,
+    homebase: HomebaseOp,
+    rejection: RejectionEffect,
+}
+
 impl HomebaseOp {
     /// Split deterministic mutations from their logical conflict footprint.
     pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
         (self.mutations, self.footprint)
+    }
+
+    pub fn footprint(&self) -> &ConflictFootprint {
+        &self.footprint
+    }
+}
+
+impl CompiledOperation {
+    pub fn logical(&self) -> &MultiliteOp {
+        &self.logical
+    }
+
+    pub fn homebase(&self) -> &HomebaseOp {
+        &self.homebase
+    }
+
+    pub fn rejection(&self) -> &RejectionEffect {
+        &self.rejection
+    }
+
+    pub(super) fn into_parts(self) -> (MultiliteOp, HomebaseOp, RejectionEffect) {
+        (self.logical, self.homebase, self.rejection)
     }
 }
 
@@ -118,6 +159,36 @@ impl MultiliteOp {
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             kind => Err(OperationCodecError::UnknownKind(kind)),
         }
+    }
+
+    /// Validate and derive every deterministic artifact for this operation.
+    pub fn compile(self) -> Result<CompiledOperation> {
+        let homebase = self.to_homebase()?;
+        let rejection = match &self {
+            Self::AlterTable(operation) => RejectionEffect::RevertAlterTable {
+                operation: operation.clone(),
+            },
+            Self::CreateTable(created) => RejectionEffect::DropTable {
+                created: created.clone(),
+            },
+            Self::InsertRows(inserted) => RejectionEffect::DeleteRows {
+                inserted: inserted.clone(),
+            },
+            Self::DeleteRows(deleted) => RejectionEffect::RestoreRows {
+                deleted: deleted.clone(),
+            },
+            Self::UpdateRows(updated) => RejectionEffect::RestoreUpdatedRows {
+                updated: updated.clone(),
+            },
+            Self::Index(operation) => RejectionEffect::RevertIndex {
+                operation: operation.clone(),
+            },
+        };
+        Ok(CompiledOperation {
+            logical: self,
+            homebase,
+            rejection,
+        })
     }
 
     /// Lower this operation to its complete Homebase representation.
@@ -256,6 +327,21 @@ mod tests {
                 }))
         );
         assert!(footprint.reads().is_empty());
+    }
+
+    #[test]
+    fn compilation_binds_lowering_and_rejection_to_the_same_operation() {
+        let operation =
+            MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
+        let expected = operation.to_homebase().unwrap();
+        let compiled = operation.clone().compile().unwrap();
+
+        assert_eq!(compiled.logical(), &operation);
+        assert_eq!(compiled.homebase(), &expected);
+        assert!(matches!(
+            compiled.rejection(),
+            RejectionEffect::DropTable { created } if created.table_name() == "notes"
+        ));
     }
 
     #[test]

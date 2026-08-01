@@ -12,7 +12,7 @@ use uuid::{Uuid, Variant, Version};
 
 use super::codes;
 use super::isolation::IsolationLevel;
-use super::operation::MultiliteOp;
+use super::operation::{CompiledOperation, MultiliteOp, RejectionEffect};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
 
@@ -46,6 +46,7 @@ pub struct HomebaseTransaction {
 pub struct CompiledTransaction {
     logical: MultiliteTransaction,
     homebase: HomebaseTransaction,
+    rejection: Vec<RejectionEffect>,
 }
 
 impl HomebaseTransaction {
@@ -86,6 +87,11 @@ impl CompiledTransaction {
     pub fn homebase(&self) -> &HomebaseTransaction {
         &self.homebase
     }
+
+    /// Local inverses in the order required to reject the transaction.
+    pub fn rejection(&self) -> &[RejectionEffect] {
+        &self.rejection
+    }
 }
 
 impl MultiliteTransaction {
@@ -109,11 +115,24 @@ impl MultiliteTransaction {
 
     /// Validate and lower this manifest exactly once for a commit proposal.
     pub fn compile(self) -> Result<CompiledTransaction> {
-        let homebase = self.to_homebase()?;
-        Ok(CompiledTransaction {
-            logical: self,
-            homebase,
-        })
+        let Self { id, operations } = self;
+        let operations = operations
+            .into_iter()
+            .map(MultiliteOp::compile)
+            .collect::<Result<Vec<_>>>()?;
+        Self::compile_operations(id, operations)
+    }
+
+    /// Mint and assemble one transaction from operations compiled during capture.
+    pub fn from_compiled_operations(
+        operations: Vec<CompiledOperation>,
+    ) -> Result<CompiledTransaction> {
+        if operations.is_empty() {
+            return Err(Error::InvalidMultiliteTransaction(
+                "transaction contains no operations".into(),
+            ));
+        }
+        Self::compile_operations(TransactionId(Uuid::new_v4().into_bytes()), operations)
     }
 
     /// Encode the immutable transaction manifest.
@@ -183,6 +202,44 @@ impl MultiliteTransaction {
         Ok(HomebaseTransaction {
             mutations,
             footprint,
+        })
+    }
+
+    fn compile_operations(
+        id: TransactionId,
+        operations: Vec<CompiledOperation>,
+    ) -> Result<CompiledTransaction> {
+        let mut logical_operations = Vec::with_capacity(operations.len());
+        let mut operation_mutations = Vec::new();
+        let mut footprint = ConflictFootprint::new();
+        let mut rejection = Vec::with_capacity(operations.len());
+        for operation in operations {
+            let (logical, homebase, inverse) = operation.into_parts();
+            let (mutations, operation_footprint) = homebase.into_parts();
+            logical_operations.push(logical);
+            operation_mutations.extend(mutations);
+            footprint.extend(operation_footprint);
+            rejection.push(inverse);
+        }
+        rejection.reverse();
+
+        let logical = MultiliteTransaction {
+            id,
+            operations: logical_operations,
+        };
+        let mut mutations = Vec::with_capacity(operation_mutations.len() + 1);
+        mutations.push(Mutation::Set {
+            key: transaction_key(id),
+            value: logical.encode()?,
+        });
+        mutations.extend(operation_mutations);
+        Ok(CompiledTransaction {
+            logical,
+            homebase: HomebaseTransaction {
+                mutations,
+                footprint,
+            },
+            rejection,
         })
     }
 
@@ -398,6 +455,13 @@ mod tests {
         let compiled = transaction.clone().compile().unwrap();
         assert_eq!(compiled.logical(), &transaction);
         assert_eq!(compiled.homebase(), &lowered);
+        assert!(matches!(
+            compiled.rejection(),
+            [
+                RejectionEffect::DeleteRows { .. },
+                RejectionEffect::DropTable { .. }
+            ]
+        ));
         assert_eq!(lowered.mutations.len(), 10);
         assert_eq!(lowered.footprint.writes().len(), 2);
         assert_eq!(lowered.footprint.constraints().len(), 4);
