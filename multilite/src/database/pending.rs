@@ -13,6 +13,7 @@ use super::catalog;
 use super::operation::RejectionEffect;
 use super::transaction::MultiliteTransaction;
 use crate::commit::history::{self, WriteRegion};
+use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
 const TABLE: &str = "__multilite__pending";
@@ -330,10 +331,6 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
         }
     }
     Ok(())
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), PendingCodecError> {

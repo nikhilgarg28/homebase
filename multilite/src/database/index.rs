@@ -20,6 +20,7 @@ use super::schema::{
 };
 use super::sql::{CreateIndexSpec, CreateIndexTerm, DropIndexSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
+use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
 const INDEX_OPERATION_VERSION: u8 = 2;
@@ -601,10 +602,6 @@ fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], IndexCodecError> {
 
 fn invalid_operation(error: IndexCodecError) -> Error {
     Error::InvalidMultiliteOp(error.to_string())
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -20,6 +20,7 @@ use super::schema::{
 };
 use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
+use crate::sqlite::quote_identifier;
 use crate::value::StoredValue;
 use crate::{Error, Result};
 
@@ -1302,10 +1303,6 @@ fn rename_sql(table: &SqlName, target: RenameTarget, from: &SqlName, to: &SqlNam
             quote_identifier(to.value())
         ),
     }
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn decode_string(value: &[u8]) -> std::result::Result<String, AlterTableCodecError> {

@@ -11,6 +11,7 @@ mod error;
 mod metastore;
 mod rowid;
 mod runtime;
+mod sqlite;
 mod value;
 
 pub use database::{Connection as MultiliteConnection, Statement as MultiliteStatement};

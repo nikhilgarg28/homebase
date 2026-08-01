@@ -22,6 +22,7 @@ use uuid::{Uuid, Variant, Version};
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
+use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
 pub use self::compiler::SchemaInvariantError;
@@ -2261,10 +2262,6 @@ fn push_index_order(sql: &mut String, order: Option<IndexOrder>) {
         Some(IndexOrder::Desc) => sql.push_str(" DESC"),
         None => {}
     }
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 struct ResolvedForeignKey {

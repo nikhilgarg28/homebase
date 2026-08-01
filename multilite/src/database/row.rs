@@ -21,6 +21,7 @@ use super::schema::{
 };
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
+use crate::sqlite::quote_identifier;
 pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
@@ -2511,10 +2512,6 @@ fn rowid_from_declared_primary_key(created: &CreateTable, row: &Row) -> Result<i
             "rowid table has a non-integer primary key value",
         )),
     }
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn materialized_column_name(

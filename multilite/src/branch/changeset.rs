@@ -18,6 +18,7 @@ use sqlite3_parser::lexer::sql::Parser;
 
 use super::WritableBranch;
 use crate::connection::with_savepoint;
+use crate::sqlite::quote_identifier;
 use crate::value::StoredValue;
 
 const CHANGESET_FRAME_VERSION: u8 = 2;
@@ -867,10 +868,6 @@ fn schema_uses_autoincrement(sql: &str) -> Result<bool, ChangesetError> {
             )
         })
     }))
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 #[derive(Debug)]
