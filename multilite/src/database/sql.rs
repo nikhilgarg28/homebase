@@ -2,9 +2,10 @@
 
 use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
-    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, IndexedColumn,
-    InsertBody, Literal, Name, OneSelect, RefAct, RefArg, ResultColumn, Select, SelectTable, Stmt,
-    TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, FrameBound,
+    FunctionCallOrder, FunctionTail, IndexedColumn, InsertBody, JoinConstraint, Literal, Name,
+    OneSelect, Over, RefAct, RefArg, ResultColumn, Select, SelectTable, SortedColumn, Stmt,
+    TabFlags, TableConstraint, Type, TypeSize, UnaryOperator, Window,
 };
 #[cfg(test)]
 use sqlite3_parser::ast::{As, Operator};
@@ -501,10 +502,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             Ok(ValidatedExecute::DropIndex(DropIndexSpec { name }))
         }
         Stmt::Insert {
+            with,
             or_conflict,
+            tbl_name,
+            columns: _,
             body,
             returning,
-            ..
         } => {
             let has_upsert = matches!(body, InsertBody::Select(_, Some(_)));
             if or_conflict.is_some() || has_upsert {
@@ -514,6 +517,32 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             if returning.is_some() {
                 return Err(Error::UnsupportedSql("INSERT RETURNING is not supported"));
+            }
+            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified and aliased INSERT targets are not supported",
+                ));
+            }
+            let table = identifier(&tbl_name.name)?;
+            if super::has_multilite_prefix(table.value())
+                || super::is_sqlite_internal_table(table.value())
+            {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            let reads_reserved = with.as_ref().is_some_and(|with| {
+                with.ctes
+                    .iter()
+                    .any(|cte| select_reads_reserved(&cte.select))
+            }) || match &body {
+                InsertBody::Select(select, _) => select_reads_reserved(select),
+                InsertBody::DefaultValues => false,
+            };
+            if reads_reserved {
+                return Err(Error::UnsupportedSql(
+                    "INSERT cannot read reserved Multilite tables",
+                ));
             }
             Ok(ValidatedExecute::Insert)
         }
@@ -711,40 +740,208 @@ fn select_reads_reserved(select: &Select) -> bool {
             .iter()
             .flatten()
             .any(|compound| one_select_reads_reserved(&compound.select))
+        || select
+            .order_by
+            .iter()
+            .flatten()
+            .any(sorted_column_reads_reserved)
+        || select.limit.as_ref().is_some_and(|limit| {
+            expression_reads_reserved(&limit.expr)
+                || limit.offset.as_ref().is_some_and(expression_reads_reserved)
+        })
 }
 
 fn one_select_reads_reserved(select: &OneSelect) -> bool {
-    let OneSelect::Select {
-        from: Some(from), ..
-    } = select
-    else {
-        return false;
-    };
-    from.select
-        .iter()
-        .any(|table| select_table_reads_reserved(table))
-        || from
-            .joins
-            .iter()
-            .flatten()
-            .any(|join| select_table_reads_reserved(&join.table))
+    match select {
+        OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            window_clause,
+            ..
+        } => {
+            columns.iter().any(|column| match column {
+                ResultColumn::Expr(expression, _) => expression_reads_reserved(expression),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            }) || from.as_ref().is_some_and(|from| {
+                from.select
+                    .iter()
+                    .any(|table| select_table_reads_reserved(table))
+                    || from.joins.iter().flatten().any(|join| {
+                        select_table_reads_reserved(&join.table)
+                            || matches!(
+                                &join.constraint,
+                                Some(JoinConstraint::On(expression))
+                                    if expression_reads_reserved(expression)
+                            )
+                    })
+            }) || where_clause
+                .as_ref()
+                .is_some_and(|expression| expression_reads_reserved(expression))
+                || group_by.iter().flatten().any(expression_reads_reserved)
+                || having
+                    .as_ref()
+                    .is_some_and(|expression| expression_reads_reserved(expression))
+                || window_clause
+                    .iter()
+                    .flatten()
+                    .any(|definition| window_reads_reserved(&definition.window))
+        }
+        OneSelect::Values(rows) => rows.iter().flatten().any(expression_reads_reserved),
+    }
 }
 
 fn select_table_reads_reserved(table: &SelectTable) -> bool {
     match table {
         SelectTable::Table(name, ..) => super::has_multilite_prefix(name.name.0.as_ref()),
-        SelectTable::TableCall(..) => false,
+        SelectTable::TableCall(name, arguments, ..) => {
+            super::has_multilite_prefix(name.name.0.as_ref())
+                || arguments.iter().flatten().any(expression_reads_reserved)
+        }
         SelectTable::Select(select, ..) => select_reads_reserved(select),
         SelectTable::Sub(from, ..) => {
             from.select
                 .iter()
                 .any(|table| select_table_reads_reserved(table))
-                || from
-                    .joins
-                    .iter()
-                    .flatten()
-                    .any(|join| select_table_reads_reserved(&join.table))
+                || from.joins.iter().flatten().any(|join| {
+                    select_table_reads_reserved(&join.table)
+                        || matches!(
+                            &join.constraint,
+                            Some(JoinConstraint::On(expression))
+                                if expression_reads_reserved(expression)
+                        )
+                })
         }
+    }
+}
+
+fn expression_reads_reserved(expression: &Expr) -> bool {
+    match expression {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expression_reads_reserved(lhs)
+                || expression_reads_reserved(start)
+                || expression_reads_reserved(end)
+        }
+        Expr::Binary(left, _, right) => {
+            expression_reads_reserved(left) || expression_reads_reserved(right)
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_ref()
+                .is_some_and(|expression| expression_reads_reserved(expression))
+                || when_then_pairs.iter().any(|(when, then)| {
+                    expression_reads_reserved(when) || expression_reads_reserved(then)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expression| expression_reads_reserved(expression))
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => expression_reads_reserved(expr),
+        Expr::Exists(select) | Expr::Subquery(select) => select_reads_reserved(select),
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            args.iter().flatten().any(expression_reads_reserved)
+                || order_by.as_ref().is_some_and(function_order_reads_reserved)
+                || filter_over
+                    .as_ref()
+                    .is_some_and(function_tail_reads_reserved)
+        }
+        Expr::FunctionCallStar { filter_over, .. } => filter_over
+            .as_ref()
+            .is_some_and(function_tail_reads_reserved),
+        Expr::InList { lhs, rhs, .. } => {
+            expression_reads_reserved(lhs) || rhs.iter().flatten().any(expression_reads_reserved)
+        }
+        Expr::InSelect { lhs, rhs, .. } => {
+            expression_reads_reserved(lhs) || select_reads_reserved(rhs)
+        }
+        Expr::InTable { lhs, rhs, args, .. } => {
+            expression_reads_reserved(lhs)
+                || super::has_multilite_prefix(rhs.name.0.as_ref())
+                || args.iter().flatten().any(expression_reads_reserved)
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            expression_reads_reserved(lhs)
+                || expression_reads_reserved(rhs)
+                || escape
+                    .as_ref()
+                    .is_some_and(|expression| expression_reads_reserved(expression))
+        }
+        Expr::Parenthesized(expressions) => expressions.iter().any(expression_reads_reserved),
+        Expr::Raise(_, expression) => expression
+            .as_ref()
+            .is_some_and(|expression| expression_reads_reserved(expression)),
+        Expr::DoublyQualified(..)
+        | Expr::Id(_)
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_) => false,
+    }
+}
+
+fn sorted_column_reads_reserved(column: &SortedColumn) -> bool {
+    expression_reads_reserved(&column.expr)
+}
+
+fn function_order_reads_reserved(order: &FunctionCallOrder) -> bool {
+    match order {
+        FunctionCallOrder::SortList(columns) => columns.iter().any(sorted_column_reads_reserved),
+    }
+}
+
+fn function_tail_reads_reserved(tail: &FunctionTail) -> bool {
+    tail.filter_clause
+        .as_ref()
+        .is_some_and(|expression| expression_reads_reserved(expression))
+        || tail.over_clause.as_ref().is_some_and(|over| match &**over {
+            Over::Window(window) => window_reads_reserved(window),
+            Over::Name(_) => false,
+        })
+}
+
+fn window_reads_reserved(window: &Window) -> bool {
+    window
+        .partition_by
+        .iter()
+        .flatten()
+        .any(expression_reads_reserved)
+        || window
+            .order_by
+            .iter()
+            .flatten()
+            .any(sorted_column_reads_reserved)
+        || window.frame_clause.as_ref().is_some_and(|frame| {
+            frame_bound_reads_reserved(&frame.start)
+                || frame.end.as_ref().is_some_and(frame_bound_reads_reserved)
+        })
+}
+
+fn frame_bound_reads_reserved(bound: &FrameBound) -> bool {
+    match bound {
+        FrameBound::Following(expression) | FrameBound::Preceding(expression) => {
+            expression_reads_reserved(expression)
+        }
+        FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing
+        | FrameBound::UnboundedPreceding => false,
     }
 }
 
@@ -1755,6 +1952,58 @@ mod tests {
             "WITH value(id) AS (SELECT 1) INSERT OR FAIL INTO notes SELECT id FROM value",
         ] {
             assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn rejects_qualified_reserved_and_reserved_reading_inserts() {
+        for sql in [
+            "INSERT INTO main.notes VALUES (1)",
+            "INSERT INTO notes AS target VALUES (1)",
+            "INSERT INTO __multilite__meta VALUES (x'01', x'02')",
+            "INSERT INTO sqlite_schema VALUES ('table', 'x', 'x', 1, '')",
+            "WITH hidden AS (SELECT value FROM __multilite__meta)
+             INSERT INTO notes SELECT value FROM hidden",
+            "INSERT INTO notes SELECT (SELECT value FROM __multilite__meta)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn public_reads_find_reserved_tables_in_every_subquery_expression() {
+        for sql in [
+            "SELECT (SELECT value FROM __multilite__meta)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM __multilite__meta)",
+            "SELECT 1 WHERE 1 IN (SELECT length(value) FROM __multilite__meta)",
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM __multilite__meta)
+                         THEN 1 ELSE 0 END",
+            "SELECT count(*) FILTER (
+                WHERE EXISTS (SELECT 1 FROM __multilite__meta)
+             ) FROM notes",
+            "SELECT 1 ORDER BY (SELECT value FROM __multilite__meta) LIMIT 1",
+            "SELECT 1 LIMIT (SELECT length(value) FROM __multilite__meta)",
+        ] {
+            assert!(
+                matches!(validate_statement(sql), Err(Error::UnsupportedSql(_))),
+                "prepared read gate accepted: {sql}"
+            );
+            assert!(
+                matches!(validate_read_statement(sql), Err(Error::PreparedWrite)),
+                "read-only gate accepted: {sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT (SELECT body FROM notes LIMIT 1)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM notes)",
+            "SELECT 1 WHERE 1 IN (SELECT id FROM notes)",
+        ] {
+            assert!(matches!(
+                validate_statement(sql),
+                Ok(ValidatedStatement::Read)
+            ));
+            validate_read_statement(sql).unwrap();
         }
     }
 
