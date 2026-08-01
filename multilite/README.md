@@ -228,11 +228,11 @@ before the first supported release.
 
 Homebase client state is stored in the same SQLite file under
 `__multilite__meta`.
-Speculative Multilite transactions and their explicit acceptance/rejection
-effects are stored under `__multilite__pending`; this is a local disposition
-journal, not a second operation log. Its versioned record codec stores repeated
-effect lists derived from all ordered operations: acceptance runs forward,
-while rejection unwinds operations in reverse. CREATE TABLE rejection drops
+Speculative Multilite transaction manifests are stored under
+`__multilite__pending`; this is a local disposition journal, not a second
+operation log. The journal does not duplicate derived effects. The operation
+compiler selects each inverse from the authenticated manifest, and rejection
+unwinds those operations in reverse. CREATE TABLE rejection drops
 the speculative table and catalog entry, ALTER TABLE rename rejection restores
 the old physical and catalog names, INSERT rejection removes the exact
 speculative rows, DELETE rejection restores each complete old row, and UPDATE

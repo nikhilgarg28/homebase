@@ -1392,10 +1392,10 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     let pending = pending_ops(&database);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].seq, DeviceSeq(1));
-    assert!(pending[0].on_accept.is_empty());
     assert!(matches!(
-        pending[0].on_reject.as_slice(),
-        [pending::Effect::DropTable { created }] if created.table_name() == "notes"
+        pending[0].rejection().unwrap().as_slice(),
+        [super::operation::RejectionEffect::DropTable { created }]
+            if created.table_name() == "notes"
     ));
 
     drop(runtime);
@@ -2841,8 +2841,8 @@ fn multi_row_insert_is_one_durable_pending_operation() {
         [MultiliteOp::InsertRows(_)]
     ));
     assert!(matches!(
-        pending[1].on_reject.as_slice(),
-        [pending::Effect::DeleteRows { .. }]
+        pending[1].rejection().unwrap().as_slice(),
+        [super::operation::RejectionEffect::DeleteRows { .. }]
     ));
     database.with_connection(|connection| {
         assert_eq!(
