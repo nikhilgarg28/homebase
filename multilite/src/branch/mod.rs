@@ -74,46 +74,12 @@ impl Default for OverlayOptions {
 pub struct WritableBranch {
     connection: Option<Connection>,
     vfs: BranchVfs,
-    baseline_connection: Option<Connection>,
-    _baseline_vfs: Option<BranchVfs>,
 }
 
 impl WritableBranch {
     pub fn open(snapshot: PinnedSnapshot, options: OverlayOptions) -> Result<Self, BranchError> {
-        Self::open_inner(snapshot, options, false)
-    }
-
-    pub fn open_for_changeset_capture(
-        snapshot: PinnedSnapshot,
-        options: OverlayOptions,
-    ) -> Result<Self, BranchError> {
-        Self::open_inner(snapshot, options, true)
-    }
-
-    fn open_inner(
-        snapshot: PinnedSnapshot,
-        options: OverlayOptions,
-        with_baseline: bool,
-    ) -> Result<Self, BranchError> {
         let database_path = snapshot.database_path().to_owned();
-        let (reader, baseline_reader) = if with_baseline {
-            let (reader, baseline) = SnapshotReader::open_pair(snapshot)?;
-            (reader, Some(baseline))
-        } else {
-            (SnapshotReader::open(snapshot)?, None)
-        };
-        let (baseline_connection, baseline_vfs) = if let Some(baseline_reader) = baseline_reader {
-            let baseline_vfs = BranchVfs::register(BranchImage::read_only(baseline_reader))?;
-            let baseline_connection = Connection::open_with_flags_and_vfs(
-                &database_path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                baseline_vfs.name(),
-            )?;
-            baseline_connection.execute_batch("PRAGMA query_only = ON; PRAGMA mmap_size = 0")?;
-            (Some(baseline_connection), Some(baseline_vfs))
-        } else {
-            (None, None)
-        };
+        let reader = SnapshotReader::open(snapshot)?;
         let vfs = BranchVfs::register(BranchImage::writable(reader, options))?;
         let connection = Connection::open_with_flags_and_vfs(
             &database_path,
@@ -131,8 +97,6 @@ impl WritableBranch {
         Ok(Self {
             connection: Some(connection),
             vfs,
-            baseline_connection,
-            _baseline_vfs: baseline_vfs,
         })
     }
 
@@ -146,12 +110,6 @@ impl WritableBranch {
         &self.vfs.image().reader.snapshot
     }
 
-    pub fn baseline_connection(&self) -> &Connection {
-        self.baseline_connection
-            .as_ref()
-            .expect("branch baseline remains open until drop")
-    }
-
     pub fn overlay_stats(&self) -> OverlayStats {
         self.vfs.image().overlay_stats()
     }
@@ -160,7 +118,6 @@ impl WritableBranch {
 impl Drop for WritableBranch {
     fn drop(&mut self) {
         drop(self.connection.take());
-        drop(self.baseline_connection.take());
     }
 }
 
@@ -209,15 +166,6 @@ impl SnapshotReader {
         let wal_path = snapshot.wal_path().to_owned();
         let (snapshot, pin) = snapshot.into_snapshot_and_pin();
         Self::open_parts(&database_path, &wal_path, snapshot, pin)
-    }
-
-    fn open_pair(snapshot: PinnedSnapshot) -> std::io::Result<(Self, Self)> {
-        let database_path = snapshot.database_path().to_owned();
-        let wal_path = snapshot.wal_path().to_owned();
-        let (snapshot, pin) = snapshot.into_snapshot_and_pin();
-        let first = Self::open_parts(&database_path, &wal_path, snapshot.clone(), pin.clone())?;
-        let second = Self::open_parts(&database_path, &wal_path, snapshot, pin)?;
-        Ok((first, second))
     }
 
     fn open_parts(

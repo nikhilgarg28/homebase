@@ -13,7 +13,7 @@ use sqlite3_parser::lexer::sql::Parser;
 use super::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
     DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode,
-    TableStorage, TypeDeclaration, available_hidden_rowid_alias,
+    TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
 
@@ -1128,21 +1128,14 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     let rowid_alias = storage == TableStorage::Rowid
         && primary.len() == 1
         && columns[primary[0].1].declared_type.is_exact_integer();
-    if storage == TableStorage::Rowid
-        && !rowid_alias
-        && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none()
-    {
+    if storage == TableStorage::Rowid && !rowid_alias {
         return Err(Error::UnsupportedSql(
-            "tables with a non-integer primary key must leave one SQLite rowid alias unshadowed",
+            "rowid tables require a single INTEGER PRIMARY KEY; other primary keys require WITHOUT ROWID",
         ));
     }
     for (_, index) in primary {
         if mode == TableMode::Strict || storage == TableStorage::WithoutRowid {
             columns[index].not_null = true;
-        } else if !rowid_alias && !columns[index].not_null {
-            return Err(Error::UnsupportedSql(
-                "every non-rowid PRIMARY KEY column must also be NOT NULL",
-            ));
         }
     }
     if checks.iter().any(|check| {
@@ -1566,7 +1559,7 @@ mod tests {
             "ALTER TABLE notes ADD COLUMN extra TEXT DEFAULT 'x'",
             "ALTER TABLE notes DROP COLUMN extra",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, payload BLOB)",
-            "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE \"Case Sensitive\" (\"Primary Key\" TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID",
             "CREATE TABLE accounts (
                 id INTEGER PRIMARY KEY,
                 organization TEXT,
@@ -1995,7 +1988,7 @@ mod tests {
                 tenant TEXT NOT NULL,
                 id INTEGER NOT NULL,
                 PRIMARY KEY (tenant, id)
-            )",
+            ) WITHOUT ROWID",
         )
         .unwrap();
     }
@@ -2027,24 +2020,18 @@ mod tests {
     }
 
     #[test]
-    fn non_rowid_primary_keys_leave_a_stable_hidden_rowid_name() {
-        assert_unsupported(
-            "CREATE TABLE shadowed (
-                key TEXT NOT NULL PRIMARY KEY,
-                rowid TEXT,
-                oid TEXT,
-                _rowid_ TEXT
+    fn rowid_tables_require_a_declared_integer_primary_key_alias() {
+        for sql in [
+            "CREATE TABLE text_key (key TEXT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE composite_key (
+                tenant TEXT NOT NULL,
+                key INTEGER NOT NULL,
+                PRIMARY KEY (tenant, key)
             )",
-        );
-
-        validate_execute(
-            "CREATE TABLE available (
-                key TEXT NOT NULL PRIMARY KEY,
-                rowid TEXT,
-                oid TEXT
-            )",
-        )
-        .unwrap();
+            "CREATE TABLE int_key (key INT NOT NULL PRIMARY KEY)",
+        ] {
+            assert_unsupported(sql);
+        }
         validate_execute(
             "CREATE TABLE aliased (
                 rowid INTEGER PRIMARY KEY,
@@ -2153,7 +2140,7 @@ mod tests {
                 label TEXT,
                 payload BLOB,
                 anything ANY UNIQUE
-            ) STRICT",
+            ) WITHOUT ROWID, STRICT",
         )
         .unwrap() else {
             unreachable!()
@@ -2219,15 +2206,16 @@ mod tests {
             let not_null = if rowid_alias { "" } else { " NOT NULL" };
             let sql =
                 format!("CREATE TABLE items (id {declaration}{not_null} PRIMARY KEY, body TEXT)");
-            let ValidatedExecute::CreateTable(spec) = validate_execute(&sql).unwrap() else {
-                unreachable!()
-            };
-            assert_eq!(
-                spec.columns[0].declared_type.is_exact_integer(),
-                rowid_alias,
-                "{declaration}"
-            );
-            assert_eq!(spec.columns[0].declared_type.affinity(), Affinity::Integer);
+            if rowid_alias {
+                let ValidatedExecute::CreateTable(spec) = validate_execute(&sql).unwrap() else {
+                    unreachable!()
+                };
+                assert!(spec.columns[0].declared_type.is_exact_integer());
+                assert_eq!(spec.columns[0].declared_type.affinity(), Affinity::Integer);
+            } else {
+                assert_unsupported(&sql);
+                validate_execute(&format!("{sql} WITHOUT ROWID")).unwrap();
+            }
         }
     }
 

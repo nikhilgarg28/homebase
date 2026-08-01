@@ -191,12 +191,16 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     {
         self.refresh_read_async().await?;
         let snapshot = self.committer.capture_snapshot(true).await?;
+        let rowid_allocator = self.rowid_allocator.clone();
         let isolation = options.isolation_level();
         let BranchUpdate {
             value,
             proposal,
             history_pin: _history_pin,
-        } = blocking::run(move || run_branch_update(snapshot, isolation, operation)).await?;
+        } = blocking::run(move || {
+            run_branch_update(snapshot, rowid_allocator, isolation, operation)
+        })
+        .await?;
         if let Some(proposal) = proposal {
             let receipt = self.committer.propose(proposal).await?;
             self.finish_branch_write_async(receipt).await?;

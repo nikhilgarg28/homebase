@@ -92,7 +92,6 @@ const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
 
 const SHORT_NAME_LIMIT: usize = 250;
 const TABLE_NAME_HASH_DOMAIN: &[u8] = b"multilite:table-name:v1\0";
-const SQLITE_ROWID_ALIASES: [&str; 3] = ["_rowid_", "rowid", "oid"];
 
 /// Maximum number of columns in a single logical index definition.
 pub const MAX_INDEX_COLUMNS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
@@ -146,18 +145,6 @@ fn unescape_identifier(bytes: &[u8], quote: u8) -> String {
         index += 1;
     }
     String::from_utf8(value).expect("SQLite parser identifiers originate in UTF-8 SQL")
-}
-
-pub fn available_hidden_rowid_alias<'a>(
-    columns: impl IntoIterator<Item = &'a SqlName>,
-) -> Option<&'static str> {
-    let columns = columns
-        .into_iter()
-        .map(SqlName::canonical)
-        .collect::<Vec<_>>();
-    SQLITE_ROWID_ALIASES
-        .into_iter()
-        .find(|candidate| !columns.contains(&candidate.as_bytes()))
 }
 
 /// SQLite's five ordinary-table type affinities.
@@ -3298,13 +3285,7 @@ fn decode_create_table(
                     .find(|column| column.id == *id)
                     .is_none_or(|column| !column.not_null)
             }))
-        || (!rowid_alias
-            && primary_key.columns().iter().any(|id| {
-                columns
-                    .iter()
-                    .find(|column| column.id == *id)
-                    .is_none_or(|column| !column.not_null)
-            }))
+        || (storage == TableStorage::Rowid && !rowid_alias)
         || unique_constraints
             .iter()
             .enumerate()
@@ -3367,9 +3348,6 @@ fn decode_create_table(
                 .is_some_and(|id| !columns.iter().any(|column| column.id == id))
                 || !expression_dependencies_match(&check.expression, &check.dependencies, &columns)
         })
-        || (storage == TableStorage::Rowid
-            && !rowid_alias
-            && available_hidden_rowid_alias(columns.iter().map(|column| &column.name)).is_none())
     {
         return Err(SchemaCodecError::InvalidSchema);
     }
@@ -5159,7 +5137,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_rowid_tables_without_a_stable_hidden_alias() {
+    fn decoder_rejects_rowid_tables_without_an_integer_primary_key_alias() {
         let mut spec = definition("shadowed");
         spec.columns[0] = CreateColumn {
             name: SqlName::new("key".into()),

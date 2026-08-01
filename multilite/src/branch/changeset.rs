@@ -22,7 +22,6 @@ use crate::value::StoredValue;
 const CHANGESET_FRAME_VERSION: u8 = 2;
 const TAG_TABLE_BINDING: u8 = 1;
 const TAG_SQLITE_CHANGESET: u8 = 2;
-const TAG_ROWID_TRANSITION: u8 = 3;
 const TABLE_BINDING_FRAME_VERSION: u8 = 1;
 const TAG_TABLE_NAME: u8 = 1;
 const TAG_TABLE_FINGERPRINT: u8 = 2;
@@ -39,7 +38,6 @@ struct TableBinding {
 pub struct CapturedChangeset {
     tables: Vec<TableBinding>,
     sqlite: Vec<u8>,
-    rowids: Vec<RowidTransition>,
 }
 
 /// One final inserted row projected from SQLite's net changeset.
@@ -48,12 +46,6 @@ pub struct CapturedInsert {
     pub table: String,
     pub rowid: i64,
     pub values: Vec<StoredValue>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RowidTransition {
-    before: Option<i64>,
-    after: Option<i64>,
 }
 
 impl CapturedChangeset {
@@ -74,8 +66,7 @@ impl CapturedChangeset {
     pub fn inserted_rows(&self) -> Result<Vec<CapturedInsert>, ChangesetError> {
         decode_changeset(&self.sqlite)?
             .into_iter()
-            .zip(&self.rowids)
-            .map(|(change, rowid)| {
+            .map(|change| {
                 if change.kind != ChangeKind::Insert {
                     return Err(ChangesetError::UnsupportedChange {
                         table: change.table,
@@ -91,11 +82,22 @@ impl CapturedChangeset {
                         ))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let rowid = change
+                    .primary_key
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, primary)| primary.then_some(index))
+                    .collect::<Vec<_>>();
+                let rowid = match rowid.as_slice() {
+                    [index] => match values[*index] {
+                        StoredValue::Integer(value) => value,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
                 Ok(CapturedInsert {
                     table: change.table,
-                    rowid: rowid.after.ok_or(ChangesetError::Malformed(
-                        "insert changeset is missing its final rowid",
-                    ))?,
+                    rowid,
                     values,
                 })
             })
@@ -114,14 +116,6 @@ impl CapturedChangeset {
         writer
             .field(TAG_SQLITE_CHANGESET, &self.sqlite)
             .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
-        for rowids in &self.rowids {
-            let mut value = Writer::with_capacity(18);
-            encode_optional_rowid(&mut value, rowids.before);
-            encode_optional_rowid(&mut value, rowids.after);
-            writer
-                .field(TAG_ROWID_TRANSITION, &value.finish())
-                .map_err(|_| ChangesetError::Malformed("captured changeset field is too large"))?;
-        }
         Ok(writer.finish())
     }
 
@@ -135,7 +129,6 @@ impl CapturedChangeset {
         }
         let mut tables = Vec::new();
         let mut sqlite = None;
-        let mut rowids = Vec::new();
         while let Some((tag, value)) = reader
             .field()
             .map_err(|_| ChangesetError::Malformed("truncated captured changeset field"))?
@@ -143,7 +136,6 @@ impl CapturedChangeset {
             match tag {
                 TAG_TABLE_BINDING => tables.push(decode_table_binding(value)?),
                 TAG_SQLITE_CHANGESET => set_once(&mut sqlite, value.to_vec())?,
-                TAG_ROWID_TRANSITION => rowids.push(decode_rowids(value)?),
                 _ => {}
             }
         }
@@ -151,30 +143,16 @@ impl CapturedChangeset {
             "captured changeset is missing its SQLite payload",
         ))?;
         let changes = decode_changeset(&sqlite)?;
-        let captured = Self {
-            tables,
-            sqlite,
-            rowids,
-        };
+        let captured = Self { tables, sqlite };
         validate_binding_set(&captured.tables, &changes)?;
-        if changes.len() != captured.rowids.len() {
-            return Err(ChangesetError::Malformed(
-                "captured rowid metadata has the wrong length",
-            ));
-        }
         Ok(captured)
     }
 
     /// Replay the final logical changes without re-running triggers or FK actions.
     pub fn apply(&self, connection: &Connection) -> Result<(), ChangesetError> {
         let changes = decode_changeset(&self.sqlite)?;
-        if changes.len() != self.rowids.len() {
-            return Err(ChangesetError::Malformed(
-                "captured rowid metadata has the wrong length",
-            ));
-        }
         validate_binding_set(&self.tables, &changes)?;
-        apply_changes(connection, &self.tables, &changes, &self.rowids)
+        apply_changes(connection, &self.tables, &changes)
     }
 
     #[cfg(test)]
@@ -194,8 +172,6 @@ impl CapturedChangeset {
 
 /// Active SQLite Session capture scoped to one branch transaction.
 pub struct ChangesetCapture<'connection> {
-    connection: &'connection Connection,
-    baseline: &'connection Connection,
     session: Session<'connection>,
     tables: BTreeMap<Vec<u8>, TableBinding>,
 }
@@ -205,12 +181,11 @@ impl<'connection> ChangesetCapture<'connection> {
         branch: &'connection WritableBranch,
         tables: &[&str],
     ) -> Result<Self, ChangesetError> {
-        Self::start_between(branch.connection(), branch.baseline_connection(), tables)
+        Self::start_between(branch.connection(), tables)
     }
 
     fn start_between(
         connection: &'connection Connection,
-        baseline: &'connection Connection,
         tables: &[&str],
     ) -> Result<Self, ChangesetError> {
         let mut bindings = BTreeMap::new();
@@ -233,8 +208,6 @@ impl<'connection> ChangesetCapture<'connection> {
             session.attach(Some(*table))?;
         }
         Ok(Self {
-            connection,
-            baseline,
             session,
             tables: bindings,
         })
@@ -244,7 +217,6 @@ impl<'connection> ChangesetCapture<'connection> {
         let mut bytes = Vec::new();
         self.session.changeset_strm(&mut bytes)?;
         let changes = decode_changeset(&bytes)?;
-        let rowids = capture_rowid_transitions(self.baseline, self.connection, &changes)?;
         let touched = changes
             .iter()
             .map(|change| canonical_name(&change.table))
@@ -260,7 +232,6 @@ impl<'connection> ChangesetCapture<'connection> {
         Ok(CapturedChangeset {
             tables,
             sqlite: bytes,
-            rowids,
         })
     }
 }
@@ -272,37 +243,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), ChangesetError> {
         ))
     } else {
         Ok(())
-    }
-}
-
-fn encode_optional_rowid(writer: &mut Writer, rowid: Option<i64>) {
-    match rowid {
-        None => writer.u8(0),
-        Some(rowid) => {
-            writer.u8(1);
-            writer.u64(rowid as u64);
-        }
-    }
-}
-
-fn decode_rowids(value: &[u8]) -> Result<RowidTransition, ChangesetError> {
-    let mut reader = Reader::new(value);
-    let before = decode_optional_rowid(&mut reader)?;
-    let after = decode_optional_rowid(&mut reader)?;
-    if reader.end().is_none() {
-        return Err(ChangesetError::Malformed("invalid captured rowid"));
-    }
-    Ok(RowidTransition { before, after })
-}
-
-fn decode_optional_rowid(reader: &mut Reader<'_>) -> Result<Option<i64>, ChangesetError> {
-    match reader.u8() {
-        Some(0) => Ok(None),
-        Some(1) => reader
-            .u64()
-            .map(|value| Some(value as i64))
-            .ok_or(ChangesetError::Malformed("invalid captured rowid")),
-        _ => Err(ChangesetError::Malformed("invalid captured rowid")),
     }
 }
 
@@ -389,6 +329,7 @@ struct NetChange {
 #[derive(Clone, Debug)]
 struct ColumnLayout {
     name: String,
+    declared_type: String,
     primary_key: u32,
     writable: bool,
 }
@@ -397,7 +338,6 @@ struct ColumnLayout {
 struct TableLayout {
     name: String,
     columns: Vec<ColumnLayout>,
-    rowid_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -405,7 +345,6 @@ struct ReplayChange {
     table: TableLayout,
     old_key: Option<Vec<StoredValue>>,
     final_row: Option<Vec<StoredValue>>,
-    final_rowid: Option<i64>,
 }
 
 fn table_binding(
@@ -555,7 +494,6 @@ fn apply_changes(
     connection: &Connection,
     expected_tables: &[TableBinding],
     changes: &[NetChange],
-    rowids: &[RowidTransition],
 ) -> Result<(), ChangesetError> {
     connection.execute_batch("SAVEPOINT __multilite_changeset_apply")?;
     let result = (|| {
@@ -573,7 +511,7 @@ fn apply_changes(
         }
 
         let replay_result = (|| {
-            let replay = prepare_replay(connection, changes, rowids)?;
+            let replay = prepare_replay(connection, changes)?;
             for change in &replay {
                 if let Some(key) = &change.old_key {
                     delete_old_row(connection, &change.table, key)?;
@@ -581,7 +519,7 @@ fn apply_changes(
             }
             for change in &replay {
                 if let Some(row) = &change.final_row {
-                    insert_final_row(connection, &change.table, row, change.final_rowid)?;
+                    insert_final_row(connection, &change.table, row)?;
                 }
             }
             let foreign_key_violation = connection.query_row(
@@ -623,11 +561,10 @@ fn apply_changes(
 fn prepare_replay(
     connection: &Connection,
     changes: &[NetChange],
-    rowids: &[RowidTransition],
 ) -> Result<Vec<ReplayChange>, ChangesetError> {
     let mut layouts: BTreeMap<String, TableLayout> = BTreeMap::new();
     let mut replay = Vec::with_capacity(changes.len());
-    for (change, captured_rowids) in changes.iter().zip(rowids) {
+    for change in changes {
         let layout = match layouts.get(&change.table) {
             Some(layout) => layout.clone(),
             None => {
@@ -655,20 +592,18 @@ fn prepare_replay(
         let final_row = match change.kind {
             ChangeKind::Delete => {
                 let current = load_current_row(connection, &layout, old_key.as_ref().unwrap())?;
-                verify_old_values(change, &current.values)?;
-                verify_old_rowid(change, &current, *captured_rowids)?;
+                verify_old_values(change, &current)?;
                 None
             }
             ChangeKind::Update => {
                 let mut current = load_current_row(connection, &layout, old_key.as_ref().unwrap())?;
-                verify_old_values(change, &current.values)?;
-                verify_old_rowid(change, &current, *captured_rowids)?;
-                for (slot, value) in current.values.iter_mut().zip(&change.new) {
+                verify_old_values(change, &current)?;
+                for (slot, value) in current.iter_mut().zip(&change.new) {
                     if let Some(value) = value {
                         *slot = value.clone();
                     }
                 }
-                Some(current.values)
+                Some(current)
             }
             ChangeKind::Insert => Some(
                 change
@@ -688,12 +623,10 @@ fn prepare_replay(
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         };
-        validate_rowid_transition(change, &layout, final_row.is_some(), *captured_rowids)?;
         replay.push(ReplayChange {
             table: layout,
             old_key,
             final_row,
-            final_rowid: captured_rowids.after,
         });
     }
     Ok(replay)
@@ -716,134 +649,16 @@ fn primary_values(
         .collect()
 }
 
-fn final_primary_values(change: &NetChange) -> Result<Vec<StoredValue>, ChangesetError> {
-    change
-        .primary_key
-        .iter()
-        .enumerate()
-        .filter_map(|(index, primary)| primary.then_some(index))
-        .map(|index| {
-            change.new[index]
-                .clone()
-                .or_else(|| change.old[index].clone())
-                .ok_or(ChangesetError::Malformed(
-                    "changeset is missing a final primary-key value",
-                ))
-        })
-        .collect()
-}
-
-fn capture_rowid_transitions(
-    baseline: &Connection,
-    connection: &Connection,
-    changes: &[NetChange],
-) -> Result<Vec<RowidTransition>, ChangesetError> {
-    let mut layouts: BTreeMap<String, TableLayout> = BTreeMap::new();
-    changes
-        .iter()
-        .map(|change| {
-            let layout = match layouts.get(&change.table) {
-                Some(layout) => layout.clone(),
-                None => {
-                    let layout = table_layout(connection, &change.table)?;
-                    layouts.insert(change.table.clone(), layout.clone());
-                    layout
-                }
-            };
-            let Some(rowid_name) = &layout.rowid_name else {
-                return Ok(RowidTransition {
-                    before: None,
-                    after: None,
-                });
-            };
-            let predicate = primary_key_predicate(&layout);
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {predicate}",
-                quote_identifier(rowid_name),
-                quote_identifier(&layout.name)
-            );
-            let before = match change.kind {
-                ChangeKind::Insert => None,
-                ChangeKind::Update | ChangeKind::Delete => {
-                    let key = primary_values(change, &change.old)?;
-                    Some(load_rowid(baseline, &sql, &key, &layout.name, "baseline")?)
-                }
-            };
-            let after = match change.kind {
-                ChangeKind::Delete => None,
-                ChangeKind::Insert | ChangeKind::Update => {
-                    let key = final_primary_values(change)?;
-                    Some(load_rowid(connection, &sql, &key, &layout.name, "final")?)
-                }
-            };
-            Ok(RowidTransition { before, after })
-        })
-        .collect()
-}
-
-fn load_rowid(
-    connection: &Connection,
-    sql: &str,
-    key: &[StoredValue],
-    table: &str,
-    state: &str,
-) -> Result<i64, ChangesetError> {
-    connection
-        .query_row(sql, params_from_iter(key), |row| row.get::<_, i64>(0))
-        .optional()?
-        .ok_or_else(|| {
-            ChangesetError::Conflict(format!("{state} row missing from branch table {table}"))
-        })
-}
-
-fn verify_old_rowid(
-    change: &NetChange,
-    current: &CurrentRow,
-    captured: RowidTransition,
-) -> Result<(), ChangesetError> {
-    if current.rowid != captured.before {
-        return Err(ChangesetError::Conflict(format!(
-            "rowid in {} changed since the branch snapshot",
-            change.table
-        )));
-    }
-    Ok(())
-}
-
-fn validate_rowid_transition(
-    change: &NetChange,
-    layout: &TableLayout,
-    has_final_row: bool,
-    captured: RowidTransition,
-) -> Result<(), ChangesetError> {
-    let expected_before = layout.rowid_name.is_some() && change.kind != ChangeKind::Insert;
-    let expected_after = layout.rowid_name.is_some() && has_final_row;
-    if captured.before.is_some() != expected_before || captured.after.is_some() != expected_after {
-        return Err(ChangesetError::Malformed(
-            "captured rowids do not match their row operation",
-        ));
-    }
-    Ok(())
-}
-
-struct CurrentRow {
-    values: Vec<StoredValue>,
-    rowid: Option<i64>,
-}
-
 fn load_current_row(
     connection: &Connection,
     table: &TableLayout,
     key: &[StoredValue],
-) -> Result<CurrentRow, ChangesetError> {
-    let mut selected = table
+) -> Result<Vec<StoredValue>, ChangesetError> {
+    let selected = table
         .columns
         .iter()
         .map(|column| quote_identifier(&column.name))
         .collect::<Vec<_>>();
-    if let Some(rowid_name) = &table.rowid_name {
-        selected.insert(0, quote_identifier(rowid_name));
-    }
     let columns = selected.join(", ");
     let predicate = primary_key_predicate(table);
     let sql = format!(
@@ -852,17 +667,9 @@ fn load_current_row(
     );
     connection
         .query_row(&sql, params_from_iter(key), |row| {
-            let value_offset = usize::from(table.rowid_name.is_some());
-            Ok(CurrentRow {
-                values: (0..table.columns.len())
-                    .map(|index| row.get_ref(index + value_offset).map(StoredValue::capture))
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-                rowid: table
-                    .rowid_name
-                    .as_ref()
-                    .map(|_| row.get::<_, i64>(0))
-                    .transpose()?,
-            })
+            (0..table.columns.len())
+                .map(|index| row.get_ref(index).map(StoredValue::capture))
+                .collect::<rusqlite::Result<Vec<_>>>()
         })
         .optional()?
         .ok_or_else(|| ChangesetError::Conflict(format!("row missing from {}", table.name)))
@@ -922,7 +729,6 @@ fn insert_final_row(
     connection: &Connection,
     table: &TableLayout,
     row: &[StoredValue],
-    rowid: Option<i64>,
 ) -> Result<(), ChangesetError> {
     let writable = table
         .columns
@@ -930,29 +736,21 @@ fn insert_final_row(
         .enumerate()
         .filter(|(_, column)| column.writable)
         .collect::<Vec<_>>();
-    let mut columns = writable
+    let columns = writable
         .iter()
         .map(|(_, column)| quote_identifier(&column.name))
-        .collect::<Vec<_>>();
-    if let Some(rowid_name) = &table.rowid_name {
-        columns.insert(0, quote_identifier(rowid_name));
-    }
-    let columns = columns.join(", ");
-    let placeholders = std::iter::repeat_n("?", writable.len() + usize::from(rowid.is_some()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = std::iter::repeat_n("?", writable.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
         "INSERT INTO {} ({columns}) VALUES ({placeholders})",
         quote_identifier(&table.name)
     );
-    let rowid_value = rowid.map(StoredValue::Integer);
     connection.execute(
         &sql,
-        params_from_iter(
-            rowid_value
-                .iter()
-                .chain(writable.iter().map(|(index, _)| &row[*index])),
-        ),
+        params_from_iter(writable.iter().map(|(index, _)| &row[*index])),
     )?;
     Ok(())
 }
@@ -1004,6 +802,7 @@ fn table_layout(connection: &Connection, table: &str) -> Result<TableLayout, Cha
             Ok((
                 ColumnLayout {
                     name: row.get(1)?,
+                    declared_type: row.get(2)?,
                     primary_key: row.get(5)?,
                     writable: true,
                 },
@@ -1018,27 +817,31 @@ fn table_layout(connection: &Connection, table: &str) -> Result<TableLayout, Cha
         return Err(ChangesetError::UnknownTable(table.to_owned()));
     }
 
-    let rowid_name = if without_rowid {
-        None
-    } else {
-        ["_rowid_", "rowid", "oid"]
-            .into_iter()
-            .find(|candidate| {
-                !columns
-                    .iter()
-                    .any(|column| column.name.eq_ignore_ascii_case(candidate))
-            })
-            .map(str::to_owned)
-            .ok_or_else(|| ChangesetError::UnsupportedTable {
+    let primary = columns
+        .iter()
+        .filter(|column| column.primary_key > 0)
+        .collect::<Vec<_>>();
+    if !without_rowid && !primary.is_empty() {
+        let has_primary_index = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk'
+             )",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if primary.len() != 1
+            || !primary[0].declared_type.eq_ignore_ascii_case("INTEGER")
+            || has_primary_index
+        {
+            return Err(ChangesetError::UnsupportedTable {
                 table: table.to_owned(),
-                reason: "all hidden rowid aliases are shadowed",
-            })?
-            .into()
-    };
+                reason: "rowid tables require a single INTEGER PRIMARY KEY alias",
+            });
+        }
+    }
     Ok(TableLayout {
         name: table.to_owned(),
         columns,
-        rowid_name,
     })
 }
 
@@ -1187,8 +990,7 @@ mod tests {
         }
 
         fn branch(&self) -> WritableBranch {
-            WritableBranch::open_for_changeset_capture(self.snapshot(), OverlayOptions::default())
-                .unwrap()
+            WritableBranch::open(self.snapshot(), OverlayOptions::default()).unwrap()
         }
     }
 
@@ -1253,99 +1055,6 @@ mod tests {
                 (4, "defaulted".into(), 5, 10),
                 (10, "beta".into(), 12, 24),
             ]
-        );
-    }
-
-    #[test]
-    fn replay_preserves_hidden_rowids_for_non_integer_primary_keys() {
-        let fixture = Fixture::new(
-            "CREATE TABLE records (
-                code TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-             )",
-            "INSERT INTO records VALUES ('a', 'one'), ('b', 'two')",
-        );
-        let branch = fixture.branch();
-        let capture = ChangesetCapture::start(&branch, &["records"]).unwrap();
-        branch
-            .connection()
-            .execute_batch(
-                "UPDATE records SET value = 'updated' WHERE code = 'a';
-                 INSERT INTO records VALUES ('c', 'three');
-                 DELETE FROM records WHERE code = 'b'",
-            )
-            .unwrap();
-        let changeset = capture.finish().unwrap();
-        changeset.apply(&fixture.writer).unwrap();
-
-        let dump = |connection: &Connection| {
-            let mut statement = connection
-                .prepare("SELECT rowid, code, value FROM records ORDER BY code")
-                .unwrap();
-            statement
-                .query_map((), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert_eq!(dump(branch.connection()), dump(&fixture.writer));
-        assert_eq!(
-            dump(&fixture.writer),
-            vec![
-                (1, "a".into(), "updated".into()),
-                (3, "c".into(), "three".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn replay_distinguishes_local_rowid_replacement_from_a_foreign_replacement() {
-        let fixture = Fixture::new(
-            "CREATE TABLE records (code TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "INSERT INTO records VALUES ('a', 'base'), ('b', 'anchor')",
-        );
-        let branch = fixture.branch();
-        let original = branch
-            .connection()
-            .query_row("SELECT rowid FROM records WHERE code = 'a'", (), |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap();
-        let capture = ChangesetCapture::start(&branch, &["records"]).unwrap();
-        branch
-            .connection()
-            .execute_batch(
-                "DELETE FROM records WHERE code = 'a';
-                 INSERT INTO records VALUES ('a', 'replaced')",
-            )
-            .unwrap();
-        let replacement = branch
-            .connection()
-            .query_row("SELECT rowid FROM records WHERE code = 'a'", (), |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap();
-        assert_ne!(replacement, original);
-
-        let changeset = capture.finish().unwrap();
-        assert_eq!(changeset.summary().unwrap().updates, 1);
-        changeset.apply(&fixture.writer).unwrap();
-        assert_eq!(
-            fixture
-                .writer
-                .query_row(
-                    "SELECT rowid, value FROM records WHERE code = 'a'",
-                    (),
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )
-                .unwrap(),
-            (replacement, "replaced".into())
         );
     }
 
@@ -1535,42 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_rows_replaced_with_the_same_logical_primary_key() {
-        let fixture = Fixture::new(
-            "CREATE TABLE records (code TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "INSERT INTO records VALUES ('a', 'base'), ('b', 'anchor')",
-        );
-        let branch = fixture.branch();
-        let capture = ChangesetCapture::start(&branch, &["records"]).unwrap();
-        branch
-            .connection()
-            .execute("UPDATE records SET value = 'branch' WHERE code = 'a'", ())
-            .unwrap();
-        let changeset = capture.finish().unwrap();
-        fixture
-            .writer
-            .execute_batch(
-                "DELETE FROM records WHERE code = 'a';
-                 INSERT INTO records VALUES ('a', 'base')",
-            )
-            .unwrap();
-
-        assert!(matches!(
-            changeset.apply(&fixture.writer),
-            Err(ChangesetError::Conflict(message)) if message.contains("rowid")
-        ));
-        assert_eq!(
-            fixture
-                .writer
-                .query_row("SELECT value FROM records WHERE code = 'a'", (), |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-            "base"
-        );
-    }
-
-    #[test]
     fn late_constraint_failure_rolls_back_only_the_replay_savepoint() {
         let fixture = Fixture::new(
             "CREATE TABLE records (
@@ -1730,9 +1403,12 @@ mod tests {
     }
 
     #[test]
-    fn complete_codec_rejects_truncation_duplicates_and_sidecar_mismatch() {
+    fn complete_codec_rejects_truncation_duplicates_and_binding_mismatch() {
         let fixture = Fixture::new(
-            "CREATE TABLE records (code TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "CREATE TABLE records (
+                code TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             ) WITHOUT ROWID",
             "INSERT INTO records VALUES ('a', 'base')",
         );
         let branch = fixture.branch();
@@ -1776,22 +1452,9 @@ mod tests {
             ))
         ));
 
-        let missing_rowid = CapturedChangeset {
-            tables: changeset.tables.clone(),
-            sqlite: changeset.sqlite.clone(),
-            rowids: Vec::new(),
-        };
-        assert!(matches!(
-            CapturedChangeset::decode(&missing_rowid.encode().unwrap()),
-            Err(ChangesetError::Malformed(
-                "captured rowid metadata has the wrong length"
-            ))
-        ));
-
         let missing_binding = CapturedChangeset {
             tables: Vec::new(),
             sqlite: changeset.sqlite,
-            rowids: changeset.rowids,
         };
         assert!(matches!(
             CapturedChangeset::decode(&missing_binding.encode().unwrap()),
@@ -1808,7 +1471,7 @@ mod tests {
             .execute("CREATE TABLE loose(value TEXT)", ())
             .unwrap();
         assert!(matches!(
-            ChangesetCapture::start_between(&connection, &connection, &["loose"]),
+            ChangesetCapture::start_between(&connection, &["loose"]),
             Err(ChangesetError::TableWithoutPrimaryKey(table)) if table == "loose"
         ));
     }
@@ -1822,6 +1485,23 @@ mod tests {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     value TEXT
                  );
+                 CREATE TABLE accepted (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT
+                 );
+                 CREATE TABLE textual (
+                    id TEXT PRIMARY KEY,
+                    value TEXT
+                 );
+                 CREATE TABLE descending (
+                    id INTEGER PRIMARY KEY DESC,
+                    value TEXT
+                 );
+                 CREATE TABLE composite (
+                    first INTEGER,
+                    second INTEGER,
+                    PRIMARY KEY (first, second)
+                 );
                  CREATE TABLE shadowed (
                     rowid TEXT,
                     _rowid_ TEXT,
@@ -1832,15 +1512,20 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            ChangesetCapture::start_between(&connection, &connection, &["generated_ids"]),
+            ChangesetCapture::start_between(&connection, &["generated_ids"]),
             Err(ChangesetError::UnsupportedTable { table, reason })
                 if table == "generated_ids" && reason.contains("AUTOINCREMENT")
         ));
-        assert!(matches!(
-            ChangesetCapture::start_between(&connection, &connection, &["shadowed"]),
-            Err(ChangesetError::UnsupportedTable { table, reason })
-                if table == "shadowed" && reason.contains("rowid")
-        ));
+        ChangesetCapture::start_between(&connection, &["accepted"]).unwrap();
+        for table in ["textual", "descending", "composite", "shadowed"] {
+            assert!(matches!(
+                ChangesetCapture::start_between(&connection, &[table]),
+                Err(ChangesetError::UnsupportedTable {
+                    table: rejected,
+                    reason
+                }) if rejected == table && reason.contains("INTEGER PRIMARY KEY")
+            ));
+        }
     }
 
     #[test]
@@ -1851,15 +1536,14 @@ mod tests {
                 "CREATE TABLE \"AUTOINCREMENT ledger\" (
                     code TEXT PRIMARY KEY,
                     note TEXT DEFAULT 'AUTOINCREMENT WITHOUT ROWID'
-                 );
+                 ) WITHOUT ROWID;
                  CREATE VIRTUAL TABLE search_docs USING fts5(body)",
             )
             .unwrap();
 
-        ChangesetCapture::start_between(&connection, &connection, &["AUTOINCREMENT ledger"])
-            .unwrap();
+        ChangesetCapture::start_between(&connection, &["AUTOINCREMENT ledger"]).unwrap();
         assert!(matches!(
-            ChangesetCapture::start_between(&connection, &connection, &["search_docs"]),
+            ChangesetCapture::start_between(&connection, &["search_docs"]),
             Err(ChangesetError::UnsupportedTable { table, reason })
                 if table == "search_docs" && reason.contains("virtual")
         ));
@@ -1875,7 +1559,7 @@ mod tests {
                     marker TEXT NOT NULL UNIQUE,
                     payload BLOB NOT NULL,
                     doubled INTEGER GENERATED ALWAYS AS (value * 2) STORED
-                 )",
+                 ) WITHOUT ROWID",
                 "INSERT INTO records(code, value, marker, payload) VALUES
                     ('k0', 0, 'marker-k0', x'00'),
                     ('k1', 1, 'marker-k1', x'01'),
@@ -1956,10 +1640,10 @@ mod tests {
         }
     }
 
-    fn dump_randomized(connection: &Connection) -> Vec<(i64, String, i64, String, Vec<u8>, i64)> {
+    fn dump_randomized(connection: &Connection) -> Vec<(String, i64, String, Vec<u8>, i64)> {
         let mut statement = connection
             .prepare(
-                "SELECT rowid, code, value, marker, payload, doubled
+                "SELECT code, value, marker, payload, doubled
                  FROM records ORDER BY code",
             )
             .unwrap();
@@ -1971,7 +1655,6 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             })
             .unwrap()

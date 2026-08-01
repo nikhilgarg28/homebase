@@ -51,6 +51,7 @@ use crate::commit::proposal::{
 use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::ConnectionOwner;
 use crate::metastore::{SqliteOrderedStore, SqliteSnapshotStore};
+use crate::rowid;
 use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
@@ -416,6 +417,7 @@ pub(crate) struct Database<H: ServerHandle> {
     refresh: RefreshGate,
     isolation_level: IsolationLevel,
     committer: Committer,
+    rowid_allocator: rowid::RowidAllocator,
     authority: Authority,
     scheduler: PushScheduler,
 }
@@ -880,6 +882,11 @@ impl<H: ServerHandle + Send + Sync + 'static> CommitBackend for DatabaseCommitBa
         reader.with_reader(|connection| connection.authorizer(Some(authorize_public)))?;
         Ok(reader)
     }
+
+    fn lease_rowids(&self) -> Result<rowid::RowidLease> {
+        self.owner
+            .with_savepoint("__multilite__rowid_lease", rowid::lease)
+    }
 }
 
 fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authorization {
@@ -1114,6 +1121,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
     let wal_path = wal_path_for(&path);
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
+            validate_user_table_shapes(connection)?;
             match classify(connection)? {
                 DatabaseState::Fresh => {
                     initialize(&owner, invitation, server, lineage, canonical.clone())
@@ -1140,6 +1148,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         checkpoint: Mutex::new(CheckpointPolicy::default()),
     });
     let committer = Committer::new(Arc::clone(&commit_backend)).map_err(committer_error)?;
+    let rowid_allocator = rowid::RowidAllocator::new(committer.clone());
     canonical.install(Arc::new(CommitterMetaSink {
         committer: committer.downgrade(),
     }))?;
@@ -1153,6 +1162,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         refresh: RefreshGate::new(),
         isolation_level,
         committer,
+        rowid_allocator,
         authority,
         scheduler: PushScheduler::new(),
     })
@@ -1209,6 +1219,7 @@ fn initialize<H: ServerHandle>(
         DeviceId(mint_id()?),
         SystemNonceSource,
     ))?;
+    owner.with_connection(|connection| rowid::initialize(connection, client.device()))?;
     block_on(client.attach(&SpaceEnvelope::plaintext(database_id.space_id())))?;
     Ok((database_id, client))
 }
@@ -1259,6 +1270,7 @@ fn reopen<H: ServerHandle>(
     owner.with_connection(|connection| {
         catalog::validate(connection)?;
         history::validate(connection)?;
+        rowid::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)?;
         commit_history.prune(connection)?;
         Ok::<_, Error>(())
@@ -1271,6 +1283,7 @@ fn reopen<H: ServerHandle>(
         DeviceId(mint_id()?),
         SystemNonceSource,
     ))?;
+    owner.with_connection(|connection| rowid::validate_device(connection, client.device()))?;
     block_on(client.attach(&envelope))?;
     Ok((database_id, client))
 }
@@ -1286,18 +1299,81 @@ fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let pending = pending::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
     let history = history::is_initialized(connection)?;
-    match (metadata, pending, catalog, history) {
-        (false, false, false, false) => Ok(DatabaseState::Fresh),
-        (true, true, true, true) => {
+    let rowids = rowid::is_initialized(connection)?;
+    match (metadata, pending, catalog, history, rowids) {
+        (false, false, false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
             catalog::validate(connection)?;
+            rowid::validate(connection)?;
             Ok(DatabaseState::Initialized)
         }
         _ => Err(Error::InvalidDatabase(
             "general metadata tables are only partially initialized",
         )),
     }
+}
+
+fn validate_user_table_shapes(connection: &SqliteConnection) -> Result<()> {
+    let mut tables = connection.prepare(
+        "SELECT name, type, wr
+         FROM pragma_table_list
+         WHERE schema = 'main'
+           AND type IN ('table', 'virtual', 'shadow')
+         ORDER BY name",
+    )?;
+    let tables = tables
+        .query_map((), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (table, kind, without_rowid) in tables {
+        if table.starts_with("sqlite_") || has_multilite_prefix(&table) {
+            continue;
+        }
+        if kind != "table" {
+            return Err(Error::InvalidDatabase(
+                "user virtual and shadow tables are not supported",
+            ));
+        }
+        let mut columns = connection.prepare(
+            "SELECT type, pk
+             FROM pragma_table_xinfo(?1)
+             WHERE pk > 0
+             ORDER BY pk",
+        )?;
+        let primary = columns
+            .query_map([&table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if primary.is_empty() {
+            return Err(Error::InvalidDatabase(
+                "every user table must declare a primary key",
+            ));
+        }
+        if without_rowid {
+            continue;
+        }
+        let primary_index: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk'
+             )",
+            [&table],
+            |row| row.get(0),
+        )?;
+        if primary.len() != 1 || !primary[0].0.eq_ignore_ascii_case("INTEGER") || primary_index {
+            return Err(Error::InvalidDatabase(
+                "rowid tables require a single INTEGER PRIMARY KEY alias",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mint_id() -> Result<[u8; 16]> {

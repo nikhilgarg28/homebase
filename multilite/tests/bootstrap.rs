@@ -112,7 +112,7 @@ fn general_open_adopts_a_preexisting_user_schema() {
                 id BLOB NOT NULL,
                 payload BLOB NOT NULL,
                 PRIMARY KEY (collection, id)
-            )",
+            ) WITHOUT ROWID",
         )
         .unwrap();
 
@@ -148,6 +148,59 @@ fn general_open_adopts_a_preexisting_user_schema() {
 }
 
 #[test]
+fn adoption_requires_declared_physical_row_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, sql) in [
+        (
+            "hidden-rowid.sqlite",
+            "CREATE TABLE items (id TEXT PRIMARY KEY, payload BLOB)",
+        ),
+        (
+            "missing-primary.sqlite",
+            "CREATE TABLE items (id INTEGER, payload BLOB)",
+        ),
+        (
+            "descending-ipk.sqlite",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY DESC, payload BLOB)",
+        ),
+        (
+            "composite-rowid.sqlite",
+            "CREATE TABLE items (
+                tenant INTEGER NOT NULL,
+                id INTEGER NOT NULL,
+                PRIMARY KEY (tenant, id)
+            )",
+        ),
+    ] {
+        let path = directory.path().join(name);
+        Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+        assert!(matches!(
+            MultiliteConnection::open(path),
+            Err(Error::InvalidDatabase(_))
+        ));
+    }
+
+    for (name, sql) in [
+        (
+            "integer-primary.sqlite",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, payload BLOB)",
+        ),
+        (
+            "without-rowid.sqlite",
+            "CREATE TABLE items (
+                tenant TEXT NOT NULL,
+                id BLOB NOT NULL,
+                PRIMARY KEY (tenant, id)
+            ) WITHOUT ROWID",
+        ),
+    ] {
+        let path = directory.path().join(name);
+        Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+        MultiliteConnection::open(path).unwrap();
+    }
+}
+
+#[test]
 fn general_schema_reopens_without_changes_and_is_stock_sqlite_readable() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database.sqlite");
@@ -159,7 +212,7 @@ fn general_schema_reopens_without_changes_and_is_stock_sqlite_readable() {
                     collection TEXT NOT NULL,
                     id BLOB PRIMARY KEY NOT NULL,
                     payload BLOB NOT NULL
-                )",
+                ) WITHOUT ROWID",
                 (),
             )
             .unwrap();

@@ -14,6 +14,7 @@ use crate::branch::snapshot::{PinnedReader, PinnedSnapshot};
 use crate::commit::history::{self, PreparedRecord};
 use crate::commit::proposal::{CommitProposal, CommitReceipt};
 use crate::commit::snapshot::{CommitSeq, SnapshotDescriptor};
+use crate::rowid::RowidLease;
 use crate::{Error, Result};
 
 const INBOX_CAPACITY: usize = 256;
@@ -117,6 +118,9 @@ pub trait CommitBackend: Send + Sync + 'static {
 
     /// Capture one read-only physical snapshot at this exact queue position.
     fn capture_view(&self) -> Result<PinnedReader>;
+
+    /// Durably reserve one range from the replica's rowid allocator.
+    fn lease_rowids(&self) -> Result<RowidLease>;
 }
 
 enum Request {
@@ -130,6 +134,9 @@ enum Request {
     },
     CaptureView {
         reply: oneshot::Sender<Result<PinnedReader>>,
+    },
+    LeaseRowids {
+        reply: oneshot::Sender<Result<RowidLease>>,
     },
 }
 
@@ -237,6 +244,22 @@ impl Committer {
     pub fn capture_view_blocking(&self) -> Result<PinnedReader> {
         pollster::block_on(self.capture_view())
     }
+
+    /// Durably reserve a rowid range at this exact queue position.
+    pub(crate) async fn lease_rowids(&self) -> Result<RowidLease> {
+        let (reply, response) = oneshot::channel();
+        self.outbox
+            .send(Request::LeaseRowids { reply })
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
+        response
+            .await
+            .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
+    }
+
+    pub(crate) fn lease_rowids_blocking(&self) -> Result<RowidLease> {
+        pollster::block_on(self.lease_rowids())
+    }
 }
 
 impl WeakCommitter {
@@ -274,7 +297,8 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
                         }
                         Ok(
                             snapshot @ (Request::CaptureSnapshot { .. }
-                            | Request::CaptureView { .. }),
+                            | Request::CaptureView { .. }
+                            | Request::LeaseRowids { .. }),
                         ) => {
                             deferred = Some(snapshot);
                             break;
@@ -311,6 +335,11 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
             Request::CaptureView { reply } => {
                 let result = catch_unwind(AssertUnwindSafe(|| backend.capture_view()))
                     .unwrap_or_else(|_| Err(Error::Committer("view capture panicked".into())));
+                let _ = reply.send(result);
+            }
+            Request::LeaseRowids { reply } => {
+                let result = catch_unwind(AssertUnwindSafe(|| backend.lease_rowids()))
+                    .unwrap_or_else(|_| Err(Error::Committer("rowid lease panicked".into())));
                 let _ = reply.send(result);
             }
         }
@@ -416,6 +445,10 @@ mod tests {
                 .capture_reader(&self.database_path)
                 .map_err(|error| Error::Branch(error.to_string()))
         }
+
+        fn lease_rowids(&self) -> Result<RowidLease> {
+            Ok(RowidLease::for_test(1, 0, 1))
+        }
     }
 
     fn backend() -> Arc<TestBackend> {
@@ -489,6 +522,8 @@ mod tests {
         first.join().unwrap();
         second.join().unwrap();
 
+        let mut lease = committer.lease_rowids_blocking().unwrap();
+        assert_eq!(lease.next_rowid(), Some(1 << 20));
         let captured = committer.capture_snapshot_blocking(false).unwrap();
         assert!(captured.logical.commit_seq >= CommitSeq(1));
         let mut committed = backend

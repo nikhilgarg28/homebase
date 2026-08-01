@@ -2762,11 +2762,14 @@ fn multi_row_insert_is_one_durable_pending_operation() {
     database
         .execute(
             &runtime,
-            "WITH input(body, payload) AS (
-                    VALUES ('one', x'01'), ('two', NULL), ('three', x'0304')
+            "WITH input(id, body, payload) AS (
+                    VALUES
+                        (3, 'one', x'01'),
+                        (1, 'two', NULL),
+                        (2, 'three', x'0304')
                  )
-                 INSERT INTO notes (body, payload)
-                 SELECT body, payload FROM input ORDER BY body DESC",
+                 INSERT INTO notes (id, body, payload)
+                 SELECT id, body, payload FROM input ORDER BY body DESC",
             (),
         )
         .unwrap();
@@ -2871,7 +2874,7 @@ fn long_primary_key_succeeds_and_oversized_key_rolls_back_before_submission() {
     database
         .execute(
             &runtime,
-            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY) WITHOUT ROWID",
             (),
         )
         .unwrap();

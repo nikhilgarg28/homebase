@@ -201,7 +201,10 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
     .unwrap();
     assert_eq!(
         db.execute(
-            "INSERT INTO notes (body) VALUES ('one'), ('two'), ('three')",
+            "INSERT INTO notes (id, body) VALUES
+                (1, 'one'),
+                (2, 'two'),
+                (3, 'three')",
             (),
         )
         .unwrap(),
@@ -211,12 +214,13 @@ fn create_select_and_insert_work_for_arbitrary_user_tables() {
     let mut statement = db
         .prepare("SELECT id, upper(body) FROM notes ORDER BY id")
         .unwrap();
+    let rows = statement
+        .query_map((), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
     assert_eq!(
-        statement
-            .query_map((), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap(),
+        rows,
         [(1, "ONE".into()), (2, "TWO".into()), (3, "THREE".into())]
     );
 }
@@ -773,7 +777,7 @@ fn composite_primary_keys_and_without_rowid_support_full_row_lifecycle() {
 }
 
 #[test]
-fn ordinary_composite_primary_keys_preserve_hidden_rowids() {
+fn without_rowid_composite_primary_keys_move_as_one_logical_identity() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("composite-rowid.sqlite")).unwrap();
     db.execute(
@@ -782,18 +786,12 @@ fn ordinary_composite_primary_keys_preserve_hidden_rowids() {
             document INTEGER NOT NULL,
             body TEXT NOT NULL,
             PRIMARY KEY (document, tenant)
-        )",
+        ) WITHOUT ROWID",
         (),
     )
     .unwrap();
     db.execute("INSERT INTO documents VALUES ('north', 1, 'original')", ())
         .unwrap();
-    let rowid = db
-        .query("SELECT rowid FROM documents", (), |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap()[0];
-
     db.execute(
         "UPDATE documents
          SET document = 2, body = 'moved'
@@ -802,20 +800,15 @@ fn ordinary_composite_primary_keys_preserve_hidden_rowids() {
     )
     .unwrap();
     assert_eq!(
-        db.query(
-            "SELECT rowid, tenant, document, body FROM documents",
-            (),
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .unwrap(),
-        [(rowid, "north".into(), 2, "moved".into())]
+        db.query("SELECT tenant, document, body FROM documents", (), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },)
+            .unwrap(),
+        [("north".into(), 2, "moved".into())]
     );
 }
 
@@ -942,7 +935,7 @@ fn update_uses_sqlite_expressions_subqueries_and_complete_row_capture() {
 }
 
 #[test]
-fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
+fn update_moves_declared_primary_keys_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("update-identity.sqlite")).unwrap();
     db.update(|transaction| {
@@ -954,7 +947,7 @@ fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
             "CREATE TABLE documents (
                 id TEXT NOT NULL PRIMARY KEY,
                 body TEXT NOT NULL
-            )",
+            ) WITHOUT ROWID",
             (),
         )?;
         transaction.execute("INSERT INTO notes VALUES (1, 'original')", ())?;
@@ -963,11 +956,6 @@ fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
     })
     .unwrap();
 
-    let original_document_rowid = db
-        .query("SELECT _rowid_ FROM documents", (), |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap()[0];
     assert_eq!(
         db.execute("UPDATE notes SET id = 2, body = 'changed' WHERE id = 1", ())
             .unwrap(),
@@ -986,12 +974,6 @@ fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
         .unwrap(),
         1
     );
-    assert!(matches!(
-        db.execute("UPDATE documents SET rowid = rowid + 1 WHERE id = 'b'", ()),
-        Err(Error::UnsupportedSql(
-            "UPDATE of SQLite rowid is not supported"
-        ))
-    ));
     assert_eq!(
         db.query("SELECT id, body FROM notes", (), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1000,15 +982,11 @@ fn update_moves_primary_keys_but_rejects_hidden_rowid_changes_atomically() {
         [(4, "changed".into())]
     );
     assert_eq!(
-        db.query("SELECT _rowid_, id, body FROM documents", (), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+        db.query("SELECT id, body FROM documents", (), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .unwrap(),
-        [(original_document_rowid, "b".into(), "moved".into())]
+        [("b".into(), "moved".into())]
     );
 
     db.execute("INSERT INTO notes VALUES (5, 'occupied')", ())
@@ -1762,31 +1740,6 @@ fn alter_column_rejects_identity_unsafe_shapes_and_accepts_rebuildable_drops() {
     let db = MultiliteConnection::open(directory.path().join("alter-safety.sqlite")).unwrap();
 
     db.execute(
-        "CREATE TABLE aliases (
-            id TEXT PRIMARY KEY NOT NULL,
-            rowid TEXT,
-            oid TEXT,
-            spare TEXT
-        )",
-        (),
-    )
-    .unwrap();
-    assert!(matches!(
-        db.execute("ALTER TABLE aliases RENAME COLUMN spare TO _rowid_", ()),
-        Err(Error::UnsupportedSql(_))
-    ));
-    assert!(matches!(
-        db.execute("ALTER TABLE aliases ADD COLUMN _rowid_ TEXT", ()),
-        Err(Error::UnsupportedSql(_))
-    ));
-    db.execute(
-        "INSERT INTO aliases (id, rowid, oid, spare)
-         VALUES ('one', 'row', 'oid', 'still here')",
-        (),
-    )
-    .unwrap();
-
-    db.execute(
         "CREATE TABLE strict_notes (id INTEGER PRIMARY KEY) STRICT",
         (),
     )
@@ -1844,13 +1797,6 @@ fn alter_column_rejects_identity_unsafe_shapes_and_accepts_rebuildable_drops() {
     db.execute("ALTER TABLE required DROP COLUMN value", ())
         .unwrap();
 
-    assert_eq!(
-        db.query("SELECT spare FROM aliases", (), |row| {
-            row.get::<_, String>(0)
-        })
-        .unwrap(),
-        ["still here"]
-    );
     assert_eq!(
         db.execute(
             "INSERT INTO strict_notes (id, payload) VALUES (1, x'01')",
