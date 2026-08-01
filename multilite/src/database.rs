@@ -573,6 +573,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
+    /// Direct metadata access for work already owned by the canonical committer.
+    ///
+    /// Routing these writes through `DatabaseMetaStore` would propose them back
+    /// to this same committer and deadlock. Keep the bypass centralized here.
+    fn committer_metadata(&self) -> OrderedMetaStore<SqliteOrderedStore> {
+        OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()))
+    }
+
     fn capture_snapshot_inner(
         &self,
         track_for_commit: bool,
@@ -744,7 +752,7 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     return Ok(PrepareOutcome::AlreadyCommitted(receipt));
                 }
                 proposal.validate()?;
-                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let store = self.committer_metadata();
                 let space = self.database_id.space_id();
                 let current_submit = block_on(store.oplog_cursors(space))?;
                 let current_admits = block_on(store.admit_cursors(space))?;
@@ -776,7 +784,7 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     return Ok(PrepareOutcome::AlreadyCommitted(receipt));
                 }
                 proposal.validate()?;
-                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let store = self.committer_metadata();
                 let space = self.database_id.space_id();
                 let current = block_on(store.oplog_cursors(space))?;
                 if current != reject.expected_submit() {
@@ -806,7 +814,7 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     return Ok(PrepareOutcome::AlreadyCommitted(receipt));
                 }
                 proposal.validate()?;
-                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let store = self.committer_metadata();
                 let space = self.database_id.space_id();
                 let current = block_on(store.oplog_cursors(space))?;
                 let expected = accept.expected_submit();
@@ -829,7 +837,7 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     return Ok(PrepareOutcome::AlreadyCommitted(receipt));
                 }
                 proposal.validate()?;
-                let store = OrderedMetaStore::new(SqliteOrderedStore::new(self.owner.clone()));
+                let store = self.committer_metadata();
                 let space = self.database_id.space_id();
                 if block_on(store.admit_cursors(space))? != append.expected_admits() {
                     return Err(Error::CommitConflict(

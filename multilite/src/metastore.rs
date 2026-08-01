@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::future::{Future, ready};
 
 use crate::Result as MultiliteResult;
-use crate::connection::ConnectionOwner;
+use crate::connection::{ConnectionOwner, ConnectionSavepoint};
 
 pub(crate) const META_TABLE: &str = "__multilite__meta";
 const META_TABLE_PREFIX: &str = META_TABLE;
@@ -131,22 +131,27 @@ impl SqliteOrderedStore {
             return Ok(());
         }
 
+        self.with_savepoint(|connection| apply_ops(connection, batch))
+    }
+
+    fn with_savepoint<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> StoreResult<T>,
+    ) -> StoreResult<T> {
         self.owner.with_connection(|connection| {
             let name = self.owner.next_savepoint_name("__multilite__store");
-            connection
-                .execute_batch(&format!("SAVEPOINT {name}"))
-                .map_err(storage_error)?;
+            let savepoint =
+                ConnectionSavepoint::begin(connection, name).map_err(multilite_storage_error)?;
 
-            match apply_ops(connection, batch) {
-                Ok(()) => connection
-                    .execute_batch(&format!("RELEASE {name}"))
-                    .map_err(storage_error),
-                Err(error) => {
-                    let rollback = connection
-                        .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))
-                        .map_err(storage_error);
-                    rollback.and(Err(error))
+            match operation(connection) {
+                Ok(value) => {
+                    savepoint.release().map_err(multilite_storage_error)?;
+                    Ok(value)
                 }
+                Err(error) => match savepoint.rollback().map_err(multilite_storage_error) {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(rollback),
+                },
             }
         })
     }
@@ -268,6 +273,10 @@ fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
 }
 
 fn storage_error(error: rusqlite::Error) -> StorageError {
+    StorageError(format!("SQLite metadata store: {error}"))
+}
+
+fn multilite_storage_error(error: crate::Error) -> StorageError {
     StorageError(format!("SQLite metadata store: {error}"))
 }
 
@@ -562,6 +571,32 @@ mod tests {
         assert!(block_on(store.apply(batch)).is_err());
         assert_eq!(block_on(store.get(b"good")).unwrap(), None);
         assert_eq!(block_on(store.get(b"bad")).unwrap(), None);
+    }
+
+    #[test]
+    fn panic_rolls_back_and_closes_the_metadata_savepoint() {
+        let store = SqliteOrderedStore::open_in_memory().unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.with_savepoint(|connection| -> StoreResult<()> {
+                connection
+                    .execute(
+                        &format!("INSERT INTO {META_TABLE} VALUES (?1, ?2)"),
+                        params![b"partial".as_slice(), b"value".as_slice()],
+                    )
+                    .map_err(storage_error)?;
+                panic!("injected metadata panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(block_on(store.get(b"partial")).unwrap(), None);
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"later".to_vec(), b"committed".to_vec());
+        block_on(store.apply(batch)).unwrap();
+        assert_eq!(
+            block_on(store.get(b"later")).unwrap(),
+            Some(b"committed".to_vec())
+        );
     }
 
     fn domain_row_count(runtime: &RuntimeConnection<NoopPolicy>) -> i64 {
