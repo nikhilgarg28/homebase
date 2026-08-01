@@ -57,7 +57,7 @@ use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 use self::authority::Authority;
-use self::policy::{PolicyState, PushScheduler, RefreshGate};
+use self::policy::PolicyActor;
 use self::row::{CapturedChange, CapturedRow, StoredValue};
 use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
 
@@ -414,13 +414,11 @@ pub(crate) struct Database<H: ServerHandle> {
     owner: ConnectionOwner,
     database_id: DatabaseId,
     client: Arc<DatabaseClient<H>>,
-    policy: PolicyState,
-    refresh: RefreshGate,
+    policy: PolicyActor,
     isolation_level: IsolationLevel,
     committer: Committer,
     rowid_allocator: rowid::RowidAllocator,
     authority: Authority,
-    scheduler: PushScheduler,
 }
 
 enum GroupSlot {
@@ -452,16 +450,17 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             connection.pragma_update(None, "foreign_keys", true)?;
             Ok::<_, rusqlite::Error>(())
         })?;
-        let database = open_on(owner, path, options)?;
-        Ok(Arc::new(database))
+        let database = Arc::new(open_on(owner, path, options)?);
+        database.start_policy_actor()?;
+        Ok(database)
     }
 
-    pub(crate) fn start_background_push(self: &Arc<Self>) -> Result<()> {
+    pub(crate) fn start_policy_actor(self: &Arc<Self>) -> Result<()> {
+        self.policy.start(Arc::downgrade(self))?;
         if self.policy.write_delay().is_some() {
-            self.scheduler.start(Arc::downgrade(self))?;
             let cursors = self.submit_cursors()?;
             if cursors.neck < cursors.tail {
-                self.scheduler.schedule(std::time::Duration::ZERO);
+                self.policy.schedule(std::time::Duration::ZERO);
             }
         }
         Ok(())
@@ -1169,13 +1168,11 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
         owner,
         database_id,
         client,
-        policy: PolicyState::new(sync_policy),
-        refresh: RefreshGate::new(),
+        policy: PolicyActor::new(sync_policy),
         isolation_level,
         committer,
         rowid_allocator,
         authority,
-        scheduler: PushScheduler::new(),
     })
 }
 

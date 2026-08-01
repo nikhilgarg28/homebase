@@ -7,6 +7,7 @@ use homebase_client::meta::{MetaStore, OplogCursors};
 use homebase_client::{ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
 use homebase_core::tag::DeviceSeq;
 
+use super::policy::RefreshTransition;
 use super::store::DatabaseMetaStore;
 use super::transaction::MultiliteTransaction;
 use super::update::{BranchUpdate, run_branch_update};
@@ -64,19 +65,35 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     }
 
     pub(crate) async fn pull_async(self: &Arc<Self>) -> Result<PullOutcome> {
-        let _refresh = self.refresh.enter().await?;
-        self.pull_locked_async().await
+        let workflow = self.policy.enter_workflow().await?;
+        match self.pull_locked_async().await {
+            Ok(outcome) => {
+                workflow.complete(RefreshTransition::Pulled {
+                    pulled_at: Instant::now(),
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                workflow.complete(RefreshTransition::Unchanged);
+                Err(error)
+            }
+        }
     }
 
     async fn pull_locked_async(self: &Arc<Self>) -> Result<PullOutcome> {
         let through = self.authority.pull().await?;
-        self.policy.mark_pulled();
         Ok(PullOutcome { through })
     }
 
     pub(crate) async fn rebase_async(self: &Arc<Self>) -> Result<()> {
-        let _refresh = self.refresh.enter().await?;
-        self.rebase_locked_async().await
+        let workflow = self.policy.enter_workflow().await?;
+        let result = self.rebase_locked_async().await;
+        workflow.complete(if result.is_ok() {
+            RefreshTransition::Rebased { pulled_at: None }
+        } else {
+            RefreshTransition::Unchanged
+        });
+        result
     }
 
     async fn rebase_locked_async(self: &Arc<Self>) -> Result<()> {
@@ -219,27 +236,32 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 
     pub(super) async fn refresh_read_async(self: &Arc<Self>) -> Result<()> {
         let requested_at = Instant::now();
-        if !self.policy.read_requires_refresh_since(requested_at) {
+        let Some(workflow) = self.policy.refresh_if_needed(requested_at).await? else {
             return Ok(());
-        }
-        let _refresh = self.refresh.enter().await?;
-        if !self.policy.read_requires_refresh_since(requested_at) {
-            return Ok(());
-        }
-        let submit = self.submit_cursors_async().await?;
-        if submit.neck < submit.tail {
-            match self.push_async().await? {
-                PushOutcome::Drained => {}
-                PushOutcome::Rejected(rejection) => {
-                    return Err(Error::RefreshPushRejected(rejection));
+        };
+        let mut transition = RefreshTransition::Unchanged;
+        let result = async {
+            let submit = self.submit_cursors_async().await?;
+            if submit.neck < submit.tail {
+                match self.push_async().await? {
+                    PushOutcome::Drained => {}
+                    PushOutcome::Rejected(rejection) => {
+                        return Err(Error::RefreshPushRejected(rejection));
+                    }
                 }
             }
+            self.pull_locked_async().await?;
+            let pulled_at = Instant::now();
+            transition = RefreshTransition::Pulled { pulled_at };
+            self.rebase_locked_async().await?;
+            transition = RefreshTransition::Rebased {
+                pulled_at: Some(pulled_at),
+            };
+            Ok(())
         }
-        self.pull_locked_async().await?;
-        let pulled_at = Instant::now();
-        self.rebase_locked_async().await?;
-        self.policy.mark_rebased(pulled_at);
-        Ok(())
+        .await;
+        workflow.complete(transition);
+        result
     }
 
     async fn submit_cursors_async(self: &Arc<Self>) -> Result<OplogCursors> {
@@ -262,8 +284,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         match self.policy.policy() {
             SyncPolicy::LocalOnly => Ok(()),
             SyncPolicy::LocalFirst { write_delay, .. } => {
-                self.scheduler
-                    .schedule_group(receipt.commit_seq, write_delay);
+                self.policy.schedule_group(receipt.commit_seq, write_delay);
                 Ok(())
             }
             SyncPolicy::Remote => match self.push_submission_async(sequence).await? {

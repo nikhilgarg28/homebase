@@ -434,8 +434,6 @@ fn local_first_zero_schedules_push_without_waiting_in_execute() {
     .unwrap();
     assert!(server.create_space(database.database_id().space_id()));
     let runtime = database.runtime().unwrap();
-    database.start_background_push().unwrap();
-
     database
         .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -474,8 +472,6 @@ fn local_first_retries_the_last_buffered_write_after_transport_recovers() {
     .unwrap();
     assert!(server.create_space(database.database_id().space_id()));
     let runtime = database.runtime().unwrap();
-    database.start_background_push().unwrap();
-
     database
         .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -505,7 +501,6 @@ fn local_first_delete_pushes_in_the_background_and_rebases_on_a_replica() {
     .unwrap();
     assert!(server.create_space(database.database_id().space_id()));
     let runtime = database.runtime().unwrap();
-    database.start_background_push().unwrap();
     database
         .update(&runtime, |update| {
             update.execute(

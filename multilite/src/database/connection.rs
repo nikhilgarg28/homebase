@@ -67,7 +67,6 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
 
     fn finish_open(database: Arc<Database<H>>) -> Result<Self> {
         let runtime = Arc::new(database.runtime()?);
-        database.start_background_push()?;
         Ok(Self { database, runtime })
     }
 
