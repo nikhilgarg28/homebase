@@ -140,15 +140,20 @@ impl SqliteOrderedStore {
     ) -> StoreResult<T> {
         self.owner.with_connection(|connection| {
             let name = self.owner.next_savepoint_name("__multilite__store");
-            let savepoint =
-                ConnectionSavepoint::begin(connection, name).map_err(multilite_storage_error)?;
+            let savepoint = ConnectionSavepoint::begin(connection, name)
+                .map_err(|error| multilite_storage_error(error.into()))?;
 
             match operation(connection) {
                 Ok(value) => {
-                    savepoint.release().map_err(multilite_storage_error)?;
+                    savepoint
+                        .release()
+                        .map_err(|error| multilite_storage_error(error.into()))?;
                     Ok(value)
                 }
-                Err(error) => match savepoint.rollback().map_err(multilite_storage_error) {
+                Err(error) => match savepoint
+                    .rollback()
+                    .map_err(|error| multilite_storage_error(error.into()))
+                {
                     Ok(()) => Err(error),
                     Err(rollback) => Err(rollback),
                 },

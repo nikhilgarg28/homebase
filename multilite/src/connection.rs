@@ -56,18 +56,30 @@ impl ConnectionOwner {
     ) -> Result<T> {
         let name = self.next_savepoint_name(prefix);
         self.with_connection(|connection| {
-            let savepoint = ConnectionSavepoint::begin(connection, name)?;
-            match operation(connection) {
-                Ok(value) => {
-                    savepoint.release()?;
-                    Ok(value)
-                }
-                Err(error) => {
-                    savepoint.rollback()?;
-                    Err(error)
-                }
-            }
+            with_savepoint(connection, name, || operation(connection))
         })
+    }
+}
+
+/// Run one operation inside a panic-safe SQLite savepoint.
+pub(crate) fn with_savepoint<T, E>(
+    connection: &Connection,
+    name: impl Into<String>,
+    operation: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    let savepoint = ConnectionSavepoint::begin(connection, name.into())?;
+    match operation() {
+        Ok(value) => {
+            savepoint.release()?;
+            Ok(value)
+        }
+        Err(error) => match savepoint.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback.into()),
+        },
     }
 }
 
@@ -78,7 +90,10 @@ pub(crate) struct ConnectionSavepoint<'connection> {
 }
 
 impl<'connection> ConnectionSavepoint<'connection> {
-    pub(crate) fn begin(connection: &'connection Connection, name: String) -> Result<Self> {
+    pub(crate) fn begin(
+        connection: &'connection Connection,
+        name: String,
+    ) -> rusqlite::Result<Self> {
         connection.execute_batch(&format!("SAVEPOINT {name}"))?;
         Ok(Self {
             connection,
@@ -87,14 +102,14 @@ impl<'connection> ConnectionSavepoint<'connection> {
         })
     }
 
-    pub(crate) fn release(mut self) -> Result<()> {
+    pub(crate) fn release(mut self) -> rusqlite::Result<()> {
         self.connection
             .execute_batch(&format!("RELEASE {}", self.name))?;
         self.active = false;
         Ok(())
     }
 
-    pub(crate) fn rollback(mut self) -> Result<()> {
+    pub(crate) fn rollback(mut self) -> rusqlite::Result<()> {
         self.connection
             .execute_batch(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name))?;
         self.active = false;
@@ -109,5 +124,49 @@ impl Drop for ConnectionSavepoint<'_> {
                 .connection
                 .execute_batch(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+    use crate::Error;
+
+    #[test]
+    fn panic_rolls_back_and_closes_the_shared_savepoint() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE values_seen (value INTEGER NOT NULL)")
+            .unwrap();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = with_savepoint::<(), Error>(&connection, "panic_guard", || {
+                connection.execute("INSERT INTO values_seen VALUES (1)", ())?;
+                panic!("injected panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM values_seen", (), |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        with_savepoint::<_, Error>(&connection, "next_guard", || {
+            connection.execute("INSERT INTO values_seen VALUES (2)", ())?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM values_seen", (), |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }

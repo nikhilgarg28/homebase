@@ -31,6 +31,7 @@ use crate::commit::committer::CommitHistory;
 use crate::commit::footprint::ConflictFootprint;
 use crate::commit::history::{self, WriteRegion};
 use crate::commit::snapshot::SnapshotDescriptor;
+use crate::connection::with_savepoint;
 use crate::database::isolation::IsolationLevel;
 use crate::database::operation::MultiliteOp;
 use crate::database::row::{CapturedRow, InsertRows};
@@ -791,24 +792,9 @@ impl AppendAdmissionsProposal {
 
 /// Validate, replay, and receipt one proposal in a single SQLite savepoint.
 pub fn apply(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {
-    connection.execute_batch("SAVEPOINT __multilite__commit_proposal")?;
-    let result = apply_inner(connection, proposal);
-    match result {
-        Ok(receipt) => {
-            connection.execute_batch("RELEASE __multilite__commit_proposal")?;
-            Ok(receipt)
-        }
-        Err(error) => {
-            let rollback = connection.execute_batch(
-                "ROLLBACK TO __multilite__commit_proposal;
-                 RELEASE __multilite__commit_proposal",
-            );
-            match rollback {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(rollback.into()),
-            }
-        }
-    }
+    with_savepoint(connection, "__multilite__commit_proposal", || {
+        apply_inner(connection, proposal)
+    })
 }
 
 fn apply_inner(connection: &Connection, proposal: &CommitProposal) -> Result<CommitReceipt> {

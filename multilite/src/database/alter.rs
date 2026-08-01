@@ -20,7 +20,6 @@ use super::schema::{
 };
 use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
-use crate::connection::ConnectionSavepoint;
 use crate::value::StoredValue;
 use crate::{Error, Result};
 
@@ -978,17 +977,7 @@ fn with_savepoint<T>(
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let name = format!("{prefix}_{}", Uuid::new_v4().simple());
-    let savepoint = ConnectionSavepoint::begin(connection, name)?;
-    match operation() {
-        Ok(value) => {
-            savepoint.release()?;
-            Ok(value)
-        }
-        Err(error) => {
-            savepoint.rollback()?;
-            Err(error)
-        }
-    }
+    crate::connection::with_savepoint(connection, name, operation)
 }
 
 fn rebuild_table_if_needed(

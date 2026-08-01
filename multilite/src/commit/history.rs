@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::{Uuid, Variant, Version};
 
 use super::snapshot::CommitSeq;
+use crate::connection::with_savepoint;
 use crate::{Error, Result};
 
 const COMMIT_LOG_TABLE: &str = "__multilite__commits";
@@ -184,24 +185,9 @@ pub fn current(connection: &Connection) -> Result<CommitSeq> {
 
 /// Advance canonical state and retain one row per accepted proposal.
 pub fn record_group(connection: &Connection, records: Vec<PreparedRecord>) -> Result<CommitSeq> {
-    connection.execute_batch("SAVEPOINT __multilite__commit_history")?;
-    let result = record_group_inner(connection, records);
-    match result {
-        Ok(commit_seq) => {
-            connection.execute_batch("RELEASE __multilite__commit_history")?;
-            Ok(commit_seq)
-        }
-        Err(error) => {
-            let rollback = connection.execute_batch(
-                "ROLLBACK TO __multilite__commit_history;
-                 RELEASE __multilite__commit_history",
-            );
-            match rollback {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(rollback.into()),
-            }
-        }
-    }
+    with_savepoint(connection, "__multilite__commit_history", || {
+        record_group_inner(connection, records)
+    })
 }
 
 fn record_group_inner(connection: &Connection, records: Vec<PreparedRecord>) -> Result<CommitSeq> {

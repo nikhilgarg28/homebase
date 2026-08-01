@@ -17,6 +17,7 @@ use sqlite3_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::WritableBranch;
+use crate::connection::with_savepoint;
 use crate::value::StoredValue;
 
 const CHANGESET_FRAME_VERSION: u8 = 2;
@@ -495,8 +496,7 @@ fn apply_changes(
     expected_tables: &[TableBinding],
     changes: &[NetChange],
 ) -> Result<(), ChangesetError> {
-    connection.execute_batch("SAVEPOINT __multilite_changeset_apply")?;
-    let result = (|| {
+    with_savepoint(connection, "__multilite_changeset_apply", || {
         validate_table_bindings(connection, expected_tables)?;
         if changes.is_empty() {
             return Ok(());
@@ -543,19 +543,7 @@ fn apply_changes(
         restore_triggers?;
         restore_foreign_keys?;
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => connection.execute_batch("RELEASE __multilite_changeset_apply")?,
-        Err(error) => {
-            connection.execute_batch(
-                "ROLLBACK TO __multilite_changeset_apply;
-                 RELEASE __multilite_changeset_apply",
-            )?;
-            return Err(error);
-        }
-    }
-    Ok(())
+    })
 }
 
 fn prepare_replay(

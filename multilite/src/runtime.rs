@@ -114,7 +114,7 @@ impl<P: HookPolicy> RuntimeConnection<P> {
         let name = self.owner.next_savepoint_name("__multilite__runtime");
         let value = self.owner.with_connection(|connection| {
             let savepoint = self.with_mode(ExecutionMode::InternalMetadata, || {
-                ConnectionSavepoint::begin(connection, name)
+                Ok(ConnectionSavepoint::begin(connection, name)?)
             })?;
             let operation_result = self.with_mode(mode, || operation(connection));
             let result = match self.take_callback_error() {
@@ -132,20 +132,23 @@ impl<P: HookPolicy> RuntimeConnection<P> {
                     match finalized {
                         Ok(()) => {
                             self.with_mode(ExecutionMode::InternalMetadata, || {
-                                savepoint.release()
+                                Ok(savepoint.release()?)
                             })?;
                             Ok((value, events))
                         }
                         Err(error) => {
                             self.with_mode(ExecutionMode::InternalMetadata, || {
-                                savepoint.rollback()
+                                Ok(savepoint.rollback()?)
                             })?;
                             Err(error)
                         }
                     }
                 }
                 Err(error) => {
-                    self.with_mode(ExecutionMode::InternalMetadata, || savepoint.rollback())?;
+                    self.with_mode(
+                        ExecutionMode::InternalMetadata,
+                        || Ok(savepoint.rollback()?),
+                    )?;
                     Err(error)
                 }
             }
