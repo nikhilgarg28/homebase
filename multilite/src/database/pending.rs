@@ -382,8 +382,10 @@ pub fn prepare_rejection(
 
     let mut writes = BTreeSet::new();
     for pending in &pending {
-        let lowered = pending.transaction.to_homebase()?;
-        writes.extend(history::writes_from_mutations(&lowered.mutations));
+        let compiled = pending.transaction.clone().compile()?;
+        writes.extend(history::writes_from_mutations(
+            compiled.homebase().mutations(),
+        ));
     }
     Ok((!pending.is_empty()).then(|| RejectionRepair {
         pending,

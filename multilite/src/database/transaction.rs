@@ -37,10 +37,30 @@ pub struct HomebaseTransaction {
     footprint: ConflictFootprint,
 }
 
+/// One validated logical transaction and its single deterministic lowering.
+///
+/// Proposal validation, authority submission, and local history extraction all
+/// consume this artifact so they cannot derive subtly different meanings from
+/// the same operation manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledTransaction {
+    logical: MultiliteTransaction,
+    homebase: HomebaseTransaction,
+}
+
 impl HomebaseTransaction {
     /// Split deterministic mutations from their typed conflict footprint.
+    #[allow(dead_code, reason = "used by focused lowering tests and tooling")]
     pub fn into_parts(self) -> (Vec<Mutation>, ConflictFootprint) {
         (self.mutations, self.footprint)
+    }
+
+    pub fn mutations(&self) -> &[Mutation] {
+        &self.mutations
+    }
+
+    pub fn footprint(&self) -> &ConflictFootprint {
+        &self.footprint
     }
 
     /// Plan assertions for one isolation level and authority snapshot.
@@ -55,6 +75,16 @@ impl HomebaseTransaction {
     ) -> (Vec<Mutation>, Vec<RangeAssert>) {
         let assertions = self.footprint.plan(isolation, upto);
         (self.mutations, assertions)
+    }
+}
+
+impl CompiledTransaction {
+    pub fn logical(&self) -> &MultiliteTransaction {
+        &self.logical
+    }
+
+    pub fn homebase(&self) -> &HomebaseTransaction {
+        &self.homebase
     }
 }
 
@@ -75,6 +105,15 @@ impl MultiliteTransaction {
     /// Operations in their SQLite apply order.
     pub fn operations(&self) -> &[MultiliteOp] {
         &self.operations
+    }
+
+    /// Validate and lower this manifest exactly once for a commit proposal.
+    pub fn compile(self) -> Result<CompiledTransaction> {
+        let homebase = self.to_homebase()?;
+        Ok(CompiledTransaction {
+            logical: self,
+            homebase,
+        })
     }
 
     /// Encode the immutable transaction manifest.
@@ -356,6 +395,9 @@ mod tests {
         assert_eq!(MultiliteTransaction::decode(&encoded).unwrap(), transaction);
 
         let lowered = transaction.to_homebase().unwrap();
+        let compiled = transaction.clone().compile().unwrap();
+        assert_eq!(compiled.logical(), &transaction);
+        assert_eq!(compiled.homebase(), &lowered);
         assert_eq!(lowered.mutations.len(), 10);
         assert_eq!(lowered.footprint.writes().len(), 2);
         assert_eq!(lowered.footprint.constraints().len(), 4);

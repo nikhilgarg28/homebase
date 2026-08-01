@@ -125,7 +125,7 @@ pub trait CommitBackend: Send + Sync + 'static {
 
 enum Request {
     Propose {
-        proposal: CommitProposal,
+        proposal: Box<CommitProposal>,
         reply: oneshot::Sender<Result<CommitReceipt>>,
     },
     CaptureSnapshot {
@@ -193,7 +193,10 @@ impl Committer {
     pub async fn propose(&self, proposal: CommitProposal) -> Result<CommitReceipt> {
         let (reply, response) = oneshot::channel();
         self.outbox
-            .send(Request::Propose { proposal, reply })
+            .send(Request::Propose {
+                proposal: Box::new(proposal),
+                reply,
+            })
             .await
             .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
         response
@@ -270,7 +273,10 @@ impl WeakCommitter {
             .ok_or_else(|| Error::Committer(CommitterError::Unavailable.to_string()))?;
         let (reply, response) = oneshot::channel();
         outbox
-            .send_blocking(Request::Propose { proposal, reply })
+            .send_blocking(Request::Propose {
+                proposal: Box::new(proposal),
+                reply,
+            })
             .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?;
         pollster::block_on(response)
             .map_err(|_| Error::Committer(CommitterError::Unavailable.to_string()))?
@@ -309,7 +315,7 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
                 }
                 let proposals = group
                     .iter()
-                    .map(|(proposal, _)| proposal)
+                    .map(|(proposal, _)| proposal.as_ref())
                     .collect::<Vec<_>>();
                 let results = catch_unwind(AssertUnwindSafe(|| backend.commit_group(&proposals)));
                 match results {
@@ -347,7 +353,10 @@ fn run<B: CommitBackend>(inbox: Receiver<Request>, backend: Arc<B>) {
     }
 }
 
-fn fail_group(group: Vec<(CommitProposal, oneshot::Sender<Result<CommitReceipt>>)>, error: Error) {
+fn fail_group(
+    group: Vec<(Box<CommitProposal>, oneshot::Sender<Result<CommitReceipt>>)>,
+    error: Error,
+) {
     for (_, reply) in group {
         let _ = reply.send(Err(error.clone()));
     }
@@ -561,8 +570,8 @@ mod tests {
         let (second_reply, second_response) = oneshot::channel();
         fail_group(
             vec![
-                (proposal("one"), first_reply),
-                (proposal("two"), second_reply),
+                (Box::new(proposal("one")), first_reply),
+                (Box::new(proposal("two")), second_reply),
             ],
             Error::CommitConflict("shared conflict".into()),
         );

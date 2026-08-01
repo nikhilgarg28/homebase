@@ -768,9 +768,11 @@ impl<H: ServerHandle + Send + Sync + 'static> DatabaseCommitBackend<H> {
                     if admitted.device == apply.local_device() {
                         continue;
                     }
-                    admitted.transaction.apply(connection)?;
-                    let lowered = admitted.transaction.to_homebase()?;
-                    writes.extend(history::writes_from_mutations(&lowered.mutations));
+                    let compiled = admitted.transaction.clone().compile()?;
+                    compiled.logical().apply(connection)?;
+                    writes.extend(history::writes_from_mutations(
+                        compiled.homebase().mutations(),
+                    ));
                 }
                 block_on(store.mark_admits_applied(space, apply.through()))?;
                 Ok(PrepareOutcome::Prepared(

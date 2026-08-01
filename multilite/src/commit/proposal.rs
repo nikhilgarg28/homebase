@@ -34,7 +34,7 @@ use crate::commit::snapshot::SnapshotDescriptor;
 use crate::database::isolation::IsolationLevel;
 use crate::database::operation::MultiliteOp;
 use crate::database::row::{CapturedRow, InsertRows};
-use crate::database::transaction::MultiliteTransaction;
+use crate::database::transaction::{CompiledTransaction, MultiliteTransaction};
 use crate::{Error, Result};
 
 const PROPOSAL_FRAME_VERSION: u8 = 4;
@@ -102,7 +102,7 @@ pub struct AdmittedTransaction {
 pub struct TransactionProposal {
     snapshot: SnapshotDescriptor,
     isolation: IsolationLevel,
-    transaction: MultiliteTransaction,
+    compiled: CompiledTransaction,
     footprint: ConflictFootprint,
 }
 
@@ -219,12 +219,12 @@ impl CommitProposal {
             .validate_tables(connection)
             .map_err(invalid_changeset)?;
         let operations = lower_insert_operations(&changeset, connection)?;
-        let transaction = MultiliteTransaction::new(operations)?;
-        let (_, mut footprint) = transaction.to_homebase()?.into_parts();
+        let compiled = MultiliteTransaction::new(operations)?.compile()?;
+        let mut footprint = compiled.homebase().footprint().clone();
         for read in reads {
             footprint.add_read(read);
         }
-        Self::from_transaction(snapshot, isolation, transaction, footprint).map(Some)
+        Self::from_compiled_transaction(snapshot, isolation, compiled, footprint).map(Some)
     }
 
     /// Build one proposal from a complete ordered logical transaction.
@@ -234,14 +234,23 @@ impl CommitProposal {
         transaction: MultiliteTransaction,
         footprint: ConflictFootprint,
     ) -> Result<Self> {
-        let (_, mandatory) = transaction.to_homebase()?.into_parts();
+        let compiled = transaction.compile()?;
+        Self::from_compiled_transaction(snapshot, isolation, compiled, footprint)
+    }
+
+    fn from_compiled_transaction(
+        snapshot: SnapshotDescriptor,
+        isolation: IsolationLevel,
+        compiled: CompiledTransaction,
+        footprint: ConflictFootprint,
+    ) -> Result<Self> {
         let body = TransactionProposal {
             snapshot,
             isolation,
-            transaction,
+            compiled,
             footprint,
         };
-        body.validate_mandatory_footprint(&mandatory)?;
+        body.validate_mandatory_footprint(body.compiled.homebase().footprint())?;
         Ok(Self {
             id: ProposalId::new(),
             body: ProposalBody::Transaction(body),
@@ -384,21 +393,20 @@ impl CommitProposal {
                 "only transaction proposals lower to Homebase submissions".into(),
             )
         })?;
-        let (mutations, mandatory) = proposal.transaction.to_homebase()?.into_parts();
-        proposal.validate_mandatory_footprint(&mandatory)?;
+        let lowered = proposal.compiled.homebase();
+        proposal.validate_mandatory_footprint(lowered.footprint())?;
         let assertions = proposal.footprint.clone().plan(
             proposal.isolation,
             proposal.snapshot.authority_applied_through,
         );
-        Ok((mutations, assertions))
+        Ok((lowered.mutations().to_vec(), assertions))
     }
 
     /// Cross-check every body-specific invariant that is independent of state.
     pub fn validate(&self) -> Result<()> {
         match &self.body {
             ProposalBody::Transaction(proposal) => {
-                let (_, mandatory) = proposal.transaction.to_homebase()?.into_parts();
-                proposal.validate_mandatory_footprint(&mandatory)
+                proposal.validate_mandatory_footprint(proposal.compiled.homebase().footprint())
             }
             ProposalBody::ApplyAdmissions(proposal) => {
                 if proposal.through < proposal.expected_admits.neck
@@ -469,7 +477,7 @@ impl CommitProposal {
                     field(TAG_KIND, &[TRANSACTION_PROPOSAL])?;
                     field(TAG_SNAPSHOT, &proposal.snapshot.encode())?;
                     field(TAG_ISOLATION, &[encode_isolation(proposal.isolation)])?;
-                    field(TAG_TRANSACTION, &proposal.transaction.encode()?)?;
+                    field(TAG_TRANSACTION, &proposal.compiled.logical().encode()?)?;
                     for key in proposal.footprint.writes() {
                         field(TAG_WRITE, &key.encode())?;
                     }
@@ -614,11 +622,14 @@ impl CommitProposal {
                 {
                     return Err(ProposalCodecError::InvalidFootprint);
                 }
+                let compiled = transaction
+                    .ok_or(ProposalCodecError::MissingField(TAG_TRANSACTION))?
+                    .compile()
+                    .map_err(|error| ProposalCodecError::InvalidTransaction(error.to_string()))?;
                 ProposalBody::Transaction(TransactionProposal {
                     snapshot: snapshot.ok_or(ProposalCodecError::MissingField(TAG_SNAPSHOT))?,
                     isolation: isolation.ok_or(ProposalCodecError::MissingField(TAG_ISOLATION))?,
-                    transaction: transaction
-                        .ok_or(ProposalCodecError::MissingField(TAG_TRANSACTION))?,
+                    compiled,
                     footprint: ConflictFootprint::from_parts(writes, constraints, reads),
                 })
             }
@@ -665,18 +676,6 @@ impl CommitProposal {
             id: id.ok_or(ProposalCodecError::MissingField(TAG_PROPOSAL_ID))?,
             body,
         };
-        if let ProposalBody::Transaction(transaction) = &proposal.body {
-            let (_, mandatory) = transaction
-                .transaction
-                .to_homebase()
-                .map_err(|error| ProposalCodecError::InvalidTransaction(error.to_string()))?
-                .into_parts();
-            if transaction.footprint.writes() != mandatory.writes()
-                || transaction.footprint.constraints() != mandatory.constraints()
-            {
-                return Err(ProposalCodecError::InvalidFootprint);
-            }
-        }
         proposal
             .validate()
             .map_err(|error| ProposalCodecError::InvalidProposal(error.to_string()))?;
@@ -716,7 +715,11 @@ impl TransactionProposal {
     }
 
     pub fn transaction(&self) -> &MultiliteTransaction {
-        &self.transaction
+        self.compiled.logical()
+    }
+
+    pub fn compiled(&self) -> &CompiledTransaction {
+        &self.compiled
     }
 
     fn validate_mandatory_footprint(&self, mandatory: &ConflictFootprint) -> Result<()> {
@@ -872,8 +875,7 @@ pub fn prepare(
             "proposal conflicts with an earlier proposal in its commit group".into(),
         ));
     }
-    let lowered = transaction.transaction().to_homebase()?;
-    let writes = history::writes_from_mutations(&lowered.mutations);
+    let writes = history::writes_from_mutations(transaction.compiled().homebase().mutations());
     transaction
         .transaction()
         .apply(connection)
@@ -1669,6 +1671,11 @@ mod tests {
         assert_eq!(
             decoded.to_homebase().unwrap(),
             proposal.to_homebase().unwrap()
+        );
+        let transaction = proposal.transaction_proposal().unwrap();
+        assert_eq!(
+            transaction.compiled().homebase().mutations(),
+            proposal.to_homebase().unwrap().0
         );
 
         let (mutations, assertions) = proposal.to_homebase().unwrap();
