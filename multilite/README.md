@@ -96,9 +96,9 @@ SQL and stable references. When an operation must execute SQLite DDL, Multilite
 renders its physical SQL from the current UUID-to-name bindings. A rename
 therefore advances neither the authority schema head nor `write-revision`, and
 stale row, index, or incoming-relationship operations compiled under the old
-spelling remain valid. The local folded catalog derives a content-addressed
-schema-revision UUID for its new spelling, so one revision UUID never denotes
-two encoded definitions. Rejection runs the inverse binding change and physical
+spelling remain valid. The local catalog updates its validated structural fold
+and derives a new content fingerprint for those changed IR bytes, without
+advancing the authority schema head or row write contract. Rejection runs the inverse binding change and physical
 rename in the same canonical transaction.
 
 Foreign-key declarations retain stable parent table, target index, and

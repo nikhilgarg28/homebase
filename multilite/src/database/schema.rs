@@ -63,7 +63,6 @@ const TAG_UNIQUE_INDEX_DEFINITION: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
 const TAG_NAMED_INDEX_DEFINITION: u8 = 1;
 const TAG_INDEX_NAME: u8 = 2;
-const TAG_INDEX_SQL: u8 = 5;
 const TAG_INDEX_ACTIVE: u8 = 6;
 const TAG_INDEX_TERM: u8 = 7;
 const TAG_INDEX_PREDICATE: u8 = 8;
@@ -765,12 +764,15 @@ pub struct IndexDefinition {
     columns: Vec<ColumnId>,
 }
 
-/// An explicit index attached to a table schema.
+/// Typed index state attached to a table schema.
+///
+/// The DDL operation owns and verifies its immutable SQL provenance. Catalog
+/// snapshots retain only this executable IR, so table rebuilds cannot acquire a
+/// second, unchecked SQL interpretation of the same index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedIndex {
     name: SqlName,
     index: IndexDefinition,
-    sql: String,
     active: bool,
     terms: Vec<IndexTerm>,
     predicate: Option<SqlExpression>,
@@ -1060,7 +1062,7 @@ impl IndexDefinition {
 }
 
 impl NamedIndex {
-    pub fn new_unique(sql: String, name: SqlName, columns: Vec<ColumnId>) -> Self {
+    pub fn new_unique(name: SqlName, columns: Vec<ColumnId>) -> Self {
         let dependencies = columns.iter().copied().collect::<BTreeSet<_>>();
         Self {
             name,
@@ -1069,7 +1071,6 @@ impl NamedIndex {
                 kind: IndexKind::Unique,
                 columns,
             },
-            sql,
             active: true,
             terms: Vec::new(),
             predicate: None,
@@ -1078,7 +1079,6 @@ impl NamedIndex {
     }
 
     pub fn new_secondary(
-        sql: String,
         name: SqlName,
         terms: Vec<IndexTerm>,
         predicate: Option<SqlExpression>,
@@ -1091,7 +1091,6 @@ impl NamedIndex {
                 kind: IndexKind::Secondary,
                 columns: Vec::new(),
             },
-            sql,
             active: true,
             terms,
             predicate,
@@ -1129,10 +1128,6 @@ impl NamedIndex {
 
     pub fn index(&self) -> &IndexDefinition {
         &self.index
-    }
-
-    pub fn sql(&self) -> &str {
-        &self.sql
     }
 
     /// Render this typed definition against current table and column bindings.
@@ -1375,7 +1370,7 @@ impl CreateTable {
     /// Decode and validate one complete locally stored schema operation.
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, SchemaCodecError> {
         let created = decode_frame(frame)?;
-        validate_snapshot_provenance_sql(&created)?;
+        validate_catalog_provenance_sql(&created)?;
         Ok(created)
     }
 
@@ -1461,19 +1456,13 @@ impl CreateTable {
     pub fn prepare_named_index(
         &self,
         connection: &Connection,
-        sql: &str,
         spec: &super::sql::CreateIndexSpec,
     ) -> Result<NamedIndex> {
         let (columns, terms, dependencies) = self.resolve_index_terms(connection, spec)?;
         if spec.unique {
-            Ok(NamedIndex::new_unique(
-                sql.to_owned(),
-                spec.name.clone(),
-                columns,
-            ))
+            Ok(NamedIndex::new_unique(spec.name.clone(), columns))
         } else {
             Ok(NamedIndex::new_secondary(
-                sql.to_owned(),
                 spec.name.clone(),
                 terms,
                 spec.predicate.clone(),
@@ -1619,18 +1608,13 @@ impl CreateTable {
             .find(|index| index.active && index.name.canonical() == name.canonical())
     }
 
-    pub fn with_added_index(&self, revision: SchemaRevisionId, index: NamedIndex) -> Result<Self> {
+    pub fn with_added_index(&self, index: NamedIndex) -> Result<Self> {
         let mut evolved = self.clone();
-        evolved.schema_revision_id = revision;
         evolved.schema.indexes.push(index);
-        evolved.validate_evolution()
+        evolved.refresh_and_validate_evolution()
     }
 
-    pub fn with_retired_index(
-        &self,
-        revision: SchemaRevisionId,
-        name: &SqlName,
-    ) -> Result<Option<Self>> {
+    pub fn with_retired_index(&self, name: &SqlName) -> Result<Option<Self>> {
         let mut evolved = self.clone();
         let position = evolved
             .schema
@@ -1640,9 +1624,8 @@ impl CreateTable {
         let Some(position) = position else {
             return Ok(None);
         };
-        evolved.schema_revision_id = revision;
         evolved.schema.indexes[position].active = false;
-        evolved.validate_evolution().map(Some)
+        evolved.refresh_and_validate_evolution().map(Some)
     }
 
     pub fn fold_added_index(&self, index: &NamedIndex) -> Result<Self> {
@@ -1718,7 +1701,6 @@ impl CreateTable {
 
     pub fn with_added_column(
         &self,
-        revision: SchemaRevisionId,
         spec: &CreateColumn,
         checks: &[CreateCheckConstraint],
     ) -> Result<(Self, ColumnId)> {
@@ -1728,19 +1710,17 @@ impl CreateTable {
             ));
         }
         let id = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
-        let evolved = self.with_added_column_identity(revision, id, spec, checks)?;
+        let evolved = self.with_added_column_identity(id, spec, checks)?;
         Ok((evolved, id))
     }
 
     pub fn with_added_column_identity(
         &self,
-        revision: SchemaRevisionId,
         id: ColumnId,
         spec: &CreateColumn,
         checks: &[CreateCheckConstraint],
     ) -> Result<Self> {
         let mut evolved = self.clone();
-        evolved.schema_revision_id = revision;
         evolved.schema.columns.push(Column {
             id,
             name: spec.name.clone(),
@@ -1764,7 +1744,7 @@ impl CreateTable {
             })
             .collect::<Result<Vec<_>>>()?;
         evolved.schema.checks.extend(checks);
-        evolved.validate_evolution()
+        evolved.refresh_and_validate_evolution()
     }
 
     /// Names read by constraints introduced with one column.
@@ -1816,11 +1796,7 @@ impl CreateTable {
                 .any(|check| check.column == Some(column.id()))
     }
 
-    pub fn with_removed_column(
-        &self,
-        revision: SchemaRevisionId,
-        column: ColumnId,
-    ) -> Result<Self> {
+    pub fn with_removed_column(&self, column: ColumnId) -> Result<Self> {
         if self.schema.primary_key.columns().contains(&column)
             || self
                 .schema
@@ -1856,13 +1832,12 @@ impl CreateTable {
             .ok_or(Error::UnsupportedSql(
                 "ALTER TABLE DROP COLUMN references an unknown column",
             ))?;
-        evolved.schema_revision_id = revision;
         evolved.schema.columns.remove(position);
         evolved
             .schema
             .checks
             .retain(|check| check.column != Some(column));
-        evolved.validate_evolution()
+        evolved.refresh_and_validate_evolution()
     }
 
     /// Fold one independently admitted column addition into the current table.
@@ -1908,7 +1883,7 @@ impl CreateTable {
 
     /// Fold one independently admitted column removal into the current table.
     pub fn fold_removed_column(&self, column: ColumnId, order: &[ColumnId]) -> Result<Self> {
-        let mut folded = self.with_removed_column(self.schema_revision_id, column)?;
+        let mut folded = self.with_removed_column(column)?;
         folded.reorder_columns(order)?;
         folded.refresh_and_validate_evolution()
     }
@@ -1955,6 +1930,9 @@ impl CreateTable {
                 predicate.rename_column(old_name, new_name);
             }
         }
+        // The authority conflict head and write contract remain unchanged,
+        // but the local folded IR has different bytes and therefore receives
+        // a different content-addressed revision.
         folded.refresh_and_validate_evolution()
     }
 
@@ -1984,19 +1962,24 @@ impl CreateTable {
         Ok(())
     }
 
-    fn refresh_schema_revision(&mut self) {
+    pub(super) fn computed_schema_revision(&self) -> SchemaRevisionId {
         const DOMAIN: &[u8] = b"multilite:folded-schema:v1\0";
 
-        self.schema_revision_id = SchemaRevisionId([0; 16]);
+        let mut normalized = self.clone();
+        normalized.schema_revision_id = SchemaRevisionId([0; 16]);
         let mut hash = Sha256::new();
         hash.update(DOMAIN);
-        hash.update(encode_create_table(self));
+        hash.update(encode_create_table(&normalized));
         let mut revision: [u8; 16] = hash.finalize()[..16]
             .try_into()
             .expect("SHA-256 prefix has a fixed length");
         revision[6] = (revision[6] & 0x0f) | 0x40;
         revision[8] = (revision[8] & 0x3f) | 0x80;
-        self.schema_revision_id = SchemaRevisionId(revision);
+        SchemaRevisionId(revision)
+    }
+
+    fn refresh_schema_revision(&mut self) {
+        self.schema_revision_id = self.computed_schema_revision();
     }
 
     fn validate_evolution(self) -> Result<Self> {
@@ -2934,9 +2917,6 @@ fn encode_named_index(index: &NamedIndex) -> Vec<u8> {
         .field(TAG_INDEX_NAME, index.name.value().as_bytes())
         .expect("index field length must fit in u32");
     writer
-        .field(TAG_INDEX_SQL, index.sql.as_bytes())
-        .expect("index field length must fit in u32");
-    writer
         .field(TAG_INDEX_ACTIVE, &[u8::from(index.active)])
         .expect("index field length must fit in u32");
     for term in &index.terms {
@@ -3342,7 +3322,6 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
     let mut reader = Reader::new(frame);
     let mut index = None;
     let mut name = None;
-    let mut sql = None;
     let mut active = None;
     let mut terms = Vec::new();
     let mut predicate = None;
@@ -3351,10 +3330,6 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
         match tag {
             TAG_NAMED_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_INDEX_NAME => set_once(&mut name, decode_name(value)?)?,
-            TAG_INDEX_SQL => set_once(
-                &mut sql,
-                String::from_utf8(value.to_vec()).map_err(|_| SchemaCodecError::InvalidUtf8)?,
-            )?,
             TAG_INDEX_ACTIVE => {
                 let [value] = value else {
                     return Err(SchemaCodecError::InvalidLength);
@@ -3385,7 +3360,6 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
     Ok(NamedIndex {
         index: index.ok_or(SchemaCodecError::MissingField(TAG_NAMED_INDEX_DEFINITION))?,
         name: name.ok_or(SchemaCodecError::MissingField(TAG_INDEX_NAME))?,
-        sql: sql.ok_or(SchemaCodecError::MissingField(TAG_INDEX_SQL))?,
         active: active.ok_or(SchemaCodecError::MissingField(TAG_INDEX_ACTIVE))?,
         terms,
         predicate,
@@ -3737,22 +3711,17 @@ fn from_homebase_inner(
     Ok(created)
 }
 
-fn validate_snapshot_provenance_sql(
+/// Validate the immutable creation provenance retained by an evolved catalog.
+///
+/// Later DDL is verified by its own operation decoder and mutates only typed
+/// IR. The initial SQL can therefore differ from the folded schema after
+/// rename/add/drop operations, and is never used to materialize that fold.
+fn validate_catalog_provenance_sql(
     created: &CreateTable,
 ) -> std::result::Result<(), SchemaCodecError> {
     let parsed = parse_create_table(&created.sql)?;
     if parsed.name != created.name {
         return Err(SchemaCodecError::SqlMismatch);
-    }
-    for index in created.indexes() {
-        let super::sql::ValidatedExecute::CreateIndex(spec) =
-            super::sql::validate_execute(index.sql()).map_err(|_| SchemaCodecError::InvalidSql)?
-        else {
-            return Err(SchemaCodecError::InvalidSql);
-        };
-        if spec.name != *index.name() || spec.unique != index.is_unique() {
-            return Err(SchemaCodecError::SqlMismatch);
-        }
     }
     Ok(())
 }
@@ -4119,15 +4088,10 @@ mod tests {
             primary_key: None,
         };
         let alpha_source = base
-            .with_added_column_identity(
-                SchemaRevisionId(test_uuid(31)),
-                alpha,
-                &added("alpha"),
-                &[],
-            )
+            .with_added_column_identity(alpha, &added("alpha"), &[])
             .unwrap();
         let beta_source = base
-            .with_added_column_identity(SchemaRevisionId(test_uuid(21)), beta, &added("beta"), &[])
+            .with_added_column_identity(beta, &added("beta"), &[])
             .unwrap();
         let base_order = base
             .columns()
@@ -4168,7 +4132,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_column_renames_derive_one_new_schema_revision() {
+    fn independent_column_renames_derive_one_authenticated_catalog_revision() {
         let base = deterministic_create("notes");
         let id = base.columns()[0].id();
         let body = base.columns()[1].id();
@@ -4354,7 +4318,6 @@ mod tests {
         );
 
         let index = NamedIndex::new_secondary(
-            "CREATE INDEX notes_body ON notes (body)".into(),
             SqlName::new("notes_body".into()),
             vec![IndexTerm::Column {
                 column: body,
@@ -4364,9 +4327,7 @@ mod tests {
             None,
             vec![body],
         );
-        let indexed = created
-            .with_added_index(SchemaRevisionId(test_uuid(90)), index)
-            .unwrap();
+        let indexed = created.with_added_index(index).unwrap();
         assert_eq!(CreateTable::decode(&indexed.encode()).unwrap(), indexed);
 
         let mut duplicate_index_dependency = indexed;
@@ -4393,12 +4354,10 @@ mod tests {
             unreachable!()
         };
         let correct = NamedIndex::new_unique(
-            "CREATE UNIQUE INDEX notes_identity ON notes (id, body)".into(),
             spec.name.clone(),
             vec![created.columns()[0].id(), created.columns()[1].id()],
         );
         let crossed = NamedIndex::new_unique(
-            "CREATE UNIQUE INDEX notes_identity ON notes (id, body)".into(),
             spec.name.clone(),
             vec![created.columns()[1].id(), created.columns()[0].id()],
         );
@@ -4986,8 +4945,10 @@ mod tests {
         let mut mode_mismatch = created.clone();
         mode_mismatch.schema.mode = TableMode::Ordinary;
         assert_eq!(
-            CreateTable::decode(&mode_mismatch.encode()).unwrap().mode(),
-            TableMode::Ordinary
+            CreateTable::decode(&mode_mismatch.encode()),
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::InvalidSchemaRevision
+            ))
         );
 
         let mut invalid_type = created;

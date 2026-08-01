@@ -184,11 +184,7 @@ impl AlterTableOperation {
                 "ALTER TABLE target column name is already bound",
             ));
         }
-        let (after, column) = before.with_added_column(
-            SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
-            &spec.column,
-            &spec.checks,
-        )?;
+        let (after, column) = before.with_added_column(&spec.column, &spec.checks)?;
         let predecessor = before
             .columns()
             .last()
@@ -232,10 +228,7 @@ impl AlterTableOperation {
                 "DROP COLUMN does not support referenced parent columns",
             ));
         }
-        let after = before.with_removed_column(
-            SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
-            column,
-        )?;
+        let after = before.with_removed_column(column)?;
         let dropped_values = capture_dropped_values(connection, &before, column, &spec.column)?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -812,12 +805,7 @@ impl AlterTableOperation {
                     .last()
                     .is_some_and(|column| column.id() == *predecessor)
                 && before
-                    .with_added_column_identity(
-                        after.schema_revision_id(),
-                        *column,
-                        &spec.column,
-                        &spec.checks,
-                    )
+                    .with_added_column_identity(*column, &spec.column, &spec.checks)
                     .is_ok_and(|expected| expected == *after) => {}
             (
                 AlterTableDelta::DropColumn {
@@ -834,7 +822,7 @@ impl AlterTableOperation {
                 && before.schema_revision_id() == self.schema_revision
                 && before.schema_revision_id() != after.schema_revision_id()
                 && before
-                    .with_removed_column(after.schema_revision_id(), *column)
+                    .with_removed_column(*column)
                     .is_ok_and(|expected| expected == *after)
                 && dropped_values
                     .iter()
@@ -1591,12 +1579,22 @@ mod tests {
         assert_eq!(lowered.mutations.len(), 3);
         assert_eq!(lowered.footprint.constraints().len(), 2);
         assert!(lowered.footprint.writes().is_empty());
+        assert!(lowered.mutations.iter().all(|mutation| {
+            mutation.key() != &table_schema_key(created.table_id(), created.schema_revision_id())
+        }));
         let Mutation::Set { value, .. } = &lowered.mutations[2] else {
             panic!("new column name registry entry was not set")
         };
         assert_eq!(value, &created.columns()[0].id().as_bytes());
 
         operation.apply(&connection).unwrap();
+        assert_ne!(
+            catalog::by_id(&connection, created.table_id())
+                .unwrap()
+                .unwrap()
+                .schema_revision_id(),
+            created.schema_revision_id()
+        );
         assert_eq!(
             catalog::column_name_by_id(&connection, created.table_id(), created.columns()[0].id())
                 .unwrap(),
@@ -1629,6 +1627,10 @@ mod tests {
             .execute("INSERT INTO notes VALUES (1)", ())
             .unwrap();
         let operation = add_operation(&connection);
+        let expected_after = match &operation.delta {
+            AlterTableDelta::AddColumn { after, .. } => after.clone(),
+            _ => unreachable!(),
+        };
         assert_eq!(
             AlterTableOperation::decode(&operation.encode()).unwrap(),
             operation
@@ -1662,6 +1664,7 @@ mod tests {
         let evolved = catalog::by_id(&connection, created.table_id())
             .unwrap()
             .unwrap();
+        assert_eq!(evolved, expected_after);
         assert_eq!(evolved.columns().len(), 2);
         assert_ne!(evolved.schema_revision_id(), created.schema_revision_id());
         assert_eq!(

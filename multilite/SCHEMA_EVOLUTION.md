@@ -13,12 +13,22 @@ SQLite materialization state.
    in an existing log record.
 3. The local catalog is a derived materialization index. Its table-name column
    is the current `(schema, name) -> TableId` binding; its encoded definition is
-   the latest immutable structural revision and may retain historical identifier
-   spellings from the DDL that created each object.
+   a validated fold of immutable DDL operations. Every folded encoding carries
+   a recomputed content-addressed revision, including folds whose mutable
+   spellings changed without advancing an authority conflict cell.
 4. SQLite execution uses freshly rendered SQL. Rendering may substitute current
    names for UUID-resolved objects, but may not change expressions, ordering,
    conflict behavior, or any other semantic property of the authenticated
    operation.
+
+`SchemaRevisionId` is a content fingerprint of one complete encoded table IR.
+Decoding recomputes it, so a valid-looking structural edit cannot retain the
+old revision. Homebase's table-schema namespace contains the authenticated
+before/after snapshots published by individual DDL operations. The local
+catalog may additionally derive a deterministic fold of several commuting
+operations; that folded revision need not have its own Homebase snapshot cell.
+The mutable active-schema cell is the distributed conflict frontier, not a
+promise that every locally derived fold is independently fetchable by revision.
 5. DML never re-resolves a stored SQL name. Row operations carry stable IDs and
    apply through the current catalog binding. Reusing an old name for a new table
    cannot retarget an older operation.
@@ -56,11 +66,10 @@ absent from that contract.
 
 ### CREATE INDEX and DROP INDEX
 
-The immutable index definition records its owner `TableId`, index UUID,
-structured terms/predicate, and original SQL. CREATE and DROP apply by index
-identity/name, while CREATE and DROP rejection render a CREATE statement whose
-target is the owner's current catalog name. Existing index definitions are not
-rewritten when their table is renamed.
+The immutable operation records original SQL and binds it to an owner `TableId`,
+index UUID, and structured terms/predicate. Catalog snapshots store only the
+typed index IR. CREATE, DROP, and rejection render from that IR against current
+table and column bindings; historical SQL is never a second executable source.
 
 ### ALTER TABLE RENAME TO
 
@@ -80,9 +89,10 @@ order.
 The operation resolves the source spelling once to a stable `ColumnId`, then
 moves its catalog binding. Rows, primary keys, UNIQUE ownership, foreign keys,
 CHECK dependencies, and index terms continue to refer to that identity. SQLite
-DDL is rendered against current bindings, and the folded catalog receives a new
-content-addressed structural revision so one revision UUID never denotes two
-encoded definitions.
+DDL is rendered against current bindings. The folded catalog derives a new
+content-addressed revision because its encoded IR changed, while the admitted
+operation publishes only its old and new name cells plus immutable provenance.
+That local revision is a fold fingerprint, not an authority conflict frontier.
 
 ### ALTER TABLE ADD COLUMN
 

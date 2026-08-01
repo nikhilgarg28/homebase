@@ -30,6 +30,7 @@ pub enum SchemaInvariantError {
     InvalidCheckConstraint,
     UnknownExpressionColumn,
     ReusedSchemaIdentity,
+    InvalidSchemaRevision,
 }
 
 impl fmt::Display for SchemaInvariantError {
@@ -53,6 +54,9 @@ impl fmt::Display for SchemaInvariantError {
             Self::InvalidCheckConstraint => "table schema has an invalid CHECK constraint",
             Self::UnknownExpressionColumn => "schema expression references an unknown table column",
             Self::ReusedSchemaIdentity => "schema operation reuses a stable identity",
+            Self::InvalidSchemaRevision => {
+                "schema revision does not authenticate the encoded table definition"
+            }
         })
     }
 }
@@ -134,7 +138,6 @@ pub(super) fn validate_table_schema(
     for index in &schema.indexes {
         if !matches!(index.index.kind, IndexKind::Unique | IndexKind::Secondary)
             || !named_index_definition_is_valid(index, columns)
-            || index.sql.is_empty()
         {
             return Err(SchemaInvariantError::InvalidNamedIndex);
         }
@@ -227,6 +230,9 @@ pub(super) fn validate_create_table(created: &CreateTable) -> Result<(), SchemaI
     if !unique {
         return Err(SchemaInvariantError::ReusedSchemaIdentity);
     }
+    if created.schema_revision_id != created.computed_schema_revision() {
+        return Err(SchemaInvariantError::InvalidSchemaRevision);
+    }
     Ok(())
 }
 
@@ -251,7 +257,7 @@ fn has_duplicates<T: PartialEq>(values: &[T]) -> bool {
 mod tests {
     use super::*;
     use crate::Error;
-    use crate::database::schema::{CreateColumn, CreateTable, SchemaRevisionId, TypeDeclaration};
+    use crate::database::schema::{CreateColumn, CreateTable, TypeDeclaration};
     use crate::database::sql::{ValidatedExecute, validate_execute};
     use uuid::Uuid;
 
@@ -307,7 +313,6 @@ mod tests {
 
         assert!(matches!(
             created.with_added_column_identity(
-                SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
                 ColumnId::from_bytes(Uuid::new_v4().into_bytes()),
                 &duplicate,
                 &[],

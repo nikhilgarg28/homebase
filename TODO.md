@@ -43,6 +43,13 @@ multilite
   DDL until that protocol exists; an online/empty-submit barrier alone is not
   sufficient because authority may still reject the operation.
 
+- Schema revision UUIDs now authenticate complete folded table IR, while the
+  Homebase table-schema namespace retains only immutable before/after snapshots
+  emitted by individual DDL operations. If bootstrap later needs random access
+  to every derived commuting fold rather than replaying the immutable schema
+  log, add an explicit authenticated fold checkpoint protocol; do not reinterpret
+  the active-schema conflict cell as that checkpoint.
+
 - A seeded two-replica integrity simulation now covers parent/child inserts,
   retargets, primary-key moves, deletes, UNIQUE conflicts, mixed DDL/DML,
   reordered pushes, rejection repair, and restarts under both isolation levels.

@@ -14,7 +14,7 @@ use super::catalog;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
-    CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
+    CreateTable, IndexId, MutationId, NamedIndex, active_schema_revision_key,
     column_index_dependency_key, column_name_scope_key, index_definition_key, schema_log_key,
     schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
@@ -83,16 +83,13 @@ impl IndexOperation {
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
             Error::UnsupportedSql("CREATE INDEX target has no synchronized schema identity"),
         )?;
-        let index = before.prepare_named_index(connection, sql, spec)?;
+        let index = before.prepare_named_index(connection, spec)?;
         let backfill = if index.is_unique() {
             backfill_unique_index(connection, &before, &index)?
         } else {
             Vec::new()
         };
-        let after = before.with_added_index(
-            SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
-            index.clone(),
-        )?;
+        let after = before.with_added_index(index.clone())?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
@@ -113,10 +110,7 @@ impl IndexOperation {
         )?;
         ensure_not_referenced(connection, &before, &index)?;
         let after = before
-            .with_retired_index(
-                SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
-                &spec.name,
-            )?
+            .with_retired_index(&spec.name)?
             .expect("catalog lookup found the index");
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -458,7 +452,7 @@ impl IndexOperation {
                 };
                 let expected_after = self
                     .before
-                    .with_added_index(self.after.schema_revision_id(), self.index.clone())
+                    .with_added_index(self.index.clone())
                     .map_err(|_| IndexCodecError::InvalidEvolution)?;
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
                     || expected_after != self.after
@@ -491,7 +485,7 @@ impl IndexOperation {
                 };
                 let expected_after = self
                     .before
-                    .with_retired_index(self.after.schema_revision_id(), self.index.name())
+                    .with_retired_index(self.index.name())
                     .map_err(|_| IndexCodecError::InvalidEvolution)?
                     .ok_or(IndexCodecError::InvalidEvolution)?;
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
@@ -798,12 +792,8 @@ mod tests {
 
         operation.record_catalog(&connection).unwrap();
         assert_eq!(
-            catalog::by_name(&connection, "notes")
-                .unwrap()
-                .unwrap()
-                .indexes()
-                .len(),
-            1
+            catalog::by_name(&connection, "notes").unwrap().unwrap(),
+            operation.after
         );
         operation.rollback(&connection).unwrap();
         assert_eq!(
@@ -924,14 +914,7 @@ mod tests {
                 .unwrap(),
             "archived_notes"
         );
-        assert_eq!(
-            catalog::by_id(&target, before.table_id())
-                .unwrap()
-                .unwrap()
-                .indexes()[0]
-                .sql(),
-            sql
-        );
+        assert_eq!(IndexOperation::decode(&create.encode()).unwrap(), create);
 
         let drop_sql = "DROP INDEX notes_tenant_slug_lookup";
         let drop = IndexOperation::prepare_drop(
@@ -1034,6 +1017,12 @@ mod tests {
             NamedIndex::decode(definition).unwrap(),
             operation.index,
             "the independently fetched definition retains every physical term"
+        );
+        assert!(
+            !definition
+                .windows(sql.len())
+                .any(|window| window == sql.as_bytes()),
+            "catalog index IR must not duplicate executable provenance SQL"
         );
         assert!(
             !lowered
