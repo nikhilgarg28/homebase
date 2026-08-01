@@ -432,10 +432,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             with,
             tbl_name,
             indexed,
+            where_clause,
             returning,
             order_by,
             limit,
-            ..
         } => {
             if with.is_some() {
                 return Err(Error::UnsupportedSql("DELETE WITH is not supported"));
@@ -466,6 +466,11 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "DELETE ORDER BY and LIMIT are not supported",
                 ));
             }
+            if where_clause.as_ref().is_some_and(expression_reads_reserved) {
+                return Err(Error::UnsupportedSql(
+                    "DELETE cannot read reserved Multilite tables",
+                ));
+            }
             Ok(ValidatedExecute::Delete)
         }
         Stmt::Update {
@@ -475,10 +480,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             indexed,
             sets,
             from,
+            where_clause,
             returning,
             order_by,
             limit,
-            ..
         } => {
             if with.is_some() {
                 return Err(Error::UnsupportedSql("UPDATE WITH is not supported"));
@@ -520,6 +525,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             if order_by.is_some() || limit.is_some() {
                 return Err(Error::UnsupportedSql(
                     "UPDATE ORDER BY and LIMIT are not supported",
+                ));
+            }
+            if sets.iter().any(|set| expression_reads_reserved(&set.expr))
+                || where_clause.as_ref().is_some_and(expression_reads_reserved)
+            {
+                return Err(Error::UnsupportedSql(
+                    "UPDATE cannot read reserved Multilite tables",
                 ));
             }
             Ok(ValidatedExecute::Update)
@@ -677,9 +689,9 @@ fn one_select_reads_reserved(select: &OneSelect) -> bool {
 
 fn select_table_reads_reserved(table: &SelectTable) -> bool {
     match table {
-        SelectTable::Table(name, ..) => super::has_multilite_prefix(name.name.0.as_ref()),
+        SelectTable::Table(name, ..) => name_reads_reserved(&name.name),
         SelectTable::TableCall(name, arguments, ..) => {
-            super::has_multilite_prefix(name.name.0.as_ref())
+            name_reads_reserved(&name.name)
                 || arguments.iter().flatten().any(expression_reads_reserved)
         }
         SelectTable::Select(select, ..) => select_reads_reserved(select),
@@ -754,7 +766,7 @@ fn expression_reads_reserved(expression: &Expr) -> bool {
         }
         Expr::InTable { lhs, rhs, args, .. } => {
             expression_reads_reserved(lhs)
-                || super::has_multilite_prefix(rhs.name.0.as_ref())
+                || name_reads_reserved(&rhs.name)
                 || args.iter().flatten().any(expression_reads_reserved)
         }
         Expr::Like {
@@ -777,6 +789,14 @@ fn expression_reads_reserved(expression: &Expr) -> bool {
         | Expr::Qualified(..)
         | Expr::Variable(_) => false,
     }
+}
+
+fn name_reads_reserved(name: &Name) -> bool {
+    SqlName::from_sqlite_token(&name.0)
+        .map(|name| super::has_multilite_prefix(name.value()))
+        // The parser should only produce valid SQLite identifier tokens. If a
+        // future parser shape violates that contract, reject conservatively.
+        .unwrap_or(true)
 }
 
 fn sorted_column_reads_reserved(column: &SortedColumn) -> bool {
@@ -1856,6 +1876,9 @@ mod tests {
     fn public_reads_find_reserved_tables_in_every_subquery_expression() {
         for sql in [
             "SELECT (SELECT value FROM __multilite__meta)",
+            "SELECT value FROM \"__multilite__meta\"",
+            "SELECT value FROM [__multilite__meta]",
+            "SELECT value FROM `__multilite__meta`",
             "SELECT 1 WHERE EXISTS (SELECT 1 FROM __multilite__meta)",
             "SELECT 1 WHERE 1 IN (SELECT length(value) FROM __multilite__meta)",
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM __multilite__meta)
@@ -1886,6 +1909,34 @@ mod tests {
                 Ok(ValidatedStatement::Read)
             ));
             validate_read_statement(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn mutating_predicates_and_assignments_cannot_read_reserved_tables() {
+        for sql in [
+            "DELETE FROM notes WHERE EXISTS (
+                SELECT 1 FROM __multilite__meta
+             )",
+            "DELETE FROM notes WHERE id IN (
+                SELECT length(value) FROM \"__multilite__meta\"
+             )",
+            "UPDATE notes SET body = (
+                SELECT value FROM [__multilite__meta] LIMIT 1
+             )",
+            "UPDATE notes SET body = 'x' WHERE EXISTS (
+                SELECT 1 FROM `__multilite__meta`
+             )",
+        ] {
+            assert_unsupported(sql);
+        }
+
+        for sql in [
+            "DELETE FROM notes WHERE EXISTS (SELECT 1 FROM archived)",
+            "UPDATE notes SET body = (SELECT body FROM archived LIMIT 1)",
+            "UPDATE notes SET body = 'x' WHERE id IN (SELECT id FROM archived)",
+        ] {
+            validate_execute(sql).unwrap();
         }
     }
 
