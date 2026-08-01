@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use homebase::Server;
 use homebase::actor::{SpaceHandle, Spawner};
 use homebase::storage::MemoryStore;
+use homebase_client::ClientError;
 use homebase_client::meta::{AdmitCursors, ClientState, DeviceOp, OrderedMetaStore, SubmitMode};
 use homebase_client::server::offline_router;
 use homebase_core::clock::{ManualClock, Timestamp};
@@ -27,7 +28,10 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use super::operation::MultiliteOp;
 use super::transaction::MultiliteTransaction;
 use super::*;
+use crate::commit::committer::{CommitBackend, CommitHistory};
 use crate::commit::history;
+use crate::commit::proposal::CommitDisposition;
+use crate::commit::snapshot::SnapshotDescriptor;
 
 struct ThreadSpawner;
 
@@ -164,16 +168,14 @@ fn backend_for<H: ServerHandle + Send + Sync + 'static>(
     database: &Database<H>,
     path: &Path,
 ) -> DatabaseCommitBackend<H> {
-    DatabaseCommitBackend {
-        owner: database.owner.clone(),
-        path: path.to_owned(),
-        wal_path: wal_path_for(path),
-        database_id: database.database_id,
-        client: Arc::clone(&database.client),
-        commit_history: CommitHistory::default(),
-        snapshot_cache: parking_lot::Mutex::new(crate::branch::snapshot::SnapshotCache::new()),
-        checkpoint: parking_lot::Mutex::new(crate::commit::checkpoint::CheckpointPolicy::default()),
-    }
+    DatabaseCommitBackend::new(
+        database.owner.clone(),
+        path.to_owned(),
+        wal_path_for(path),
+        database.database_id,
+        Arc::clone(&database.client),
+        CommitHistory::default(),
+    )
 }
 
 fn table_sql<H: ServerHandle + Send + Sync + 'static>(
@@ -3710,7 +3712,7 @@ fn branch_logical_coordinates_come_from_the_pinned_sqlite_snapshot() {
                     let mut proposal_id = [5; 16];
                     proposal_id[6] = (proposal_id[6] & 0x0f) | 0x40;
                     proposal_id[8] = (proposal_id[8] & 0x3f) | 0x80;
-                    backend.commit_history.record_group(
+                    backend.commit_history().record_group(
                         connection,
                         vec![history::PreparedRecord {
                             proposal_id,
