@@ -490,6 +490,78 @@ fn local_first_retries_the_last_buffered_write_after_transport_recovers() {
 }
 
 #[test]
+fn local_first_repairs_a_definitively_rejected_background_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let winner = Database::open_with(
+        directory.path().join("local-first-rejection-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(winner.database_id().space_id()));
+    let loser = Database::open_with(
+        directory.path().join("local-first-rejection-loser.sqlite"),
+        OpenOptions::new()
+            .invitation(winner.replica_invitation())
+            .sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::from_secs(60),
+                read_staleness: Duration::from_secs(60),
+            })
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let winner_runtime = winner.runtime().unwrap();
+    let loser_runtime = loser.runtime().unwrap();
+
+    loser
+        .execute(
+            &loser_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, losing TEXT)",
+            (),
+        )
+        .unwrap();
+    winner
+        .execute(
+            &winner_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, winning BLOB)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+
+    loser.policy.schedule(Duration::ZERO);
+    wait_until(|| {
+        let state = client_state(&loser);
+        let cursors = state.spaces[&loser.database_id().space_id()].cursors;
+        cursors.neck == cursors.tail
+            && pending_ops(&loser).is_empty()
+            && !table_exists(&loser, "notes")
+    });
+
+    loser.pull().unwrap();
+    loser.rebase(&loser_runtime).unwrap();
+    assert!(table_exists(&loser, "notes"));
+    loser.with_connection(|connection| {
+        let columns = connection
+            .prepare("SELECT name, type FROM pragma_table_info('notes') ORDER BY cid")
+            .unwrap()
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("id".into(), "INTEGER".into()),
+                ("winning".into(), "BLOB".into())
+            ]
+        );
+    });
+}
+
+#[test]
 fn local_first_delete_pushes_in_the_background_and_rebases_on_a_replica() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

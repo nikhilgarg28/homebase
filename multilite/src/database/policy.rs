@@ -10,7 +10,7 @@ use homebase_client::ServerHandle;
 
 use super::Database;
 use crate::commit::snapshot::CommitSeq;
-use crate::{Error, PushOutcome, Result};
+use crate::{Error, Result};
 
 const INITIAL_PUSH_RETRY: Duration = Duration::from_millis(100);
 const MAX_PUSH_RETRY: Duration = Duration::from_secs(30);
@@ -54,6 +54,7 @@ enum Command {
         group: CommitSeq,
         deadline: Instant,
     },
+    PushComplete(Result<()>),
     Stop,
 }
 
@@ -140,9 +141,16 @@ impl PolicyActor {
         };
         let sender = self.sender.clone();
         let policy = self.policy;
+        let (pushes, push_jobs) = mpsc::channel();
+        let push_sender = sender.clone();
+        let push_database = database.clone();
+        std::thread::Builder::new()
+            .name("multilite-policy-workflow".into())
+            .spawn(move || run_push_worker(push_jobs, push_sender, push_database))
+            .map_err(|error| Error::BackgroundWorker(error.to_string()))?;
         std::thread::Builder::new()
             .name("multilite-policy".into())
-            .spawn(move || run_actor(receiver, sender, database, policy))
+            .spawn(move || run_actor(receiver, sender, pushes, policy))
             .map_err(|error| Error::BackgroundWorker(error.to_string()))?;
         Ok(())
     }
@@ -210,6 +218,8 @@ struct PolicyMachine {
     deadline: Option<Instant>,
     retry_delay: Duration,
     last_group: Option<CommitSeq>,
+    push_pending: bool,
+    push_in_flight: bool,
 }
 
 impl PolicyMachine {
@@ -224,6 +234,8 @@ impl PolicyMachine {
             deadline: None,
             retry_delay: INITIAL_PUSH_RETRY,
             last_group: None,
+            push_pending: false,
+            push_in_flight: false,
         }
     }
 
@@ -232,7 +244,7 @@ impl PolicyMachine {
         self.grant_next(sender);
     }
 
-    fn complete(&mut self, token: u64, transition: RefreshTransition, sender: &Sender<Command>) {
+    fn complete(&mut self, token: u64, transition: RefreshTransition) {
         if self.active != Some(token) {
             return;
         }
@@ -252,11 +264,10 @@ impl PolicyMachine {
             }
         }
         self.active = None;
-        self.grant_next(sender);
     }
 
     fn grant_next(&mut self, sender: &Sender<Command>) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.push_pending || self.push_in_flight {
             return;
         }
         while let Some(waiter) = self.waiters.pop_front() {
@@ -325,16 +336,44 @@ impl PolicyMachine {
             .unwrap_or(MAX_PUSH_RETRY)
             .min(MAX_PUSH_RETRY);
     }
+
+    fn mark_push_due(&mut self) {
+        self.deadline = None;
+        self.push_pending = true;
+    }
+
+    fn take_push_job(&mut self) -> bool {
+        if !self.push_pending || self.push_in_flight || self.active.is_some() {
+            return false;
+        }
+        self.push_pending = false;
+        self.push_in_flight = true;
+        true
+    }
+
+    fn complete_push(&mut self, result: &Result<()>) {
+        if !self.push_in_flight {
+            return;
+        }
+        self.push_in_flight = false;
+        if result.is_ok() {
+            self.retry_delay = INITIAL_PUSH_RETRY;
+        } else {
+            // One retry deadline covers every write observed while this failed
+            // attempt was in flight; otherwise zero-delay schedules could spin
+            // against an unavailable authority without honoring backoff.
+            self.push_pending = false;
+            self.push_failed();
+        }
+    }
 }
 
-fn run_actor<H>(
+fn run_actor(
     receiver: Receiver<Command>,
     sender: Sender<Command>,
-    database: Weak<Database<H>>,
+    pushes: Sender<()>,
     policy: SyncPolicy,
-) where
-    H: ServerHandle + Send + Sync + 'static,
-{
+) {
     let mut state = PolicyMachine::new(policy);
     loop {
         let received = match state.deadline {
@@ -356,23 +395,46 @@ fn run_actor<H>(
                 &sender,
             ),
             Ok(Command::Complete { token, transition }) => {
-                state.complete(token, transition, &sender)
+                state.complete(token, transition);
+                drive(&mut state, &sender, &pushes);
             }
             Ok(Command::Schedule(deadline)) => state.schedule(deadline),
             Ok(Command::ScheduleGroup { group, deadline }) => state.schedule_group(group, deadline),
+            Ok(Command::PushComplete(result)) => {
+                state.complete_push(&result);
+                drive(&mut state, &sender, &pushes);
+            }
             Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
-                state.deadline = None;
-                let Some(database) = database.upgrade() else {
-                    return;
-                };
-                match database.push() {
-                    Ok(PushOutcome::Drained | PushOutcome::Rejected(_)) => {
-                        state.retry_delay = INITIAL_PUSH_RETRY
-                    }
-                    Err(_) => state.push_failed(),
-                }
+                state.mark_push_due();
+                drive(&mut state, &sender, &pushes);
             }
+        }
+    }
+}
+
+fn drive(state: &mut PolicyMachine, sender: &Sender<Command>, pushes: &Sender<()>) {
+    if state.take_push_job() {
+        if pushes.send(()).is_err() {
+            state.push_in_flight = false;
+            state.push_failed();
+        }
+    } else {
+        state.grant_next(sender);
+    }
+}
+
+fn run_push_worker<H>(jobs: Receiver<()>, sender: Sender<Command>, database: Weak<Database<H>>)
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    while jobs.recv().is_ok() {
+        let Some(database) = database.upgrade() else {
+            return;
+        };
+        let result = database.run_scheduled_push();
+        if sender.send(Command::PushComplete(result)).is_err() {
+            return;
         }
     }
 }
@@ -442,8 +504,8 @@ mod tests {
             RefreshTransition::Rebased {
                 pulled_at: Some(Instant::now()),
             },
-            &sender,
         );
+        state.grant_next(&sender);
         assert!(matches!(
             pollster::block_on(second_response).unwrap(),
             AcquireReply::Fresh
@@ -478,7 +540,8 @@ mod tests {
             &sender,
         );
 
-        state.complete(first.token, RefreshTransition::Unchanged, &sender);
+        state.complete(first.token, RefreshTransition::Unchanged);
+        state.grant_next(&sender);
         assert!(matches!(
             pollster::block_on(second_response).unwrap(),
             AcquireReply::Lease(_)
@@ -487,18 +550,76 @@ mod tests {
     }
 
     #[test]
-    fn explicit_pull_then_rebase_advances_one_atomic_freshness_state() {
+    fn a_due_push_waits_for_refresh_and_precedes_the_next_waiter() {
         let (sender, _receiver) = mpsc::channel();
+        let mut state = PolicyMachine::new(SyncPolicy::Remote);
+        let requested_at = Instant::now();
+        let (first_reply, first_response) = oneshot::channel();
+        state.enqueue(
+            Waiter {
+                mode: AcquireMode::IfStale,
+                requested_at,
+                reply: first_reply,
+            },
+            &sender,
+        );
+        let AcquireReply::Lease(mut first) = pollster::block_on(first_response).unwrap() else {
+            unreachable!()
+        };
+        let (second_reply, mut second_response) = oneshot::channel();
+        state.enqueue(
+            Waiter {
+                mode: AcquireMode::IfStale,
+                requested_at,
+                reply: second_reply,
+            },
+            &sender,
+        );
+
+        state.mark_push_due();
+        assert!(!state.take_push_job());
+        state.complete(first.token, RefreshTransition::Unchanged);
+        assert!(state.take_push_job());
+        state.grant_next(&sender);
+        assert!(second_response.try_recv().unwrap().is_none());
+
+        state.complete_push(&Ok(()));
+        state.grant_next(&sender);
+        assert!(matches!(
+            pollster::block_on(second_response).unwrap(),
+            AcquireReply::Lease(_)
+        ));
+        first.completed = true;
+    }
+
+    #[test]
+    fn a_failed_push_rearms_with_bounded_backoff() {
+        let mut state = PolicyMachine::new(SyncPolicy::LocalFirst {
+            write_delay: Duration::ZERO,
+            read_staleness: Duration::ZERO,
+        });
+        state.mark_push_due();
+        assert!(state.take_push_job());
+        state.complete_push(&Err(Error::BackgroundWorker("injected".into())));
+
+        let deadline = state.deadline.expect("failed push is rescheduled");
+        assert!(deadline > Instant::now());
+        assert_eq!(state.retry_delay, INITIAL_PUSH_RETRY * 2);
+        assert!(!state.push_in_flight);
+    }
+
+    #[test]
+    fn explicit_pull_then_rebase_advances_one_atomic_freshness_state() {
         let mut state = PolicyMachine::new(SyncPolicy::Remote);
         let pulled_at = Instant::now();
 
         state.active = Some(1);
-        state.complete(1, RefreshTransition::Pulled { pulled_at }, &sender);
+        state.complete(1, RefreshTransition::Pulled { pulled_at });
         assert!(state.last_refresh.is_none());
         assert_eq!(state.unapplied_pull, Some(pulled_at));
 
         state.active = Some(2);
-        state.complete(2, RefreshTransition::Rebased { pulled_at: None }, &sender);
+        state.complete(2, RefreshTransition::Rebased { pulled_at: None });
         assert_eq!(state.last_refresh, Some(pulled_at));
         assert!(state.unapplied_pull.is_none());
         assert!(!state.requires_refresh(pulled_at));

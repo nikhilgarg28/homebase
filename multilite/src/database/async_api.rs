@@ -21,11 +21,10 @@ use crate::{Error, Params, Result, blocking};
 
 impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     pub(crate) async fn push_async(self: &Arc<Self>) -> Result<PushOutcome> {
-        self.push_via_authority_async(None).await
-    }
-
-    async fn push_submission_async(self: &Arc<Self>, sequence: DeviceSeq) -> Result<PushOutcome> {
-        self.push_via_authority_async(Some(sequence)).await
+        let workflow = self.policy.enter_workflow().await?;
+        let result = self.push_via_authority_async(None).await;
+        workflow.complete(RefreshTransition::Unchanged);
+        result
     }
 
     async fn push_via_authority_async(
@@ -51,7 +50,32 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         }
     }
 
+    /// Run one delayed LocalFirst push while the policy actor owns the workflow.
+    pub(super) fn run_scheduled_push(self: &Arc<Self>) -> Result<()> {
+        pollster::block_on(async {
+            match self.push_via_authority_async(None).await? {
+                PushOutcome::Drained => Ok(()),
+                PushOutcome::Rejected(rejection) => {
+                    self.rollback_locked_async(rejection).await?;
+                    match self.push_via_authority_async(None).await? {
+                        PushOutcome::Drained => Ok(()),
+                        PushOutcome::Rejected(rejection) => {
+                            Err(Error::AuthorityRejected(rejection.error))
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     pub(crate) async fn rollback_async(self: &Arc<Self>, rejection: PushRejection) -> Result<()> {
+        let workflow = self.policy.enter_workflow().await?;
+        let result = self.rollback_locked_async(rejection).await;
+        workflow.complete(RefreshTransition::Unchanged);
+        result
+    }
+
+    async fn rollback_locked_async(self: &Arc<Self>, rejection: PushRejection) -> Result<()> {
         if rejection.database_id != self.database_id
             || rejection.device_id != self.client.device()
             || rejection.failed_at != rejection.submit_cursors.neck
@@ -243,7 +267,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         let result = async {
             let submit = self.submit_cursors_async().await?;
             if submit.neck < submit.tail {
-                match self.push_async().await? {
+                match self.push_via_authority_async(None).await? {
                     PushOutcome::Drained => {}
                     PushOutcome::Rejected(rejection) => {
                         return Err(Error::RefreshPushRejected(rejection));
@@ -287,15 +311,23 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
                 self.policy.schedule_group(receipt.commit_seq, write_delay);
                 Ok(())
             }
-            SyncPolicy::Remote => match self.push_submission_async(sequence).await? {
-                PushOutcome::Drained => Ok(()),
-                PushOutcome::Rejected(rejection) => {
-                    let error = rejection.error.clone();
-                    self.rollback_async(rejection).await?;
-                    let _ = self.push_async().await;
-                    Err(Error::AuthorityRejected(error))
+            SyncPolicy::Remote => {
+                let workflow = self.policy.enter_workflow().await?;
+                let result = async {
+                    match self.push_via_authority_async(Some(sequence)).await? {
+                        PushOutcome::Drained => Ok(()),
+                        PushOutcome::Rejected(rejection) => {
+                            let error = rejection.error.clone();
+                            self.rollback_locked_async(rejection).await?;
+                            let _ = self.push_via_authority_async(None).await;
+                            Err(Error::AuthorityRejected(error))
+                        }
+                    }
                 }
-            },
+                .await;
+                workflow.complete(RefreshTransition::Unchanged);
+                result
+            }
         }
     }
 }
