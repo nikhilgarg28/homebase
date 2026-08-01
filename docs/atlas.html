@@ -236,7 +236,7 @@
 
 <!-- ==================== GRAMMAR ==================== -->
 <div id="view-grammar" class="view">
-  <p class="gintro">The grammar is <b>frozen by policy</b> (see <code>multilite/SQL_GRAMMAR.md</code>): a feature counts as done only when it clears the nine-point completion gate (validated logical op, round-tripping codecs, contract-checked guards, convergence tests, bounded failure). So "incomplete" cells split into two very different things: <span style="color:#c4aaff">deliberately fenced out</span> (a decision, with a reason) versus <span style="color:#8ec5ff">future work</span>. Click any chip for the why.</p>
+  <p class="gintro">Grammar growth is <b>guarded by policy</b> (see <code>multilite/SQL_GRAMMAR.md</code>): a feature counts as done only when it clears the nine-point completion gate (validated logical op, round-tripping codecs, contract-checked guards, convergence tests, bounded failure). So "incomplete" cells split into two very different things: <span style="color:#c4aaff">deliberately fenced out</span> (a decision, with a reason) versus <span style="color:#8ec5ff">future work</span>. Click any chip for the why.</p>
   <div class="legend">
     <span class="key"><span class="swatch" style="background:#2f9e63"></span> supported</span>
     <span class="key"><span class="swatch" style="background:#e3b341"></span> partial / caveats</span>
@@ -312,13 +312,16 @@ components: [
   summary:"Python binding (early).",
   behavior:["Python ints are arbitrary precision, so the 2^53 hazard does not apply; keep parity tests with the Rust API."], invariants:[], health:[] },
 { id:"conformance", layer:"surface", name:"Conformance suites",
-  files:["multilite-conformance/","third_party/sql-logic-test/"],
+  files:["multilite-conformance/","third_party/sql-logic-test/","multilite/tests/operation_pairs.rs"],
   summary:"External SQL conformance corpora (sql-logic-test) plus the crate's own conformance harness.",
   behavior:[
     "Measures the managed SQL surface against stock SQLite behavior on the accepted grammar.",
-    "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape."],
-  invariants:["Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures."],
-  health:[{sev:"low", text:"Single-engine parity is landed; multi-replica convergence corpora, sharding, progress, and historical coverage tracking remain roadmap work.", known:true}] },
+    "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape.",
+    "The typed operation-pair registry runs 23 DML, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (92 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
+  invariants:[
+    "Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures.",
+    "The pair registry covers every current logical operation family and includes commutative, conflicting, isolation-dependent, and directional relationships."],
+  health:[{sev:"low", text:"Single-engine parity and a hand-curated two-replica pair matrix are landed; corpus-driven multi-replica convergence, sharding, progress, historical coverage, and fault-injected DST remain roadmap work.", known:true}] },
 
 /* ---- multilite: SQL surface & capture ---- */
 { id:"sqlgate", layer:"multilite", band:"SQL surface & capture", name:"SQL gate",
@@ -948,6 +951,7 @@ for client_batch in &req.batches {
   behavior:[
     "Layer 1: in-memory store faults. Layer 3: object-store faults under real slatedb with power-loss reopen.",
     "Multilite's seeded two-replica integrity simulation landed Aug 1 (tests/integrity.rs): parent/child inserts, retargets, PK moves, UNIQUE conflicts, mixed DDL/DML, reordered pushes, rejection repair, and restarts. Every round checks converged rows, catalog validity, integrity_check/foreign_key_check, an empty pending journal, projected authority row frames, and exact UNIQUE/FK cells.",
+    "The deterministic operation-pair registry complements the seeded workload: concrete pair contracts run both admission orders and both isolation levels, with normalized order-independence checks for every pair declared commutative.",
     "Full DST integration (seeded scheduler, fault injection, crash points) is the next step \u2014 current restarts occur only between completed operations."],
   invariants:["Every seed reproducible through reopen and recovery."], health:[] },
 ],
@@ -1244,7 +1248,7 @@ roadmap: [
   detail:"From review: allocator rowids exceed 2^53 for nearly all device tags. Mandate BigInt in npm (or re-budget tag/slot bits)." },
 { id:"r53", title:"Live queries / db.watch", themes:["ecosystem"], layers:["multilite"], horizon:"later", detail:"Reactive query subscriptions over the commit stream." },
 { id:"r54", title:"Conformance, compatibility & convergence suites", themes:["ecosystem","correctness"], layers:["multilite","sim","bindings"], horizon:"next",
-  detail:"Grow sql-logic-test coverage with unsupported-vs-wrong classification and statement-shape history; add SQLite-oracle fixtures, two/many-replica convergence and rejection cases, isolation/policy matrices, reopen/crash runs, per-binding parity, corpus sharding, and CI trend artifacts." },
+  detail:"Grow sql-logic-test coverage with unsupported-vs-wrong classification and statement-shape history; expand the landed typed pair registry whenever operation families or target relationships grow; add corpus-generated two/many-replica convergence and rejection cases, policy matrices, reopen/crash runs, per-binding parity, corpus sharding, and CI trend artifacts." },
 { id:"r55", title:"Multi-schema / ATTACH", themes:["ecosystem"], layers:["multilite"], horizon:"research", detail:"" },
 { id:"r56", title:"Async API follow-ups", themes:["ecosystem"], layers:["multilite"], horizon:"later",
   detail:"Configurable worker sizing/shutdown; streaming owned-row APIs if adapters demand; cancellation/stress telemetry." },

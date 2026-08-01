@@ -117,22 +117,24 @@ immediate local existence and `MATCH SIMPLE` NULL behavior against the branch
 snapshot.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
-optional SQLite predicate; `WITH`, `RETURNING`, index hints, `ORDER BY`, and
-`LIMIT` remain rejected. SQLite evaluates the predicate and the preupdate hook
-captures every complete old row image. `DeleteRows` lowers those rows to exact
-Homebase point deletes with the same primary-index and write-revision guards as
-inserts. Remote apply verifies the complete current row before deleting it, and
-rejection restores values plus the hidden SQLite rowid when one exists.
-Zero-row deletes create no logical transaction.
+optional `WITH` clause, SQLite predicate, and ordinary `INDEXED BY` or `NOT
+INDEXED` hint; `RETURNING`, `ORDER BY`, and `LIMIT` remain rejected. SQLite
+evaluates the predicate and the preupdate hook captures every complete old row
+image. `DeleteRows` lowers those rows to exact Homebase point deletes with the
+same primary-index and write-revision guards as inserts. Remote apply verifies
+the complete current row before deleting it, and rejection restores values
+plus the hidden SQLite rowid when one exists. Zero-row deletes create no
+logical transaction.
 
-`UPDATE` uses the same single-table grammar boundary as `DELETE`, while
-allowing ordinary SQLite expressions and subqueries in `SET` and `WHERE`.
-SQLite supplies complete before/after row images. Stable-key updates lower to a
-point Set; primary-key moves lower to a Delete of the old key followed by a Set
-of the new key, with both keys in the conflict footprint. Rejection restores
-the old image. Integer primary-key moves follow SQLite's rowid alias, while
-non-integer primary-key moves preserve their hidden rowid; direct hidden-rowid
-changes remain unsupported.
+`UPDATE` uses the same target boundary as `DELETE`, while allowing `WITH`,
+`UPDATE ... FROM`, tuple assignments, ordinary SQLite expressions and
+subqueries, and ordinary index hints. SQLite supplies complete before/after row
+images, so these forms use the same lowering rather than a parallel expression
+evaluator. Stable-key updates lower to a point Set; primary-key moves lower to
+a Delete of the old key followed by a Set of the new key, with both keys in the
+conflict footprint. Rejection restores the old image. Integer primary-key moves
+follow SQLite's rowid alias, while non-integer primary-key moves preserve their
+hidden rowid; direct hidden-rowid changes remain unsupported.
 
 `Connection::open` is the single file-lifecycle verb;
 `MultiliteConnection` remains an alias for compatibility. Open initializes or
@@ -178,6 +180,17 @@ This deliberately coarse prefix covers joins, subqueries, trigger reads, and
 write predicates without changing native SQLite execution. Exact primary-key
 and index-prefix tracing remain future precision work; unsupported precision
 always widens to the table root rather than omitting a dependency.
+
+`tests/operation_pairs.rs` is the executable compatibility table for operation
+pairs. Each row names two concrete logical operation families, their target
+relationship, and the expected result under both isolation levels and both
+admission orders. The harness requires the first submission to admit, checks
+whether the second must admit or reject, performs rejection repair, converges
+both replicas, runs SQLite and foreign-key integrity checks, and compares a
+normalized schema-and-row observation. Pairs declared commutative must produce
+the same observation in either order. A registry meta-test covers every current
+logical operation family and requires examples of commutative, conflicting,
+isolation-dependent, and directional relationships.
 
 `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` are rejected inside
 managed closures because the closure owns its outer lifecycle. Returning an
