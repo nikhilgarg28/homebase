@@ -82,10 +82,6 @@ impl CompiledOperation {
         &self.homebase
     }
 
-    pub fn rejection(&self) -> &RejectionEffect {
-        &self.rejection
-    }
-
     pub(super) fn into_parts(self) -> (MultiliteOp, HomebaseOp, RejectionEffect) {
         (self.logical, self.homebase, self.rejection)
     }
@@ -339,7 +335,7 @@ mod tests {
         assert_eq!(compiled.logical(), &operation);
         assert_eq!(compiled.homebase(), &expected);
         assert!(matches!(
-            compiled.rejection(),
+            &compiled.rejection,
             RejectionEffect::DropTable { created } if created.table_name() == "notes"
         ));
     }

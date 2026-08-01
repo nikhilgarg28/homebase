@@ -96,6 +96,7 @@ impl CompiledTransaction {
 
 impl MultiliteTransaction {
     /// Mint one transaction containing the supplied ordered operations.
+    #[cfg(test)]
     pub fn new(operations: Vec<MultiliteOp>) -> Result<Self> {
         if operations.is_empty() {
             return Err(Error::InvalidMultiliteTransaction(
@@ -109,6 +110,7 @@ impl MultiliteTransaction {
     }
 
     /// Operations in their SQLite apply order.
+    #[cfg(test)]
     pub fn operations(&self) -> &[MultiliteOp] {
         &self.operations
     }

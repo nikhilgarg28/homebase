@@ -238,7 +238,7 @@ impl CommitProposal {
         Self::from_compiled_transaction(snapshot, isolation, compiled, footprint)
     }
 
-    fn from_compiled_transaction(
+    pub(crate) fn from_compiled_transaction(
         snapshot: SnapshotDescriptor,
         isolation: IsolationLevel,
         compiled: CompiledTransaction,

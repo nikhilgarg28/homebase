@@ -11,7 +11,7 @@ use rusqlite::{Connection, Row};
 
 use super::alter::AlterTableOperation;
 use super::index::IndexOperation;
-use super::operation::MultiliteOp;
+use super::operation::{CompiledOperation, MultiliteOp};
 use super::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
 use super::schema::{CreateTable, TableId, table_prefix};
 use super::sql::ValidatedExecute;
@@ -33,7 +33,7 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
     isolation: IsolationLevel,
     connection: &'a Connection,
     hooks: BranchHooks<'a>,
-    operations: Vec<MultiliteOp>,
+    operations: Vec<CompiledOperation>,
     footprint: ConflictFootprint,
     _server: PhantomData<fn() -> H>,
 }
@@ -123,8 +123,8 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     self.hooks
                         .with_internal(|| CreateTable::prepare(self.connection, sql, table))?,
                 );
-                let (_, footprint) = operation.to_homebase()?.into_parts();
-                let MultiliteOp::CreateTable(created) = &operation else {
+                let operation = operation.compile()?;
+                let MultiliteOp::CreateTable(created) = operation.logical() else {
                     unreachable!("create-table constructor returned another operation")
                 };
                 let materialization_sql = self
@@ -144,7 +144,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         "CREATE TABLE captured application rows",
                     ));
                 }
-                self.record_operation(operation, footprint);
+                self.record_operation(operation);
                 Ok(changed)
             }
             ValidatedExecute::CreateIndex(spec) => {
@@ -157,7 +157,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         })?;
                         self.hooks
                             .with_internal(|| operation.record_catalog(self.connection))?;
-                        captured_operation = Some(operation);
+                        captured_operation = Some(MultiliteOp::Index(operation).compile()?);
                         Ok(changed)
                     },
                     |_| Ok(()),
@@ -167,17 +167,16 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         "CREATE INDEX captured application rows",
                     ));
                 }
-                let operation = MultiliteOp::Index(
-                    captured_operation.expect("successful index creation prepared an operation"),
-                );
-                let (_, footprint) = operation.to_homebase()?.into_parts();
-                self.record_operation(operation, footprint);
+                let operation =
+                    captured_operation.expect("successful index creation compiled an operation");
+                self.record_operation(operation);
                 Ok(changed)
             }
             ValidatedExecute::DropIndex(spec) => {
                 let operation = self
                     .hooks
                     .with_internal(|| IndexOperation::prepare_drop(self.connection, sql, &spec))?;
+                let compiled = MultiliteOp::Index(operation.clone()).compile()?;
                 let (changed, events) = self.hooks.run_schema(
                     || {
                         let changed = self.connection.execute(sql, params)?;
@@ -192,9 +191,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                         "DROP INDEX captured application rows",
                     ));
                 }
-                let operation = MultiliteOp::Index(operation);
-                let (_, footprint) = operation.to_homebase()?.into_parts();
-                self.record_operation(operation, footprint);
+                self.record_operation(compiled);
                 Ok(changed)
             }
             ValidatedExecute::Insert => {
@@ -221,15 +218,13 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                             ));
                         }
                         if let Some(inserted) = inserted {
-                            let operation = MultiliteOp::InsertRows(inserted);
-                            let (_, footprint) = operation.to_homebase()?.into_parts();
-                            captured_operation = Some((operation, footprint));
+                            captured_operation = Some(MultiliteOp::InsertRows(inserted).compile()?);
                         }
                         Ok(())
                     },
                 )?;
-                if let Some((operation, footprint)) = captured_operation {
-                    self.record_operation(operation, footprint);
+                if let Some(operation) = captured_operation {
+                    self.record_operation(operation);
                 }
                 Ok(changed)
             }
@@ -257,15 +252,13 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                             ));
                         }
                         if let Some(deleted) = deleted {
-                            let operation = MultiliteOp::DeleteRows(deleted);
-                            let (_, footprint) = operation.to_homebase()?.into_parts();
-                            captured_operation = Some((operation, footprint));
+                            captured_operation = Some(MultiliteOp::DeleteRows(deleted).compile()?);
                         }
                         Ok(())
                     },
                 )?;
-                if let Some((operation, footprint)) = captured_operation {
-                    self.record_operation(operation, footprint);
+                if let Some(operation) = captured_operation {
+                    self.record_operation(operation);
                 }
                 Ok(changed)
             }
@@ -297,15 +290,13 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                             ));
                         }
                         if let Some(updated) = updated {
-                            let operation = MultiliteOp::UpdateRows(updated);
-                            let (_, footprint) = operation.to_homebase()?.into_parts();
-                            captured_operation = Some((operation, footprint));
+                            captured_operation = Some(MultiliteOp::UpdateRows(updated).compile()?);
                         }
                         Ok(())
                     },
                 )?;
-                if let Some((operation, footprint)) = captured_operation {
-                    self.record_operation(operation, footprint);
+                if let Some(operation) = captured_operation {
+                    self.record_operation(operation);
                 }
                 Ok(changed)
             }
@@ -318,8 +309,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         params: Q,
         operation: AlterTableOperation,
     ) -> Result<usize> {
-        let logical = MultiliteOp::AlterTable(operation.clone());
-        let (_, footprint) = logical.to_homebase()?.into_parts();
+        let logical = MultiliteOp::AlterTable(operation.clone()).compile()?;
         let (changed, events) = self.hooks.run_schema(
             || {
                 if operation.materializes_internally() {
@@ -343,16 +333,17 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 "ALTER TABLE captured application rows",
             ));
         }
-        self.record_operation(logical, footprint);
+        self.record_operation(logical);
         Ok(changed)
     }
 
-    fn record_operation(&mut self, operation: MultiliteOp, footprint: ConflictFootprint) {
+    fn record_operation(&mut self, operation: CompiledOperation) {
+        self.footprint
+            .extend(operation.homebase().footprint().clone());
         self.operations.push(operation);
-        self.footprint.extend(footprint);
     }
 
-    fn into_branch_parts(mut self) -> Result<(Vec<MultiliteOp>, ConflictFootprint)> {
+    fn into_branch_parts(mut self) -> Result<(Vec<CompiledOperation>, ConflictFootprint)> {
         let reads = self.hooks.read_prefixes()?;
         for read in reads {
             self.footprint.add_read(read);
@@ -644,8 +635,8 @@ where
     let proposal = if operations.is_empty() {
         None
     } else {
-        let transaction = MultiliteTransaction::new(operations)?;
-        Some(CommitProposal::from_transaction(
+        let transaction = MultiliteTransaction::from_compiled_operations(operations)?;
+        Some(CommitProposal::from_compiled_transaction(
             logical,
             isolation,
             transaction,
