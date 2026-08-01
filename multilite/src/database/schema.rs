@@ -1877,6 +1877,7 @@ impl CreateTable {
                 predicate.rename_column(old_name, new_name);
             }
         }
+        folded.refresh_schema_revision();
         Ok(folded)
     }
 
@@ -4265,6 +4266,39 @@ mod tests {
         assert_eq!(
             CreateTable::decode(&alpha_then_beta.encode()).unwrap(),
             alpha_then_beta
+        );
+    }
+
+    #[test]
+    fn independent_column_renames_derive_one_new_schema_revision() {
+        let base = deterministic_create("notes");
+        let id = base.columns()[0].id();
+        let body = base.columns()[1].id();
+        let id_name = SqlName::new("id".into());
+        let body_name = SqlName::new("body".into());
+        let note_id = SqlName::new("note_id".into());
+        let contents = SqlName::new("contents".into());
+
+        let id_then_body = base
+            .fold_renamed_column_expressions(id, &id_name, &note_id)
+            .unwrap()
+            .fold_renamed_column_expressions(body, &body_name, &contents)
+            .unwrap();
+        let body_then_id = base
+            .fold_renamed_column_expressions(body, &body_name, &contents)
+            .unwrap()
+            .fold_renamed_column_expressions(id, &id_name, &note_id)
+            .unwrap();
+
+        assert_eq!(id_then_body, body_then_id);
+        assert_ne!(id_then_body.schema_revision_id(), base.schema_revision_id());
+        assert_ne!(
+            table_schema_key(base.table_id(), base.schema_revision_id()),
+            table_schema_key(id_then_body.table_id(), id_then_body.schema_revision_id())
+        );
+        assert_eq!(
+            CreateTable::decode(&id_then_body.encode()).unwrap(),
+            id_then_body
         );
     }
 
