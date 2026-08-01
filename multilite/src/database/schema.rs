@@ -4,6 +4,8 @@
 //! mutable revision cells. It can be reconstructed only from a complete,
 //! self-consistent admitted envelope.
 
+mod compiler;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -20,6 +22,8 @@ use uuid::{Uuid, Variant, Version};
 use super::{catalog, codes};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result};
+
+pub use self::compiler::SchemaInvariantError;
 
 const SCHEMA_FRAME_VERSION: u8 = 6;
 const TAG_MUTATION_ID: u8 = 1;
@@ -896,6 +900,36 @@ impl PrimaryKey {
 }
 
 impl TableSchema {
+    #[allow(clippy::too_many_arguments)]
+    fn try_from_parts(
+        owner: TableId,
+        mode: TableMode,
+        storage: TableStorage,
+        columns: Vec<Column>,
+        primary_key: PrimaryKey,
+        unique_constraints: Vec<UniqueConstraint>,
+        indexes: Vec<NamedIndex>,
+        foreign_keys: Vec<ForeignKeyDefinition>,
+        checks: Vec<CheckConstraint>,
+    ) -> std::result::Result<Self, SchemaInvariantError> {
+        let schema = Self {
+            mode,
+            storage,
+            columns,
+            primary_key,
+            unique_constraints,
+            indexes,
+            foreign_keys,
+            checks,
+        };
+        compiler::validate_table_schema(owner, &schema)?;
+        Ok(schema)
+    }
+
+    fn validate_for(&self, owner: TableId) -> std::result::Result<(), SchemaInvariantError> {
+        compiler::validate_table_schema(owner, self)
+    }
+
     pub fn mode(&self) -> TableMode {
         self.mode
     }
@@ -1181,6 +1215,33 @@ impl NamedIndex {
 }
 
 impl CreateTable {
+    #[allow(clippy::too_many_arguments)]
+    fn try_from_parts(
+        mutation_id: MutationId,
+        sql: String,
+        table_id: TableId,
+        schema_revision_id: SchemaRevisionId,
+        name: SqlName,
+        schema: TableSchema,
+    ) -> std::result::Result<Self, SchemaInvariantError> {
+        schema.validate_for(table_id)?;
+        let created = Self {
+            mutation_id,
+            sql,
+            table_id,
+            schema_revision_id,
+            name,
+            schema,
+        };
+        compiler::validate_create_table(&created)?;
+        Ok(created)
+    }
+
+    fn validate_ir(&self) -> std::result::Result<(), SchemaInvariantError> {
+        self.schema.validate_for(self.table_id)?;
+        compiler::validate_create_table(self)
+    }
+
     /// Mint durable identities for one validated table creation.
     #[cfg(test)]
     pub fn new(sql: &str, spec: CreateTableSpec) -> Self {
@@ -2456,24 +2517,30 @@ fn build_create_table(
             }
         })
         .collect();
+    let schema = TableSchema::try_from_parts(
+        table_id,
+        mode,
+        storage,
+        columns,
+        primary_key,
+        unique_constraints,
+        Vec::new(),
+        foreign_keys,
+        checks,
+    )
+    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
     let mut table = CreateTable {
         mutation_id,
         sql: sql.to_owned(),
         table_id,
         schema_revision_id,
         name,
-        schema: TableSchema {
-            mode,
-            storage,
-            columns,
-            primary_key,
-            unique_constraints,
-            indexes: Vec::new(),
-            foreign_keys,
-            checks,
-        },
+        schema,
     };
     table.refresh_schema_revision();
+    table
+        .validate_ir()
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
     Ok(table)
 }
 
@@ -3082,17 +3149,8 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     let sql = sql.ok_or(SchemaCodecError::MissingField(TAG_SQL))?;
     let (table_id, schema_revision_id, name, schema) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
-    if !schema_identities_are_unique(mutation_id, table_id, schema_revision_id, &schema) {
-        return Err(SchemaCodecError::InvalidSchema);
-    }
-    Ok(CreateTable {
-        mutation_id,
-        sql,
-        table_id,
-        schema_revision_id,
-        name,
-        schema,
-    })
+    CreateTable::try_from_parts(mutation_id, sql, table_id, schema_revision_id, name, schema)
+        .map_err(|_| SchemaCodecError::InvalidSchema)
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), SchemaCodecError> {
@@ -3233,156 +3291,25 @@ fn decode_create_table(
             _ => {}
         }
     }
-    let mode = mode.ok_or(SchemaCodecError::MissingField(TAG_TABLE_MODE))?;
-    let storage = storage.ok_or(SchemaCodecError::MissingField(TAG_TABLE_STORAGE))?;
-    let primary_key = primary_key.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_KEY))?;
-    let rowid_alias = storage == TableStorage::Rowid
-        && primary_key.columns().len() == 1
-        && primary_key.columns().first().is_some_and(|id| {
-            columns
-                .iter()
-                .find(|column| column.id == *id)
-                .is_some_and(|column| column.declared_type.is_exact_integer())
-        });
-    if columns.is_empty()
-        || columns.iter().enumerate().any(|(index, column)| {
-            columns[..index]
-                .iter()
-                .any(|seen| seen.name.canonical() == column.name.canonical())
-        })
-        || columns
-            .iter()
-            .any(|column| !column.not_null && column.not_null_name.is_some())
-        || primary_key.index.kind != IndexKind::Primary
-        || primary_key.columns().is_empty()
-        || !index_columns_supported(IndexKind::Primary, primary_key.columns().len())
-        || primary_key
-            .columns()
-            .iter()
-            .enumerate()
-            .any(|(index, column)| {
-                primary_key.columns()[..index].contains(column)
-                    || !columns.iter().any(|candidate| candidate.id == *column)
-            })
-        || (mode == TableMode::Strict
-            && columns.iter().any(|column| {
-                column.strict_type().is_none()
-                    || (primary_key.columns().contains(&column.id) && !column.not_null)
-            }))
-        || (storage == TableStorage::WithoutRowid
-            && primary_key.columns().iter().any(|id| {
-                columns
-                    .iter()
-                    .find(|column| column.id == *id)
-                    .is_none_or(|column| !column.not_null)
-            }))
-        || (storage == TableStorage::Rowid && !rowid_alias)
-        || unique_constraints
-            .iter()
-            .enumerate()
-            .any(|(index, unique)| {
-                unique.index.kind != IndexKind::Unique
-                    || unique.columns().is_empty()
-                    || !index_columns_supported(IndexKind::Unique, unique.columns().len())
-                    || unique_constraints[..index]
-                        .iter()
-                        .any(|seen| seen.index.id == unique.index.id)
-                    || unique
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .any(|(column_index, column)| {
-                            unique.columns()[..column_index].contains(column)
-                                || !columns.iter().any(|candidate| candidate.id == *column)
-                        })
-            })
-        || indexes.iter().enumerate().any(|(index, definition)| {
-            !matches!(
-                definition.index.kind,
-                IndexKind::Unique | IndexKind::Secondary
-            ) || !named_index_definition_is_valid(definition, &columns)
-                || definition.sql.is_empty()
-                || indexes[..index]
-                    .iter()
-                    .any(|seen| seen.index.id == definition.index.id)
-                || (definition.active
-                    && indexes[..index].iter().any(|seen| {
-                        seen.active && seen.name.canonical() == definition.name.canonical()
-                    }))
-        })
-        || foreign_keys.iter().enumerate().any(|(index, foreign_key)| {
-            foreign_key.columns.is_empty()
-                || foreign_key.columns.len() > MAX_INDEX_COLUMNS
-                || foreign_key.columns.len() != foreign_key.referenced_columns.len()
-                || foreign_key.columns.len() != foreign_key.referenced_column_names.len()
-                || foreign_key.referenced_table == table_id.unwrap_or(TableId([0; 16]))
-                || foreign_keys[..index]
-                    .iter()
-                    .any(|seen| seen.id == foreign_key.id)
-                || foreign_key
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .any(|(column_index, column)| {
-                        foreign_key.columns[..column_index].contains(column)
-                            || !columns.iter().any(|candidate| candidate.id == *column)
-                    })
-                || foreign_key.referenced_columns.iter().enumerate().any(
-                    |(column_index, column)| {
-                        foreign_key.referenced_columns[..column_index].contains(column)
-                    },
-                )
-        })
-        || checks.iter().any(|check| {
-            check
-                .column
-                .is_some_and(|id| !columns.iter().any(|column| column.id == id))
-                || !expression_dependencies_match(&check.expression, &check.dependencies, &columns)
-        })
-    {
-        return Err(SchemaCodecError::InvalidSchema);
-    }
+    let table_id = table_id.ok_or(SchemaCodecError::MissingField(TAG_TABLE_ID))?;
+    let schema = TableSchema::try_from_parts(
+        table_id,
+        mode.ok_or(SchemaCodecError::MissingField(TAG_TABLE_MODE))?,
+        storage.ok_or(SchemaCodecError::MissingField(TAG_TABLE_STORAGE))?,
+        columns,
+        primary_key.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_KEY))?,
+        unique_constraints,
+        indexes,
+        foreign_keys,
+        checks,
+    )
+    .map_err(|_| SchemaCodecError::InvalidSchema)?;
     Ok((
-        table_id.ok_or(SchemaCodecError::MissingField(TAG_TABLE_ID))?,
+        table_id,
         schema_revision_id.ok_or(SchemaCodecError::MissingField(TAG_SCHEMA_REVISION_ID))?,
         name.ok_or(SchemaCodecError::MissingField(TAG_TABLE_NAME))?,
-        TableSchema {
-            mode,
-            storage,
-            columns,
-            primary_key,
-            unique_constraints,
-            indexes,
-            foreign_keys,
-            checks,
-        },
+        schema,
     ))
-}
-
-fn schema_identities_are_unique(
-    mutation: MutationId,
-    table: TableId,
-    schema_revision: SchemaRevisionId,
-    schema: &TableSchema,
-) -> bool {
-    let mut identities = BTreeSet::new();
-    std::iter::once(mutation.0)
-        .chain([table.0, schema_revision.0, schema.primary_key.index.id.0])
-        .chain(schema.columns.iter().map(|column| column.id.0))
-        .chain(
-            schema
-                .unique_constraints
-                .iter()
-                .map(|unique| unique.index.id.0),
-        )
-        .chain(schema.indexes.iter().map(|index| index.index.id.0))
-        .chain(
-            schema
-                .foreign_keys
-                .iter()
-                .map(|foreign_key| foreign_key.id.0),
-        )
-        .all(|identity| identities.insert(identity))
 }
 
 fn decode_foreign_key_definition(
@@ -5162,35 +5089,8 @@ mod tests {
 
     #[test]
     fn decoder_rejects_rowid_tables_without_an_integer_primary_key_alias() {
-        let mut spec = definition("shadowed");
-        spec.columns[0] = CreateColumn {
-            name: SqlName::new("key".into()),
-            declared_type: TypeDeclaration::text(),
-            not_null: true,
-            not_null_name: None,
-            default: None,
-            primary_key: Some(0),
-        };
-        for name in ["rowid", "oid", "_rowid_"] {
-            spec.columns.push(CreateColumn {
-                name: SqlName::new(name.into()),
-                declared_type: TypeDeclaration::text(),
-                not_null: false,
-                not_null_name: None,
-                default: None,
-                primary_key: None,
-            });
-        }
-        let created = CreateTable::new(
-            "CREATE TABLE shadowed (
-                key TEXT NOT NULL PRIMARY KEY,
-                body TEXT NOT NULL,
-                rowid TEXT,
-                oid TEXT,
-                _rowid_ TEXT
-            )",
-            spec,
-        );
+        let mut created = deterministic_create("shadowed");
+        created.schema.columns[0].declared_type = TypeDeclaration::text();
 
         assert_eq!(
             CreateTable::decode(&created.encode()),
