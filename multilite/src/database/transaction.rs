@@ -265,6 +265,8 @@ impl MultiliteTransaction {
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         for operation in &self.operations {
             operation.apply(connection)?;
+            #[cfg(debug_assertions)]
+            operation.verify_materialized(connection)?;
         }
         Ok(())
     }
@@ -509,6 +511,47 @@ mod tests {
         assert_eq!(snapshot, serializable);
         assert_eq!(snapshot.len(), 4);
         assert!(snapshot.iter().all(|assertion| assertion.upto == frontier));
+    }
+
+    #[test]
+    fn canonical_apply_detects_a_row_after_image_divergence() {
+        let created = create_operation();
+        let MultiliteOp::CreateTable(table) = &created else {
+            unreachable!()
+        };
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        connection.execute(table.sql(), ()).unwrap();
+        catalog::insert(&connection, table).unwrap();
+        let inserted = InsertRows::from_captured(
+            &connection,
+            &[CapturedRow {
+                table: "notes".into(),
+                rowid: 7,
+                values: vec![StoredValue::Integer(7)],
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE notes ADD COLUMN marker TEXT;
+                 CREATE TRIGGER mutate_canonical_insert
+                 AFTER INSERT ON notes
+                 BEGIN
+                     UPDATE notes SET id = id + 1 WHERE rowid = NEW.rowid;
+                 END",
+            )
+            .unwrap();
+        let transaction =
+            MultiliteTransaction::new(vec![MultiliteOp::InsertRows(inserted)]).unwrap();
+
+        assert!(matches!(
+            transaction.apply(&connection),
+            Err(Error::InvalidDatabase(
+                "canonical INSERT diverged from its captured branch after-image"
+            ))
+        ));
     }
 
     #[test]

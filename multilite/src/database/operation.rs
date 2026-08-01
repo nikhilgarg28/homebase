@@ -297,6 +297,17 @@ impl MultiliteOp {
             Self::Index(index) => index.apply(connection),
         }
     }
+
+    /// Check the canonical row state against the branch-captured operation.
+    #[cfg(debug_assertions)]
+    pub(super) fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        match self {
+            Self::InsertRows(inserted) => inserted.verify_materialized(connection),
+            Self::DeleteRows(deleted) => deleted.verify_materialized(connection),
+            Self::UpdateRows(updated) => updated.verify_materialized(connection),
+            Self::AlterTable(_) | Self::CreateTable(_) | Self::Index(_) => Ok(()),
+        }
+    }
 }
 
 /// Failure to decode one logical operation frame.

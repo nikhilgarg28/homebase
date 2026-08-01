@@ -596,6 +596,16 @@ impl InsertRows {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
+    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        let created = self.catalog_definition(connection)?;
+        self.validate_materialized_against(
+            connection,
+            &created,
+            "canonical INSERT diverged from its captured branch after-image",
+        )
+    }
+
     pub fn delete_materialized(&self, connection: &Connection) -> Result<()> {
         self.delete_materialized_with(
             connection,
@@ -641,6 +651,39 @@ impl InsertRows {
     ) -> Result<()> {
         self.materialized_rows(connection, created, mismatch)
             .map(|_| ())
+    }
+
+    #[cfg(debug_assertions)]
+    fn validate_materialized_absent(
+        &self,
+        connection: &Connection,
+        mismatch: &'static str,
+    ) -> Result<()> {
+        let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.table)?;
+        let predicates = created
+            .primary_key_columns()
+            .map(|column| materialized_column_name(connection, self.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE {predicates}",
+            quote_identifier(&table_name)
+        );
+        let mut select = connection.prepare(&sql)?;
+        for row in &self.rows {
+            if select
+                .query_row(params_from_iter(self.primary_values(row)?), |_| Ok(()))
+                .optional()?
+                .is_some()
+            {
+                return Err(Error::InvalidDatabase(mismatch));
+            }
+        }
+        Ok(())
     }
 
     fn materialized_rows(
@@ -1397,6 +1440,14 @@ impl DeleteRows {
             .delete_materialized_with(connection, "DELETE row no longer matches SQLite state")
     }
 
+    #[cfg(debug_assertions)]
+    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        self.deleted.validate_materialized_absent(
+            connection,
+            "canonical DELETE retained a row removed on its captured branch",
+        )
+    }
+
     pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
         self.deleted.apply(connection)
     }
@@ -1617,6 +1668,44 @@ impl UpdateRows {
             &self.before,
             &self.after,
             "UPDATE row no longer matches SQLite state",
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        let created = self.after.catalog_definition(connection)?;
+        self.after.validate_materialized_against(
+            connection,
+            &created,
+            "canonical UPDATE diverged from its captured branch after-image",
+        )?;
+        let after_keys = self
+            .after
+            .rows
+            .iter()
+            .map(|row| self.after.row_key(row))
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let mut retired_rows = Vec::new();
+        for row in &self.before.rows {
+            let key = self
+                .before
+                .row_key(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+            if !after_keys.contains(&key) {
+                retired_rows.push(row.clone());
+            }
+        }
+        if retired_rows.is_empty() {
+            return Ok(());
+        }
+        let retired = InsertRows {
+            rows: retired_rows,
+            ..self.before.clone()
+        };
+        retired.validate_materialized_absent(
+            connection,
+            "canonical UPDATE retained a retired primary-key image",
         )
     }
 
@@ -4502,6 +4591,7 @@ mod tests {
 
         updated.before.apply(&connection).unwrap();
         updated.apply(&connection).unwrap();
+        updated.verify_materialized(&connection).unwrap();
         assert_eq!(
             connection
                 .prepare("SELECT id, body FROM notes ORDER BY id")
@@ -4670,6 +4760,30 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn delete_verifier_rejects_a_reappeared_primary_key() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        let deleted = DeleteRows {
+            deleted: inserted.clone(),
+        };
+
+        inserted.apply(&connection).unwrap();
+        deleted.apply(&connection).unwrap();
+        deleted.verify_materialized(&connection).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (7, 'other', x'')", ())
+            .unwrap();
+
+        assert!(matches!(
+            deleted.verify_materialized(&connection),
+            Err(Error::InvalidDatabase(
+                "canonical DELETE retained a row removed on its captured branch"
+            ))
+        ));
     }
 
     #[test]
