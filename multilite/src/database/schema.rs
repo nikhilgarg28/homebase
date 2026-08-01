@@ -1202,7 +1202,7 @@ impl CreateTable {
     /// Lower this schema change to its complete Homebase representation.
     pub fn to_homebase(&self) -> SchemaHomebaseOp {
         let log = schema_log_key(self.mutation_id);
-        let name_scope = table_name_scope_key(&self.name);
+        let name_scope = schema_object_name_scope_key(&self.name);
         let schema = table_schema_key(self.table_id, self.schema_revision_id);
         let active_schema_revision = active_schema_revision_key(self.table_id);
         let active_primary_index = active_primary_index_key(self.table_id);
@@ -2558,17 +2558,20 @@ pub fn schema_log_key(id: MutationId) -> Key {
         .expect("schema log components are bounded and non-empty")
 }
 
-pub fn table_name_scope_key(name: &SqlName) -> Key {
+/// One SQLite schema-object name shared by tables, indexes, views, and triggers.
+///
+/// SQLite rejects duplicate names across these object kinds, so every
+/// synchronized DDL operation must acquire and release this same cell.
+pub fn schema_object_name_scope_key(name: &SqlName) -> Key {
     let component = name_component(name.canonical());
     Key::from_bytes([
         codes::ROOT,
         codes::SCHEMA,
         codes::NAMES,
-        codes::TABLES,
         codes::MAIN,
         component.as_slice(),
     ])
-    .expect("table-name scope components are bounded and non-empty")
+    .expect("schema-object name scope components are bounded and non-empty")
 }
 
 pub fn table_schema_key(table: TableId, revision: SchemaRevisionId) -> Key {
@@ -2656,19 +2659,6 @@ pub fn active_schema_revision_key(table: TableId) -> Key {
         codes::ACTIVE_SCHEMA_REVISION,
     ])
     .expect("active schema revision key is bounded")
-}
-
-pub fn index_name_scope_key(name: &SqlName) -> Key {
-    let component = name_component(name.canonical());
-    Key::from_bytes([
-        codes::ROOT,
-        codes::SCHEMA,
-        codes::NAMES,
-        codes::INDEXES,
-        codes::MAIN,
-        component.as_slice(),
-    ])
-    .expect("index-name scope components are bounded and non-empty")
 }
 
 pub fn index_definition_key(table: TableId, index: IndexId) -> Key {
@@ -4287,7 +4277,7 @@ mod tests {
         assert_eq!(lowered.footprint.writes().len(), 1);
         assert_explicit_range_assertions(
             &lowered.footprint,
-            &[table_name_scope_key(&created.name)],
+            &[schema_object_name_scope_key(&created.name)],
         );
 
         let Mutation::Set { key: log, value } = &lowered.mutations[0] else {
@@ -4569,7 +4559,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                table_name_scope_key(&child.name),
+                schema_object_name_scope_key(&child.name),
                 active_schema_revision_key(parent.table_id()),
             ],
         );
@@ -4646,7 +4636,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                table_name_scope_key(&child.name),
+                schema_object_name_scope_key(&child.name),
                 active_schema_revision_key(parent.table_id()),
             ],
         );
@@ -4873,8 +4863,8 @@ mod tests {
         assert!(long.starts_with(b"hash-"));
         assert_eq!(long.len(), 37);
         assert_eq!(
-            table_name_scope_key(&SqlName::new("Notes".into())),
-            table_name_scope_key(&SqlName::new("nOtEs".into()))
+            schema_object_name_scope_key(&SqlName::new("Notes".into())),
+            schema_object_name_scope_key(&SqlName::new("nOtEs".into()))
         );
     }
 

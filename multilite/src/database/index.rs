@@ -15,8 +15,8 @@ use super::codes;
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
     CreateTable, IndexId, MutationId, NamedIndex, SchemaRevisionId, active_schema_revision_key,
-    column_index_dependency_key, column_name_scope_key, index_definition_key, index_name_scope_key,
-    schema_log_key, table_schema_key, write_revision_key,
+    column_index_dependency_key, column_name_scope_key, index_definition_key, schema_log_key,
+    schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
 use super::sql::{CreateIndexSpec, CreateIndexTerm, DropIndexSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
@@ -126,7 +126,7 @@ impl IndexOperation {
 
     pub fn to_homebase(&self) -> Result<IndexHomebaseOp> {
         self.validate().map_err(invalid_operation)?;
-        let name = index_name_scope_key(self.index.name());
+        let name = schema_object_name_scope_key(self.index.name());
         let schema_head = active_schema_revision_key(self.after.table_id());
         let mut footprint = ConflictFootprint::new();
         footprint.add_constraint(name.clone());
@@ -735,7 +735,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                index_name_scope_key(operation.index.name()),
+                schema_object_name_scope_key(operation.index.name()),
                 active_schema_revision_key(before.table_id()),
                 primary_index_prefix(&before),
                 column_name_scope_key(
@@ -825,7 +825,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                index_name_scope_key(operation.index.name()),
+                schema_object_name_scope_key(operation.index.name()),
                 active_schema_revision_key(before.table_id()),
                 column_name_scope_key(
                     before.table_id(),
@@ -1128,7 +1128,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                index_name_scope_key(drop.index.name()),
+                schema_object_name_scope_key(drop.index.name()),
                 active_schema_revision_key(before.table_id()),
             ],
         );
@@ -1172,7 +1172,7 @@ mod tests {
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
-                index_name_scope_key(drop.index.name()),
+                schema_object_name_scope_key(drop.index.name()),
                 active_schema_revision_key(drop.after.table_id()),
                 write_revision_key(drop.after.table_id()),
                 column_index_dependency_key(

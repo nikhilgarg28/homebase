@@ -1699,6 +1699,88 @@ fn conflicting_index_ddl_repairs_local_sqlite_before_converging() {
 }
 
 #[test]
+fn tables_and_indexes_contend_for_one_sqlite_schema_name() {
+    for index_wins in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("schema-name-{index_wins}-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("schema-name-{index_wins}-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())?;
+                transaction.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY)", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("ALTER TABLE notes RENAME TO collision", ())
+            .unwrap();
+        second
+            .execute("CREATE INDEX collision ON tasks (id)", ())
+            .unwrap();
+
+        let (winner, loser) = if index_wins {
+            (&second, &first)
+        } else {
+            (&first, &second)
+        };
+        assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = loser.push().unwrap() else {
+            panic!("a table and index acquired the same SQLite schema name")
+        };
+        loser.rollback(&rejection).unwrap();
+        assert_eq!(loser.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        assert_eq!(tables(&first), tables(&second));
+        assert_eq!(index_names(&first), index_names(&second));
+        if index_wins {
+            assert_eq!(
+                tables(&first)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                ["notes", "tasks"]
+            );
+            assert_eq!(index_names(&first), ["collision"]);
+        } else {
+            assert_eq!(
+                tables(&first)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                ["collision", "tasks"]
+            );
+            assert!(index_names(&first).is_empty());
+        }
+    }
+}
+
+#[test]
 fn conflicting_table_renames_repair_physical_names_and_converge() {
     let directory = tempfile::tempdir().unwrap();
     let second_path = directory.path().join("rename-ddl-second.sqlite");

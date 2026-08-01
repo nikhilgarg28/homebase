@@ -1337,7 +1337,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
                 b"multilite".as_slice(),
                 b"schema".as_slice(),
                 b"names".as_slice(),
-                b"tables".as_slice(),
+                b"main".as_slice(),
             ])
     }));
     assert!(range_asserts.iter().any(|assertion| {

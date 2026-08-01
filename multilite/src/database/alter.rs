@@ -15,7 +15,7 @@ use super::row::primary_index_prefix;
 use super::schema::{
     ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
     column_check_dependency_key, column_dependency_prefix, column_name_scope_key, schema_log_key,
-    table_name_scope_key, table_schema_key, write_revision_key,
+    schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
 use super::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::commit::footprint::ConflictFootprint;
@@ -340,8 +340,8 @@ impl AlterTableOperation {
                 })
             }
             AlterTableDelta::RenameTable { old_name, new_name } => self.rename_homebase(
-                table_name_scope_key(old_name),
-                table_name_scope_key(new_name),
+                schema_object_name_scope_key(old_name),
+                schema_object_name_scope_key(new_name),
                 self.table.as_bytes().to_vec(),
             ),
             AlterTableDelta::RenameColumn {

@@ -75,7 +75,9 @@ index precision. Ordinary definitions may contain repeated column terms,
 `ASC`/`DESC`, explicit collations, scalar expression terms, and a partial-index
 predicate. These richer forms remain rejected for `UNIQUE` indexes until
 Multilite can reproduce their exact comparison semantics in Homebase key
-images.
+images. Tables and indexes acquire names through one shared schema-object
+registry, matching SQLite's single namespace and making cross-kind collisions
+ordinary admission conflicts rather than apply-time failures.
 
 Table rename preserves the table, column, primary-index, UNIQUE-index,
 secondary-index, foreign-key, and schema-revision UUIDs. It moves only the
