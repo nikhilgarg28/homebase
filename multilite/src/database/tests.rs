@@ -448,6 +448,48 @@ fn local_first_zero_schedules_push_without_waiting_in_execute() {
 }
 
 #[test]
+fn local_first_retries_the_last_buffered_write_after_transport_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let available = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let routed_server = Arc::clone(&server);
+    let routed_available = Arc::clone(&available);
+    let routed_attempts = Arc::clone(&attempts);
+    let database = Database::open_with(
+        directory.path().join("local-first-retry.sqlite"),
+        OpenOptions::new()
+            .sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::from_millis(250),
+                read_staleness: Duration::from_secs(60),
+            })
+            .server(move |space: &SpaceId| {
+                routed_attempts.fetch_add(1, Ordering::Relaxed);
+                routed_available
+                    .load(Ordering::Acquire)
+                    .then(|| routed_server.space(space))
+                    .flatten()
+            }),
+    )
+    .unwrap();
+    assert!(server.create_space(database.database_id().space_id()));
+    let runtime = database.runtime().unwrap();
+    database.start_background_push().unwrap();
+
+    database
+        .execute(&runtime, "CREATE TABLE notes (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let attempts_before = attempts.load(Ordering::Relaxed);
+    available.store(false, Ordering::Release);
+    wait_until(|| attempts.load(Ordering::Relaxed) > attempts_before);
+    assert!(!pending_ops(&database).is_empty());
+
+    available.store(true, Ordering::Release);
+    wait_until(|| pending_ops(&database).is_empty());
+    assert!(table_exists(&database, "notes"));
+}
+
+#[test]
 fn local_first_delete_pushes_in_the_background_and_rebases_on_a_replica() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

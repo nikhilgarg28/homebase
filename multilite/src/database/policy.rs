@@ -9,7 +9,10 @@ use homebase_client::ServerHandle;
 
 use super::Database;
 use crate::commit::snapshot::CommitSeq;
-use crate::{Error, Result};
+use crate::{Error, PushOutcome, Result};
+
+const INITIAL_PUSH_RETRY: Duration = Duration::from_millis(100);
+const MAX_PUSH_RETRY: Duration = Duration::from_secs(30);
 
 /// How locally materialized SQLite state interacts with authority.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +184,7 @@ where
     H: ServerHandle + Send + Sync + 'static,
 {
     let mut deadline: Option<Instant> = None;
+    let mut retry_delay = INITIAL_PUSH_RETRY;
     loop {
         let received = match deadline {
             Some(at) if at <= Instant::now() => Err(RecvTimeoutError::Timeout),
@@ -190,6 +194,7 @@ where
         match received {
             Ok(SchedulerCommand::Schedule(candidate)) => {
                 deadline = Some(deadline.map_or(candidate, |current| current.min(candidate)));
+                retry_delay = INITIAL_PUSH_RETRY;
             }
             Ok(SchedulerCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
@@ -197,10 +202,20 @@ where
                 let Some(database) = database.upgrade() else {
                     return;
                 };
-                // A rejection remains in the submit log so explicit
-                // push/rollback can surface and repair it; transient failures
-                // are retried by later work.
-                let _ = database.push();
+                match database.push() {
+                    Ok(PushOutcome::Drained) => retry_delay = INITIAL_PUSH_RETRY,
+                    // A definitive authority rejection remains in the submit
+                    // log for explicit rollback; retrying cannot change it.
+                    Ok(PushOutcome::Rejected(_)) => retry_delay = INITIAL_PUSH_RETRY,
+                    Err(_) => {
+                        let now = Instant::now();
+                        deadline = Some(now.checked_add(retry_delay).unwrap_or(now));
+                        retry_delay = retry_delay
+                            .checked_mul(2)
+                            .unwrap_or(MAX_PUSH_RETRY)
+                            .min(MAX_PUSH_RETRY);
+                    }
+                }
             }
         }
     }
