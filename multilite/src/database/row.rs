@@ -26,19 +26,21 @@ use crate::sqlite::quote_identifier;
 pub(crate) use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ROW_FRAME_VERSION: u8 = 5;
-const ROW_SET_FRAME_VERSION: u8 = 1;
+const ROW_FRAME_VERSION: u8 = 6;
+const ROW_IMAGE_FRAME_VERSION: u8 = 1;
+const ROW_SET_FRAME_VERSION: u8 = 2;
 const UPDATE_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
-const TAG_PRIMARY_INDEX: u8 = 2;
-const TAG_KEY_PART: u8 = 3;
 const TAG_COLUMN_VALUE: u8 = 4;
-const TAG_INDEX_RULES: u8 = 6;
-const TAG_TABLE_STORAGE: u8 = 7;
-const TAG_FOREIGN_KEY: u8 = 8;
-const TAG_INCOMING_FOREIGN_KEY: u8 = 9;
-const TAG_TABLE: u8 = 1;
-const TAG_ROW: u8 = 2;
+const TAG_SET_TABLE: u8 = 1;
+const TAG_SET_SCHEMA_REVISION: u8 = 2;
+const TAG_SET_PRIMARY_INDEX: u8 = 3;
+const TAG_SET_TABLE_STORAGE: u8 = 4;
+const TAG_SET_KEY_PART: u8 = 5;
+const TAG_SET_INDEX_RULES: u8 = 6;
+const TAG_SET_FOREIGN_KEY: u8 = 7;
+const TAG_SET_INCOMING_FOREIGN_KEY: u8 = 8;
+const TAG_SET_ROW: u8 = 9;
 const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_AFFINITY: u8 = 2;
 const TAG_KEY_PART_FLAGS: u8 = 3;
@@ -392,81 +394,12 @@ impl InsertRows {
     }
 
     #[cfg(test)]
-    pub fn from_homebase(
+    fn validate_homebase(
+        &self,
         batch: &AdmittedBatch<Vec<u8>>,
-    ) -> std::result::Result<Self, RowCodecError> {
+    ) -> std::result::Result<(), RowCodecError> {
         batch.validate().map_err(|_| RowCodecError::InvalidBatch)?;
-        if batch.entries.is_empty() {
-            return Err(RowCodecError::InvalidBatch);
-        }
-        let mut operation = None::<Self>;
-        for entry in &batch.entries {
-            let Mutation::Set { key, value } = &entry.device_entry.mutation else {
-                return Err(RowCodecError::InvalidBatch);
-            };
-            let components = key.components();
-            if components.len() < 4
-                || components[0].as_bytes() != codes::ROOT
-                || components[1].as_bytes() != codes::TABLES
-            {
-                return Err(RowCodecError::InvalidBatch);
-            }
-            if components[3].as_bytes() != codes::ROWS {
-                continue;
-            }
-            if components.len() < 6 {
-                return Err(RowCodecError::InvalidBatch);
-            }
-            let table = TableId::from_bytes(uuid_bytes(components[2].as_bytes())?);
-            let primary_index = IndexId::from_bytes(uuid_bytes(components[4].as_bytes())?);
-            let (
-                schema_revision,
-                encoded_primary_index,
-                storage,
-                key_parts,
-                indexes,
-                foreign_keys,
-                incoming_foreign_keys,
-                row,
-            ) = decode_row(value)?;
-            if encoded_primary_index != primary_index {
-                return Err(RowCodecError::InvalidBatch);
-            }
-            let candidate = operation.get_or_insert_with(|| Self {
-                table,
-                schema_revision,
-                primary_index,
-                storage,
-                key_parts: key_parts.clone(),
-                indexes: indexes.clone(),
-                foreign_keys: foreign_keys.clone(),
-                incoming_foreign_keys: incoming_foreign_keys.clone(),
-                rows: Vec::new(),
-            });
-            if candidate.table != table
-                || candidate.schema_revision != schema_revision
-                || candidate.primary_index != primary_index
-                || candidate.storage != storage
-                || candidate.key_parts != key_parts
-                || candidate.indexes != indexes
-                || candidate.foreign_keys != foreign_keys
-                || candidate.incoming_foreign_keys != incoming_foreign_keys
-            {
-                return Err(RowCodecError::InvalidBatch);
-            }
-            let expected = candidate.key_images(&row)?;
-            if components[5..]
-                .iter()
-                .map(|component| component.as_bytes())
-                .ne(expected.iter().map(Vec::as_slice))
-            {
-                return Err(RowCodecError::InvalidBatch);
-            }
-            candidate.rows.push(row);
-        }
-        let operation = operation.ok_or(RowCodecError::InvalidBatch)?;
-        operation.validate_structure()?;
-        let expected = operation
+        let expected = self
             .to_homebase()
             .map_err(|_| RowCodecError::InvalidBatch)?
             .mutations;
@@ -478,18 +411,50 @@ impl InsertRows {
         {
             return Err(RowCodecError::InvalidBatch);
         }
-        Ok(operation)
+        Ok(())
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_SET_FRAME_VERSION);
         writer
-            .field(TAG_TABLE, &self.table.as_bytes())
+            .field(TAG_SET_TABLE, &self.table.as_bytes())
             .expect("row field length fits in u32");
+        writer
+            .field(TAG_SET_SCHEMA_REVISION, &self.schema_revision.as_bytes())
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_SET_PRIMARY_INDEX, &self.primary_index.as_bytes())
+            .expect("row field length fits in u32");
+        writer
+            .field(TAG_SET_TABLE_STORAGE, &[self.storage.to_u8()])
+            .expect("row field length fits in u32");
+        for part in &self.key_parts {
+            writer
+                .field(TAG_SET_KEY_PART, &encode_key_part(*part))
+                .expect("row field length fits in u32");
+        }
+        for index in &self.indexes {
+            writer
+                .field(TAG_SET_INDEX_RULES, &encode_index_rules(index))
+                .expect("row field length fits in u32");
+        }
+        for foreign_key in &self.foreign_keys {
+            writer
+                .field(TAG_SET_FOREIGN_KEY, &encode_foreign_key(foreign_key))
+                .expect("row field length fits in u32");
+        }
+        for incoming in &self.incoming_foreign_keys {
+            writer
+                .field(
+                    TAG_SET_INCOMING_FOREIGN_KEY,
+                    &encode_incoming_foreign_key(incoming),
+                )
+                .expect("row field length fits in u32");
+        }
         for row in &self.rows {
             writer
-                .field(TAG_ROW, &self.encode_row(row))
+                .field(TAG_SET_ROW, &encode_row_image(row))
                 .expect("row field length fits in u32");
         }
         writer.finish()
@@ -501,53 +466,59 @@ impl InsertRows {
             return Err(RowCodecError::UnknownVersion);
         }
         let mut table = None;
-        let mut operation = None::<Self>;
+        let mut schema_revision = None;
+        let mut primary_index = None;
+        let mut storage = None;
+        let mut key_parts = Vec::new();
+        let mut indexes = Vec::new();
+        let mut foreign_keys = Vec::new();
+        let mut incoming_foreign_keys = Vec::new();
+        let mut rows = Vec::new();
         while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
             match tag {
-                TAG_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
-                TAG_ROW => {
-                    let table = table.ok_or(RowCodecError::MissingField(TAG_TABLE))?;
-                    let (
-                        schema_revision,
-                        primary_index,
-                        storage,
-                        key_parts,
-                        indexes,
-                        foreign_keys,
-                        incoming_foreign_keys,
-                        row,
-                    ) = decode_row(value)?;
-                    let candidate = operation.get_or_insert_with(|| Self {
-                        table,
-                        schema_revision,
-                        primary_index,
-                        storage,
-                        key_parts: key_parts.clone(),
-                        indexes: indexes.clone(),
-                        foreign_keys: foreign_keys.clone(),
-                        incoming_foreign_keys: incoming_foreign_keys.clone(),
-                        rows: Vec::new(),
-                    });
-                    if candidate.table != table
-                        || candidate.schema_revision != schema_revision
-                        || candidate.primary_index != primary_index
-                        || candidate.storage != storage
-                        || candidate.key_parts != key_parts
-                        || candidate.indexes != indexes
-                        || candidate.foreign_keys != foreign_keys
-                        || candidate.incoming_foreign_keys != incoming_foreign_keys
-                    {
-                        return Err(RowCodecError::InvalidBatch);
-                    }
-                    candidate.rows.push(row);
+                TAG_SET_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
+                TAG_SET_SCHEMA_REVISION => set_once(
+                    &mut schema_revision,
+                    SchemaRevisionId::from_bytes(uuid_bytes(value)?),
+                )?,
+                TAG_SET_PRIMARY_INDEX => {
+                    set_once(&mut primary_index, IndexId::from_bytes(uuid_bytes(value)?))?
                 }
+                TAG_SET_TABLE_STORAGE => {
+                    let [value] = value else {
+                        return Err(RowCodecError::InvalidLength);
+                    };
+                    set_once(
+                        &mut storage,
+                        TableStorage::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
+                    )?;
+                }
+                TAG_SET_KEY_PART => key_parts.push(decode_key_part(value)?),
+                TAG_SET_INDEX_RULES => indexes.push(decode_index_rules(value)?),
+                TAG_SET_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
+                TAG_SET_INCOMING_FOREIGN_KEY => {
+                    incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
+                }
+                TAG_SET_ROW => rows.push(decode_row_image(value)?),
                 _ => {}
             }
         }
-        let operation = operation.ok_or(RowCodecError::MissingField(TAG_ROW))?;
-        if Some(operation.table) != table {
-            return Err(RowCodecError::InvalidBatch);
+        if rows.is_empty() {
+            return Err(RowCodecError::MissingField(TAG_SET_ROW));
         }
+        let operation = Self {
+            table: table.ok_or(RowCodecError::MissingField(TAG_SET_TABLE))?,
+            schema_revision: schema_revision
+                .ok_or(RowCodecError::MissingField(TAG_SET_SCHEMA_REVISION))?,
+            primary_index: primary_index
+                .ok_or(RowCodecError::MissingField(TAG_SET_PRIMARY_INDEX))?,
+            storage: storage.ok_or(RowCodecError::MissingField(TAG_SET_TABLE_STORAGE))?,
+            key_parts,
+            indexes,
+            foreign_keys,
+            incoming_foreign_keys,
+            rows,
+        };
         operation.validate_structure()?;
         Ok(operation)
     }
@@ -1142,35 +1113,6 @@ impl InsertRows {
         writer
             .field(TAG_SCHEMA_REVISION, &self.schema_revision.as_bytes())
             .expect("row field length fits in u32");
-        writer
-            .field(TAG_PRIMARY_INDEX, &self.primary_index.as_bytes())
-            .expect("row field length fits in u32");
-        writer
-            .field(TAG_TABLE_STORAGE, &[self.storage.to_u8()])
-            .expect("row field length fits in u32");
-        for part in &self.key_parts {
-            writer
-                .field(TAG_KEY_PART, &encode_key_part(*part))
-                .expect("row field length fits in u32");
-        }
-        for index in &self.indexes {
-            writer
-                .field(TAG_INDEX_RULES, &encode_index_rules(index))
-                .expect("row field length fits in u32");
-        }
-        for foreign_key in &self.foreign_keys {
-            writer
-                .field(TAG_FOREIGN_KEY, &encode_foreign_key(foreign_key))
-                .expect("row field length fits in u32");
-        }
-        for incoming in &self.incoming_foreign_keys {
-            writer
-                .field(
-                    TAG_INCOMING_FOREIGN_KEY,
-                    &encode_incoming_foreign_key(incoming),
-                )
-                .expect("row field length fits in u32");
-        }
         for (column, value) in &row.values {
             writer
                 .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
@@ -1178,6 +1120,31 @@ impl InsertRows {
         }
         writer.finish()
     }
+}
+
+fn encode_row_image(row: &Row) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.u8(ROW_IMAGE_FRAME_VERSION);
+    for (column, value) in &row.values {
+        writer
+            .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
+            .expect("row field length fits in u32");
+    }
+    writer.finish()
+}
+
+fn decode_row_image(frame: &[u8]) -> std::result::Result<Row, RowCodecError> {
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(ROW_IMAGE_FRAME_VERSION) {
+        return Err(RowCodecError::UnknownVersion);
+    }
+    let mut values = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        if tag == TAG_COLUMN_VALUE {
+            values.push(decode_column_value(value)?);
+        }
+    }
+    validate_row_values(values)
 }
 
 fn encode_index_rules(index: &IndexRules) -> Vec<u8> {
@@ -2450,59 +2417,10 @@ fn decode_column_value(
     ))
 }
 
-type DecodedRow = (
-    SchemaRevisionId,
-    IndexId,
-    TableStorage,
-    Vec<KeyPartRules>,
-    Vec<IndexRules>,
-    Vec<ForeignKeyRules>,
-    Vec<IncomingForeignKeyRules>,
-    Row,
-);
-
-fn decode_row(frame: &[u8]) -> std::result::Result<DecodedRow, RowCodecError> {
-    let mut reader = Reader::new(frame);
-    if reader.u8() != Some(ROW_FRAME_VERSION) {
-        return Err(RowCodecError::UnknownVersion);
-    }
-    let mut schema_revision = None;
-    let mut primary_index = None;
-    let mut storage = None;
-    let mut key_parts = Vec::new();
-    let mut indexes = Vec::new();
-    let mut foreign_keys = Vec::new();
-    let mut incoming_foreign_keys = Vec::new();
-    let mut values = Vec::new();
-    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
-        match tag {
-            TAG_SCHEMA_REVISION => set_once(
-                &mut schema_revision,
-                SchemaRevisionId::from_bytes(uuid_bytes(value)?),
-            )?,
-            TAG_PRIMARY_INDEX => {
-                set_once(&mut primary_index, IndexId::from_bytes(uuid_bytes(value)?))?
-            }
-            TAG_TABLE_STORAGE => {
-                let [value] = value else {
-                    return Err(RowCodecError::InvalidLength);
-                };
-                set_once(
-                    &mut storage,
-                    TableStorage::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
-                )?;
-            }
-            TAG_KEY_PART => key_parts.push(decode_key_part(value)?),
-            TAG_INDEX_RULES => indexes.push(decode_index_rules(value)?),
-            TAG_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
-            TAG_INCOMING_FOREIGN_KEY => {
-                incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
-            }
-            TAG_COLUMN_VALUE => values.push(decode_column_value(value)?),
-            _ => {}
-        }
-    }
-    if key_parts.is_empty() || values.is_empty() {
+fn validate_row_values(
+    values: Vec<(ColumnId, StoredValue)>,
+) -> std::result::Result<Row, RowCodecError> {
+    if values.is_empty() {
         return Err(RowCodecError::InvalidRow);
     }
     if values
@@ -2512,17 +2430,7 @@ fn decode_row(frame: &[u8]) -> std::result::Result<DecodedRow, RowCodecError> {
     {
         return Err(RowCodecError::DuplicateField);
     }
-    let storage = storage.ok_or(RowCodecError::MissingField(TAG_TABLE_STORAGE))?;
-    Ok((
-        schema_revision.ok_or(RowCodecError::MissingField(TAG_SCHEMA_REVISION))?,
-        primary_index.ok_or(RowCodecError::MissingField(TAG_PRIMARY_INDEX))?,
-        storage,
-        key_parts,
-        indexes,
-        foreign_keys,
-        incoming_foreign_keys,
-        Row { values },
-    ))
+    Ok(Row { values })
 }
 
 fn materialized_table_name(connection: &Connection, table: TableId) -> Result<String> {
@@ -2592,6 +2500,7 @@ pub enum RowCodecError {
     DuplicateUniqueKey,
     NullPrimaryKey,
     InvalidKey(KeyError),
+    #[cfg(test)]
     InvalidBatch,
 }
 
@@ -2612,6 +2521,7 @@ impl fmt::Display for RowCodecError {
             }
             Self::NullPrimaryKey => f.write_str("primary key value is NULL"),
             Self::InvalidKey(error) => write!(f, "invalid Homebase row key: {error}"),
+            #[cfg(test)]
             Self::InvalidBatch => f.write_str("admitted row operation has an invalid envelope"),
         }
     }
@@ -3022,9 +2932,56 @@ mod tests {
             assert_eq!(mutation.key(), assertion);
             assert_eq!(mutation.key().components().len(), 6);
         }
+        inserted
+            .validate_homebase(&admit(lowered.mutations))
+            .unwrap();
+    }
+
+    #[test]
+    fn row_codecs_store_rules_once_and_keep_homebase_values_compact() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        let mut first_row = inserted.clone();
+        first_row.rows.truncate(1);
+
         assert_eq!(
-            InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
-            inserted
+            inserted.encode().len(),
+            first_row.encode().len() + 5 + encode_row_image(&inserted.rows[1]).len()
+        );
+
+        let lowered = inserted.to_homebase().unwrap();
+        for (row, mutation) in inserted.rows.iter().zip(&lowered.mutations) {
+            let Mutation::Set { value, .. } = mutation else {
+                panic!("insert row mutation was not a set")
+            };
+            let encoded_values = row
+                .values
+                .iter()
+                .map(|(column, value)| 5 + encode_column_value(*column, value).len())
+                .sum::<usize>();
+            assert_eq!(value.len(), 1 + 5 + 16 + encoded_values);
+            assert_eq!(value, &inserted.encode_row(row));
+        }
+    }
+
+    #[test]
+    fn row_set_codec_rejects_duplicate_common_fields() {
+        let created = definition();
+        let connection = connection(&created);
+        let inserted = inserted(&connection);
+        let mut malformed = Writer::new();
+        malformed.u8(ROW_SET_FRAME_VERSION);
+        malformed
+            .field(TAG_SET_TABLE, &inserted.table.as_bytes())
+            .unwrap();
+        malformed
+            .field(TAG_SET_TABLE, &inserted.table.as_bytes())
+            .unwrap();
+
+        assert_eq!(
+            InsertRows::decode(&malformed.finish()),
+            Err(RowCodecError::DuplicateField)
         );
     }
 
@@ -3089,14 +3046,13 @@ mod tests {
             Mutation::Set { key, value }
                 if key == &reference.key && value == &child_key.encode()
         ));
-        assert_eq!(
-            InsertRows::from_homebase(&admit(lowered.mutations.clone())).unwrap(),
-            inserted
-        );
+        inserted
+            .validate_homebase(&admit(lowered.mutations.clone()))
+            .unwrap();
         let mut missing_reference = admit(lowered.mutations.clone());
         missing_reference.entries.pop();
         assert_eq!(
-            InsertRows::from_homebase(&missing_reference),
+            inserted.validate_homebase(&missing_reference),
             Err(RowCodecError::InvalidBatch)
         );
         let mut corrupt_reference = admit(lowered.mutations);
@@ -3106,7 +3062,7 @@ mod tests {
         };
         value.push(0);
         assert_eq!(
-            InsertRows::from_homebase(&corrupt_reference),
+            inserted.validate_homebase(&corrupt_reference),
             Err(RowCodecError::InvalidBatch)
         );
 
@@ -3661,10 +3617,9 @@ mod tests {
                 .iter()
                 .all(|mutation| lowered.footprint.constraints().contains(mutation.key()))
         );
-        assert_eq!(
-            InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
-            inserted
-        );
+        inserted
+            .validate_homebase(&admit(lowered.mutations))
+            .unwrap();
         let deleted = DeleteRows::from_captured(&connection, &captured)
             .unwrap()
             .unwrap()
@@ -3729,10 +3684,9 @@ mod tests {
         );
         assert_eq!(lowered.mutations.len(), baseline.mutations.len());
         assert_eq!(lowered.footprint, baseline.footprint);
-        assert_eq!(
-            InsertRows::from_homebase(&admit(lowered.mutations)).unwrap(),
-            inserted
-        );
+        inserted
+            .validate_homebase(&admit(lowered.mutations))
+            .unwrap();
 
         let deleted = DeleteRows::from_captured(&connection, &captured)
             .unwrap()
@@ -3812,10 +3766,9 @@ mod tests {
                 .iter()
                 .all(|mutation| lowered.footprint.constraints().contains(mutation.key()))
         );
-        assert_eq!(
-            InsertRows::from_homebase(&admit(lowered.mutations.clone())).unwrap(),
-            inserted
-        );
+        inserted
+            .validate_homebase(&admit(lowered.mutations.clone()))
+            .unwrap();
 
         let deleted = DeleteRows::from_captured(&connection, &[captured])
             .unwrap()
@@ -3877,21 +3830,21 @@ mod tests {
         let mut missing = lowered.clone();
         missing.pop();
         assert_eq!(
-            InsertRows::from_homebase(&admit(missing)),
+            inserted.validate_homebase(&admit(missing)),
             Err(RowCodecError::InvalidBatch)
         );
 
         let mut crossed = lowered.clone();
         crossed.swap(1, 2);
         assert_eq!(
-            InsertRows::from_homebase(&admit(crossed)),
+            inserted.validate_homebase(&admit(crossed)),
             Err(RowCodecError::InvalidBatch)
         );
 
         let mut extra = lowered.clone();
         extra.push(lowered.last().unwrap().clone());
         assert_eq!(
-            InsertRows::from_homebase(&admit(extra)),
+            inserted.validate_homebase(&admit(extra)),
             Err(RowCodecError::InvalidBatch)
         );
 
@@ -3901,7 +3854,7 @@ mod tests {
         };
         value.push(0);
         assert_eq!(
-            InsertRows::from_homebase(&admit(corrupt)),
+            inserted.validate_homebase(&admit(corrupt)),
             Err(RowCodecError::InvalidBatch)
         );
     }
