@@ -660,7 +660,7 @@ pub trait CommitBackend: Send + Sync + 'static {
     fn lease_rowids(&self) -> Result<RowidLease>;
 }`}] },
 { id:"backend", layer:"multilite", band:"Commit spine", name:"Commit backend",
-  files:["multilite/src/database/backend.rs"],
+  files:["multilite/src/database/commit_backend.rs"],
   summary:"Canonical SQLite commit execution: replay, OCC validation, cursor re-checks, pending journal, receipts \u2014 all inside one group savepoint.",
   behavior:[
     "prepare() replays logical ops onto canonical SQLite and validates the footprint against local commit history and earlier group members.",
@@ -668,7 +668,7 @@ pub trait CommitBackend: Send + Sync + 'static {
     "Duplicate proposal ids resolve idempotently via durable receipts (hash-checked)."],
   invariants:["A proposal is applied at most once; a receipt exists iff its group finalized."], health:[],
   snippets:[
-    {title:"Group commit: nested savepoints, duplicate ids resolved by payload hash", file:"database/backend.rs", code:
+    {title:"Group commit: nested savepoints, duplicate ids resolved by payload hash", file:"database/commit_backend.rs", code:
 `self.owner.with_savepoint("__multilite__commit_group", |connection| {
     let mut accepted_writes = BTreeSet::new();
     for proposal in proposals {

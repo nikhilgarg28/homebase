@@ -3,7 +3,7 @@
 mod alter;
 mod async_api;
 mod authority;
-mod backend;
+mod commit_backend;
 pub(crate) mod catalog;
 mod codes;
 mod connection;
@@ -50,7 +50,7 @@ use crate::runtime::{ExecutionMode, HookPolicy, RuntimeConnection};
 use crate::{Error, Params, Result};
 
 use self::authority::Authority;
-use self::backend::DatabaseCommitBackend;
+use self::commit_backend::DatabaseCommitBackend;
 use self::policy::PolicyActor;
 use self::row::{CapturedChange, CapturedRow, StoredValue};
 use self::store::{CanonicalMetaSink, CanonicalRouter, DatabaseMetaStore};
