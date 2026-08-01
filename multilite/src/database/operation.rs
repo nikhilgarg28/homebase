@@ -131,7 +131,7 @@ impl MultiliteOp {
                 (mutations, footprint)
             }
             Self::CreateTable(created) => {
-                let schema = created.to_homebase();
+                let schema = created.to_homebase()?;
                 (schema.mutations, schema.footprint)
             }
             Self::InsertRows(inserted) => {

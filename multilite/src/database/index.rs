@@ -85,7 +85,7 @@ impl IndexOperation {
         let after = before.with_added_index(
             SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
             index.clone(),
-        );
+        )?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
@@ -109,7 +109,7 @@ impl IndexOperation {
             .with_retired_index(
                 SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
                 &spec.name,
-            )
+            )?
             .expect("catalog lookup found the index");
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
@@ -437,7 +437,8 @@ impl IndexOperation {
                 };
                 let expected_after = self
                     .before
-                    .with_added_index(self.after.schema_revision_id(), self.index.clone());
+                    .with_added_index(self.after.schema_revision_id(), self.index.clone())
+                    .map_err(|_| IndexCodecError::InvalidEvolution)?;
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
                     || expected_after != self.after
                     || !self.before.named_index_matches_spec(&self.index, &spec)
@@ -470,6 +471,7 @@ impl IndexOperation {
                 let expected_after = self
                     .before
                     .with_retired_index(self.after.schema_revision_id(), self.index.name())
+                    .map_err(|_| IndexCodecError::InvalidEvolution)?
                     .ok_or(IndexCodecError::InvalidEvolution)?;
                 if self.before.schema_revision_id() == self.after.schema_revision_id()
                     || expected_after != self.after

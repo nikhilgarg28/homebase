@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use super::{
-    CreateTable, IndexKind, MAX_INDEX_COLUMNS, TableId, TableMode, TableSchema, TableStorage,
-    expression_dependencies_match, index_columns_supported, named_index_definition_is_valid,
+    Column, ColumnId, CreateTable, IndexKind, MAX_INDEX_COLUMNS, SqlExpression, TableId, TableMode,
+    TableSchema, TableStorage, index_columns_supported, named_index_definition_is_valid,
+    type_declaration_roundtrips,
 };
 
 /// One violated invariant while constructing a semantic schema value.
@@ -14,6 +15,7 @@ pub enum SchemaInvariantError {
     EmptyTable,
     DuplicateColumnName,
     InvalidNullability,
+    InvalidColumnType,
     InvalidPrimaryKey,
     InvalidStrictColumn,
     NullablePrimaryKey,
@@ -26,6 +28,7 @@ pub enum SchemaInvariantError {
     SelfReferentialForeignKey,
     DuplicateForeignKeyIdentity,
     InvalidCheckConstraint,
+    UnknownExpressionColumn,
     ReusedSchemaIdentity,
 }
 
@@ -35,6 +38,7 @@ impl fmt::Display for SchemaInvariantError {
             Self::EmptyTable => "table schema has no columns",
             Self::DuplicateColumnName => "table schema reuses a column name",
             Self::InvalidNullability => "column nullability contradicts its named constraint",
+            Self::InvalidColumnType => "column has an invalid type declaration",
             Self::InvalidPrimaryKey => "table schema has an invalid primary key",
             Self::InvalidStrictColumn => "STRICT table schema has an invalid column declaration",
             Self::NullablePrimaryKey => "table storage requires non-null primary-key columns",
@@ -47,6 +51,7 @@ impl fmt::Display for SchemaInvariantError {
             Self::SelfReferentialForeignKey => "self-referential foreign keys are not supported",
             Self::DuplicateForeignKeyIdentity => "table schema reuses a foreign-key identity",
             Self::InvalidCheckConstraint => "table schema has an invalid CHECK constraint",
+            Self::UnknownExpressionColumn => "schema expression references an unknown table column",
             Self::ReusedSchemaIdentity => "schema operation reuses a stable identity",
         })
     }
@@ -67,6 +72,13 @@ pub(super) fn validate_table_schema(
         }
         if !column.not_null && column.not_null_name.is_some() {
             return Err(SchemaInvariantError::InvalidNullability);
+        }
+        if column.declared_type.name.is_empty()
+            || column.declared_type.arguments.len() > 2
+            || column.declared_type.arguments.iter().any(String::is_empty)
+            || !type_declaration_roundtrips(&column.declared_type)
+        {
+            return Err(SchemaInvariantError::InvalidColumnType);
         }
     }
 
@@ -157,12 +169,35 @@ pub(super) fn validate_table_schema(
         if check
             .column
             .is_some_and(|id| !columns.iter().any(|column| column.id == id))
-            || !expression_dependencies_match(&check.expression, &check.dependencies, columns)
+            || bind_expression(&check.expression, columns)? != check.dependencies
         {
             return Err(SchemaInvariantError::InvalidCheckConstraint);
         }
     }
     Ok(())
+}
+
+/// Bind every column spelling in one parsed SQLite expression to stable IDs.
+///
+/// Expressions remain an owned SQLite AST for deterministic rendering, while
+/// this resolved identity list is the semantic input to DDL conflict planning.
+pub(super) fn bind_expression(
+    expression: &SqlExpression,
+    columns: &[Column],
+) -> Result<Vec<ColumnId>, SchemaInvariantError> {
+    expression
+        .referenced_columns()
+        .into_iter()
+        .map(|name| {
+            columns
+                .iter()
+                .find(|column| column.name.canonical() == name.canonical())
+                .map(|column| column.id)
+                .ok_or(SchemaInvariantError::UnknownExpressionColumn)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(BTreeSet::into_iter)
+        .map(Iterator::collect)
 }
 
 pub(super) fn validate_create_table(created: &CreateTable) -> Result<(), SchemaInvariantError> {
@@ -215,8 +250,10 @@ fn has_duplicates<T: PartialEq>(values: &[T]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::schema::{CreateTable, TypeDeclaration};
+    use crate::Error;
+    use crate::database::schema::{CreateColumn, CreateTable, SchemaRevisionId, TypeDeclaration};
     use crate::database::sql::{ValidatedExecute, validate_execute};
+    use uuid::Uuid;
 
     fn table() -> CreateTable {
         let sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)";
@@ -254,5 +291,30 @@ mod tests {
             reused.validate_ir(),
             Err(SchemaInvariantError::ReusedSchemaIdentity)
         );
+    }
+
+    #[test]
+    fn schema_evolution_cannot_construct_an_invalid_ir() {
+        let created = table();
+        let duplicate = CreateColumn {
+            name: created.columns()[1].name().clone(),
+            declared_type: TypeDeclaration::text(),
+            not_null: false,
+            not_null_name: None,
+            default: None,
+            primary_key: None,
+        };
+
+        assert!(matches!(
+            created.with_added_column_identity(
+                SchemaRevisionId::from_bytes(Uuid::new_v4().into_bytes()),
+                ColumnId::from_bytes(Uuid::new_v4().into_bytes()),
+                &duplicate,
+                &[],
+            ),
+            Err(Error::InvalidDatabase(
+                "schema evolution produced an invalid table definition"
+            ))
+        ));
     }
 }

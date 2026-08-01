@@ -203,6 +203,9 @@ pub fn validate(connection: &Connection) -> Result<()> {
 }
 
 pub fn insert(connection: &Connection, created: &CreateTable) -> Result<()> {
+    created.validate_ir().map_err(|_| {
+        Error::InvalidDatabase("schema catalog rejected an invalid table definition")
+    })?;
     connection.execute(
         &format!(
             "INSERT INTO {TABLE} (schema_name, table_name, table_id, definition)
@@ -235,6 +238,9 @@ pub fn insert(connection: &Connection, created: &CreateTable) -> Result<()> {
 }
 
 pub fn replace(connection: &Connection, definition: &CreateTable) -> Result<()> {
+    definition.validate_ir().map_err(|_| {
+        Error::InvalidDatabase("schema catalog rejected an invalid table definition")
+    })?;
     let changed = connection.execute(
         &format!(
             "UPDATE {TABLE} SET definition = ?1

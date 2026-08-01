@@ -535,8 +535,9 @@ fn collect_expression_columns(expression: &Expr, columns: &mut BTreeMap<Vec<u8>,
 }
 
 fn record_expression_column(columns: &mut BTreeMap<Vec<u8>, SqlName>, value: &str) {
-    let name = SqlName::from_sqlite_token(value)
-        .expect("validated schema expressions contain non-empty SQLite identifiers");
+    // Preserve malformed spellings as unresolved names. The compiler will
+    // classify them instead of allowing parser/compiler disagreement to panic.
+    let name = SqlName::from_sqlite_token(value).unwrap_or_else(|_| SqlName::new(value.to_owned()));
     columns.entry(name.canonical().to_vec()).or_insert(name);
 }
 
@@ -1237,9 +1238,16 @@ impl CreateTable {
         Ok(created)
     }
 
-    fn validate_ir(&self) -> std::result::Result<(), SchemaInvariantError> {
+    pub(super) fn validate_ir(&self) -> std::result::Result<(), SchemaInvariantError> {
         self.schema.validate_for(self.table_id)?;
         compiler::validate_create_table(self)
+    }
+
+    fn validate_operation(&self) -> Result<()> {
+        self.validate_ir()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        validate_initial_provenance_sql(self)
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
     }
 
     /// Mint durable identities for one validated table creation.
@@ -1261,7 +1269,8 @@ impl CreateTable {
     }
 
     /// Lower this schema change to its complete Homebase representation.
-    pub fn to_homebase(&self) -> SchemaHomebaseOp {
+    pub fn to_homebase(&self) -> Result<SchemaHomebaseOp> {
+        self.validate_operation()?;
         let log = schema_log_key(self.mutation_id);
         let name_scope = schema_object_name_scope_key(&self.name);
         let schema = table_schema_key(self.table_id, self.schema_revision_id);
@@ -1328,10 +1337,10 @@ impl CreateTable {
             key,
             value: self.mutation_id.0.to_vec(),
         }));
-        SchemaHomebaseOp {
+        Ok(SchemaHomebaseOp {
             mutations,
             footprint,
-        }
+        })
     }
 
     /// Raise one complete authenticated Homebase batch into a schema change.
@@ -1387,6 +1396,8 @@ impl CreateTable {
 
     /// Render immutable CREATE TABLE provenance against current parent bindings.
     pub fn materialization_sql(&self, connection: &Connection) -> Result<String> {
+        self.validate_ir()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         render_structural_create_table(self, connection)
     }
 
@@ -1603,23 +1614,30 @@ impl CreateTable {
             .find(|index| index.active && index.name.canonical() == name.canonical())
     }
 
-    pub fn with_added_index(&self, revision: SchemaRevisionId, index: NamedIndex) -> Self {
+    pub fn with_added_index(&self, revision: SchemaRevisionId, index: NamedIndex) -> Result<Self> {
         let mut evolved = self.clone();
         evolved.schema_revision_id = revision;
         evolved.schema.indexes.push(index);
-        evolved
+        evolved.validate_evolution()
     }
 
-    pub fn with_retired_index(&self, revision: SchemaRevisionId, name: &SqlName) -> Option<Self> {
+    pub fn with_retired_index(
+        &self,
+        revision: SchemaRevisionId,
+        name: &SqlName,
+    ) -> Result<Option<Self>> {
         let mut evolved = self.clone();
         let position = evolved
             .schema
             .indexes
             .iter()
-            .position(|index| index.active && index.name.canonical() == name.canonical())?;
+            .position(|index| index.active && index.name.canonical() == name.canonical());
+        let Some(position) = position else {
+            return Ok(None);
+        };
         evolved.schema_revision_id = revision;
         evolved.schema.indexes[position].active = false;
-        Some(evolved)
+        evolved.validate_evolution().map(Some)
     }
 
     pub fn fold_added_index(&self, index: &NamedIndex) -> Result<Self> {
@@ -1638,8 +1656,7 @@ impl CreateTable {
         }
         let mut folded = self.clone();
         folded.schema.indexes.push(index.clone());
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     pub fn fold_retired_index(&self, index: &NamedIndex) -> Result<Self> {
@@ -1658,8 +1675,7 @@ impl CreateTable {
             ));
         }
         current.active = false;
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     pub fn fold_removed_index(&self, index: &NamedIndex) -> Result<Self> {
@@ -1673,8 +1689,7 @@ impl CreateTable {
                 "index rollback references an unknown identity",
             ))?;
         folded.schema.indexes.remove(position);
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     pub fn fold_restored_index(&self, index: &NamedIndex) -> Result<Self> {
@@ -1693,8 +1708,7 @@ impl CreateTable {
             ));
         }
         *current = index.clone();
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     pub fn with_added_column(
@@ -1745,7 +1759,7 @@ impl CreateTable {
             })
             .collect::<Result<Vec<_>>>()?;
         evolved.schema.checks.extend(checks);
-        Ok(evolved)
+        evolved.validate_evolution()
     }
 
     /// Names read by constraints introduced with one column.
@@ -1843,7 +1857,7 @@ impl CreateTable {
             .schema
             .checks
             .retain(|check| check.column != Some(column));
-        Ok(evolved)
+        evolved.validate_evolution()
     }
 
     /// Fold one independently admitted column addition into the current table.
@@ -1884,16 +1898,14 @@ impl CreateTable {
                 .cloned(),
         );
         folded.reorder_columns(order)?;
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     /// Fold one independently admitted column removal into the current table.
     pub fn fold_removed_column(&self, column: ColumnId, order: &[ColumnId]) -> Result<Self> {
         let mut folded = self.with_removed_column(self.schema_revision_id, column)?;
         folded.reorder_columns(order)?;
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     /// Refresh expression spellings after one stable column binding moves.
@@ -1938,8 +1950,7 @@ impl CreateTable {
                 predicate.rename_column(old_name, new_name);
             }
         }
-        folded.refresh_schema_revision();
-        Ok(folded)
+        folded.refresh_and_validate_evolution()
     }
 
     fn reorder_columns(&mut self, order: &[ColumnId]) -> Result<()> {
@@ -1981,6 +1992,18 @@ impl CreateTable {
         revision[6] = (revision[6] & 0x0f) | 0x40;
         revision[8] = (revision[8] & 0x3f) | 0x80;
         self.schema_revision_id = SchemaRevisionId(revision);
+    }
+
+    fn validate_evolution(self) -> Result<Self> {
+        self.validate_ir().map_err(|_| {
+            Error::InvalidDatabase("schema evolution produced an invalid table definition")
+        })?;
+        Ok(self)
+    }
+
+    fn refresh_and_validate_evolution(mut self) -> Result<Self> {
+        self.refresh_schema_revision();
+        self.validate_evolution()
     }
 
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &Column> {
@@ -2453,59 +2476,71 @@ fn build_create_table(
             default: column.default.clone(),
         })
         .collect::<Vec<_>>();
+    let primary_columns = spec_primary_key_ids_from_columns(&column_specs, &columns).ok_or(
+        Error::CaptureInvariant("validated PRIMARY KEY columns could not be resolved"),
+    )?;
     let primary_key = PrimaryKey {
         name: primary_key_name,
         index: IndexDefinition {
             id: row_index_id,
             kind: IndexKind::Primary,
-            columns: spec_primary_key_ids_from_columns(&column_specs, &columns)
-                .expect("validated PRIMARY KEY columns exist"),
+            columns: primary_columns,
         },
     };
     let checks = lower_checks(check_specs, &columns)?;
     let unique_constraints = unique_specs
         .into_iter()
-        .map(|unique| UniqueConstraint {
-            name: unique.name,
-            index: IndexDefinition {
-                id: IndexId(mint()),
-                kind: IndexKind::Unique,
-                columns: unique
-                    .columns
-                    .into_iter()
-                    .map(|name| {
-                        columns
-                            .iter()
-                            .find(|column| column.name.canonical() == name.canonical())
-                            .expect("validated UNIQUE column exists")
-                            .id
-                    })
-                    .collect(),
-            },
+        .map(|unique| {
+            let resolved = unique
+                .columns
+                .into_iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.name.canonical() == name.canonical())
+                        .map(Column::id)
+                        .ok_or(Error::CaptureInvariant(
+                            "validated UNIQUE column could not be resolved",
+                        ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(UniqueConstraint {
+                name: unique.name,
+                index: IndexDefinition {
+                    id: IndexId(mint()),
+                    kind: IndexKind::Unique,
+                    columns: resolved,
+                },
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let foreign_keys = resolved_foreign_keys
         .into_iter()
         .map(|resolved| {
             let parent_columns = resolved
                 .parent
                 .foreign_key_target_columns(resolved.target)
-                .expect("resolved foreign-key target exists");
-            ForeignKeyDefinition {
+                .ok_or(Error::CaptureInvariant(
+                    "resolved foreign-key target disappeared during lowering",
+                ))?;
+            let child_columns = resolved
+                .spec
+                .columns
+                .into_iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.name.canonical() == name.canonical())
+                        .map(Column::id)
+                        .ok_or(Error::CaptureInvariant(
+                            "validated FOREIGN KEY child column could not be resolved",
+                        ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ForeignKeyDefinition {
                 id: ForeignKeyId(mint()),
                 name: resolved.spec.name,
-                columns: resolved
-                    .spec
-                    .columns
-                    .into_iter()
-                    .map(|name| {
-                        columns
-                            .iter()
-                            .find(|column| column.name.canonical() == name.canonical())
-                            .expect("validated FOREIGN KEY child column exists")
-                            .id
-                    })
-                    .collect(),
+                columns: child_columns,
                 referenced_table: resolved.parent.table_id(),
                 referenced_table_name: resolved.parent.table_name_identity().clone(),
                 referenced_index: resolved.target,
@@ -2514,9 +2549,9 @@ fn build_create_table(
                     .iter()
                     .map(|column| column.name().clone())
                     .collect(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let schema = TableSchema::try_from_parts(
         table_id,
         mode,
@@ -2579,21 +2614,12 @@ fn resolve_expression_dependencies(
     expression: &SqlExpression,
     columns: &[Column],
 ) -> Result<Vec<ColumnId>> {
-    expression
-        .referenced_columns()
-        .into_iter()
-        .map(|name| {
-            columns
-                .iter()
-                .find(|column| column.name.canonical() == name.canonical())
-                .map(Column::id)
-                .ok_or(Error::UnsupportedSql(
-                    "schema expression references an unknown column",
-                ))
-        })
-        .collect::<Result<BTreeSet<_>>>()
-        .map(BTreeSet::into_iter)
-        .map(Iterator::collect)
+    compiler::bind_expression(expression, columns).map_err(|error| match error {
+        SchemaInvariantError::UnknownExpressionColumn => {
+            Error::UnsupportedSql("schema expression references an unknown column")
+        }
+        error => Error::InvalidMultiliteOp(error.to_string()),
+    })
 }
 
 fn spec_primary_key_ids_from_columns(
@@ -3089,6 +3115,7 @@ pub enum SchemaCodecError {
     InvalidColumnFlags(u8),
     InvalidTableMode(u8),
     InvalidTableStorage(u8),
+    InvalidInvariant(SchemaInvariantError),
     InvalidSchema,
     InvalidUuid,
     InvalidSql,
@@ -3110,6 +3137,7 @@ impl fmt::Display for SchemaCodecError {
             Self::InvalidColumnFlags(value) => write!(f, "invalid column flags {value}"),
             Self::InvalidTableMode(value) => write!(f, "invalid table mode {value}"),
             Self::InvalidTableStorage(value) => write!(f, "invalid table storage {value}"),
+            Self::InvalidInvariant(error) => write!(f, "invalid structured schema: {error}"),
             Self::InvalidSchema => f.write_str("invalid structured schema"),
             Self::InvalidUuid => f.write_str("schema id is not a UUID v4"),
             Self::InvalidSql => f.write_str("literal SQL is outside the supported grammar"),
@@ -3150,7 +3178,7 @@ fn decode_frame(frame: &[u8]) -> std::result::Result<CreateTable, SchemaCodecErr
     let (table_id, schema_revision_id, name, schema) =
         create_table.ok_or(SchemaCodecError::MissingField(TAG_CREATE_TABLE))?;
     CreateTable::try_from_parts(mutation_id, sql, table_id, schema_revision_id, name, schema)
-        .map_err(|_| SchemaCodecError::InvalidSchema)
+        .map_err(SchemaCodecError::InvalidInvariant)
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), SchemaCodecError> {
@@ -3229,15 +3257,6 @@ fn index_dependencies_match(index: &NamedIndex, columns: &[Column]) -> bool {
     index.dependencies == expected.into_iter().collect::<Vec<_>>()
 }
 
-fn expression_dependencies_match(
-    expression: &SqlExpression,
-    dependencies: &[ColumnId],
-    columns: &[Column],
-) -> bool {
-    resolve_expression_dependencies(expression, columns)
-        .is_ok_and(|expected| expected == dependencies)
-}
-
 fn decode_create_table(
     frame: &[u8],
 ) -> std::result::Result<(TableId, SchemaRevisionId, SqlName, TableSchema), SchemaCodecError> {
@@ -3303,7 +3322,7 @@ fn decode_create_table(
         foreign_keys,
         checks,
     )
-    .map_err(|_| SchemaCodecError::InvalidSchema)?;
+    .map_err(SchemaCodecError::InvalidInvariant)?;
     Ok((
         table_id,
         schema_revision_id.ok_or(SchemaCodecError::MissingField(TAG_SCHEMA_REVISION_ID))?,
@@ -3758,7 +3777,10 @@ fn from_homebase_inner(
     if admitted_log_key != &schema_log_key(created.mutation_id) {
         return Err(SchemaCodecError::InvalidBatch);
     }
-    let expected = created.to_homebase().mutations;
+    let expected = created
+        .to_homebase()
+        .map_err(|_| SchemaCodecError::InvalidSchema)?
+        .mutations;
     if expected.len() != batch.entries.len()
         || expected
             .iter()
@@ -3850,9 +3872,13 @@ fn validate_initial_provenance_sql(
             .ok_or(SchemaCodecError::SqlMismatch)?;
         if parsed.name != encoded.name
             || parsed.columns.as_slice() != columns.as_slice()
-            || parsed.referenced_table != encoded.referenced_table_name
+            || parsed.referenced_table.canonical() != encoded.referenced_table_name.canonical()
             || parsed.referenced_columns.as_ref().is_some_and(|columns| {
-                columns.as_slice() != encoded.referenced_column_names.as_slice()
+                columns.len() != encoded.referenced_column_names.len()
+                    || columns
+                        .iter()
+                        .zip(&encoded.referenced_column_names)
+                        .any(|(parsed, encoded)| parsed.canonical() != encoded.canonical())
             })
         {
             return Err(SchemaCodecError::SqlMismatch);
@@ -4232,7 +4258,7 @@ mod tests {
     #[test]
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
-        let lowered = created.to_homebase();
+        let lowered = created.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 9);
         assert_eq!(lowered.footprint.constraints().len(), 1);
         assert_eq!(lowered.footprint.writes().len(), 1);
@@ -4276,7 +4302,7 @@ mod tests {
 
         let decoded = CreateTable::decode(&created.encode()).unwrap();
         assert_eq!(decoded, created);
-        let lowered = created.to_homebase();
+        let lowered = created.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 11);
         assert_eq!(
             lowered.mutations[6].key(),
@@ -4377,7 +4403,9 @@ mod tests {
             .clear();
         assert_eq!(
             CreateTable::decode(&missing_check_dependency.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::InvalidCheckConstraint
+            ))
         );
 
         let index = NamedIndex::new_secondary(
@@ -4391,7 +4419,9 @@ mod tests {
             None,
             vec![body],
         );
-        let indexed = created.with_added_index(SchemaRevisionId(test_uuid(90)), index);
+        let indexed = created
+            .with_added_index(SchemaRevisionId(test_uuid(90)), index)
+            .unwrap();
         assert_eq!(CreateTable::decode(&indexed.encode()).unwrap(), indexed);
 
         let mut duplicate_index_dependency = indexed;
@@ -4400,7 +4430,9 @@ mod tests {
             .push(body);
         assert_eq!(
             CreateTable::decode(&duplicate_index_dependency.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::InvalidNamedIndex
+            ))
         );
     }
 
@@ -4516,7 +4548,7 @@ mod tests {
         );
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
 
-        let lowered = child.to_homebase();
+        let lowered = child.to_homebase().unwrap();
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
@@ -4593,7 +4625,7 @@ mod tests {
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
         child.validate_foreign_key_parents(&connection).unwrap();
 
-        let lowered = child.to_homebase();
+        let lowered = child.to_homebase().unwrap();
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
@@ -4769,7 +4801,7 @@ mod tests {
         );
 
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
-        let lowered = created.to_homebase();
+        let lowered = created.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 15);
         for (mutation, unique) in lowered.mutations[6..10]
             .iter()
@@ -4802,7 +4834,9 @@ mod tests {
         unknown_column.schema.unique_constraints[0].index.columns[0] = ColumnId(test_uuid(99));
         assert_eq!(
             CreateTable::decode(&unknown_column.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::InvalidUniqueConstraint
+            ))
         );
 
         let mut duplicate_index = deterministic_overlapping_unique_create();
@@ -4810,7 +4844,9 @@ mod tests {
             duplicate_index.schema.unique_constraints[0].index.id;
         assert_eq!(
             CreateTable::decode(&duplicate_index.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::DuplicateIndexIdentity
+            ))
         );
     }
 
@@ -4854,7 +4890,7 @@ mod tests {
 
     #[test]
     fn admitted_envelope_rejects_missing_or_corrupt_revision_cells() {
-        let lowered = deterministic_create("notes").to_homebase();
+        let lowered = deterministic_create("notes").to_homebase().unwrap();
         let mut missing = admit(lowered.mutations.clone());
         missing.entries.pop();
         assert_eq!(
@@ -4892,6 +4928,10 @@ mod tests {
             CreateTable::decode_operation(&mismatch.encode()),
             Err(SchemaCodecError::SqlMismatch)
         );
+        assert!(matches!(
+            mismatch.to_homebase(),
+            Err(Error::InvalidMultiliteOp(message)) if message.contains("contradicts")
+        ));
 
         let mut invalid = decode_frame(&created.encode()).unwrap();
         invalid.sql = "CREATE TABLE".into();
@@ -5017,7 +5057,9 @@ mod tests {
             TypeDeclaration::new("DECIMAL".into(), Vec::new());
         assert_eq!(
             CreateTable::decode(&invalid_type.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::InvalidStrictColumn
+            ))
         );
     }
 
@@ -5069,21 +5111,27 @@ mod tests {
         duplicate_name.schema.columns[1].name = SqlName::new("ID".into());
         assert_eq!(
             CreateTable::decode(&duplicate_name.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::DuplicateColumnName
+            ))
         );
 
         let mut duplicate_column_id = created.clone();
         duplicate_column_id.schema.columns[1].id = duplicate_column_id.schema.columns[0].id;
         assert_eq!(
             CreateTable::decode(&duplicate_column_id.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::ReusedSchemaIdentity
+            ))
         );
 
         let mut reused_identity = created;
         reused_identity.schema.primary_key.index.id = IndexId(reused_identity.table_id.0);
         assert_eq!(
             CreateTable::decode(&reused_identity.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::ReusedSchemaIdentity
+            ))
         );
     }
 
@@ -5094,7 +5142,9 @@ mod tests {
 
         assert_eq!(
             CreateTable::decode(&created.encode()),
-            Err(SchemaCodecError::InvalidSchema)
+            Err(SchemaCodecError::InvalidInvariant(
+                SchemaInvariantError::MissingRowidAlias
+            ))
         );
     }
 
