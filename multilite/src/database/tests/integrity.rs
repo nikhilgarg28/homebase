@@ -45,7 +45,7 @@ struct MaterializedState {
     schema: Vec<(String, String, String, String)>,
     parents: Vec<(i64, String, String)>,
     children: Vec<(i64, String, String)>,
-    foreign_references: BTreeMap<Key, Vec<u8>>,
+    materialized_cells: BTreeMap<Key, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -469,11 +469,13 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
         let first_state = audit(&first);
         let second_state = audit(&second);
         assert_eq!(first_state, second_state, "replicas diverged: {context}");
-        assert_eq!(
-            first_state.foreign_references,
-            authority_foreign_references(&first),
-            "authority reference cells diverged from SQLite rows: {context}"
-        );
+        crate::database::row::validate_materialized_cells(
+            &first_state.materialized_cells,
+            &authority_materialized_cells(&first),
+        )
+        .unwrap_or_else(|error| {
+            panic!("authority cells diverged from SQLite rows: {context}: {error}")
+        });
     }
     coverage
 }
@@ -507,6 +509,10 @@ where
     database.with_connection(|connection| {
         catalog::validate(connection).unwrap();
         pending::validate(connection).unwrap();
+        assert!(
+            pending::load(connection).unwrap().is_empty(),
+            "synchronized database retained pending operations"
+        );
         let integrity = connection
             .query_row("PRAGMA integrity_check", (), |row| row.get::<_, String>(0))
             .unwrap();
@@ -557,18 +563,18 @@ where
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        let foreign_references =
-            crate::database::row::expected_foreign_reference_cells(connection).unwrap();
+        let materialized_cells =
+            crate::database::row::expected_materialized_cells(connection).unwrap();
         MaterializedState {
             schema,
             parents,
             children,
-            foreign_references,
+            materialized_cells,
         }
     })
 }
 
-fn authority_foreign_references<H>(database: &Database<H>) -> BTreeMap<Key, Vec<u8>>
+fn authority_materialized_cells<H>(database: &Database<H>) -> BTreeMap<Key, Vec<u8>>
 where
     H: ServerHandle + Send + Sync + 'static,
 {
@@ -600,6 +606,11 @@ where
             }
         }
     }
-    state.retain(|key, _| TargetFamily::classify(key) == Some(TargetFamily::ForeignReference));
+    state.retain(|key, _| {
+        matches!(
+            TargetFamily::classify(key),
+            Some(TargetFamily::Row | TargetFamily::UniqueOwner | TargetFamily::ForeignReference)
+        )
+    });
     state
 }

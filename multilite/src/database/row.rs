@@ -17,6 +17,8 @@ use super::catalog;
 use super::catalog::CatalogSnapshot;
 #[cfg(test)]
 use super::codes;
+#[cfg(test)]
+use super::guard::TargetFamily;
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::schema::{
     Affinity, Column, ColumnId, CreateTable, ForeignKeyDefinition, ForeignKeyId, IndexId,
@@ -1124,6 +1126,28 @@ impl InsertRows {
     }
 }
 
+#[cfg(test)]
+fn decode_stored_row(frame: &[u8]) -> std::result::Result<Row, RowCodecError> {
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(ROW_FRAME_VERSION) {
+        return Err(RowCodecError::UnknownVersion);
+    }
+    let mut schema_revision = None;
+    let mut values = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        match tag {
+            TAG_SCHEMA_REVISION => set_once(
+                &mut schema_revision,
+                SchemaRevisionId::from_bytes(uuid_bytes(value)?),
+            )?,
+            TAG_COLUMN_VALUE => values.push(decode_column_value(value)?),
+            _ => {}
+        }
+    }
+    schema_revision.ok_or(RowCodecError::MissingField(TAG_SCHEMA_REVISION))?;
+    validate_row_values(values)
+}
+
 fn encode_row_image(row: &Row) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.u8(ROW_IMAGE_FRAME_VERSION);
@@ -2175,7 +2199,7 @@ fn capture_table(connection: &Connection, created: &CreateTable) -> Result<Vec<C
 }
 
 #[cfg(test)]
-pub(super) fn expected_foreign_reference_cells(
+pub(super) fn expected_materialized_cells(
     connection: &Connection,
 ) -> Result<BTreeMap<Key, Vec<u8>>> {
     let catalog = CatalogSnapshot::load(connection)?;
@@ -2185,18 +2209,76 @@ pub(super) fn expected_foreign_reference_cells(
         let Some(rows) = InsertRows::from_catalog(&catalog, &captured)? else {
             continue;
         };
-        let references = rows
-            .foreign_reference_map()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        for (key, owner) in references {
-            if expected.insert(key, owner).is_some() {
+        for mutation in rows.to_homebase()?.mutations {
+            let Mutation::Set { key, value } = mutation else {
                 return Err(Error::CaptureInvariant(
-                    "materialized rows produce duplicate foreign-reference cells",
+                    "materialized rows lowered to a destructive mutation",
+                ));
+            };
+            if expected.insert(key, value).is_some() {
+                return Err(Error::CaptureInvariant(
+                    "materialized rows produce duplicate authority cells",
                 ));
             }
         }
     }
     Ok(expected)
+}
+
+#[cfg(test)]
+pub(super) fn validate_materialized_cells(
+    expected: &BTreeMap<Key, Vec<u8>>,
+    actual: &BTreeMap<Key, Vec<u8>>,
+) -> Result<()> {
+    let exact_family = |key: &Key| {
+        matches!(
+            TargetFamily::classify(key),
+            Some(TargetFamily::UniqueOwner | TargetFamily::ForeignReference)
+        )
+    };
+    let expected_exact = expected
+        .iter()
+        .filter(|(key, _)| exact_family(key))
+        .collect::<BTreeMap<_, _>>();
+    let actual_exact = actual
+        .iter()
+        .filter(|(key, _)| exact_family(key))
+        .collect::<BTreeMap<_, _>>();
+    if expected_exact != actual_exact {
+        return Err(Error::CaptureInvariant(
+            "authority UNIQUE or foreign-reference cells diverge from materialized rows",
+        ));
+    }
+
+    let expected_rows = expected
+        .iter()
+        .filter(|(key, _)| TargetFamily::classify(key) == Some(TargetFamily::Row))
+        .collect::<BTreeMap<_, _>>();
+    let actual_rows = actual
+        .iter()
+        .filter(|(key, _)| TargetFamily::classify(key) == Some(TargetFamily::Row))
+        .collect::<BTreeMap<_, _>>();
+    if !expected_rows.keys().eq(actual_rows.keys()) {
+        return Err(Error::CaptureInvariant(
+            "authority row identities diverge from materialized rows",
+        ));
+    }
+    for (key, expected_frame) in expected_rows {
+        let expected_row = decode_stored_row(expected_frame)
+            .map_err(|_| Error::CaptureInvariant("materialized row frame is malformed"))?;
+        let actual_row = decode_stored_row(actual_rows[key])
+            .map_err(|_| Error::CaptureInvariant("authority row frame is malformed"))?;
+        if actual_row.values.iter().any(|(column, actual)| {
+            expected_row
+                .value(*column)
+                .is_some_and(|expected| expected != actual)
+        }) {
+            return Err(Error::CaptureInvariant(
+                "authority row values diverge from materialized rows",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn row_prefix(
@@ -2916,6 +2998,20 @@ mod tests {
         }
     }
 
+    fn stored_row_frame(revision: SchemaRevisionId, row: &Row) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(ROW_FRAME_VERSION);
+        writer
+            .field(TAG_SCHEMA_REVISION, &revision.as_bytes())
+            .unwrap();
+        for (column, value) in &row.values {
+            writer
+                .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
+                .unwrap();
+        }
+        writer.finish()
+    }
+
     #[test]
     fn insert_codec_and_homebase_envelope_roundtrip() {
         let created = definition();
@@ -2954,6 +3050,79 @@ mod tests {
         inserted
             .validate_homebase(&admit(lowered.mutations))
             .unwrap();
+    }
+
+    #[test]
+    fn materialized_cell_audit_projects_historical_rows_and_rejects_corruption() {
+        let created = definition();
+        let connection = connection(&created);
+        connection
+            .execute("INSERT INTO notes VALUES (7, 'hello', x'0102')", ())
+            .unwrap();
+        let expected = expected_materialized_cells(&connection).unwrap();
+        let row_key = expected
+            .keys()
+            .find(|key| TargetFamily::classify(key) == Some(TargetFamily::Row))
+            .unwrap()
+            .clone();
+        let mut historical = decode_stored_row(&expected[&row_key]).unwrap();
+        historical.values.pop();
+
+        let mut actual = expected.clone();
+        actual.insert(
+            row_key.clone(),
+            stored_row_frame(created.schema_revision_id(), &historical),
+        );
+        validate_materialized_cells(&expected, &actual).unwrap();
+
+        let body = historical.values.get_mut(1).unwrap();
+        body.1 = StoredValue::Text(b"corrupt".to_vec());
+        actual.insert(
+            row_key.clone(),
+            stored_row_frame(created.schema_revision_id(), &historical),
+        );
+        assert!(matches!(
+            validate_materialized_cells(&expected, &actual),
+            Err(Error::CaptureInvariant(
+                "authority row values diverge from materialized rows"
+            ))
+        ));
+
+        actual = expected.clone();
+        actual.remove(&row_key);
+        assert!(matches!(
+            validate_materialized_cells(&expected, &actual),
+            Err(Error::CaptureInvariant(
+                "authority row identities diverge from materialized rows"
+            ))
+        ));
+    }
+
+    #[test]
+    fn materialized_cell_audit_rejects_corrupt_ownership_cells() {
+        let created = unique_definition();
+        let connection = connection(&created);
+        connection
+            .execute(
+                "INSERT INTO accounts VALUES (7, 'acme', 'a@example.com')",
+                (),
+            )
+            .unwrap();
+        let expected = expected_materialized_cells(&connection).unwrap();
+        let unique_key = expected
+            .keys()
+            .find(|key| TargetFamily::classify(key) == Some(TargetFamily::UniqueOwner))
+            .unwrap()
+            .clone();
+        let mut actual = expected.clone();
+        actual.insert(unique_key, b"another owner".to_vec());
+
+        assert!(matches!(
+            validate_materialized_cells(&expected, &actual),
+            Err(Error::CaptureInvariant(
+                "authority UNIQUE or foreign-reference cells diverge from materialized rows"
+            ))
+        ));
     }
 
     #[test]

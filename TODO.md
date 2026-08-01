@@ -54,8 +54,9 @@ multilite
   retargets, primary-key moves, deletes, UNIQUE conflicts, mixed DDL/DML,
   reordered pushes, rejection repair, and restarts under both isolation levels.
   Every round requires converged schema and rows, valid catalog metadata, clean
-  `integrity_check`/`foreign_key_check`, and exact agreement between
-  materialized rows and live authority reverse-reference cells. Evolve this
+  `integrity_check`/`foreign_key_check`, an empty pending journal, and exact
+  projected agreement between materialized rows and historical authority row
+  frames, plus exact UNIQUE ownership and reverse-reference cells. Evolve this
   scenario simulation into a proper deterministic simulation test with a
   seeded scheduler; injected authority delay, loss, duplication, and partition;
   injected VFS/disk short reads, short writes, I/O failures, and corruption; and
