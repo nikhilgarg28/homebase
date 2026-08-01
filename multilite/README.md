@@ -3,25 +3,32 @@
 Rust library for multi-writer SQLite with end-to-end encrypted sync, built on
 the Homebase coordination kernel.
 
-The accepted SQL surface and the completion gate for future grammar are tracked
-in [`SQL_GRAMMAR.md`](./SQL_GRAMMAR.md).
+The documentation has one source for each kind of contract:
+
+- [`SQL_GRAMMAR.md`](./SQL_GRAMMAR.md) defines the accepted SQL surface and the
+  completion gate for every future grammar addition.
+- [`SCHEMA_EVOLUTION.md`](./SCHEMA_EVOLUTION.md) defines stable identities,
+  materialization, repair, and DDL compatibility.
+- [`GUARDS.md`](./GUARDS.md) is the generated audit of every logical target,
+  mutation, assertion, and rejection effect.
+- [`../DESIGN.md`](../DESIGN.md) is the system architecture. The root
+  `MULTILITE_CHALLENGES.md` is explicitly a historical vtable-era record.
 
 **Not ready for production use.** The current surface is a small,
 rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
-Homebase metadata. Public SQL currently permits a restricted persistent
-`CREATE TABLE`, identity-preserving `ALTER TABLE ... RENAME TO`, read-only
-prepared `SELECT`, `INSERT`, `DELETE`, and `UPDATE` against non-reserved tables.
-A table must use the initial four declared types and exactly one inline primary
-key. Inline and table-level `UNIQUE`
-declarations, including ordered multi-column constraints, are supported with
-SQLite's default comparison rules, as are explicit composite
-`CREATE [UNIQUE] INDEX`/`DROP INDEX` operations. Immediate `NO ACTION` foreign
-keys may target the complete primary key, table-declared UNIQUE key, or active
-explicit UNIQUE index of an existing synchronized table when child and parent
-affinities match. Other actions, deferral, self-references, and richer schema
-forms remain rejected. Other verbs, caller-owned transactions, conflict
-clauses, attached databases, and `AUTOINCREMENT` are rejected, and the
-`__multilite__` namespace is reserved.
+Homebase metadata. Public SQL currently permits restricted persistent
+`CREATE TABLE`; table/column rename and column add/drop forms of `ALTER TABLE`;
+`CREATE [UNIQUE] INDEX` and `DROP INDEX`; read-only `SELECT`; and captured
+`INSERT`, `DELETE`, and `UPDATE` against non-reserved tables. Ordinary and
+`STRICT` tables are supported. A rowid table must expose one exact `INTEGER
+PRIMARY KEY` alias; richer and composite primary keys use `WITHOUT ROWID`.
+Defaults, CHECK constraints, named constraints, ordered multi-column UNIQUE
+keys, and immediate `NO ACTION` foreign keys participate in the synchronized
+schema and guard model. Other verbs, caller-owned transactions, conflict
+clauses, attached databases, `AUTOINCREMENT`, deferred or cascading foreign
+keys, and unsupported expression/collation forms are rejected. The
+`__multilite__` namespace is reserved. Exact boundaries live in the grammar
+spec and executable parser tests rather than this overview.
 The internal operation layer translates restricted table creation and captured
 row insertion/deletion/replacement into lean logical operations. `Connection::update(|tx| ...)`
 accumulates multiple statements into one UUID-keyed `MultiliteTransaction`,
