@@ -12,7 +12,7 @@ use uuid::{Uuid, Variant, Version};
 
 #[cfg(test)]
 use super::codes;
-use super::guard::{GuardPlan, LogicalTarget};
+use super::guard::{GuardPlan, LogicalTarget, OperationFamily, validate_mutations};
 use super::isolation::IsolationLevel;
 use super::operation::{CompiledOperation, MultiliteOp, RejectionEffect};
 use crate::commit::footprint::ConflictFootprint;
@@ -202,6 +202,7 @@ impl MultiliteTransaction {
             key: transaction_key(self.id),
             value: self.encode()?,
         }];
+        validate_mutations(OperationFamily::TransactionEnvelope, &mutations)?;
         let mut guards = GuardPlan::merged();
         for operation in &self.operations {
             let (operation_mutations, operation_footprint, operation_guards) =
@@ -246,6 +247,7 @@ impl MultiliteTransaction {
             key: transaction_key(id),
             value: logical.encode()?,
         });
+        validate_mutations(OperationFamily::TransactionEnvelope, &mutations)?;
         mutations.extend(operation_mutations);
         let footprint = guards.footprint();
         Ok(CompiledTransaction {

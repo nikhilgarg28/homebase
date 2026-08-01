@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
 use super::catalog;
-use super::guard::GuardPlan;
+use super::guard::{GuardPlan, RejectionKind, validate_mutations, validate_rejection};
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
 use super::schema::CreateTable;
@@ -167,26 +167,53 @@ impl MultiliteOp {
     /// Validate and derive every deterministic artifact for this operation.
     pub fn compile(self) -> Result<CompiledOperation> {
         let homebase = self.to_homebase()?;
-        let rejection = match &self {
-            Self::AlterTable(operation) => RejectionEffect::RevertAlterTable {
-                operation: operation.clone(),
-            },
-            Self::CreateTable(created) => RejectionEffect::DropTable {
-                created: created.clone(),
-            },
-            Self::InsertRows(inserted) => RejectionEffect::DeleteRows {
-                inserted: inserted.clone(),
-            },
-            Self::DeleteRows(deleted) => RejectionEffect::RestoreRows {
-                deleted: deleted.clone(),
-            },
-            Self::UpdateRows(updated) => RejectionEffect::RestoreUpdatedRows {
-                updated: updated.clone(),
-            },
-            Self::Index(operation) => RejectionEffect::RevertIndex {
-                operation: operation.clone(),
-            },
+        let (rejection, rejection_kind) = match &self {
+            Self::AlterTable(operation) => (
+                RejectionEffect::RevertAlterTable {
+                    operation: operation.clone(),
+                },
+                RejectionKind::RevertAlterTable,
+            ),
+            Self::CreateTable(created) => (
+                RejectionEffect::DropTable {
+                    created: created.clone(),
+                },
+                RejectionKind::DropTable,
+            ),
+            Self::InsertRows(inserted) => (
+                RejectionEffect::DeleteRows {
+                    inserted: inserted.clone(),
+                },
+                RejectionKind::DeleteRows,
+            ),
+            Self::DeleteRows(deleted) => (
+                RejectionEffect::RestoreRows {
+                    deleted: deleted.clone(),
+                },
+                RejectionKind::RestoreRows,
+            ),
+            Self::UpdateRows(updated) => (
+                RejectionEffect::RestoreUpdatedRows {
+                    updated: updated.clone(),
+                },
+                RejectionKind::RestoreUpdatedRows,
+            ),
+            Self::Index(operation) => (
+                RejectionEffect::RevertIndex {
+                    operation: operation.clone(),
+                },
+                RejectionKind::RevertIndex,
+            ),
         };
+        validate_rejection(
+            homebase
+                .guards
+                .operation()
+                .ok_or(crate::Error::CaptureInvariant(
+                    "operation lowering produced an unscoped guard plan",
+                ))?,
+            rejection_kind,
+        )?;
         Ok(CompiledOperation {
             logical: self,
             homebase,
@@ -242,6 +269,12 @@ impl MultiliteOp {
                 (mutations, footprint, guards)
             }
         };
+        validate_mutations(
+            guards.operation().ok_or(crate::Error::CaptureInvariant(
+                "operation lowering produced an unscoped guard plan",
+            ))?,
+            &mutations,
+        )?;
         Ok(HomebaseOp {
             mutations,
             footprint,

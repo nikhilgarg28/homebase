@@ -1,6 +1,8 @@
 //! Typed logical targets used by Homebase mutations and conflict guards.
 
 use homebase_core::key::{Key, KeyError};
+use homebase_core::range::Range;
+use homebase_core::tag::Mutation;
 use sha2::{Digest, Sha256};
 
 use super::codes;
@@ -33,6 +35,7 @@ pub enum TargetFamily {
 /// Logical operation family whose conflict contract emitted a guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OperationFamily {
+    TransactionEnvelope,
     CreateTable,
     InsertRows,
     DeleteRows,
@@ -45,6 +48,129 @@ pub enum OperationFamily {
     DropColumn,
     TransactionRead,
 }
+
+/// Mutation shape permitted against one logical target family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MutationKind {
+    Set,
+    Delete,
+    DeletePrefix,
+}
+
+/// One permitted durable mutation shape in the checked compiler contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MutationContract {
+    operation: OperationFamily,
+    kind: MutationKind,
+    target: TargetFamily,
+}
+
+macro_rules! mutation_contract {
+    ($operation:ident, $kind:ident, $target:ident) => {
+        MutationContract {
+            operation: OperationFamily::$operation,
+            kind: MutationKind::$kind,
+            target: TargetFamily::$target,
+        }
+    };
+}
+
+/// Central allowlist for every Homebase mutation emitted by the compiler.
+pub const MUTATION_CONTRACTS: &[MutationContract] = &[
+    mutation_contract!(TransactionEnvelope, Set, TransactionLog),
+    mutation_contract!(CreateTable, Set, SchemaLog),
+    mutation_contract!(CreateTable, Set, SchemaObjectName),
+    mutation_contract!(CreateTable, Set, TableSchema),
+    mutation_contract!(CreateTable, Set, ActivePrimaryIndex),
+    mutation_contract!(CreateTable, Set, ActiveSchemaRevision),
+    mutation_contract!(CreateTable, Set, IndexDefinition),
+    mutation_contract!(CreateTable, Set, ColumnName),
+    mutation_contract!(CreateTable, Set, WriteRevision),
+    mutation_contract!(InsertRows, Set, Row),
+    mutation_contract!(InsertRows, Set, UniqueOwner),
+    mutation_contract!(InsertRows, Set, ForeignReference),
+    mutation_contract!(DeleteRows, Delete, Row),
+    mutation_contract!(DeleteRows, Delete, UniqueOwner),
+    mutation_contract!(DeleteRows, Delete, ForeignReference),
+    mutation_contract!(DeleteRows, DeletePrefix, ForeignReference),
+    mutation_contract!(UpdateRows, Set, Row),
+    mutation_contract!(UpdateRows, Set, UniqueOwner),
+    mutation_contract!(UpdateRows, Set, ForeignReference),
+    mutation_contract!(UpdateRows, Delete, Row),
+    mutation_contract!(UpdateRows, Delete, UniqueOwner),
+    mutation_contract!(UpdateRows, Delete, ForeignReference),
+    mutation_contract!(UpdateRows, DeletePrefix, ForeignReference),
+    mutation_contract!(CreateIndex, Set, SchemaLog),
+    mutation_contract!(CreateIndex, Set, SchemaObjectName),
+    mutation_contract!(CreateIndex, Set, TableSchema),
+    mutation_contract!(CreateIndex, Set, ActiveSchemaRevision),
+    mutation_contract!(CreateIndex, Set, ColumnDependency),
+    mutation_contract!(CreateIndex, Set, IndexDefinition),
+    mutation_contract!(CreateIndex, Set, UniqueOwner),
+    mutation_contract!(CreateIndex, Set, WriteRevision),
+    mutation_contract!(DropIndex, Set, SchemaLog),
+    mutation_contract!(DropIndex, Set, TableSchema),
+    mutation_contract!(DropIndex, Set, ActiveSchemaRevision),
+    mutation_contract!(DropIndex, Delete, SchemaObjectName),
+    mutation_contract!(DropIndex, Delete, ColumnDependency),
+    mutation_contract!(RenameTable, Set, SchemaLog),
+    mutation_contract!(RenameTable, Set, SchemaObjectName),
+    mutation_contract!(RenameTable, Delete, SchemaObjectName),
+    mutation_contract!(RenameColumn, Set, SchemaLog),
+    mutation_contract!(RenameColumn, Set, ColumnName),
+    mutation_contract!(RenameColumn, Delete, ColumnName),
+    mutation_contract!(AddColumn, Set, SchemaLog),
+    mutation_contract!(AddColumn, Set, ColumnName),
+    mutation_contract!(AddColumn, Set, TableSchema),
+    mutation_contract!(AddColumn, Set, ColumnDependency),
+    mutation_contract!(AddColumn, Set, WriteRevision),
+    mutation_contract!(DropColumn, Set, SchemaLog),
+    mutation_contract!(DropColumn, Set, TableSchema),
+    mutation_contract!(DropColumn, Delete, ColumnName),
+    mutation_contract!(DropColumn, Delete, ColumnDependency),
+    mutation_contract!(DropColumn, DeletePrefix, ColumnDependency),
+];
+
+/// Local materialized-state repair selected when authority rejects an op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RejectionKind {
+    DropTable,
+    DeleteRows,
+    RestoreRows,
+    RestoreUpdatedRows,
+    RevertIndex,
+    RevertAlterTable,
+}
+
+/// One operation-to-repair mapping in the checked compiler contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RejectionContract {
+    operation: OperationFamily,
+    rejection: RejectionKind,
+}
+
+macro_rules! rejection_contract {
+    ($operation:ident, $rejection:ident) => {
+        RejectionContract {
+            operation: OperationFamily::$operation,
+            rejection: RejectionKind::$rejection,
+        }
+    };
+}
+
+/// Central allowlist for speculative rejection repair.
+pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
+    rejection_contract!(CreateTable, DropTable),
+    rejection_contract!(InsertRows, DeleteRows),
+    rejection_contract!(DeleteRows, RestoreRows),
+    rejection_contract!(UpdateRows, RestoreUpdatedRows),
+    rejection_contract!(CreateIndex, RevertIndex),
+    rejection_contract!(DropIndex, RevertIndex),
+    rejection_contract!(RenameTable, RevertAlterTable),
+    rejection_contract!(RenameColumn, RevertAlterTable),
+    rejection_contract!(AddColumn, RevertAlterTable),
+    rejection_contract!(DropColumn, RevertAlterTable),
+];
 
 impl TargetFamily {
     /// Classify a rendered target back into the compiler's finite vocabulary.
@@ -112,7 +238,7 @@ impl TargetFamily {
 
 /// Whether a guard is mandatory by invariant, selected for write conflicts, or
 /// included only by serializable isolation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GuardClass {
     Invariant,
     Write,
@@ -120,7 +246,7 @@ pub enum GuardClass {
 }
 
 /// Semantic reason an operation depends on one logical target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GuardReason {
     SchemaObjectName,
     ColumnNameBinding,
@@ -269,6 +395,10 @@ impl GuardPlan {
         Self::default()
     }
 
+    pub fn operation(&self) -> Option<OperationFamily> {
+        self.operation
+    }
+
     pub fn invariant(&mut self, target: Key, reason: GuardReason) -> MultiliteResult<()> {
         self.insert(target, GuardClass::Invariant, reason)
     }
@@ -342,6 +472,108 @@ impl GuardPlan {
         });
         Ok(())
     }
+}
+
+/// Reject compiler output that writes outside its declared operation contract.
+pub fn validate_mutations(
+    operation: OperationFamily,
+    mutations: &[Mutation],
+) -> MultiliteResult<()> {
+    for mutation in mutations {
+        let (kind, key) = match mutation {
+            Mutation::Set { key, .. } => (MutationKind::Set, key),
+            Mutation::Delete { key } => (MutationKind::Delete, key),
+            Mutation::DeleteRange {
+                range: Range::Prefix(prefix),
+            } => (MutationKind::DeletePrefix, prefix),
+            Mutation::DeleteRange { range: Range::Full } => {
+                return Err(Error::CaptureInvariant(
+                    "Multilite operations cannot delete the full Homebase keyspace",
+                ));
+            }
+        };
+        let family = TargetFamily::classify(key).ok_or(Error::CaptureInvariant(
+            "mutation target is outside the logical target registry",
+        ))?;
+        if !MUTATION_CONTRACTS.iter().any(|contract| {
+            contract.operation == operation && contract.kind == kind && contract.target == family
+        }) {
+            return Err(Error::CaptureInvariant(
+                "mutation is absent from the operation contract",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject an inverse that does not match its operation's declared repair.
+pub fn validate_rejection(
+    operation: OperationFamily,
+    rejection: RejectionKind,
+) -> MultiliteResult<()> {
+    if REJECTION_CONTRACTS
+        .iter()
+        .any(|contract| contract.operation == operation && contract.rejection == rejection)
+    {
+        Ok(())
+    } else {
+        Err(Error::CaptureInvariant(
+            "rejection repair is absent from the operation contract",
+        ))
+    }
+}
+
+#[cfg(test)]
+fn audit_markdown() -> String {
+    use std::fmt::Write as _;
+
+    let mut audit = String::from(
+        "# Multilite Operation Contracts\n\n\
+         This file is generated from the checked contracts in `src/database/guard.rs`. \
+         The compiler rejects mutations, guards, and rejection repairs absent from these tables.\n\n\
+         Guard classes have distinct semantics: `Invariant` is mandatory at every isolation level, \
+         `Write` participates in write/write validation, and `SerializableRead` is added only for \
+         serializable transactions. Repeated runtime guards are retained for auditability before \
+         the executable footprint is prefix-pruned.\n\n\
+         ## Mutations\n\n\
+         | Operation | Mutation | Target family |\n\
+         | --- | --- | --- |\n",
+    );
+    for contract in MUTATION_CONTRACTS {
+        writeln!(
+            audit,
+            "| `{:?}` | `{:?}` | `{:?}` |",
+            contract.operation, contract.kind, contract.target
+        )
+        .unwrap();
+    }
+    audit.push_str(
+        "\n## Guards\n\n\
+         | Operation | Class | Reason | Target family |\n\
+         | --- | --- | --- | --- |\n",
+    );
+    for contract in GUARD_CONTRACTS {
+        writeln!(
+            audit,
+            "| `{:?}` | `{:?}` | `{:?}` | `{:?}` |",
+            contract.operation, contract.class, contract.reason, contract.target
+        )
+        .unwrap();
+    }
+    audit.push_str(
+        "\n## Rejection Repair\n\n\
+         | Operation | Local inverse |\n\
+         | --- | --- |\n",
+    );
+    for contract in REJECTION_CONTRACTS {
+        writeln!(
+            audit,
+            "| `{:?}` | `{:?}` |",
+            contract.operation, contract.rejection
+        )
+        .unwrap();
+    }
+    audit
 }
 
 /// One point or component-prefix address in Multilite's durable Homebase model.
@@ -787,5 +1019,109 @@ mod tests {
                 "guard is absent from the operation contract"
             ))
         ));
+    }
+
+    #[test]
+    fn checked_guard_audit_matches_the_compiler_contracts() {
+        assert_eq!(include_str!("../../GUARDS.md"), audit_markdown());
+    }
+
+    #[test]
+    fn mutation_and_rejection_contracts_are_enforced() {
+        let table = id(1, TableId::from_bytes);
+        let index = id(2, IndexId::from_bytes);
+        let row = LogicalTarget::Row {
+            table,
+            index,
+            images: vec![b"row".to_vec()],
+        }
+        .render()
+        .unwrap();
+        validate_mutations(
+            OperationFamily::InsertRows,
+            &[Mutation::Set {
+                key: row.clone(),
+                value: Vec::new(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_mutations(
+                OperationFamily::InsertRows,
+                &[Mutation::Delete { key: row.clone() }]
+            ),
+            Err(Error::CaptureInvariant(
+                "mutation is absent from the operation contract"
+            ))
+        ));
+        assert!(matches!(
+            validate_mutations(
+                OperationFamily::DeleteRows,
+                &[Mutation::DeleteRange { range: Range::Full }]
+            ),
+            Err(Error::CaptureInvariant(
+                "Multilite operations cannot delete the full Homebase keyspace"
+            ))
+        ));
+        validate_rejection(OperationFamily::InsertRows, RejectionKind::DeleteRows).unwrap();
+        assert!(validate_rejection(OperationFamily::InsertRows, RejectionKind::DropTable).is_err());
+    }
+
+    #[test]
+    fn central_contract_tables_are_duplicate_free_and_cover_every_operation() {
+        use std::collections::BTreeSet;
+
+        let mutations = MUTATION_CONTRACTS
+            .iter()
+            .map(|contract| (contract.operation, contract.kind, contract.target))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mutations.len(), MUTATION_CONTRACTS.len());
+        let guards = GUARD_CONTRACTS
+            .iter()
+            .map(|contract| {
+                (
+                    contract.operation,
+                    contract.class,
+                    contract.reason,
+                    contract.target,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(guards.len(), GUARD_CONTRACTS.len());
+        let rejections = REJECTION_CONTRACTS
+            .iter()
+            .map(|contract| (contract.operation, contract.rejection))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(rejections.len(), REJECTION_CONTRACTS.len());
+
+        let logical_operations = BTreeSet::from([
+            OperationFamily::CreateTable,
+            OperationFamily::InsertRows,
+            OperationFamily::DeleteRows,
+            OperationFamily::UpdateRows,
+            OperationFamily::CreateIndex,
+            OperationFamily::DropIndex,
+            OperationFamily::RenameTable,
+            OperationFamily::RenameColumn,
+            OperationFamily::AddColumn,
+            OperationFamily::DropColumn,
+        ]);
+        assert_eq!(
+            REJECTION_CONTRACTS
+                .iter()
+                .map(|contract| contract.operation)
+                .collect::<BTreeSet<_>>(),
+            logical_operations
+        );
+        assert!(logical_operations.iter().all(|operation| {
+            MUTATION_CONTRACTS
+                .iter()
+                .any(|contract| contract.operation == *operation)
+        }));
+        assert!(logical_operations.iter().all(|operation| {
+            GUARD_CONTRACTS
+                .iter()
+                .any(|contract| contract.operation == *operation)
+        }));
     }
 }

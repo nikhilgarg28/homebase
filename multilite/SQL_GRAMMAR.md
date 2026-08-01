@@ -19,8 +19,9 @@ true:
 3. Stored SQL provenance projects to the same resolved operation.
 4. Homebase lowering is deterministic and admitted batches are authenticated by
    decoding and exact re-lowering.
-5. Snapshot-isolation writes and mandatory constraints are explicit; any
-   serializable read contribution is conservative and complete.
+5. Every mutation, mandatory invariant, write guard, serializable read, and
+   rejection inverse is declared in the checked [`GUARDS.md`](./GUARDS.md)
+   contract; any serializable read contribution is conservative and complete.
 6. Local branch execution and canonical logical application produce the same
    touched rows and catalog state.
 7. Pending rejection effects restore the before-state atomically.
