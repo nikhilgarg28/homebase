@@ -63,6 +63,11 @@ pub struct IndexHomebaseOp {
 }
 
 impl IndexOperation {
+    #[cfg(debug_assertions)]
+    pub(super) fn table_id(&self) -> super::schema::TableId {
+        self.after.table_id()
+    }
+
     /// Prepare a CREATE INDEX after SQLite has validated and built it.
     pub fn prepare_create(
         connection: &Connection,

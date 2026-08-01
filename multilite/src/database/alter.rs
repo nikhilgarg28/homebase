@@ -103,6 +103,11 @@ pub struct AlterTableHomebaseOp {
 }
 
 impl AlterTableOperation {
+    #[cfg(debug_assertions)]
+    pub(super) fn table_id(&self) -> TableId {
+        self.table
+    }
+
     /// Resolve the SQL source name once, then retain only its stable identity.
     pub fn prepare_rename_table(
         connection: &Connection,

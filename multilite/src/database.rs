@@ -11,6 +11,8 @@ mod index;
 pub(crate) mod isolation;
 pub(crate) mod operation;
 mod pending;
+#[cfg(debug_assertions)]
+mod physical;
 mod policy;
 mod rebase;
 pub(crate) mod row;

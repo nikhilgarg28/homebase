@@ -305,7 +305,13 @@ impl MultiliteOp {
             Self::InsertRows(inserted) => inserted.verify_materialized(connection),
             Self::DeleteRows(deleted) => deleted.verify_materialized(connection),
             Self::UpdateRows(updated) => updated.verify_materialized(connection),
-            Self::AlterTable(_) | Self::CreateTable(_) | Self::Index(_) => Ok(()),
+            Self::AlterTable(altered) => {
+                super::physical::verify_table(connection, altered.table_id())
+            }
+            Self::CreateTable(created) => {
+                super::physical::verify_table(connection, created.table_id())
+            }
+            Self::Index(index) => super::physical::verify_table(connection, index.table_id()),
         }
     }
 }
