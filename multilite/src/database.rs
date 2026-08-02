@@ -766,6 +766,7 @@ fn open_on<H: ServerHandle + Send + Sync + 'static>(
     let commit_history = CommitHistory::default();
     let canonical = CanonicalRouter::default();
     let wal_path = wal_path_for(&path);
+    owner.with_connection(crate::repair::register)?;
     let (database_id, client) =
         owner.with_savepoint("__multilite__database_open", |connection| {
             validate_user_table_shapes(connection)?;
@@ -841,6 +842,7 @@ fn initialize<H: ServerHandle>(
     };
     SqliteOrderedStore::initialize(owner)?;
     owner.with_connection(pending::initialize)?;
+    owner.with_connection(crate::repair::initialize)?;
     owner.with_connection(catalog::initialize)?;
     owner.with_connection(history::initialize)?;
     let store = DatabaseMetaStore::with_database(owner.clone(), canonical);
@@ -903,6 +905,7 @@ fn reopen<H: ServerHandle>(
         catalog::validate(connection)?;
         history::validate(connection)?;
         rowid::validate(connection)?;
+        crate::repair::validate(connection)?;
         pending::validate_active_from(connection, space.cursors.neck)?;
         commit_history.prune(connection)?;
         Ok::<_, Error>(())
@@ -929,14 +932,16 @@ enum DatabaseState {
 fn classify(connection: &SqliteConnection) -> Result<DatabaseState> {
     let metadata = SqliteOrderedStore::is_initialized(connection)?;
     let pending = pending::is_initialized(connection)?;
+    let repair = crate::repair::is_initialized(connection)?;
     let catalog = catalog::is_initialized(connection)?;
     let history = history::is_initialized(connection)?;
     let rowids = rowid::is_initialized(connection)?;
-    match (metadata, pending, catalog, history, rowids) {
-        (false, false, false, false, false) => Ok(DatabaseState::Fresh),
-        (true, true, true, true, true) => {
+    match (metadata, pending, repair, catalog, history, rowids) {
+        (false, false, false, false, false, false) => Ok(DatabaseState::Fresh),
+        (true, true, true, true, true, true) => {
             SqliteOrderedStore::validate(connection)?;
             pending::validate(connection)?;
+            crate::repair::validate(connection)?;
             catalog::validate(connection)?;
             rowid::validate(connection)?;
             Ok(DatabaseState::Initialized)

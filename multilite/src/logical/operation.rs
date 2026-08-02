@@ -251,6 +251,22 @@ impl MultiliteOp {
         }
     }
 
+    /// Capture any local-only inverse state required before speculative apply.
+    pub(crate) fn capture_local_repair(&self, connection: &Connection) -> Result<()> {
+        match self {
+            Self::AlterTable(altered) => altered.capture_local_repair(connection),
+            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => Ok(()),
+        }
+    }
+
+    /// Sidecar identity required while this operation remains pending.
+    pub(crate) fn repair_id(&self) -> Option<crate::repair::RepairId> {
+        match self {
+            Self::AlterTable(altered) => altered.repair_id(),
+            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => None,
+        }
+    }
+
     /// Check the canonical row state against the branch-captured operation.
     #[cfg(debug_assertions)]
     pub(super) fn verify_materialized(&self, connection: &Connection) -> Result<()> {

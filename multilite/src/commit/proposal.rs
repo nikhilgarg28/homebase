@@ -863,7 +863,7 @@ pub fn prepare(
     let writes = history::writes_from_mutations(transaction.compiled().homebase().mutations());
     transaction
         .transaction()
-        .apply(connection)
+        .apply_speculative(connection)
         .map_err(classify_replay_error)?;
     Ok(PrepareOutcome::Prepared(proposal.prepare_receipt(writes)?))
 }

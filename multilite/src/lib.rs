@@ -13,6 +13,7 @@ mod logical;
 mod metastore;
 #[cfg(debug_assertions)]
 mod physical;
+mod repair;
 mod rowid;
 mod runtime;
 mod sql;

@@ -13,6 +13,7 @@ use crate::catalog;
 use crate::commit::history::{self, WriteRegion};
 use crate::logical::operation::RejectionEffect;
 use crate::logical::transaction::MultiliteTransaction;
+use crate::repair;
 use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
@@ -53,6 +54,9 @@ impl RejectionRepair {
             return Err(Error::StalePushRejection);
         }
         apply_rejection(connection, &self.effects)?;
+        if repair::is_initialized(connection)? {
+            repair::validate_expected(connection, [])?;
+        }
         if !self.pending.is_empty() {
             connection.execute(&format!("DELETE FROM {TABLE}"), ())?;
         }
@@ -191,6 +195,19 @@ pub fn insert(
     seq: DeviceSeq,
     transaction: &MultiliteTransaction,
 ) -> Result<()> {
+    let repair_ids = transaction.repair_ids().collect::<BTreeSet<_>>();
+    if repair_ids.len() != transaction.repair_ids().count() {
+        return Err(Error::InvalidMultiliteTransaction(
+            "transaction reuses a destructive repair identity".into(),
+        ));
+    }
+    for repair_id in repair_ids {
+        if !repair::contains(connection, repair_id)? {
+            return Err(Error::CaptureInvariant(
+                "destructive operation was journaled without its repair sidecar",
+            ));
+        }
+    }
     let pending = PendingTransaction::new(seq, transaction.clone());
     connection.execute(
         &format!("INSERT INTO {TABLE} (device_seq, record) VALUES (?1, ?2)"),
@@ -233,6 +250,12 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
         .take_while(|pending| pending.seq <= through)
         .collect::<Vec<_>>();
     if !accepted.is_empty() {
+        for repair_id in accepted
+            .iter()
+            .flat_map(|pending| pending.transaction.repair_ids())
+        {
+            repair::retire(connection, repair_id)?;
+        }
         connection.execute(
             &format!("DELETE FROM {TABLE} WHERE device_seq <= ?1"),
             [through.0.to_be_bytes().as_slice()],
@@ -300,12 +323,21 @@ pub fn reject_active(
 
 /// Verify that every pending transaction still belongs to the active submit log.
 pub fn validate_active_from(connection: &Connection, neck: DeviceSeq) -> Result<()> {
-    if load(connection)?
-        .into_iter()
-        .any(|pending| pending.seq < neck)
-    {
+    let pending = load(connection)?;
+    if pending.iter().any(|pending| pending.seq < neck) {
         return Err(Error::InvalidDatabase(
             "accepted pending transaction was not finalized with its submit trim",
+        ));
+    }
+    let repair_ids = pending
+        .iter()
+        .flat_map(|pending| pending.transaction.repair_ids())
+        .collect::<Vec<_>>();
+    if repair::is_initialized(connection)? {
+        repair::validate_expected(connection, repair_ids)?;
+    } else if !repair_ids.is_empty() {
+        return Err(Error::InvalidDatabase(
+            "pending destructive operation has no repair sidecar tables",
         ));
     }
     Ok(())
@@ -530,6 +562,51 @@ mod tests {
 
     fn transaction(operation: MultiliteOp) -> MultiliteTransaction {
         MultiliteTransaction::new(vec![operation]).unwrap()
+    }
+
+    fn pending_drop() -> (Connection, MultiliteTransaction, repair::RepairId) {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
+        catalog::initialize(&connection).unwrap();
+        let create_sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(create_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(create_sql, spec);
+        connection.execute(create_sql, ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        connection
+            .execute_batch("INSERT INTO notes VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+        let drop_sql = "ALTER TABLE notes DROP COLUMN body";
+        let crate::sql::ValidatedExecute::DropColumn(spec) =
+            crate::sql::validate_execute(drop_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let operation = MultiliteOp::AlterTable(
+            AlterTableOperation::prepare_drop_column(&connection, drop_sql, &spec).unwrap(),
+        );
+        let transaction = transaction(operation);
+        let repair_id = transaction.repair_ids().next().unwrap();
+        transaction.apply_speculative(&connection).unwrap();
+        (connection, transaction, repair_id)
+    }
+
+    fn active_commit(seq: DeviceSeq) -> Vec<(DeviceSeq, DeviceOp)> {
+        vec![(
+            seq,
+            DeviceOp::Commit {
+                entries: Vec::new(),
+                range_asserts: Vec::new(),
+                evidence: Vec::new(),
+                submit_mode: SubmitMode::Unchecked,
+            },
+        )]
     }
 
     #[test]
@@ -902,6 +979,168 @@ mod tests {
             load(&connection).unwrap(),
             [PendingTransaction::new(DeviceSeq(9), later)]
         );
+    }
+
+    #[test]
+    fn accepted_drop_column_retires_local_repair_with_its_pending_row() {
+        let (connection, transaction, repair_id) = pending_drop();
+        insert(&connection, DeviceSeq(3), &transaction).unwrap();
+        assert!(repair::contains(&connection, repair_id).unwrap());
+
+        accept_through(&connection, DeviceSeq(3)).unwrap();
+
+        assert!(load(&connection).unwrap().is_empty());
+        assert!(!repair::contains(&connection, repair_id).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('notes')",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_acceptance_cleanup_restores_pending_row_and_sidecar_together() {
+        let (connection, transaction, repair_id) = pending_drop();
+        insert(&connection, DeviceSeq(3), &transaction).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_pending_cleanup
+                 BEFORE DELETE ON {TABLE}
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END"
+            ))
+            .unwrap();
+
+        assert!(
+            crate::connection::with_savepoint(&connection, "test_accept", || {
+                accept_through(&connection, DeviceSeq(3))
+            })
+            .is_err()
+        );
+        assert_eq!(load(&connection).unwrap().len(), 1);
+        assert!(repair::contains(&connection, repair_id).unwrap());
+    }
+
+    #[test]
+    fn rejected_drop_column_restores_values_and_consumes_local_repair() {
+        let (connection, transaction, repair_id) = pending_drop();
+        insert(&connection, DeviceSeq(4), &transaction).unwrap();
+
+        reject_active(&connection, &active_commit(DeviceSeq(4))).unwrap();
+
+        assert_eq!(
+            connection
+                .prepare("SELECT id, body FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [(1, "one".into()), (2, "two".into())]
+        );
+        assert!(load(&connection).unwrap().is_empty());
+        assert!(!repair::contains(&connection, repair_id).unwrap());
+    }
+
+    #[test]
+    fn rejection_repairs_multiple_destructive_operations_newest_first() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
+        catalog::initialize(&connection).unwrap();
+        let create_sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, first TEXT, second BLOB)";
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(create_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(create_sql, spec);
+        connection.execute(create_sql, ()).unwrap();
+        catalog::insert(&connection, &created).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'one', x'0001')", ())
+            .unwrap();
+
+        let first_sql = "ALTER TABLE notes DROP COLUMN first";
+        let crate::sql::ValidatedExecute::DropColumn(first_spec) =
+            crate::sql::validate_execute(first_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let first =
+            AlterTableOperation::prepare_drop_column(&connection, first_sql, &first_spec).unwrap();
+        first.capture_local_repair(&connection).unwrap();
+        first.apply(&connection).unwrap();
+
+        let second_sql = "ALTER TABLE notes DROP COLUMN second";
+        let crate::sql::ValidatedExecute::DropColumn(second_spec) =
+            crate::sql::validate_execute(second_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let second =
+            AlterTableOperation::prepare_drop_column(&connection, second_sql, &second_spec)
+                .unwrap();
+        second.capture_local_repair(&connection).unwrap();
+        second.apply(&connection).unwrap();
+
+        let transaction = MultiliteTransaction::new(vec![
+            MultiliteOp::AlterTable(first),
+            MultiliteOp::AlterTable(second),
+        ])
+        .unwrap();
+        assert_eq!(transaction.repair_ids().count(), 2);
+        insert(&connection, DeviceSeq(7), &transaction).unwrap();
+
+        reject_active(&connection, &active_commit(DeviceSeq(7))).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT id, first, hex(second) FROM notes", (), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },)
+                .unwrap(),
+            (1, "one".into(), "0001".into())
+        );
+        assert!(load(&connection).unwrap().is_empty());
+        repair::validate_expected(&connection, []).unwrap();
+        catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn reopen_validation_rejects_missing_and_orphaned_repair_jobs() {
+        let (missing, transaction, repair_id) = pending_drop();
+        insert(&missing, DeviceSeq(5), &transaction).unwrap();
+        repair::retire(&missing, repair_id).unwrap();
+        assert!(matches!(
+            validate_active_from(&missing, DeviceSeq(5)),
+            Err(Error::InvalidDatabase(
+                "repair sidecars do not match pending destructive operations"
+            ))
+        ));
+
+        let (orphaned, transaction, _) = pending_drop();
+        insert(&orphaned, DeviceSeq(6), &transaction).unwrap();
+        orphaned
+            .execute(&format!("DELETE FROM {TABLE}"), ())
+            .unwrap();
+        assert!(matches!(
+            validate_active_from(&orphaned, DeviceSeq(6)),
+            Err(Error::InvalidDatabase(
+                "repair sidecars do not match pending destructive operations"
+            ))
+        ));
     }
 
     #[test]

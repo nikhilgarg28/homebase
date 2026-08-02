@@ -27,6 +27,11 @@ images. The normalized row operation and enclosing transaction frame enforce
 the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls
 back the complete SQLite statement with a typed error.
 
+`DROP COLUMN` replicates metadata only. Its originating replica streams the
+dropped values into a local repair sidecar, currently bounded at 100,000 rows
+and 64 MiB. Crossing either limit refuses the statement before schema,
+pending-journal, or sidecar state becomes durable.
+
 ## Completion Gate
 
 A new statement family or syntax extension is incomplete until all of these are

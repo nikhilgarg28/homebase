@@ -3088,6 +3088,125 @@ fn index_creation_and_referenced_column_drop_conflict_in_either_order() {
 }
 
 #[test]
+fn rejected_drop_column_restores_local_sidecar_after_restart() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory
+            .path()
+            .join(format!("drop-sidecar-{isolation:?}-first.sqlite"));
+        let second_path = directory
+            .path()
+            .join(format!("drop-sidecar-{isolation:?}-second.sqlite"));
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let invitation = first.replica_invitation();
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(invitation.clone())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT,
+                    detail BLOB
+                )",
+                (),
+            )
+            .unwrap();
+        first
+            .execute(
+                "INSERT INTO notes VALUES (1, 'one', x'0001ff'), (2, 'two', NULL)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("CREATE INDEX notes_detail ON notes (detail)", ())
+            .unwrap();
+        second
+            .execute("ALTER TABLE notes DROP COLUMN detail", ())
+            .unwrap();
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(invitation.clone())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("a stale DROP COLUMN ignored the admitted index dependency")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(invitation.clone())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id, hex(detail) FROM notes ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(1, "0001FF".into()), (2, "".into())]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT id, body, hex(detail) FROM notes ORDER BY id",
+                        (),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .unwrap(),
+                [
+                    (1, "one".into(), "0001FF".into()),
+                    (2, "two".into(), "".into()),
+                ]
+            );
+            assert_eq!(index_names(database), ["notes_detail"]);
+        }
+    }
+}
+
+#[test]
 fn admitted_check_dependency_rejects_a_stale_referenced_column_drop() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

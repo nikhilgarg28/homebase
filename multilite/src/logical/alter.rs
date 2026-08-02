@@ -6,8 +6,8 @@ use homebase_core::range::Range;
 use homebase_core::reader::Reader;
 use homebase_core::tag::Mutation;
 use homebase_core::writer::Writer;
+use rusqlite::Connection;
 use rusqlite::config::DbConfig;
-use rusqlite::{Connection, ToSql, params_from_iter};
 use uuid::{Uuid, Variant, Version};
 
 use super::guard::{GuardPlan, GuardReason, OperationFamily};
@@ -19,12 +19,12 @@ use super::schema::{
 };
 use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
+use crate::repair;
 use crate::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
 use crate::sqlite::quote_identifier;
-use crate::value::StoredValue;
 use crate::{Error, Result};
 
-const ALTER_TABLE_VERSION: u8 = 4;
+const ALTER_TABLE_VERSION: u8 = 5;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_TABLE: u8 = 3;
@@ -35,22 +35,12 @@ const TAG_SOURCE_TABLE: u8 = 7;
 const TAG_COLUMN: u8 = 8;
 const TAG_BEFORE: u8 = 9;
 const TAG_AFTER: u8 = 10;
-const TAG_DROPPED_VALUE: u8 = 11;
 const TAG_SCHEMA_REVISION: u8 = 12;
 const TAG_PREDECESSOR: u8 = 13;
 const RENAME_TABLE: u8 = 1;
 const RENAME_COLUMN: u8 = 2;
 const ADD_COLUMN: u8 = 3;
 const DROP_COLUMN: u8 = 4;
-const TAG_DROPPED_PRIMARY: u8 = 1;
-const TAG_DROPPED_COLUMN: u8 = 3;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DroppedValue {
-    primary: Vec<StoredValue>,
-    value: StoredValue,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AlterTableDelta {
     RenameTable {
@@ -74,7 +64,6 @@ enum AlterTableDelta {
         name: SqlName,
         before: CreateTable,
         after: CreateTable,
-        dropped_values: Vec<DroppedValue>,
     },
 }
 
@@ -229,7 +218,6 @@ impl AlterTableOperation {
             ));
         }
         let after = before.with_removed_column(column)?;
-        let dropped_values = capture_dropped_values(connection, &before, column, &spec.column)?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),
@@ -241,7 +229,6 @@ impl AlterTableOperation {
                 name: spec.column.clone(),
                 before,
                 after,
-                dropped_values,
             },
         };
         operation.validate().map_err(invalid_operation)?;
@@ -398,6 +385,45 @@ impl AlterTableOperation {
         matches!(self.delta, AlterTableDelta::DropColumn { .. })
     }
 
+    /// Local sidecar identity required while this destructive operation is pending.
+    pub(crate) fn repair_id(&self) -> Option<repair::RepairId> {
+        matches!(self.delta, AlterTableDelta::DropColumn { .. })
+            .then(|| self.mutation_id.as_bytes())
+    }
+
+    /// Stream destroyed values into local durable storage before canonical apply.
+    pub(crate) fn capture_local_repair(&self, connection: &Connection) -> Result<()> {
+        let AlterTableDelta::DropColumn {
+            column,
+            name,
+            before,
+            ..
+        } = &self.delta
+        else {
+            return Ok(());
+        };
+        self.validate_catalog_before(connection)?;
+        let table = catalog::name_by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+            "DROP COLUMN table has no current name binding",
+        ))?;
+        let current_column = catalog::column_name_by_id(connection, self.table, *column)?.ok_or(
+            Error::InvalidDatabase("DROP COLUMN column has no current name binding"),
+        )?;
+        if current_column.canonical() != name.canonical() {
+            return Err(Error::InvalidDatabase(
+                "DROP COLUMN repair no longer matches the current column binding",
+            ));
+        }
+        let primary = primary_key_names(connection, before)?;
+        repair::capture_drop_column(
+            connection,
+            self.mutation_id.as_bytes(),
+            table.value(),
+            &primary,
+            current_column.value(),
+        )
+    }
+
     /// Record the binding change after a branch has executed the user's SQL.
     pub fn record_catalog(&self, connection: &Connection) -> Result<()> {
         with_savepoint(connection, "__multilite__record_alter", || {
@@ -525,7 +551,6 @@ impl AlterTableOperation {
                 column,
                 name,
                 before,
-                dropped_values,
                 ..
             } => {
                 connection.execute_batch(&format!(
@@ -541,8 +566,16 @@ impl AlterTableOperation {
                 let order = catalog::column_order(connection, self.table)?;
                 let folded = current.fold_added_column(before, *column, &order)?;
                 catalog::replace(connection, &folded)?;
-                restore_dropped_values(connection, &folded, *column, name, dropped_values)?;
-                rebuild_table_if_needed(connection, &folded, true)
+                let primary = primary_key_names(connection, &folded)?;
+                repair::restore_drop_column(
+                    connection,
+                    self.mutation_id.as_bytes(),
+                    table.value(),
+                    &primary,
+                    name.value(),
+                )?;
+                rebuild_table_if_needed(connection, &folded, true)?;
+                repair::retire(connection, self.mutation_id.as_bytes())
             }
         }
     }
@@ -636,7 +669,6 @@ impl AlterTableOperation {
                 name,
                 before,
                 after,
-                dropped_values,
             } => {
                 put_action(&mut writer, DROP_COLUMN);
                 put_column(&mut writer, *column);
@@ -647,11 +679,6 @@ impl AlterTableOperation {
                 writer
                     .field(TAG_AFTER, &after.encode())
                     .expect("ALTER TABLE field fits in u32");
-                for value in dropped_values {
-                    writer
-                        .field(TAG_DROPPED_VALUE, &encode_dropped_value(value))
-                        .expect("ALTER TABLE field fits in u32");
-                }
             }
         }
         writer.finish()
@@ -672,7 +699,6 @@ impl AlterTableOperation {
         let mut predecessor = None;
         let mut before = None;
         let mut after = None;
-        let mut dropped_values = Vec::new();
         let mut old_name = None;
         let mut new_name = None;
         while let Some((tag, value)) = reader
@@ -710,14 +736,12 @@ impl AlterTableOperation {
                     &mut after,
                     CreateTable::decode(value).map_err(|_| AlterTableCodecError::InvalidSchema)?,
                 )?,
-                TAG_DROPPED_VALUE => dropped_values.push(decode_dropped_value(value)?),
                 TAG_OLD_NAME => set_once(&mut old_name, SqlName::new(decode_string(value)?))?,
                 TAG_NEW_NAME => set_once(&mut new_name, SqlName::new(decode_string(value)?))?,
                 _ => {}
             }
         }
         let action = action.ok_or(AlterTableCodecError::MissingField(TAG_ACTION))?;
-        let unexpected_dropped_values = action != DROP_COLUMN && !dropped_values.is_empty();
         let delta = match action {
             RENAME_TABLE => AlterTableDelta::RenameTable {
                 old_name: take_required(&mut old_name, TAG_OLD_NAME)?,
@@ -740,7 +764,6 @@ impl AlterTableOperation {
                 name: take_required(&mut old_name, TAG_OLD_NAME)?,
                 before: take_required(&mut before, TAG_BEFORE)?,
                 after: take_required(&mut after, TAG_AFTER)?,
-                dropped_values,
             },
             _ => return Err(AlterTableCodecError::InvalidAction),
         };
@@ -750,7 +773,6 @@ impl AlterTableOperation {
             || after.is_some()
             || old_name.is_some()
             || new_name.is_some()
-            || unexpected_dropped_values
         {
             return Err(AlterTableCodecError::InvalidAction);
         }
@@ -813,7 +835,6 @@ impl AlterTableOperation {
                     name,
                     before,
                     after,
-                    dropped_values,
                 },
                 ValidatedExecute::DropColumn(spec),
             ) if spec.table == self.source_table
@@ -823,10 +844,7 @@ impl AlterTableOperation {
                 && before.schema_revision_id() != after.schema_revision_id()
                 && before
                     .with_removed_column(*column)
-                    .is_ok_and(|expected| expected == *after)
-                && dropped_values
-                    .iter()
-                    .all(|value| value.primary.len() == before.primary_key_columns().count()) => {}
+                    .is_ok_and(|expected| expected == *after) => {}
             _ => return Err(AlterTableCodecError::InvalidRename),
         }
         Ok(())
@@ -1105,176 +1123,16 @@ fn materialized_dependents(connection: &Connection, table: &SqlName) -> Result<V
         .map_err(Into::into)
 }
 
-fn capture_dropped_values(
-    connection: &Connection,
-    table: &CreateTable,
-    _column: ColumnId,
-    column_name: &SqlName,
-) -> Result<Vec<DroppedValue>> {
-    let table_name = catalog::name_by_id(connection, table.table_id())?.ok_or(
-        Error::InvalidDatabase("DROP COLUMN table has no current name binding"),
-    )?;
-    let primary = table
+fn primary_key_names(connection: &Connection, table: &CreateTable) -> Result<Vec<String>> {
+    table
         .primary_key_columns()
         .map(|column| {
             catalog::column_name_by_id(connection, table.table_id(), column.id())?.ok_or(
                 Error::InvalidDatabase("DROP COLUMN primary key has no current name binding"),
             )
         })
-        .collect::<Result<Vec<_>>>()?;
-    let mut selected = primary
-        .iter()
-        .map(|name| quote_identifier(name.value()))
-        .collect::<Vec<_>>();
-    selected.push(quote_identifier(column_name.value()));
-    let sql = format!(
-        "SELECT {} FROM {}",
-        selected.join(", "),
-        quote_identifier(table_name.value())
-    );
-    let primary_width = primary.len();
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map((), |row| {
-        let primary = (0..primary_width)
-            .map(|index| row.get_ref(index).map(StoredValue::capture))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(DroppedValue {
-            primary,
-            value: StoredValue::capture(row.get_ref(primary_width)?),
-        })
-    })?;
-    // TODO: enforce deterministic row/byte limits and spill large DDL repair
-    // payloads before DROP COLUMN is widened beyond its initial restricted form.
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
-}
-
-fn restore_dropped_values(
-    connection: &Connection,
-    table: &CreateTable,
-    _column: ColumnId,
-    column_name: &SqlName,
-    values: &[DroppedValue],
-) -> Result<()> {
-    if values.is_empty() {
-        return Ok(());
-    }
-    let table_name = catalog::name_by_id(connection, table.table_id())?.ok_or(
-        Error::InvalidDatabase("pending DROP COLUMN table has no current name binding"),
-    )?;
-    let primary = table
-        .primary_key_columns()
-        .map(|column| {
-            catalog::column_name_by_id(connection, table.table_id(), column.id())?.ok_or(
-                Error::InvalidDatabase(
-                    "pending DROP COLUMN primary key has no current name binding",
-                ),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let predicates = primary
-        .iter()
-        .map(|name| format!("{} IS ?", quote_identifier(name.value())))
-        .collect::<Vec<_>>();
-    let sql = format!(
-        "UPDATE {} SET {} = ? WHERE {}",
-        quote_identifier(table_name.value()),
-        quote_identifier(column_name.value()),
-        predicates.join(" AND ")
-    );
-    let mut statement = connection.prepare(&sql)?;
-    for value in values {
-        let mut parameters = Vec::<&dyn ToSql>::with_capacity(1 + value.primary.len());
-        parameters.push(&value.value);
-        parameters.extend(value.primary.iter().map(|value| value as &dyn ToSql));
-        if statement.execute(params_from_iter(parameters))? != 1 {
-            return Err(Error::InvalidDatabase(
-                "pending DROP COLUMN row no longer matches SQLite state",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn encode_dropped_value(value: &DroppedValue) -> Vec<u8> {
-    let mut writer = Writer::new();
-    for primary in &value.primary {
-        writer
-            .field(TAG_DROPPED_PRIMARY, &encode_stored_value(primary))
-            .expect("dropped value field fits in u32");
-    }
-    writer
-        .field(TAG_DROPPED_COLUMN, &encode_stored_value(&value.value))
-        .expect("dropped value field fits in u32");
-    writer.finish()
-}
-
-fn decode_dropped_value(frame: &[u8]) -> std::result::Result<DroppedValue, AlterTableCodecError> {
-    let mut reader = Reader::new(frame);
-    let mut primary = Vec::new();
-    let mut value = None;
-    while let Some((tag, bytes)) = reader
-        .field()
-        .map_err(|_| AlterTableCodecError::Truncated)?
-    {
-        match tag {
-            TAG_DROPPED_PRIMARY => primary.push(decode_stored_value(bytes)?),
-            TAG_DROPPED_COLUMN => set_once(&mut value, decode_stored_value(bytes)?)?,
-            _ => {}
-        }
-    }
-    Ok(DroppedValue {
-        primary,
-        value: value.ok_or(AlterTableCodecError::MissingField(TAG_DROPPED_COLUMN))?,
-    })
-}
-
-fn encode_stored_value(value: &StoredValue) -> Vec<u8> {
-    match value {
-        StoredValue::Null => vec![0],
-        StoredValue::Integer(value) => {
-            let mut encoded = vec![1];
-            encoded.extend_from_slice(&value.to_be_bytes());
-            encoded
-        }
-        StoredValue::Real(value) => {
-            let mut encoded = vec![2];
-            encoded.extend_from_slice(&value.to_be_bytes());
-            encoded
-        }
-        StoredValue::Text(value) => {
-            let mut encoded = vec![3];
-            encoded.extend_from_slice(value);
-            encoded
-        }
-        StoredValue::Blob(value) => {
-            let mut encoded = vec![4];
-            encoded.extend_from_slice(value);
-            encoded
-        }
-    }
-}
-
-fn decode_stored_value(frame: &[u8]) -> std::result::Result<StoredValue, AlterTableCodecError> {
-    let Some((&kind, value)) = frame.split_first() else {
-        return Err(AlterTableCodecError::InvalidValue);
-    };
-    match kind {
-        0 if value.is_empty() => Ok(StoredValue::Null),
-        1 => Ok(StoredValue::Integer(i64::from_be_bytes(
-            value
-                .try_into()
-                .map_err(|_| AlterTableCodecError::InvalidValue)?,
-        ))),
-        2 => Ok(StoredValue::Real(u64::from_be_bytes(
-            value
-                .try_into()
-                .map_err(|_| AlterTableCodecError::InvalidValue)?,
-        ))),
-        3 => Ok(StoredValue::Text(value.to_vec())),
-        4 => Ok(StoredValue::Blob(value.to_vec())),
-        _ => Err(AlterTableCodecError::InvalidValue),
-    }
+        .map(|result| result.map(|name| name.value().to_owned()))
+        .collect()
 }
 
 fn rename_sql(table: &SqlName, target: RenameTarget, from: &SqlName, to: &SqlName) -> String {
@@ -1355,7 +1213,6 @@ pub enum AlterTableCodecError {
     InvalidRename,
     InvalidAction,
     InvalidSchema,
-    InvalidValue,
 }
 
 impl fmt::Display for AlterTableCodecError {
@@ -1374,7 +1231,6 @@ impl fmt::Display for AlterTableCodecError {
             }
             Self::InvalidAction => formatter.write_str("invalid ALTER TABLE action"),
             Self::InvalidSchema => formatter.write_str("invalid ALTER TABLE schema evolution"),
-            Self::InvalidValue => formatter.write_str("invalid retained DROP COLUMN value"),
         }
     }
 }
@@ -1391,6 +1247,8 @@ mod tests {
 
     fn connection() -> (Connection, CreateTable) {
         let connection = Connection::open_in_memory().unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
         catalog::initialize(&connection).unwrap();
         let created = CreateTable::new(
             "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
@@ -1419,6 +1277,8 @@ mod tests {
 
     fn connection_with(sql: &str) -> (Connection, CreateTable) {
         let connection = Connection::open_in_memory().unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
         catalog::initialize(&connection).unwrap();
         let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
@@ -1476,6 +1336,11 @@ mod tests {
             unreachable!()
         };
         AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
+    }
+
+    fn apply_speculative_drop(connection: &Connection, operation: &AlterTableOperation) {
+        operation.capture_local_repair(connection).unwrap();
+        operation.apply(connection).unwrap();
     }
 
     #[test]
@@ -1688,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_column_retains_values_for_rejection_repair() {
+    fn drop_column_wire_is_metadata_only_and_sidecar_repairs_rejection() {
         let (connection, _) = connection();
         connection
             .execute("INSERT INTO notes VALUES (1)", ())
@@ -1703,7 +1568,15 @@ mod tests {
             .unwrap();
 
         let drop = drop_operation(&connection);
+        let repair_id = drop.repair_id().unwrap();
+        assert!(!repair::contains(&connection, repair_id).unwrap());
         assert_eq!(AlterTableOperation::decode(&drop.encode()).unwrap(), drop);
+        assert!(
+            !drop
+                .encode()
+                .windows(b"custom".len())
+                .any(|window| window == b"custom")
+        );
         let lowered = drop.to_homebase().unwrap();
         let AlterTableDelta::DropColumn { column, after, .. } = &drop.delta else {
             unreachable!()
@@ -1716,7 +1589,8 @@ mod tests {
         assert_eq!(lowered.footprint.constraints().len(), 2);
         assert_eq!(lowered.footprint.writes().len(), 1);
 
-        drop.apply(&connection).unwrap();
+        apply_speculative_drop(&connection, &drop);
+        assert!(repair::contains(&connection, repair_id).unwrap());
         assert_eq!(
             connection
                 .query_row(
@@ -1728,6 +1602,7 @@ mod tests {
             1
         );
         drop.rollback(&connection).unwrap();
+        assert!(!repair::contains(&connection, repair_id).unwrap());
         assert_eq!(
             connection
                 .prepare("SELECT id, body FROM notes ORDER BY id")
@@ -1741,6 +1616,96 @@ mod tests {
             [(1, Some("custom".into())), (2, None)]
         );
         catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn failed_speculative_drop_rolls_back_sidecar_schema_and_catalog_together() {
+        let (connection, _) = connection();
+        simple_add_operation(&connection)
+            .apply(&connection)
+            .unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'kept')", ())
+            .unwrap();
+        let drop = drop_operation(&connection);
+        let repair_id = drop.repair_id().unwrap();
+
+        let result: Result<()> =
+            crate::connection::with_savepoint(&connection, "__multilite__test_failed_drop", || {
+                drop.capture_local_repair(&connection)?;
+                drop.apply(&connection)?;
+                Err(Error::CaptureInvariant("injected after destructive apply"))
+            });
+
+        assert!(matches!(
+            result,
+            Err(Error::CaptureInvariant("injected after destructive apply"))
+        ));
+        assert!(!repair::contains(&connection, repair_id).unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes WHERE id = 1", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            catalog::by_name(&connection, "notes")
+                .unwrap()
+                .unwrap()
+                .columns()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn drop_column_wire_size_is_independent_of_destroyed_row_count() {
+        let (empty, _) = connection();
+        simple_add_operation(&empty).apply(&empty).unwrap();
+        let empty_drop = drop_operation(&empty);
+
+        let (populated, _) = connection();
+        simple_add_operation(&populated).apply(&populated).unwrap();
+        for id in 1..=100 {
+            populated
+                .execute(
+                    "INSERT INTO notes (id, body) VALUES (?1, printf('body-%d', ?1))",
+                    [id],
+                )
+                .unwrap();
+        }
+        let populated_drop = drop_operation(&populated);
+
+        assert_eq!(empty_drop.encode().len(), populated_drop.encode().len());
+        assert!(!repair::contains(&populated, populated_drop.repair_id().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn admitted_drop_column_materializes_without_creating_local_repair() {
+        let (connection, _) = connection();
+        simple_add_operation(&connection)
+            .apply(&connection)
+            .unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'remote')", ())
+            .unwrap();
+        let drop = drop_operation(&connection);
+
+        drop.apply(&connection).unwrap();
+
+        assert!(!repair::contains(&connection, drop.repair_id().unwrap()).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('notes')",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1758,7 +1723,7 @@ mod tests {
             .unwrap();
         let drop = prepare_drop(&connection, "ALTER TABLE notes DROP COLUMN guarded");
 
-        drop.apply(&connection).unwrap();
+        apply_speculative_drop(&connection, &drop);
         assert_eq!(
             connection
                 .prepare("SELECT name FROM pragma_table_info('notes') ORDER BY cid")
@@ -1850,7 +1815,7 @@ mod tests {
             .unwrap();
         let drop = prepare_drop(&connection, "ALTER TABLE notes DROP COLUMN middle");
 
-        drop.apply(&connection).unwrap();
+        apply_speculative_drop(&connection, &drop);
         drop.rollback(&connection).unwrap();
 
         assert_eq!(
@@ -1904,7 +1869,7 @@ mod tests {
             .unwrap();
         let drop = prepare_drop(&connection, "ALTER TABLE pairs DROP COLUMN middle");
 
-        drop.apply(&connection).unwrap();
+        apply_speculative_drop(&connection, &drop);
         drop.rollback(&connection).unwrap();
 
         assert_eq!(
@@ -1956,7 +1921,7 @@ mod tests {
             .unwrap();
         let drop = prepare_drop(&connection, "ALTER TABLE parents DROP COLUMN middle");
 
-        drop.apply(&connection).unwrap();
+        apply_speculative_drop(&connection, &drop);
         drop.rollback(&connection).unwrap();
 
         assert_eq!(

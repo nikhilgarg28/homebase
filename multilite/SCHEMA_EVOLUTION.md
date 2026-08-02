@@ -32,9 +32,11 @@ promise that every locally derived fold is independently fetchable by revision.
 5. DML never re-resolves a stored SQL name. Row operations carry stable IDs and
    apply through the current catalog binding. Reusing an old name for a new table
    cannot retarget an older operation.
-6. Pending state stores typed semantic inverses plus explicit preconditions, not
-   arbitrary executable undo SQL. Inverses resolve current names by UUID and run
-   in reverse operation order inside the canonical repair transaction.
+6. Pending state stores the same metadata-only logical frame sent to Homebase,
+   not arbitrary executable undo SQL. Typed inverses resolve current names by
+   UUID and run in reverse operation order inside the canonical repair
+   transaction. Destructive operations additionally join to local-only repair
+   sidecars by mutation UUID; those values never enter a replicated frame.
 7. A name-only table rename does not change row encoding, keyspaces, columns,
    indexes, relationships, or the write contract. It therefore does not
    invalidate stale DML.
@@ -109,9 +111,24 @@ additions use narrower schema and dependency cells.
 DROP resolves and retires one `ColumnId`; identities are never reused. The
 compiler rejects active primary-key, index, CHECK, relationship, or referenced
 parent dependencies that make retirement unsafe. Materialized values are
-captured for rejection repair, so a non-final physical column can be restored
-at its original logical position. Historical row frames may retain the retired
-value because current-schema projection ignores inactive identities.
+streamed into the originating replica's `__multilite__repair` sidecar in the
+same canonical savepoint that applies the drop and journals its pending
+transaction. The replicated operation contains only the mutation identity and
+before/after schema IR, so its size is independent of table cardinality.
+
+Acceptance deletes the sidecar together with pending-journal retirement.
+Rejection re-adds the physical column, streams retained values back by declared
+primary-key identity, restores the folded catalog, rebuilds the complete table
+definition, and consumes the sidecar. Empty tables still create a durable job
+marker. Reopen requires an exact match between pending destructive mutation
+UUIDs and repair jobs, rejecting both missing and orphaned state. Capture is
+currently refused with a typed error above 100,000 rows or 64 MiB; launch work
+will replace that practical ceiling with spillable/chunked storage while
+preserving one atomic disposition.
+
+This lets a non-final physical column return at its original logical position.
+Historical row frames may retain the retired value because current-schema
+projection ignores inactive identities.
 
 ## Conflict Rules
 
@@ -165,5 +182,9 @@ boundary rather than being rewritten opportunistically.
   and outgoing foreign keys, and ordinary indexes.
 - Pending repair after accepted prefixes, rejected suffixes, restart, and name
   reuse.
+- Metadata-only destructive frames whose size is independent of row count;
+  exact sidecar retirement on acceptance and consumption on rejection.
+- Empty, malformed, missing, and orphaned repair sidecars; typed row/byte limit
+  refusal must leave schema, pending state, and sidecars unchanged.
 - Stock SQLite reopen, `integrity_check`, and `foreign_key_check` after every
   convergence scenario.

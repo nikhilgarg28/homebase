@@ -179,70 +179,12 @@ impl CapturedRow {
     }
 }
 
-impl StoredValue {
-    fn encoded_len(&self) -> usize {
-        match self {
-            Self::Null => 1,
-            Self::Integer(_) | Self::Real(_) => 9,
-            Self::Text(value) | Self::Blob(value) => 1usize.saturating_add(value.len()),
-        }
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Null => vec![0],
-            Self::Integer(value) => {
-                let mut encoded = vec![1];
-                encoded.extend_from_slice(&value.to_be_bytes());
-                encoded
-            }
-            Self::Real(bits) => {
-                let mut encoded = vec![2];
-                encoded.extend_from_slice(&bits.to_be_bytes());
-                encoded
-            }
-            Self::Text(value) => {
-                let mut encoded = vec![3];
-                encoded.extend_from_slice(value);
-                encoded
-            }
-            Self::Blob(value) => {
-                let mut encoded = vec![4];
-                encoded.extend_from_slice(value);
-                encoded
-            }
-        }
-    }
-
-    fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
-        let mut reader = Reader::new(frame);
-        let kind = reader.u8().ok_or(RowCodecError::Truncated)?;
-        let value = match kind {
-            0 => Self::Null,
-            1 => {
-                let bits = reader.u64().ok_or(RowCodecError::InvalidLength)?;
-                Self::Integer(i64::from_be_bytes(bits.to_be_bytes()))
-            }
-            2 => Self::Real(reader.u64().ok_or(RowCodecError::InvalidLength)?),
-            3 | 4 => {
-                let remaining = reader.rest().len();
-                let bytes = reader
-                    .take(remaining)
-                    .expect("remaining byte count came from this reader")
-                    .to_vec();
-                if kind == 3 {
-                    Self::Text(bytes)
-                } else {
-                    Self::Blob(bytes)
-                }
-            }
-            _ => return Err(RowCodecError::InvalidValue),
-        };
-        if reader.end().is_none() {
-            return Err(RowCodecError::InvalidLength);
-        }
-        Ok(value)
-    }
+fn decode_stored_value(frame: &[u8]) -> std::result::Result<StoredValue, RowCodecError> {
+    StoredValue::decode(frame).map_err(|error| match error {
+        crate::value::StoredValueCodecError::Truncated => RowCodecError::Truncated,
+        crate::value::StoredValueCodecError::InvalidLength => RowCodecError::InvalidLength,
+        crate::value::StoredValueCodecError::InvalidKind(_) => RowCodecError::InvalidValue,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3203,7 +3145,7 @@ fn decode_column_value(
     while let Some((tag, bytes)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
         match tag {
             TAG_COLUMN_ID => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(bytes)?))?,
-            TAG_VALUE => set_once(&mut value, StoredValue::decode(bytes)?)?,
+            TAG_VALUE => set_once(&mut value, decode_stored_value(bytes)?)?,
             _ => {}
         }
     }
@@ -6720,11 +6662,11 @@ mod tests {
         }
         assert_eq!(
             StoredValue::decode(&[0, 1]),
-            Err(RowCodecError::InvalidLength)
+            Err(crate::value::StoredValueCodecError::InvalidLength)
         );
         assert_eq!(
             StoredValue::decode(&[1, 0]),
-            Err(RowCodecError::InvalidLength)
+            Err(crate::value::StoredValueCodecError::InvalidLength)
         );
     }
 }

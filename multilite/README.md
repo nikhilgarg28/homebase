@@ -38,7 +38,10 @@ methods; updates additionally provide `execute`. The manifest is the first
 Homebase mutation and carries the ordered operation frames.
 Admission decoding re-lowers those frames and requires every following mutation
 to match exactly. All local statement effects, their one Homebase submission,
-and their one pending-effects row commit in one outer SQLite savepoint. Push,
+their one pending-effects row, and any local-only destructive repair sidecar
+commit in one outer SQLite savepoint. Sidecars are joined by mutation UUID and
+never enter the transaction manifest, push, authority log, or another replica's
+pull. Push,
 pull, rebase, and rollback cover both schema and row operations. `push()` admits the active
 Homebase stream, then atomically advances its local submit cursor and retires
 every definitively accepted pending prefix in one SQLite savepoint. It returns
@@ -91,6 +94,16 @@ the Homebase submit window. Capture is fenced at 100,000 direct row events and
 64 MiB per row operation and transaction; an oversized statement rolls back
 with a typed error rather than retaining unbounded memory or reaching a codec
 length panic.
+
+`DROP COLUMN` follows the same logical/pending lifecycle but keeps destroyed
+column values in local SQLite repair tables. Capture uses a streaming
+`INSERT ... SELECT`, so user-space memory is constant and the replicated frame
+contains only mutation identity plus before/after schema IR. Acceptance retires
+the repair job with its pending prefix; rejection restores values by declared
+primary-key identity before rebuilding the original table definition. Reopen
+requires repair jobs to match pending destructive operations exactly. The
+current sidecar copy is refused above 100,000 rows or 64 MiB with a typed,
+atomic error; spillable larger captures remain launch work.
 
 Ordinary secondary indexes are synchronized schema and physical SQLite access
 paths only. Their names and definitions converge across replicas, but row
@@ -157,7 +170,8 @@ hidden rowid; direct hidden-rowid changes remain unsupported.
 `Connection::open` is the single file-lifecycle verb;
 `MultiliteConnection` remains an alias for compatibility. Open initializes or
 validates database identity, Homebase metadata, the pending-effects journal,
-and the schema catalog in one general implementation path. Existing SQLite
+the local repair sidecars, and the schema catalog in one general implementation
+path. Existing SQLite
 user tables are preserved and remain readable. Inserts, deletes, and updates
 against an adopted table are rejected until that table has a synchronized
 schema identity.

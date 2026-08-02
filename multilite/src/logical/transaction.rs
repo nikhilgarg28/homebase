@@ -316,6 +316,22 @@ impl MultiliteTransaction {
         Ok(())
     }
 
+    /// Materialize a locally-originated transaction and retain inverse state.
+    pub(crate) fn apply_speculative(&self, connection: &Connection) -> Result<()> {
+        for operation in &self.operations {
+            operation.capture_local_repair(connection)?;
+            operation.apply(connection)?;
+            #[cfg(debug_assertions)]
+            operation.verify_materialized(connection)?;
+        }
+        Ok(())
+    }
+
+    /// Local repair jobs that must exist while this transaction is pending.
+    pub(crate) fn repair_ids(&self) -> impl Iterator<Item = crate::repair::RepairId> + '_ {
+        self.operations.iter().filter_map(MultiliteOp::repair_id)
+    }
+
     /// Raise and authenticate one complete admitted transaction batch.
     pub fn from_homebase(batch: &AdmittedBatch<Vec<u8>>) -> Result<Self> {
         Self::from_homebase_inner(batch)
