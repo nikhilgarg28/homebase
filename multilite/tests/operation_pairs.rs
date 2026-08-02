@@ -58,16 +58,16 @@ impl ExpectedPair {
 
 #[derive(Clone, Copy, Debug)]
 struct RegisteredOperation {
-    family: OperationFamily,
+    shape: SqlShape,
     sql: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum OperationFamily {
+enum SqlShape {
     CreateTable,
-    InsertRows,
-    DeleteRows,
-    UpdateRows,
+    Insert,
+    Delete,
+    Update,
     CreateIndex,
     DropIndex,
     RenameTable,
@@ -76,23 +76,23 @@ enum OperationFamily {
     DropColumn,
 }
 
-const OPERATION_FAMILIES: [OperationFamily; 10] = [
-    OperationFamily::CreateTable,
-    OperationFamily::InsertRows,
-    OperationFamily::DeleteRows,
-    OperationFamily::UpdateRows,
-    OperationFamily::CreateIndex,
-    OperationFamily::DropIndex,
-    OperationFamily::RenameTable,
-    OperationFamily::RenameColumn,
-    OperationFamily::AddColumn,
-    OperationFamily::DropColumn,
+const SQL_SHAPES: [SqlShape; 10] = [
+    SqlShape::CreateTable,
+    SqlShape::Insert,
+    SqlShape::Delete,
+    SqlShape::Update,
+    SqlShape::CreateIndex,
+    SqlShape::DropIndex,
+    SqlShape::RenameTable,
+    SqlShape::RenameColumn,
+    SqlShape::AddColumn,
+    SqlShape::DropColumn,
 ];
 
 macro_rules! operation {
-    ($family:ident, $sql:literal) => {
+    ($shape:ident, $sql:literal) => {
         RegisteredOperation {
-            family: OperationFamily::$family,
+            shape: SqlShape::$shape,
             sql: $sql,
         }
     };
@@ -128,11 +128,11 @@ const PAIR_CASES: &[PairCase] = &[
         name: "insert_disjoint_rows",
         relationship: "different primary and unique keys",
         left: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (3, 'three', 'left', 'd3')"
         ),
         right: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (4, 'four', 'right', 'd4')"
         ),
         snapshot: ExpectedPair::COMMUTE,
@@ -142,11 +142,11 @@ const PAIR_CASES: &[PairCase] = &[
         name: "insert_same_primary_key",
         relationship: "same row identity",
         left: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (3, 'three-left', 'left', 'd3')"
         ),
         right: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (3, 'three-right', 'right', 'd4')"
         ),
         snapshot: ExpectedPair::CONFLICT,
@@ -156,12 +156,54 @@ const PAIR_CASES: &[PairCase] = &[
         name: "insert_same_unique_key",
         relationship: "different rows claiming one unique value",
         left: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (3, 'shared', 'left', 'd3')"
         ),
         right: operation!(
-            InsertRows,
+            Insert,
             "INSERT INTO notes VALUES (4, 'shared', 'right', 'd4')"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "insert_or_ignore_disjoint_rows",
+        relationship: "conflict-mode insert with disjoint surviving effects",
+        left: operation!(
+            Insert,
+            "INSERT OR IGNORE INTO notes VALUES (3, 'three', 'left', 'd3')"
+        ),
+        right: operation!(
+            Insert,
+            "INSERT OR IGNORE INTO notes VALUES (4, 'four', 'right', 'd4')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "insert_or_ignore_same_primary_key",
+        relationship: "conflict-mode inserts whose surviving effects claim one row",
+        left: operation!(
+            Insert,
+            "INSERT OR IGNORE INTO notes VALUES (3, 'three-left', 'left', 'd3')"
+        ),
+        right: operation!(
+            Insert,
+            "INSERT OR IGNORE INTO notes VALUES (3, 'three-right', 'right', 'd4')"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_do_nothing_same_unique_key",
+        relationship: "UPSERT survivors claiming one unique owner",
+        left: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (3, 'shared', 'left', 'd3') ON CONFLICT DO NOTHING"
+        ),
+        right: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (4, 'shared', 'right', 'd4') ON CONFLICT DO NOTHING"
         ),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
@@ -169,57 +211,76 @@ const PAIR_CASES: &[PairCase] = &[
     PairCase {
         name: "update_disjoint_rows",
         relationship: "different row writes with a shared predicate-read table",
-        left: operation!(UpdateRows, "UPDATE notes SET body = 'left' WHERE id = 1"),
-        right: operation!(UpdateRows, "UPDATE notes SET body = 'right' WHERE id = 2"),
+        left: operation!(Update, "UPDATE notes SET body = 'left' WHERE id = 1"),
+        right: operation!(Update, "UPDATE notes SET body = 'right' WHERE id = 2"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
         name: "update_same_row",
         relationship: "same row identity",
-        left: operation!(UpdateRows, "UPDATE notes SET body = 'left' WHERE id = 1"),
-        right: operation!(UpdateRows, "UPDATE notes SET body = 'right' WHERE id = 1"),
+        left: operation!(Update, "UPDATE notes SET body = 'left' WHERE id = 1"),
+        right: operation!(Update, "UPDATE notes SET body = 'right' WHERE id = 1"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "update_or_ignore_disjoint_rows",
+        relationship: "conflict-mode writes to different rows with one predicate-read table",
+        left: operation!(
+            Update,
+            "UPDATE OR IGNORE notes SET body = 'left' WHERE id = 1"
+        ),
+        right: operation!(
+            Update,
+            "UPDATE OR IGNORE notes SET body = 'right' WHERE id = 2"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "update_or_ignore_same_unique_key",
+        relationship: "conflict-mode updates whose surviving effects claim one unique owner",
+        left: operation!(
+            Update,
+            "UPDATE OR IGNORE notes SET slug = 'shared' WHERE id = 1"
+        ),
+        right: operation!(
+            Update,
+            "UPDATE OR IGNORE notes SET slug = 'shared' WHERE id = 2"
+        ),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
         name: "delete_disjoint_rows",
         relationship: "different row deletes with a shared predicate-read table",
-        left: operation!(DeleteRows, "DELETE FROM notes WHERE id = 1"),
-        right: operation!(DeleteRows, "DELETE FROM notes WHERE id = 2"),
+        left: operation!(Delete, "DELETE FROM notes WHERE id = 1"),
+        right: operation!(Delete, "DELETE FROM notes WHERE id = 2"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
         name: "update_and_delete_same_row",
-        relationship: "same row identity across operation families",
-        left: operation!(UpdateRows, "UPDATE notes SET body = 'left' WHERE id = 1"),
-        right: operation!(DeleteRows, "DELETE FROM notes WHERE id = 1"),
+        relationship: "same row identity across SQL shapes",
+        left: operation!(Update, "UPDATE notes SET body = 'left' WHERE id = 1"),
+        right: operation!(Delete, "DELETE FROM notes WHERE id = 1"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
         name: "sibling_foreign_key_inserts",
         relationship: "different children referencing one live parent",
-        left: operation!(
-            InsertRows,
-            "INSERT INTO children VALUES (101, 'p10', 'left')"
-        ),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO children VALUES (102, 'p10', 'right')"
-        ),
+        left: operation!(Insert, "INSERT INTO children VALUES (101, 'p10', 'left')"),
+        right: operation!(Insert, "INSERT INTO children VALUES (102, 'p10', 'right')"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
         name: "parent_delete_and_child_insert",
         relationship: "parent key and its incoming-reference range",
-        left: operation!(DeleteRows, "DELETE FROM parents WHERE id = 20"),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO children VALUES (101, 'p20', 'late')"
-        ),
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO children VALUES (101, 'p20', 'late')"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -355,10 +416,7 @@ const PAIR_CASES: &[PairCase] = &[
             CreateIndex,
             "CREATE INDEX notes_detail_lookup ON notes (detail)"
         ),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"
-        ),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::COMMUTE,
     },
@@ -369,10 +427,7 @@ const PAIR_CASES: &[PairCase] = &[
             CreateIndex,
             "CREATE UNIQUE INDEX notes_detail_unique ON notes (detail)"
         ),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"
-        ),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -380,10 +435,7 @@ const PAIR_CASES: &[PairCase] = &[
         name: "drop_secondary_index_and_stale_insert",
         relationship: "access-path retirement and a row write",
         left: operation!(DropIndex, "DROP INDEX notes_by_body"),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"
-        ),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::COMMUTE,
     },
@@ -391,10 +443,7 @@ const PAIR_CASES: &[PairCase] = &[
         name: "table_rename_and_stale_insert",
         relationship: "stable table identity across a stale name binding",
         left: operation!(RenameTable, "ALTER TABLE notes RENAME TO archived_notes"),
-        right: operation!(
-            InsertRows,
-            "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"
-        ),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::COMMUTE,
     },
@@ -418,7 +467,7 @@ fn registered_operation_pairs_obey_admission_and_convergence_contracts() {
 }
 
 #[test]
-fn pair_registry_covers_each_supported_operation_family_and_relationship_class() {
+fn pair_registry_covers_each_supported_sql_shape_and_relationship_class() {
     let names = PAIR_CASES
         .iter()
         .map(|case| case.name)
@@ -430,11 +479,11 @@ fn pair_registry_covers_each_supported_operation_family_and_relationship_class()
     );
     assert!(PAIR_CASES.iter().all(|case| !case.relationship.is_empty()));
 
-    let families = PAIR_CASES
+    let shapes = PAIR_CASES
         .iter()
-        .flat_map(|case| [case.left.family, case.right.family])
+        .flat_map(|case| [case.left.shape, case.right.shape])
         .collect::<BTreeSet<_>>();
-    assert_eq!(families, BTreeSet::from(OPERATION_FAMILIES));
+    assert_eq!(shapes, BTreeSet::from(SQL_SHAPES));
 
     assert!(PAIR_CASES.iter().any(|case| case.snapshot.commutes()));
     assert!(PAIR_CASES.iter().any(|case| {

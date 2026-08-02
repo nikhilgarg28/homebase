@@ -4,9 +4,9 @@ use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, FrameBound,
     FromClause, FunctionCallOrder, FunctionTail, Indexed, IndexedColumn, InsertBody,
-    JoinConstraint, Literal, Name, OneSelect, Over, RefAct, RefArg, ResultColumn, Select,
-    SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type, TypeSize, UnaryOperator,
-    Window, With,
+    JoinConstraint, Literal, Name, OneSelect, Over, RefAct, RefArg, ResolveType, ResultColumn,
+    Select, SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type, TypeSize,
+    UnaryOperator, Upsert, UpsertDo, Window, With,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -396,11 +396,20 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             body,
             returning,
         } => {
-            let has_upsert = matches!(body, InsertBody::Select(_, Some(_)));
-            if or_conflict.is_some() || has_upsert {
+            if !matches!(
+                or_conflict,
+                None | Some(ResolveType::Abort | ResolveType::Ignore)
+            ) {
                 return Err(Error::UnsupportedSql(
-                    "INSERT conflict clauses and REPLACE are not supported",
+                    "INSERT supports only ABORT and IGNORE conflict resolution",
                 ));
+            }
+            let upsert = match &body {
+                InsertBody::Select(_, upsert) => upsert.as_deref(),
+                InsertBody::DefaultValues => None,
+            };
+            if upsert.is_some_and(|upsert| !upsert_is_do_nothing(upsert)) {
+                return Err(Error::UnsupportedSql("UPSERT DO UPDATE is not supported"));
             }
             if returning.is_some() {
                 return Err(Error::UnsupportedSql("INSERT RETURNING is not supported"));
@@ -423,7 +432,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }) || match &body {
                 InsertBody::Select(select, _) => select_reads_reserved(select),
                 InsertBody::DefaultValues => false,
-            };
+            } || upsert.is_some_and(upsert_reads_reserved);
             if reads_reserved {
                 return Err(Error::UnsupportedSql(
                     "INSERT cannot read reserved Multilite tables",
@@ -481,9 +490,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             order_by,
             limit,
         } => {
-            if or_conflict.is_some() {
+            if !matches!(
+                or_conflict,
+                None | Some(ResolveType::Abort | ResolveType::Ignore)
+            ) {
                 return Err(Error::UnsupportedSql(
-                    "UPDATE conflict clauses are not supported",
+                    "UPDATE supports only ABORT and IGNORE conflict resolution",
                 ));
             }
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
@@ -657,6 +669,27 @@ fn with_reads_reserved(with: Option<&With>) -> bool {
     with.iter()
         .flat_map(|with| &with.ctes)
         .any(|cte| select_reads_reserved(&cte.select))
+}
+
+fn upsert_is_do_nothing(upsert: &Upsert) -> bool {
+    matches!(upsert.do_clause, UpsertDo::Nothing)
+        && upsert.next.as_deref().is_none_or(upsert_is_do_nothing)
+}
+
+fn upsert_reads_reserved(upsert: &Upsert) -> bool {
+    upsert.index.as_ref().is_some_and(|index| {
+        index.targets.iter().any(sorted_column_reads_reserved)
+            || index
+                .where_clause
+                .as_ref()
+                .is_some_and(expression_reads_reserved)
+    }) || match &upsert.do_clause {
+        UpsertDo::Nothing => false,
+        UpsertDo::Set { sets, where_clause } => {
+            sets.iter().any(|set| expression_reads_reserved(&set.expr))
+                || where_clause.as_ref().is_some_and(expression_reads_reserved)
+        }
+    } || upsert.next.as_deref().is_some_and(upsert_reads_reserved)
 }
 
 fn from_reads_reserved(from: &FromClause) -> bool {
@@ -1843,14 +1876,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_replace_and_insert_conflict_forms() {
+    fn accepts_net_effect_safe_conflict_forms() {
+        for sql in [
+            "INSERT OR ABORT INTO notes VALUES (1)",
+            "INSERT OR IGNORE INTO notes VALUES (1)",
+            "INSERT INTO notes VALUES (1) ON CONFLICT DO NOTHING",
+            "INSERT INTO notes VALUES (1) ON CONFLICT(id) DO NOTHING",
+            "UPDATE OR ABORT notes SET body = 'next'",
+            "UPDATE OR IGNORE notes SET body = 'next'",
+        ] {
+            validate_execute(sql).unwrap_or_else(|error| panic!("rejected {sql}: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_partial_or_mixed_conflict_forms() {
         for sql in [
             "REPLACE INTO notes VALUES (1)",
-            "INSERT OR IGNORE INTO notes VALUES (1)",
             "INSERT OR REPLACE INTO notes VALUES (1)",
-            "INSERT INTO notes VALUES (1) ON CONFLICT DO NOTHING",
             "INSERT INTO notes VALUES (1) ON CONFLICT(id) DO UPDATE SET id = 2",
             "WITH value(id) AS (SELECT 1) INSERT OR FAIL INTO notes SELECT id FROM value",
+            "INSERT OR ROLLBACK INTO notes VALUES (1)",
+            "UPDATE OR FAIL notes SET body = 'next'",
+            "UPDATE OR REPLACE notes SET body = 'next'",
         ] {
             assert_unsupported(sql);
         }

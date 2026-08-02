@@ -119,7 +119,7 @@ mod tests {
     use super::*;
     use crate::catalog;
     use crate::logical::operation::MultiliteOp;
-    use crate::logical::row::{CapturedRow, InsertRows, StoredValue};
+    use crate::logical::row::{CapturedRow, RowChanges, RowSet, StoredValue};
     use crate::logical::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     #[test]
@@ -151,7 +151,7 @@ mod tests {
         catalog::initialize(&source).unwrap();
         source.execute(table.sql(), ()).unwrap();
         catalog::insert(&source, table).unwrap();
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &source,
             &[CapturedRow {
                 table: "notes".into(),
@@ -161,8 +161,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let transaction =
-            MultiliteTransaction::new(vec![created, MultiliteOp::InsertRows(inserted)]).unwrap();
+        let transaction = MultiliteTransaction::new(vec![
+            created,
+            MultiliteOp::ChangeRows(RowChanges::inserted(inserted)),
+        ])
+        .unwrap();
 
         let target = Connection::open_in_memory().unwrap();
         catalog::initialize(&target).unwrap();

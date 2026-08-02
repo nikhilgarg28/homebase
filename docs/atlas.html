@@ -205,6 +205,33 @@
   #heat th { color: var(--muted); font-weight: 600; background: var(--bg2); }
   #heat td.hot { cursor: pointer; }
   .rm-note { color: var(--muted); font-size: 12.5px; margin: 4px 0 14px; max-width: 900px; line-height: 1.55; }
+
+  /* ============ LAUNCH VIEW ============ */
+  #view-launch { max-width: 980px; margin: 0 auto; padding: 26px 24px 80px; }
+  .lc-progress { display: flex; align-items: center; gap: 14px; margin: 6px 0 24px; }
+  .lc-progress .gbar { height: 12px; }
+  .lc-progress .pct { font-size: 14px; font-weight: 650; min-width: 110px; }
+  .lc-group { border: 1px solid var(--line); border-radius: 12px; background: var(--bg2); padding: 14px 18px 10px; margin-bottom: 16px; }
+  .lc-group > h3 { margin: 0 0 2px; font-size: 15px; }
+  .lc-group > .lc-blurb { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; line-height: 1.5; }
+  .lc-item { display: flex; gap: 11px; padding: 9px 8px; border-radius: 8px; cursor: pointer; align-items: baseline; }
+  .lc-item:hover { background: var(--card); }
+  .lc-item + .lc-item { border-top: 1px solid rgba(42,52,71,.5); }
+  .lc-status { flex: 0 0 74px; text-align: center; font-size: 10.5px; font-weight: 700; padding: 2.5px 0;
+    border-radius: 14px; letter-spacing: .05em; align-self: center; }
+  .lc-status.s-done { background: #173425; color: #7fe0a7; }
+  .lc-status.s-wip { background: #17324e; color: #8ec5ff; }
+  .lc-status.s-todo { background: none; border: 1px solid var(--line); color: var(--muted); }
+  .lc-status.s-decision { background: #2c2347; color: #c4aaff; }
+  .lc-body { flex: 1; min-width: 0; }
+  .lc-title { font-size: 13.8px; font-weight: 600; line-height: 1.35; }
+  .lc-title s { color: var(--muted); }
+  .lc-detail { display: none; font-size: 12.8px; color: var(--muted); line-height: 1.55; margin-top: 6px; }
+  .lc-item.open .lc-detail { display: block; }
+  .lc-defer { border-style: dashed; }
+  .lc-defer .lc-blurb { margin-bottom: 4px; }
+  .lc-defer ul { margin: 6px 0 10px; padding-left: 20px; }
+  .lc-defer li { font-size: 12.8px; color: var(--muted); line-height: 1.55; margin-bottom: 4px; }
 </style>
 </head>
 <body>
@@ -215,6 +242,7 @@
     <button data-view="system" class="active">System &amp; Flows</button>
     <button data-view="grammar">SQL Grammar</button>
     <button data-view="roadmap">Roadmap</button>
+    <button data-view="launch">Launch</button>
   </nav>
   <div class="stamp">curated snapshot &middot; Aug 1, 2026 &middot; main @ 8212653</div>
 </header>
@@ -276,6 +304,13 @@
   <table id="heat" style="display:none"></table>
 </div>
 
+<!-- ==================== LAUNCH ==================== -->
+<div id="view-launch" class="view">
+  <p class="rm-note">The minimal set before announcing the project (settled Aug&nbsp;1, 2026). Inclusion test: skipping an item risks <b>losing user data</b>, <b>silent divergence</b>, or <b>freezing a wire/durable format we'll regret</b> &mdash; everything else ships after the announcement. Click an item for its rationale.</p>
+  <div class="lc-progress"><div class="gbar" id="lc-bar"></div><div class="pct" id="lc-pct"></div></div>
+  <div id="lc-groups"></div>
+</div>
+
 <script>
 /* ================================================================
    DATA — curated snapshot of the repo (edit freely; the shell below
@@ -317,7 +352,7 @@ components: [
   behavior:[
     "Measures the managed SQL surface against stock SQLite behavior on the accepted grammar.",
     "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape.",
-    "The typed operation-pair registry runs 23 DML, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (92 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
+    "The typed operation-pair registry runs 28 DML, conflict-mode, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (112 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
   invariants:[
     "Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures.",
     "The pair registry covers every current logical operation family and includes commutative, conflicting, isolation-dependent, and directional relationships."],
@@ -332,6 +367,7 @@ components: [
     "All names \u2014 write targets and read positions \u2014 are dequoted via SqlName::from_sqlite_token before reserved-name checks (closed Aug 1, commit 26bee3d).",
     "Every expression position is walked for reserved reads, including DML CTEs, UPDATE FROM sources, DELETE WHERE, and UPDATE SET/WHERE.",
     "Captured DML admits WITH-prefixed UPDATE/DELETE, UPDATE FROM, tuple assignments, and safe INDEXED BY / NOT INDEXED hints without adding durable operation variants.",
+    "INSERT/UPDATE OR ABORT and OR IGNORE plus UPSERT DO NOTHING compile from SQLite's observed net effects; replacement and partial-statement modes remain fenced.",
     "CREATE TABLE resolves to a validated spec (columns, PK, uniques, FKs, checks) before anything executes.",
     "It is a classifier and UX layer \u2014 the runtime authorizer is the actual security boundary."],
   invariants:["Accepting a statement never implies every SQLite spelling of it is supported; every extension must clear SQL_GRAMMAR.md's completion gate."],
@@ -346,10 +382,13 @@ components: [
         // future parser shape violates that contract, reject conservatively.
         .unwrap_or(true)
 }`},
-    {title:"UPDATE gate: every fenced clause is an explicit typed rejection", file:"sql.rs", code:
-`if or_conflict.is_some() {
+    {title:"UPDATE gate: admit atomic/no-op modes and fence partial/replacement modes", file:"sql.rs", code:
+`if !matches!(
+    or_conflict,
+    None | Some(ResolveType::Abort | ResolveType::Ignore)
+) {
     return Err(Error::UnsupportedSql(
-        "UPDATE conflict clauses are not supported",
+        "UPDATE supports only ABORT and IGNORE conflict resolution",
     ));
 }
 validate_index_hint(indexed.as_ref())?;
@@ -441,30 +480,26 @@ pub fn compile(self) -> Result<CompiledOperation> {
             RejectionEffect::DropTable { created: created.clone() },
             RejectionKind::DropTable,
         ),
-        Self::InsertRows(inserted) => (
-            RejectionEffect::DeleteRows { inserted: inserted.clone() },
-            RejectionKind::DeleteRows,
+        Self::ChangeRows(changes) => (
+            RejectionEffect::RestoreRowChanges { changes: changes.clone() },
+            RejectionKind::RestoreRowChanges,
         ),
-        Self::DeleteRows(deleted) => (
-            RejectionEffect::RestoreRows { deleted: deleted.clone() },
-            RejectionKind::RestoreRows,
-        ),
-        // ... UpdateRows, AlterTable, Index ...
+        // ... CreateTable, AlterTable, Index ...
     };
     // lowering + guard plan are checked against the contract tables here
 }`}] },
 { id:"rowops", layer:"multilite", band:"Logical operation compiler", name:"Row lowering",
   files:["multilite/src/logical/row.rs"],
-  summary:"Captured rows \u2192 Insert/Delete/UpdateRows with key images, unique-owner cells, and foreign-reference handshake cells.",
+  summary:"Captured SQLite events \u2192 one normalized RowChanges operation with key images, unique-owner cells, and foreign-reference handshake cells.",
   behavior:[
     "Key images are order-preserving per class; integral REALs normalize onto the integer image so 1 == 1.0.",
     "Incoming FK reference prefixes are diffed operation-wide (multi-row parent-key rotations are safe).",
-    "Row cells are compact: version + schema revision id + values \u2014 rules live once on the operation.",
-    "UpdateRows orders deletes of moved sources before destination sets."],
+    "Row cells are compact: version + schema revision id + values \u2014 one RowRules envelope is shared by every delta.",
+    "Every moved or retired source is deleted before any destination is set.",
+    "Capture is fenced at 100,000 hook events and 64 MiB; normalized row operations and transaction manifests enforce the same durable byte boundary."],
   invariants:["Every emitted guard/mutation must classify into the finite LogicalTarget registry."],
   health:[
-    {sev:"med", text:"Rules are derived then instantly re-derived for validation 3\u20135\u00d7 per statement (each incoming-FK derivation walks the whole catalog). Keep the deep check for decodes; share one derivation locally."},
-    {sev:"low", text:"is_unique_entry_key sniffs raw key layout (component 3) and is currently always-true; if key shape changes it silently drops the uniqueness guard."},
+    {sev:"low", text:"Decoded operations deliberately re-derive catalog rules before canonical apply; local capture shares one RowRules value across the complete statement."},
     {sev:"low", text:"Cross-class ordering (int vs non-integral real) still diverges from SQLite numeric order \u2014 latent; nothing scans ordered ranges today."}] },
 { id:"schemaops", layer:"multilite", band:"Logical operation compiler", name:"Schema IR & DDL",
   files:["multilite/src/logical/schema.rs","multilite/src/logical/schema/compiler.rs","multilite/src/logical/alter.rs","multilite/src/logical/index.rs"],
@@ -502,12 +537,8 @@ pub fn compile(self) -> Result<CompiledOperation> {
 pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
-    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
-    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
-    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(RowChanges, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(RowChanges, Invariant, WriteContract, WriteRevision),
     contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
     contract!(DropIndex, Write, SchemaRevision, ActiveSchemaRevision),
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
@@ -1118,19 +1149,22 @@ grammar: [
   { name:"INSERT \u2026 SELECT", status:"supported", note:"The SELECT body and any CTEs are walked for reserved reads. Worth a boundary test that vendored SQLite's xfer optimization cannot bypass the rowid hook." },
   { name:"WITH \u2026 INSERT (CTE prefix)", status:"supported", note:"CTE selects are reserved-read checked like the body." },
   { name:"DEFAULT VALUES", status:"supported", note:"" },
-  { name:"INSERT OR REPLACE / IGNORE / ABORT / FAIL / ROLLBACK, REPLACE INTO", status:"fenced", note:"\u201cINSERT conflict clauses and REPLACE are not supported\u201d \u2014 blocked on the statement-delta compiler; each conflict mode needs its own OCC spec." },
-  { name:"UPSERT (ON CONFLICT DO \u2026)", status:"fenced", note:"Same rejection and same prerequisite as conflict clauses." },
+  { name:"INSERT OR ABORT / OR IGNORE", status:"supported", note:"SQLite executes the statement on the branch; RowChanges compiles only the rows actually changed. Mixed ignored+inserted statements have two-replica convergence coverage under both isolation levels." },
+  { name:"INSERT OR REPLACE / OR FAIL / OR ROLLBACK, REPLACE INTO", status:"fenced", note:"Replacement and partial-statement conflict modes need an explicit OCC and rejection-repair contract before admission." },
+  { name:"UPSERT ON CONFLICT \u2026 DO NOTHING", status:"supported", note:"Single or chained DO NOTHING clauses, including conflict targets, compile from SQLite's observed net row effects." },
+  { name:"UPSERT \u2026 DO UPDATE", status:"fenced", note:"The delta compiler can represent it, but this mixed procedural form still needs dedicated OCC, malformed-codec, rejection-repair, pair-registry, and convergence tests." },
   { name:"RETURNING", status:"fenced", note:"\u201cINSERT RETURNING is not supported.\u201d" },
   { name:"qualified / aliased targets (db.t, t AS a)", status:"fenced", note:"\u201cqualified and aliased INSERT targets are not supported.\u201d" } ] },
 { family:"UPDATE / DELETE", items:[
   { name:"UPDATE t SET col = expr \u2026 WHERE \u2026 (subqueries allowed)", status:"supported", note:"Full before/after row capture; subqueries run against the branch snapshot; SET, FROM, CTE, and WHERE expressions are reserved-read checked." },
   { name:"primary-key moves via UPDATE", status:"supported", note:"Declared PK moves are atomic; multi-row key rotations diff operation-wide, so parent-key swaps are safe." },
   { name:"DELETE FROM t WHERE \u2026 (subqueries allowed)", status:"supported", note:"Every old row image buffered for rejection repair; WHERE is reserved-read checked (commit 26bee3d)." },
-  { name:"unbounded bulk DELETE / UPDATE", status:"partial", note:"Semantically correct but O(rows) memory, mutations, and range asserts. Deterministic capture budgets + possible DeleteRange lowering are TODO." },
+  { name:"bulk DELETE / UPDATE", status:"partial", note:"Semantically correct and deterministically fenced at 100,000 hook events / 64 MiB, but still O(rows) mutations and range asserts. Spill/chunking and possible DeleteRange lowering remain future work." },
   { name:"tuple assignment SET (a,b) = (\u2026)", status:"supported", note:"SQLite evaluates the tuple on the private branch; the preupdate hook captures the final before/after image, so no parallel expression evaluator is needed." },
-  { name:"UPDATE \u2026 FROM", status:"supported", note:"FROM sources participate in reserved-read checks and serializable table-root tracing; final rows lower through ordinary UpdateRows." },
-  { name:"UPDATE OR ABORT / FAIL / IGNORE / REPLACE / ROLLBACK", status:"fenced", note:"\u201cUPDATE conflict clauses are not supported\u201d \u2014 same statement-delta-compiler prerequisite." },
-  { name:"WITH \u2026 DELETE / WITH \u2026 UPDATE (CTE prefixes)", status:"supported", note:"Every CTE SELECT is traversed for reserved sources; execution and capture use the same row operation families as unprefixed DML." },
+  { name:"UPDATE \u2026 FROM", status:"supported", note:"FROM sources participate in reserved-read checks and serializable table-root tracing; final rows lower through the shared RowChanges statement delta." },
+  { name:"UPDATE OR ABORT / OR IGNORE", status:"supported", note:"Final before/after images are normalized operation-wide; ignored rows produce no durable operation." },
+  { name:"UPDATE OR FAIL / OR REPLACE / OR ROLLBACK", status:"fenced", note:"Partial-statement and replacement semantics need an explicit OCC and rejection-repair contract." },
+  { name:"WITH \u2026 DELETE / WITH \u2026 UPDATE (CTE prefixes)", status:"supported", note:"Every CTE SELECT is traversed for reserved sources; execution and capture use the same RowChanges operation as unprefixed DML." },
   { name:"ORDER BY / LIMIT forms", status:"fenced", note:"\u201cDELETE ORDER BY and LIMIT\u201d / \u201cUPDATE ORDER BY and LIMIT\u201d are rejected." },
   { name:"INDEXED BY / NOT INDEXED", status:"supported", note:"Planner hints do not enter the durable operation. Reserved SQLite/Multilite index names are rejected; ordinary named indexes and NOT INDEXED are accepted." },
   { name:"RETURNING", status:"fenced", note:"Rejected on both statements." },
@@ -1160,11 +1194,11 @@ roadmap: [
 { id:"r2", title:"Checked-unlease replacement coverage bug", themes:["correctness"], layers:["client"], horizon:"now",
   detail:"unlease_checked can remove a usable lease in favor of a live replacement whose barrier hasn't applied, then permit removing the replacement too. Preserve a live usable covering reservation across replacement/refresh/repair/expiry/crash; add regression tests for the two-step removal." },
 { id:"r3", title:"Deterministic capture budgets everywhere", themes:["correctness"], layers:["multilite"], horizon:"now",
-  detail:"Make every durable operation encoder fallible; one budget across row count, row bytes, key components, operation/transaction bytes, DELETE repair, DROP COLUMN repair, UNIQUE backfill. Oversized statements roll back atomically with stable typed errors \u2014 never a u32 panic." },
+  detail:"Interim safety is landed: row DML is fenced inside the preupdate hook at 100,000 events / 64 MiB, then rechecked on operation and transaction encode/decode. Launch requires bounded-memory spill files plus chunked pending/authority payloads for much larger statements, while preserving one operation-wide normalization and one atomic admission/rejection decision; partial chunks must never become visible. Add crash cleanup, reopen, repair, convergence, and configurable hard-cap tests. Extend the typed boundary to DROP COLUMN repair and UNIQUE backfill." },
 { id:"r4", title:"Two-replica integrity sim \u2192 full DST", themes:["correctness"], layers:["multilite","sim"], horizon:"now",
   detail:"The seeded two-replica scenario now audits projected authority row frames, UNIQUE/FK cells, pending cleanup, SQLite integrity, and convergence. Next: a proper deterministic scheduler; authority delay/loss/duplication/partition; VFS short reads/writes, I/O failure, corruption; and crash points around WAL, pending-journal, cursor, and metadata transitions." },
 { id:"r5", title:"Bounded speculative DELETE capture", themes:["correctness","performance"], layers:["multilite"], horizon:"now",
-  detail:"DELETE buffers every old row image in memory. Enforce per-statement row/byte limits with atomic rollback first; later evaluate spilling restoration images, chunking, and lowering eligible predicates to Homebase DeleteRange (must preserve rollback data and footprints)." },
+  detail:"The first boundary is landed: DELETE/UPDATE/INSERT capture rolls back at 100,000 hook events or 64 MiB and durable frames are rechecked. The launch requirement in l3 adds spilling restoration images and atomic chunked representation; separately evaluate lowering eligible predicates to Homebase DeleteRange while preserving rollback data and footprints." },
 { id:"r6", title:"Empty key-component validation", themes:["correctness"], layers:["core"], horizon:"now",
   detail:"Ensure key components cannot be empty; prefixes may be empty but keys may not." },
 { id:"r7", title:"Refresh workflow: retry the push\u2192pull\u2192rebase drain", themes:["correctness"], layers:["multilite"], horizon:"next",
@@ -1191,8 +1225,8 @@ roadmap: [
   detail:"Before dense admission history becomes the only bootstrap path: a trust object binding one materialized space state to an admission seq and device/space lineage, so a new replica verifies a checkpoint and replays only the dense suffix. A Homebase primitive, not a Multilite snapshot." },
 { id:"r20", title:"FK evolution: retirement, retargeting, coercion", themes:["protocol"], layers:["multilite"], horizon:"later",
   detail:"Define retirement/GC for dropped relationships before widening the grammar; then durable retargeting/removal, affinity/collation coercion, self-references and cycles, deferred constraints, mutating actions, add/drop relationship evolution." },
-{ id:"r21", title:"Statement-delta compiler (conflict clauses, triggers)", themes:["protocol","correctness"], layers:["multilite"], horizon:"later",
-  detail:"One compiler that normalizes mixed/repeated preupdate events into a deterministic ordered net effect, derives guards for every affected table, materializes procedural effects exactly once, and produces an exact inverse. Prerequisite for REPLACE/UPSERT/triggers/mutating FK actions \u2014 each conflict mode needs its own OCC spec." },
+{ id:"r21", title:"Finish statement-delta grammar (replacement, triggers)", themes:["protocol","correctness"], layers:["multilite"], horizon:"later",
+  detail:"RowChanges now normalizes mixed/repeated preupdate events, derives operation-wide guards, and produces one exact inverse. OR ABORT, OR IGNORE, and UPSERT DO NOTHING are admitted. Remaining work: explicit OCC contracts and completion-gate evidence for REPLACE, DO UPDATE, FAIL/ROLLBACK, triggers, and mutating FK actions." },
 { id:"r22", title:"Serverless-born clients acquiring authority later", themes:["protocol"], layers:["client"], horizon:"research",
   detail:"How does an oplog accumulated without leases acquire authority and ship? Device-scoped-prefix/ledger pattern may make it safe." },
 { id:"r23", title:"Adopt an existing SQLite file", themes:["protocol","ecosystem"], layers:["multilite"], horizon:"next",
@@ -1216,7 +1250,8 @@ roadmap: [
 { id:"r34", title:"Client identity-spec reconciliation", themes:["security","protocol"], layers:["client"], horizon:"next",
   detail:"Enclave/KeyBundle/bootstrap-record \u2192 SpaceEnvelope + identity module; SystemRecord::Bootstrap \u2192 Envelope; delete derive_space_id (ids are HKDF(name_key) commitments); drop rotate_secret/rotate_space_key from v1 (KeyEpoch stays, permanently 0)." },
 { id:"r35", title:"Bucketing / padding before encryption", themes:["security"], layers:["client","core"], horizon:"later", detail:"Pad key components & values to buckets before sealing (size-leak hygiene)." },
-{ id:"r36", title:"UUID indirection for key components", themes:["security","protocol"], layers:["core"], horizon:"research", detail:"Better rotation via indirection." },
+{ id:"r36", title:"Decide the key-rotation model (UUID indirection candidate)", themes:["security","protocol"], layers:["core","client"], horizon:"research",
+  detail:"v1 ships without cryptographic revocation (KeyEpoch permanently 0), so the rotation model must be decided before it's load-bearing. Candidate under consideration: per-component UUID indirection \u2014 main keys become lists of plaintext UUIDs \u2192 encrypted values, plus an encrypted dictionary mapping component \u2192 encrypted UUID. Rotation then re-keys the dictionary without rewriting the main keyspace. Pros: rotation cost proportional to the dictionary, not the data; ordered scans keep working over stable UUIDs. Cons/open questions: two lookups per resolve; the plaintext UUID list leaks structure (count/ordering) unless bucketed \u2014 interacts with the padding TODO; dictionary becomes a write hot-spot and a consistency point under concurrent admission; range assertions and prefix semantics must be defined over post-indirection keys. Compare against the simpler alternatives (eager re-key generation rewrite; lazy per-prefix re-key) before committing." },
 
 /* performance */
 { id:"r37", title:"unlease_checked cost", themes:["performance"], layers:["client"], horizon:"later",
@@ -1266,6 +1301,10 @@ roadmap: [
   detail:"Define the release matrix and automation: crates.io, npm with BigInt-safe rowids, Python wheels, Ruby gem, Homebrew formula, signed/checksummed CLI binaries, supported OS/architecture targets, version compatibility, reproducible builds, install smoke tests, upgrade policy, and release notes." },
 { id:"r65", title:"Benchmark suite and performance budgets", themes:["performance","correctness"], layers:["multilite","sim"], horizon:"next",
   detail:"Build reproducible benchmarks against stock SQLite for point/range reads, inserts/updates/deletes, DDL and UNIQUE/FK work, branch/snapshot/connection startup, commit/group-commit, push/pull/rebase, rejection repair, reopen, WAL/checkpoint pressure, database size, concurrency, and memory/bytes written. Track baselines and regression budgets in CI." },
+{ id:"r66", title:"Local at-rest encryption: page-encrypting VFS layer (AtRest::Pages)", themes:["security"], layers:["multilite"], horizon:"later",
+  detail:"Post-launch. Implement at-rest encryption as a page cipher in Multilite's own VFS stack (sqlite3mc/SEE pattern), not SQLCipher \u2014 the sqlcipher amalgamation is unpatched for the rowid hook and the snapshot engine parses WAL frames directly, so the encryption boundary must stay under our control. Must cover writable-branch overlay files and any future spill files; frame headers stay plaintext so WAL page-mapping keeps working, but cold-parse == incremental-parse and salt rotation need tests against encrypted images. Pick per-page reserve-byte layout (nonce/MAC) before anyone has data \u2014 changing it is a full-file rewrite. Per-file key = HKDF(space local secret, file id), wrapped in the envelope. Rekey is a full rewrite: design it as the same drain-then-rewrite problem as the rotation \u00d7 push-pipeline TODO." },
+{ id:"r67", title:"Decide server authorization / token checking", themes:["security","protocol"], layers:["server"], horizon:"next",
+  detail:"Decide whether the v1 server validates authorization itself or delegates to the deployment (network isolation, reverse proxy). If in-server: bearer tokens carrying space-scoped claims checked per verb, which forces the minter design from the identity spec (hosted auth can mint partition-scoped claims only if the tenant shares the name key \u2014 the threat-model tension). If delegated: document loudly that an unauthenticated reachable server admits any well-formed write, and that E2EE protects confidentiality but not integrity-against-spam/DoS. Either way the transport should reserve the Authorization header and claim format now so adding enforcement isn't a wire change." },
 
 /* standing decisions */
 { id:"r60", title:"Uniqueness = plain column tuples, period", themes:["protocol"], layers:["multilite"], horizon:"boundary",
@@ -1275,6 +1314,79 @@ roadmap: [
 { id:"r62", title:"Serializable reads stay coarse until measured", themes:["performance","protocol"], layers:["multilite"], horizon:"boundary",
   detail:"Table-root prefixes cover joins/subqueries/trigger reads/write predicates. Precision is an optimization after correctness; a statement may be conservative but never omit a dependency." },
 ],
+
+launch: {
+  groups: [
+  { name:"A. Engine \u2014 won't eat your data", blurb:"Multilite correctness items where skipping risks data loss or silent divergence.",
+    items:[
+    { id:"l1", status:"done", title:"Statement-delta compiler (RowChanges)",
+      detail:"One normalizer folds mixed/repeated preupdate events into deterministic net before/after images for the statement's synchronized table, checks SQLite before-image continuity, derives operation-wide mutations and guards, and supplies one RestoreRowChanges inverse. Malformed codecs, deterministic normalization, apply/inverse, guard contracts, pair behavior, and rejection/reopen are covered." },
+    { id:"l2", status:"wip", title:"Admit conflict modes through the completion gate",
+      detail:"OR ABORT, OR IGNORE, and UPSERT DO NOTHING are landed with mixed-outcome convergence coverage. REPLACE, DO UPDATE, FAIL/ROLLBACK, triggers, and mutating FK actions remain fenced until each has its own OCC spec, pair-registry entries, and rejection-repair tests." },
+    { id:"l3", status:"partial", title:"Spillable, bounded-memory atomic capture",
+      detail:"Mandatory for launch. Row DML currently fails atomically at 100,000 captured events or 64 MiB, with operation/transaction codec rechecks. Replace that practical ceiling with bounded-memory spill storage, operation-wide normalization across chunks, chunked pending and authority representation, one atomic admission/rejection decision, exact inverse repair, crash cleanup, and a configurable abuse cap. Apply the same typed limits to DROP COLUMN repair and UNIQUE backfill." },
+    { id:"l4", status:"todo", title:"Crash-safe suffix archive before rejection rollback",
+      detail:"Suffix-forfeit stays the contract, but silently discarding offline work is the one behavior early users will call data loss. Export the forfeited logical transactions durably before rollback; pairs with the CLI's export-forfeited command." },
+    { id:"l5", status:"todo", title:"Foreign-writer detection + quarantine (not tolerance)",
+      detail:"Process-level file ownership incl. the double-open-same-file guard, plus a data_version / WAL-epoch / schema-cookie observer entering an explicit quarantine state. The pitch is 'it's just SQLite', so someone will open the file with stock sqlite3 \u2014 silent divergence there is brand-destroying; detection is a fraction of the tolerance work." },
+    { id:"l6", status:"decision", title:"Fence DROP COLUMN for v0",
+      detail:"The replicated-DDL vs local-repair split isn't designed and the replicated frame is unbounded. Withdrawing is a one-line gate change and easier to announce than to caveat. TODO.md already leans this way." },
+    { id:"l7", status:"wip", title:"Crash injection in the integrity sim",
+      detail:"The seeded two-replica sim and the 28-pair convergence registry are landed (the convergence evidence). Missing: process-kill points around WAL, pending-journal, cursor, and metadata transitions \u2014 the durability evidence behind any 'crash-safe' claim. Likely the long pole; parallelizes with everything else." }] },
+
+  { name:"B. Kernel \u2014 freeze before it's public", blurb:"Homebase items that become compat promises the day of the announcement.",
+    items:[
+    { id:"l8", status:"todo", title:"Server transport layer",
+      detail:"One HTTP/1.1+TLS POST endpoint per verb carrying the existing binary frames; protocol version header + /v1/health with supported range (the part you can't retrofit); bearer tokens with space-scoped claims; request-size caps and per-device rate limits at the edge. Client impl behind ServerHandle retries dumbly \u2014 device-seq + checksum admission already makes that safe. Defer streaming/push, compression, batching." },
+    { id:"l9", status:"todo", title:"Fix checked-unlease replacement coverage",
+      detail:"Known lease-safety bug: a usable lease can be removed in favor of a live replacement whose barrier hasn't applied, then the replacement removed too. Regression tests for the two-step removal sequence." },
+    { id:"l10", status:"decision", title:"Lease-barrier scope: global vs prefix-local",
+      detail:"Code records the space-global admission high-water at grant; older design text says prefix-local. Wire-visible semantics \u2014 decide, document, align before anyone depends on it." },
+    { id:"l11", status:"todo", title:"Identity & vocabulary freeze",
+      detail:"Envelope/keystore reconciliation (SpaceEnvelope, delete derive_space_id), the Link vs Account naming call, empty-key-component validation, and the crates.io naming transition. None hard; all irreversible after announcement." },
+    { id:"l12", status:"wip", title:"Threat-model doc",
+      detail:"The announcement artifact for an E2EE product \u2014 the first question will be 'what does the server see'. Largely written (DESIGN.md honest-but-dumb + key hierarchy); must include the honest parts: no cryptographic revocation in v1, the minter-needs-name-key tension, and the at-rest delegation below." },
+    { id:"l24", status:"decision", title:"Freeze OpenOptions with explicit AtRest::None",
+      detail:"Builder-style open: space + keystore/envelope handle (never raw key bytes) + sync policy + a non-exhaustive AtRest enum with None explicit \u2014 so 'we didn't encrypt your local file' is a visible choice in user code, and adding AtRest::Pages later isn't a breaking change. State plainly in the threat model that v1 at-rest protection is delegated to OS disk encryption; 'E2EE' is a claim about the server, and someone will check the .db file within a day of the announcement. The page-encrypting VFS itself is post-launch (roadmap: AtRest::Pages)." },
+    { id:"l25", status:"decision", title:"Server authorization model",
+      detail:"Decide in-server token checking (space-scoped claims per verb \u2014 forces the minter/name-key design) vs delegating to deployment (network isolation / reverse proxy \u2014 must be documented loudly: a reachable unauthenticated server admits any well-formed write). Minimum for launch: reserve the Authorization header and claim format in the transport so adding enforcement is not a wire change. See roadmap card 'server authorization'." }] },
+
+  { name:"C. Evidence \u2014 numbers to publish", blurb:"Benchmarks and test results legible to outsiders; stock SQLite is the only comparison anchor.",
+    items:[
+    { id:"l13", status:"todo", title:"Benchmark suite (six numbers)",
+      detail:"1) single-row write latency p50/p99 vs stock, both isolation levels (the multilite tax); 2) concurrent-writer throughput 1/4/16 threads (the win chart); 3) read + snapshot-open cost, incl. reads under a heavy writer; 4) bulk DML at the budget boundary, showing clean over-budget failure; 5) sync: push round trip, rebase apply rate, cold-start replay per 100k ops (prices the no-checkpoints footnote); 6) DB+WAL footprint overhead. Criterion for micro; one checked-in markdown table for the rest. See roadmap card 'benchmarks'." },
+    { id:"l14", status:"todo", title:"Crash-injected recovery seeds",
+      detail:"N seeds with kill points around WAL/journal/cursor/meta transitions, all recovering to validated state. Publish N." },
+    { id:"l15", status:"wip", title:"Randomized two-replica convergence corpus",
+      detail:"Generalize the hand-curated pair registry (28 relationships, 112 executions \u2014 landed) into seeded random DML/DDL programs with random interleavings and rejection patterns, same oracle: converged rows+schema, clean integrity/FK checks, authority reverse-reference agreement. '10,000 random schedules, zero divergence' is a sentence people quote." },
+    { id:"l16", status:"todo", title:"Network-fault DST over the real transport",
+      detail:"Run the shipping transport client under the sim's delay/duplication/loss/partition schedule \u2014 tests the code that ships, not the trait. Blocked on l8." },
+    { id:"l17", status:"wip", title:"Differential fuzz + SLT coverage numbers",
+      detail:"Random in-grammar statements vs stock SQLite oracle, plus three sql-logic-test numbers: % in-grammar, pass rate on in-grammar, % correctly rejected as unsupported (never wrong results). The conformance harness and unsupported-vs-failure reporting are landed; the fuzz driver and published numbers are not." }] },
+
+  { name:"D. Ecosystem & announcement wrapper", blurb:"Launch-scope only: names, Python, CLI, distribution, quickstart. npm/Ruby follow fast.",
+    items:[
+    { id:"l18", status:"todo", title:"Reserve every name now",
+      detail:"crates.io transition (homebase \u2192 server, homebase-client, retire homebased), PyPI, npm, the Ruby gem, brew formula/tap, GitHub org. An afternoon of work; irreversible if squatted after the announcement." },
+    { id:"l19", status:"wip", title:"Python binding",
+      detail:"PyO3/maturin, sync-first API over the runtime-neutral futures. Python ints are arbitrary precision, so rowids are safe with zero design work. Early skeleton exists in python/." },
+    { id:"l20", status:"todo", title:"multilite CLI",
+      detail:"A correctness feature, not DX sugar \u2014 foreign writers are fenced, so people cannot poke a db with the sqlite3 shell. Verbs: shell (REPL through the gate), status (sync state, pending, quarantine), push/pull, export-forfeited (pairs with l4), serve --dev (in-process server for the quickstart), bench." },
+    { id:"l21", status:"todo", title:"Distribution",
+      detail:"cargo install, prebuilt binaries on GitHub releases, own brew tap (homebrew-core after the announcement earns notability). Server: one static binary + Docker image + MinIO example compose." },
+    { id:"l22", status:"todo", title:"Ten-minute quickstart",
+      detail:"Rust + Python paths: install, create db, write/query, run serve --dev, sync two replicas, observe a conflict rejection repair itself. If it takes more than ten minutes, cut scope from the quickstart, not the docs." },
+    { id:"l23", status:"decision", title:"npm BigInt rowid policy (decision only)",
+      detail:"Allocator rowids exceed 2^53 for nearly every device tag; as Number they corrupt silently. Decide BigInt-only vs re-budgeting tag/slot bits before the binding is written \u2014 the binding itself is a fast-follow, not launch-blocking." }] },
+  ],
+  deferred: [
+    "Performance debt: bulk-DML footprint collapse, prepare_cached, snapshot/branch startup, indexed journal retirement \u2014 invisible at demo scale; grammar already fences unbounded DML once budgets land.",
+    "Views, DROP TABLE, ATTACH, generated columns \u2014 documented future cells in the grammar matrix.",
+    "Triggers and mutating FK actions \u2014 the delta compiler makes them possible; announce as a boundary, ship later.",
+    "Authenticated checkpoints \u2014 new replicas replay history; honest footnote, fine at v0 space sizes.",
+    "Live queries / db.watch, npm and Ruby bindings, adoption/promotion of existing tables, device fencing, rotation \u00d7 push ordering (moot until rotation exists \u2014 say so in the threat model)."
+  ],
+},
 };
 
 /* ================================================================
@@ -1586,8 +1698,37 @@ roadmap: [
     renderRoadmap();
   }));
 
+  /* ---------- launch ---------- */
+  const LC_STATUS = { done:"done", wip:"in progress", todo:"todo", decision:"decide" };
+  function renderLaunch() {
+    const host = $("#lc-groups");
+    const all = DATA.launch.groups.flatMap(g => g.items);
+    const score = all.reduce((n, i) => n + (i.status === "done" ? 1 : i.status === "wip" ? 0.5 : 0), 0);
+    const pct = Math.round(100 * score / all.length);
+    $("#lc-pct").textContent = `${pct}% \u00b7 ${all.filter(i=>i.status==="done").length} done, ${all.filter(i=>i.status==="wip").length} in progress, ${all.length} total`;
+    const counts = { done:0, wip:0, todo:0, decision:0 };
+    all.forEach(i => counts[i.status]++);
+    $("#lc-bar").innerHTML = [["done","#2f9e63"],["wip","#5aa9ff"],["decision","#9d7bff"],["todo","#2a3447"]]
+      .map(([s, c]) => counts[s] ? `<div style="flex:${counts[s]};background:${c}"></div>` : "").join("");
+    host.innerHTML = "";
+    DATA.launch.groups.forEach(g => {
+      const el = document.createElement("div"); el.className = "lc-group";
+      el.innerHTML = `<h3>${g.name}</h3><p class="lc-blurb">${g.blurb}</p>` +
+        g.items.map(i => `<div class="lc-item" data-id="${i.id}">
+          <span class="lc-status s-${i.status}">${LC_STATUS[i.status]}</span>
+          <span class="lc-body"><span class="lc-title">${i.title}</span>
+          <span class="lc-detail">${i.detail}</span></span></div>`).join("");
+      host.appendChild(el);
+    });
+    const defer = document.createElement("div"); defer.className = "lc-group lc-defer";
+    defer.innerHTML = `<h3>Explicitly not blocking</h3><p class="lc-blurb">Announce these as documented boundaries or fast-follows.</p>
+      <ul>${DATA.launch.deferred.map(d => `<li>${d}</li>`).join("")}</ul>`;
+    host.appendChild(defer);
+    $$(".lc-item", host).forEach(el => el.addEventListener("click", () => el.classList.toggle("open")));
+  }
+
   /* ---------- init ---------- */
-  buildMap(); buildFlowRail(); buildGrammar(); renderRoadmap();
+  buildMap(); buildFlowRail(); buildGrammar(); renderRoadmap(); renderLaunch();
   $$(".fchip")[0].click();
   requestAnimationFrame(drawEdges);
   setTimeout(drawEdges, 250); // after fonts settle

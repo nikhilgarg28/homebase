@@ -8,10 +8,21 @@ restricted `CREATE TABLE`, `ALTER TABLE` rename/add/drop forms,
 `UPDATE`. Exact accepted forms are defined by tests and the parser; accepting a
 SQLite statement does not imply that every SQLite spelling is supported.
 
-Captured UPDATE and DELETE syntax includes CTE prefixes, `UPDATE ... FROM`,
-tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These forms compile to the
-same row-image operations as simpler DML. Conflict clauses, `RETURNING`, and
-`ORDER BY` / `LIMIT` remain outside the managed write surface.
+Captured INSERT, UPDATE, and DELETE syntax compiles through one statement-delta
+operation that folds repeated touches into deterministic before/after row
+images. `INSERT [OR ABORT|OR IGNORE]`, `UPDATE [OR ABORT|OR IGNORE]`, and UPSERT
+chains containing only `DO NOTHING` are supported. `REPLACE`, `OR FAIL`,
+`OR ROLLBACK`, UPSERT `DO UPDATE`, triggers, mutating foreign-key actions,
+`RETURNING`, and write `ORDER BY` / `LIMIT` remain outside the managed surface.
+
+Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
+FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings
+produce the same statement-delta operation as simpler DML.
+
+Each statement may capture at most 100,000 direct row events and 64 MiB of row
+images. The normalized row operation and enclosing transaction frame enforce
+the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls
+back the complete SQLite statement with a typed error.
 
 ## Completion Gate
 

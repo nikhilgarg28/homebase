@@ -62,19 +62,27 @@ schema revision, index definitions, active primary index, and one mutable
 changed valid row lowering. The inverse translation verifies the complete
 envelope and checks that stored SQL projects to the same structured operation.
 
-SQLite's preupdate hook captures final inserted values after affinity has run.
-One SQL statement becomes one `InsertRows` operation even when it inserts many
-rows. Row frames identify their schema revision and carry column-UUID/value
-pairs using lossless SQLite storage classes. Primary-key values become separate
+SQLite's preupdate hook captures final inserted, deleted, and updated values
+after affinity and conflict handling have run. One SQL statement becomes one
+`RowChanges` operation: its ordered hook events are folded into deterministic
+net before/after images for one synchronized table, while immutable table,
+index, and relationship rules are stored once. `OR ABORT`, `OR IGNORE`, and
+UPSERT chains containing only `DO NOTHING` therefore lower only the rows SQLite
+actually changed. Row frames identify their schema revision and carry
+column-UUID/value pairs using lossless SQLite storage classes. Primary-key
+values become separate
 Homebase key components under the table and primary-index UUID. Submissions
 assert every exact row key, every non-NULL unique tuple, and the table's
 active-primary-index and write-revision cells. Composite unique values occupy
 one Homebase component per key part under their immutable index UUID;
 their value identifies the owning row. Tuples containing NULL emit no ownership
-cell, matching SQLite's distinct-NULL behavior. Accepted foreign rows replay by
-stable IDs through the local schema catalog; rejected local rows are deleted by
-the pending journal in the same transaction that rolls back the Homebase submit
-window.
+cell, matching SQLite's distinct-NULL behavior. Accepted foreign row deltas
+replay by stable IDs through the local schema catalog; the pending journal
+restores the exact net before-images in the same transaction that rolls back
+the Homebase submit window. Capture is fenced at 100,000 direct row events and
+64 MiB per row operation and transaction; an oversized statement rolls back
+with a typed error rather than retaining unbounded memory or reaching a codec
+length panic.
 
 Ordinary secondary indexes are synchronized schema and physical SQLite access
 paths only. Their names and definitions converge across replicas, but row
@@ -120,7 +128,7 @@ snapshot.
 optional `WITH` clause, SQLite predicate, and ordinary `INDEXED BY` or `NOT
 INDEXED` hint; `RETURNING`, `ORDER BY`, and `LIMIT` remain rejected. SQLite
 evaluates the predicate and the preupdate hook captures every complete old row
-image. `DeleteRows` lowers those rows to exact Homebase point deletes with the
+image. `RowChanges` lowers those rows to exact Homebase point deletes with the
 same primary-index and write-revision guards as inserts. Remote apply verifies
 the complete current row before deleting it, and rejection restores values
 plus the hidden SQLite rowid when one exists. Zero-row deletes create no
@@ -132,7 +140,9 @@ subqueries, and ordinary index hints. SQLite supplies complete before/after row
 images, so these forms use the same lowering rather than a parallel expression
 evaluator. Stable-key updates lower to a point Set; primary-key moves lower to
 a Delete of the old key followed by a Set of the new key, with both keys in the
-conflict footprint. Rejection restores the old image. Integer primary-key moves
+conflict footprint. Across a multi-row operation every retired source is
+deleted before any destination is set, so one row may move into another row's
+former key. Rejection restores the old image. Integer primary-key moves
 follow SQLite's rowid alias, while non-integer primary-key moves preserve their
 hidden rowid; direct hidden-rowid changes remain unsupported.
 

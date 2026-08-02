@@ -1624,8 +1624,8 @@ fn serializable_branch_update_is_one_submission_pending_record_and_admission() {
         pending[0].transaction.operations(),
         [
             MultiliteOp::CreateTable(_),
-            MultiliteOp::InsertRows(_),
-            MultiliteOp::InsertRows(_)
+            MultiliteOp::ChangeRows(_),
+            MultiliteOp::ChangeRows(_)
         ]
     ));
 
@@ -2910,11 +2910,11 @@ fn multi_row_insert_is_one_durable_pending_operation() {
     assert_eq!(pending.len(), 2);
     assert!(matches!(
         pending[1].transaction.operations(),
-        [MultiliteOp::InsertRows(_)]
+        [MultiliteOp::ChangeRows(_)]
     ));
     assert!(matches!(
         pending[1].rejection().unwrap().as_slice(),
-        [crate::logical::operation::RejectionEffect::DeleteRows { .. }]
+        [crate::logical::operation::RejectionEffect::RestoreRowChanges { .. }]
     ));
     database.with_connection(|connection| {
         assert_eq!(

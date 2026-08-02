@@ -21,6 +21,8 @@ use crate::{Error, Result};
 const TRANSACTION_FRAME_VERSION: u8 = 1;
 const TAG_TRANSACTION_ID: u8 = 1;
 const TAG_OPERATION: u8 = 2;
+const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
+const MAX_TRANSACTION_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TransactionId([u8; 16]);
@@ -146,14 +148,39 @@ impl MultiliteTransaction {
 
     /// Encode the immutable transaction manifest.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_limits(MAX_TRANSACTION_OPERATIONS, MAX_TRANSACTION_FRAME_BYTES)
+    }
+
+    fn encode_with_limits(&self, max_operations: usize, max_bytes: usize) -> Result<Vec<u8>> {
+        if self.operations.len() > max_operations {
+            return Err(Error::CaptureLimitExceeded {
+                resource: "transaction operation count",
+                limit: max_operations,
+            });
+        }
         let mut writer = Writer::new();
         writer.u8(TRANSACTION_FRAME_VERSION);
         writer
             .field(TAG_TRANSACTION_ID, &self.id.0)
             .map_err(|_| transaction_field_too_large())?;
+        let mut encoded_bytes = 1 + 5 + self.id.0.len();
         for operation in &self.operations {
+            let operation = operation.encode();
+            encoded_bytes = encoded_bytes
+                .checked_add(5)
+                .and_then(|bytes| bytes.checked_add(operation.len()))
+                .ok_or(Error::CaptureLimitExceeded {
+                    resource: "transaction frame bytes",
+                    limit: max_bytes,
+                })?;
+            if encoded_bytes > max_bytes {
+                return Err(Error::CaptureLimitExceeded {
+                    resource: "transaction frame bytes",
+                    limit: max_bytes,
+                });
+            }
             writer
-                .field(TAG_OPERATION, &operation.encode())
+                .field(TAG_OPERATION, &operation)
                 .map_err(|_| transaction_field_too_large())?;
         }
         Ok(writer.finish())
@@ -161,6 +188,21 @@ impl MultiliteTransaction {
 
     /// Decode one complete immutable transaction manifest.
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, TransactionCodecError> {
+        Self::decode_with_limits(
+            frame,
+            MAX_TRANSACTION_OPERATIONS,
+            MAX_TRANSACTION_FRAME_BYTES,
+        )
+    }
+
+    fn decode_with_limits(
+        frame: &[u8],
+        max_operations: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<Self, TransactionCodecError> {
+        if frame.len() > max_bytes {
+            return Err(TransactionCodecError::FrameTooLarge);
+        }
         let mut reader = Reader::new(frame);
         let version = reader.u8().ok_or(TransactionCodecError::Truncated)?;
         if version != TRANSACTION_FRAME_VERSION {
@@ -180,6 +222,9 @@ impl MultiliteTransaction {
                     }
                 }
                 TAG_OPERATION => {
+                    if operations.len() == max_operations {
+                        return Err(TransactionCodecError::TooManyOperations);
+                    }
                     operations.push(MultiliteOp::decode(value).map_err(|error| {
                         TransactionCodecError::InvalidOperation(error.to_string())
                     })?)
@@ -338,6 +383,8 @@ pub enum TransactionCodecError {
     InvalidLength,
     InvalidUuid,
     Empty,
+    TooManyOperations,
+    FrameTooLarge,
     InvalidOperation(String),
     InvalidBatch,
 }
@@ -354,6 +401,8 @@ impl fmt::Display for TransactionCodecError {
             Self::InvalidLength => f.write_str("transaction field has an invalid length"),
             Self::InvalidUuid => f.write_str("transaction id is not a UUID v4"),
             Self::Empty => f.write_str("transaction contains no operations"),
+            Self::TooManyOperations => f.write_str("transaction contains too many operations"),
+            Self::FrameTooLarge => f.write_str("transaction manifest is too large"),
             Self::InvalidOperation(error) => write!(f, "invalid transaction operation: {error}"),
             Self::InvalidBatch => f.write_str("admitted transaction does not match its manifest"),
         }
@@ -370,7 +419,7 @@ mod tests {
 
     use super::*;
     use crate::catalog;
-    use crate::logical::row::{CapturedRow, InsertRows, StoredValue};
+    use crate::logical::row::{CapturedRow, RowChanges, RowSet, StoredValue};
     use crate::logical::schema::{CreateColumn, CreateTableSpec, SqlName, TypeDeclaration};
 
     fn create_operation() -> MultiliteOp {
@@ -405,7 +454,7 @@ mod tests {
         catalog::initialize(&connection).unwrap();
         connection.execute(table.sql(), ()).unwrap();
         catalog::insert(&connection, table).unwrap();
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
@@ -415,8 +464,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut transaction =
-            MultiliteTransaction::new(vec![created, MultiliteOp::InsertRows(inserted)]).unwrap();
+        let mut transaction = MultiliteTransaction::new(vec![
+            created,
+            MultiliteOp::ChangeRows(RowChanges::inserted(inserted)),
+        ])
+        .unwrap();
         transaction.id = TransactionId(test_uuid(1));
         transaction
     }
@@ -474,7 +526,7 @@ mod tests {
         assert!(matches!(
             compiled.rejection(),
             [
-                RejectionEffect::DeleteRows { .. },
+                RejectionEffect::RestoreRowChanges { .. },
                 RejectionEffect::DropTable { .. }
             ]
         ));
@@ -490,6 +542,35 @@ mod tests {
         assert_eq!(
             MultiliteTransaction::from_homebase(&admitted(lowered.mutations)).unwrap(),
             transaction
+        );
+    }
+
+    #[test]
+    fn manifest_codec_enforces_operation_and_byte_budgets() {
+        let transaction = MultiliteTransaction::new(vec![create_operation()]).unwrap();
+        assert!(matches!(
+            transaction.encode_with_limits(0, usize::MAX),
+            Err(Error::CaptureLimitExceeded {
+                resource: "transaction operation count",
+                limit: 0,
+            })
+        ));
+        assert!(matches!(
+            transaction.encode_with_limits(usize::MAX, 1),
+            Err(Error::CaptureLimitExceeded {
+                resource: "transaction frame bytes",
+                limit: 1,
+            })
+        ));
+
+        let encoded = transaction.encode().unwrap();
+        assert_eq!(
+            MultiliteTransaction::decode_with_limits(&encoded, 0, encoded.len()),
+            Err(TransactionCodecError::TooManyOperations)
+        );
+        assert_eq!(
+            MultiliteTransaction::decode_with_limits(&encoded, usize::MAX, encoded.len() - 1,),
+            Err(TransactionCodecError::FrameTooLarge)
         );
     }
 
@@ -513,6 +594,7 @@ mod tests {
         assert!(snapshot.iter().all(|assertion| assertion.upto == frontier));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn canonical_apply_detects_a_row_after_image_divergence() {
         let created = create_operation();
@@ -523,7 +605,7 @@ mod tests {
         catalog::initialize(&connection).unwrap();
         connection.execute(table.sql(), ()).unwrap();
         catalog::insert(&connection, table).unwrap();
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
@@ -543,13 +625,15 @@ mod tests {
                  END",
             )
             .unwrap();
-        let transaction =
-            MultiliteTransaction::new(vec![MultiliteOp::InsertRows(inserted)]).unwrap();
+        let transaction = MultiliteTransaction::new(vec![MultiliteOp::ChangeRows(
+            RowChanges::inserted(inserted),
+        )])
+        .unwrap();
 
         assert!(matches!(
             transaction.apply(&connection),
             Err(Error::InvalidDatabase(
-                "canonical INSERT diverged from its captured branch after-image"
+                "canonical row changes diverged from captured after-images"
             ))
         ));
     }

@@ -328,10 +328,8 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
                     .execute_batch(&format!("DROP TABLE {}", quote_identifier(name.value())))?;
                 catalog::remove_by_id(connection, created.table_id())?;
             }
-            RejectionEffect::DeleteRows { inserted } => inserted.delete_materialized(connection)?,
-            RejectionEffect::RestoreRows { deleted } => deleted.restore_materialized(connection)?,
-            RejectionEffect::RestoreUpdatedRows { updated } => {
-                updated.restore_materialized(connection)?
+            RejectionEffect::RestoreRowChanges { changes } => {
+                changes.restore_materialized(connection)?
             }
             RejectionEffect::RevertIndex { operation } => operation.rollback(connection)?,
         }
@@ -390,7 +388,9 @@ mod tests {
     use super::*;
     use crate::logical::alter::AlterTableOperation;
     use crate::logical::operation::{MultiliteOp, RejectionEffect};
-    use crate::logical::row::{CapturedRow, DeleteRows, InsertRows, StoredValue, UpdateRows};
+    use crate::logical::row::{
+        CapturedRow, DeletedRowsFixture, RowChanges, RowSet, StoredValue, UpdatedRowsFixture,
+    };
     use crate::logical::schema::{
         CreateColumn, CreateTable, CreateTableSpec, SqlName, TypeDeclaration,
     };
@@ -418,7 +418,7 @@ mod tests {
         )
     }
 
-    fn insert_operation() -> MultiliteOp {
+    fn insert_row_set() -> RowSet {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let MultiliteOp::CreateTable(created) = operation("notes") else {
@@ -426,7 +426,7 @@ mod tests {
         };
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
-        let inserted = InsertRows::from_captured(
+        RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
@@ -435,15 +435,16 @@ mod tests {
             }],
         )
         .unwrap()
-        .unwrap();
-        MultiliteOp::InsertRows(inserted)
+        .unwrap()
+    }
+
+    fn insert_operation() -> MultiliteOp {
+        MultiliteOp::ChangeRows(RowChanges::inserted(insert_row_set()))
     }
 
     fn delete_operation() -> MultiliteOp {
-        let MultiliteOp::InsertRows(inserted) = insert_operation() else {
-            unreachable!()
-        };
-        MultiliteOp::DeleteRows(DeleteRows::decode(&inserted.encode()).unwrap())
+        let deleted = DeletedRowsFixture::from_row_set(insert_row_set());
+        MultiliteOp::ChangeRows(RowChanges::deleted(deleted))
     }
 
     fn update_operation() -> MultiliteOp {
@@ -481,8 +482,8 @@ mod tests {
         );
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
-        MultiliteOp::UpdateRows(
-            UpdateRows::from_captured(
+        MultiliteOp::ChangeRows(RowChanges::updated(
+            UpdatedRowsFixture::from_captured(
                 &connection,
                 &[(
                     CapturedRow {
@@ -505,7 +506,7 @@ mod tests {
             )
             .unwrap()
             .unwrap(),
-        )
+        ))
     }
 
     fn alter_operation() -> MultiliteOp {
@@ -565,17 +566,17 @@ mod tests {
     }
 
     #[test]
-    fn codec_and_journal_roundtrip_insert_rows_and_its_delete_effect() {
+    fn codec_and_journal_roundtrip_insert_shaped_changes_and_their_inverse() {
         let operation = insert_operation();
         let transaction = transaction(operation.clone());
         let pending = PendingTransaction::new(DeviceSeq(11), transaction.clone());
-        let MultiliteOp::InsertRows(inserted) = &operation else {
+        let MultiliteOp::ChangeRows(changes) = &operation else {
             unreachable!()
         };
         assert_eq!(
             pending.rejection().unwrap(),
-            vec![RejectionEffect::DeleteRows {
-                inserted: inserted.clone(),
+            vec![RejectionEffect::RestoreRowChanges {
+                changes: changes.clone(),
             }]
         );
         assert_eq!(
@@ -614,17 +615,17 @@ mod tests {
     }
 
     #[test]
-    fn codec_and_journal_roundtrip_delete_rows_and_its_restore_effect() {
+    fn codec_and_journal_roundtrip_delete_shaped_changes_and_their_inverse() {
         let operation = delete_operation();
         let transaction = transaction(operation.clone());
         let pending = PendingTransaction::new(DeviceSeq(12), transaction.clone());
-        let MultiliteOp::DeleteRows(deleted) = &operation else {
+        let MultiliteOp::ChangeRows(changes) = &operation else {
             unreachable!()
         };
         assert_eq!(
             pending.rejection().unwrap(),
-            vec![RejectionEffect::RestoreRows {
-                deleted: deleted.clone(),
+            vec![RejectionEffect::RestoreRowChanges {
+                changes: changes.clone(),
             }]
         );
         assert_eq!(
@@ -639,17 +640,17 @@ mod tests {
     }
 
     #[test]
-    fn codec_and_journal_roundtrip_update_rows_and_its_restore_effect() {
+    fn codec_and_journal_roundtrip_update_shaped_changes_and_their_inverse() {
         let operation = update_operation();
         let transaction = transaction(operation.clone());
         let pending = PendingTransaction::new(DeviceSeq(13), transaction.clone());
-        let MultiliteOp::UpdateRows(updated) = &operation else {
+        let MultiliteOp::ChangeRows(changes) = &operation else {
             unreachable!()
         };
         assert_eq!(
             pending.rejection().unwrap(),
-            vec![RejectionEffect::RestoreUpdatedRows {
-                updated: updated.clone(),
+            vec![RejectionEffect::RestoreRowChanges {
+                changes: changes.clone(),
             }]
         );
         assert_eq!(
@@ -678,7 +679,7 @@ mod tests {
         connection
             .execute("INSERT INTO notes VALUES (7)", ())
             .unwrap();
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
@@ -688,16 +689,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let transaction =
-            MultiliteTransaction::new(vec![created, MultiliteOp::InsertRows(inserted.clone())])
-                .unwrap();
+        let transaction = MultiliteTransaction::new(vec![
+            created,
+            MultiliteOp::ChangeRows(RowChanges::inserted(inserted.clone())),
+        ])
+        .unwrap();
         insert(&connection, DeviceSeq(1), &transaction).unwrap();
 
         let pending = load(&connection).unwrap();
         assert!(matches!(
             pending[0].rejection().unwrap().as_slice(),
             [
-                RejectionEffect::DeleteRows { .. },
+                RejectionEffect::RestoreRowChanges { .. },
                 RejectionEffect::DropTable { created }
             ] if created.table_name() == "notes"
         ));

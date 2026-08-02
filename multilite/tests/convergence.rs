@@ -172,6 +172,266 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn ignored_conflicts_compile_only_the_rows_sqlite_changed_and_converge() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory.path().join("ignore-first.sqlite"),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join("ignore-second.sqlite"),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE
+                )",
+                (),
+            )
+            .unwrap();
+        first
+            .execute("INSERT INTO accounts VALUES (1, 'shared')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        assert_eq!(
+            first
+                .execute(
+                    "INSERT OR IGNORE INTO accounts VALUES
+                        (2, 'shared'), (3, 'first'),
+                        (6, 'third'), (7, 'fourth')",
+                    (),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            first
+                .execute(
+                    "UPDATE OR IGNORE accounts
+                     SET email = CASE id
+                         WHEN 6 THEN 'shared'
+                         ELSE email || '-updated'
+                     END
+                     WHERE id IN (6, 7)",
+                    (),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        assert_eq!(
+            second
+                .execute(
+                    "INSERT INTO accounts VALUES
+                        (4, 'shared'), (5, 'second')
+                     ON CONFLICT(email) DO NOTHING
+                     ON CONFLICT DO NOTHING",
+                    (),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, email FROM accounts ORDER BY id", (), |row| Ok(
+                        (row.get::<_, i64>(0)?, row.get::<_, String>(1)?)
+                    ),)
+                    .unwrap(),
+                [
+                    (1, "shared".into()),
+                    (3, "first".into()),
+                    (5, "second".into()),
+                    (6, "third".into()),
+                    (7, "fourth-updated".into()),
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn conflict_mode_rejection_repair_survives_reopen_and_restores_only_net_changes() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory.path().join("repair-first.sqlite");
+        let second_path = directory.path().join("repair-second.sqlite");
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let invitation = first.replica_invitation();
+        let second_options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server)))
+        };
+        let second =
+            MultiliteConnection::open_with(&second_path, second_options().invitation(invitation))
+                .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO accounts VALUES
+                        (1, 'shared'), (5, 'five'), (6, 'six')",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("INSERT INTO accounts VALUES (3, 'winner')", ())
+            .unwrap();
+        assert_eq!(
+            second
+                .execute(
+                    "INSERT OR IGNORE INTO accounts VALUES
+                        (1, 'ignored'), (3, 'loser'), (4, 'also speculative')",
+                    (),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("conflicting INSERT OR IGNORE was admitted under {isolation:?}")
+        };
+
+        drop(second);
+        let second = MultiliteConnection::open_with(&second_path, second_options()).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id, email FROM accounts ORDER BY id", (), |row| Ok(
+                    (row.get::<_, i64>(0)?, row.get::<_, String>(1)?)
+                ),)
+                .unwrap(),
+            [
+                (1, "shared".into()),
+                (3, "loser".into()),
+                (4, "also speculative".into()),
+                (5, "five".into()),
+                (6, "six".into()),
+            ]
+        );
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id, email FROM accounts ORDER BY id", (), |row| Ok(
+                    (row.get::<_, i64>(0)?, row.get::<_, String>(1)?)
+                ),)
+                .unwrap(),
+            [
+                (1, "shared".into()),
+                (3, "winner".into()),
+                (5, "five".into()),
+                (6, "six".into()),
+            ]
+        );
+
+        first
+            .execute("UPDATE accounts SET email = 'winner-six' WHERE id = 6", ())
+            .unwrap();
+        assert_eq!(
+            second
+                .execute(
+                    "UPDATE OR IGNORE accounts
+                     SET email = CASE id WHEN 5 THEN 'shared' ELSE 'loser-six' END
+                     WHERE id IN (5, 6)",
+                    (),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("conflicting UPDATE OR IGNORE was admitted under {isolation:?}")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        let expected = [
+            (1, String::from("shared")),
+            (3, String::from("winner")),
+            (5, String::from("five")),
+            (6, String::from("winner-six")),
+        ];
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, email FROM accounts ORDER BY id", (), |row| Ok(
+                        (row.get::<_, i64>(0)?, row.get::<_, String>(1)?)
+                    ),)
+                    .unwrap(),
+                expected
+            );
+        }
+
+        drop(first);
+        drop(second);
+        for path in [&first_path, &second_path] {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn richer_captured_dml_repairs_conflicts_and_converges() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

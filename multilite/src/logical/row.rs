@@ -33,7 +33,9 @@ use crate::{Error, Result};
 const ROW_FRAME_VERSION: u8 = 6;
 const ROW_IMAGE_FRAME_VERSION: u8 = 1;
 const ROW_SET_FRAME_VERSION: u8 = 2;
-const UPDATE_FRAME_VERSION: u8 = 1;
+const ROW_CHANGES_FRAME_VERSION: u8 = 1;
+const TABLE_CHANGES_FRAME_VERSION: u8 = 1;
+const ROW_DELTA_FRAME_VERSION: u8 = 1;
 const TAG_SCHEMA_REVISION: u8 = 1;
 const TAG_COLUMN_VALUE: u8 = 4;
 const TAG_SET_TABLE: u8 = 1;
@@ -49,8 +51,11 @@ const TAG_COLUMN_ID: u8 = 1;
 const TAG_COLUMN_AFFINITY: u8 = 2;
 const TAG_KEY_PART_FLAGS: u8 = 3;
 const TAG_VALUE: u8 = 2;
-const TAG_UPDATE_BEFORE: u8 = 1;
-const TAG_UPDATE_AFTER: u8 = 2;
+const TAG_CHANGED_TABLE: u8 = 1;
+const TAG_CHANGE_RULES: u8 = 1;
+const TAG_CHANGE_ROW: u8 = 2;
+const TAG_DELTA_BEFORE: u8 = 1;
+const TAG_DELTA_AFTER: u8 = 2;
 const TAG_RULES_INDEX_ID: u8 = 1;
 const TAG_RULES_INDEX_PART: u8 = 2;
 const TAG_FOREIGN_KEY_ID: u8 = 1;
@@ -65,6 +70,11 @@ const TAG_INCOMING_CHILD_PRIMARY_INDEX: u8 = 3;
 const TAG_INCOMING_PARENT_INDEX: u8 = 5;
 const TAG_INCOMING_PARENT_PART: u8 = 6;
 const KEY_PART_ROWID_ALIAS: u8 = 1;
+
+/// Maximum direct row events retained for one SQLite statement.
+pub(crate) const MAX_CAPTURED_CHANGES: usize = 100_000;
+/// Maximum encoded bytes retained by one logical row operation.
+pub(crate) const MAX_ROW_OPERATION_BYTES: usize = 64 * 1024 * 1024;
 
 /// One complete SQLite row image observed after affinity and generated values ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +95,99 @@ pub enum CapturedChange {
     },
 }
 
+/// Per-statement memory fence applied inside the SQLite preupdate hook.
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureBudget {
+    changes: usize,
+    bytes: usize,
+    max_changes: usize,
+    max_bytes: usize,
+}
+
+impl Default for CaptureBudget {
+    fn default() -> Self {
+        Self {
+            changes: 0,
+            bytes: 0,
+            max_changes: MAX_CAPTURED_CHANGES,
+            max_bytes: MAX_ROW_OPERATION_BYTES,
+        }
+    }
+}
+
+impl CaptureBudget {
+    pub(crate) fn reset(&mut self) {
+        self.changes = 0;
+        self.bytes = 0;
+    }
+
+    pub(crate) fn record(&mut self, change: &CapturedChange) -> Result<()> {
+        let changes = self
+            .changes
+            .checked_add(1)
+            .ok_or_else(|| capture_limit("row-change count", self.max_changes))?;
+        if changes > self.max_changes {
+            return Err(capture_limit("row-change count", self.max_changes));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(change.retained_bytes()?)
+            .ok_or_else(|| capture_limit("row-capture bytes", self.max_bytes))?;
+        if bytes > self.max_bytes {
+            return Err(capture_limit("row-capture bytes", self.max_bytes));
+        }
+        self.changes = changes;
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(max_changes: usize, max_bytes: usize) -> Self {
+        Self {
+            max_changes,
+            max_bytes,
+            ..Self::default()
+        }
+    }
+}
+
+impl CapturedChange {
+    fn retained_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Insert(row) | Self::Delete(row) => row.retained_bytes(),
+            Self::Update { before, after } => before
+                .retained_bytes()?
+                .checked_add(after.retained_bytes()?)
+                .ok_or_else(|| capture_limit("row-capture bytes", MAX_ROW_OPERATION_BYTES)),
+        }
+    }
+}
+
+impl CapturedRow {
+    fn retained_bytes(&self) -> Result<usize> {
+        self.values.iter().try_fold(
+            self.table
+                .len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| capture_limit("row-capture bytes", MAX_ROW_OPERATION_BYTES))?,
+            |bytes, value| {
+                bytes
+                    .checked_add(value.encoded_len())
+                    .ok_or_else(|| capture_limit("row-capture bytes", MAX_ROW_OPERATION_BYTES))
+            },
+        )
+    }
+}
+
 impl StoredValue {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Null => 1,
+            Self::Integer(_) | Self::Real(_) => 9,
+            Self::Text(value) | Self::Blob(value) => 1usize.saturating_add(value.len()),
+        }
+    }
+
     fn encode(&self) -> Vec<u8> {
         match self {
             Self::Null => vec![0],
@@ -213,9 +315,9 @@ impl Row {
     }
 }
 
-/// One logical multi-row INSERT captured from a single SQLite statement.
+/// Immutable interpretation rules shared by every row in one operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InsertRows {
+struct RowRules {
     table: TableId,
     schema_revision: SchemaRevisionId,
     primary_index: IndexId,
@@ -224,20 +326,47 @@ pub struct InsertRows {
     indexes: Vec<IndexRules>,
     foreign_keys: Vec<ForeignKeyRules>,
     incoming_foreign_keys: Vec<IncomingForeignKeyRules>,
+}
+
+/// Homogeneous row images interpreted under one table's stable rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowSet {
+    rules: RowRules,
     rows: Vec<Row>,
 }
 
 /// One logical multi-row DELETE carrying the complete removed row images.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeleteRows {
-    deleted: InsertRows,
+pub struct DeletedRowsFixture {
+    deleted: RowSet,
 }
 
 /// One logical multi-row UPDATE carrying complete before and after row images.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateRows {
-    before: InsertRows,
-    after: InsertRows,
+pub struct UpdatedRowsFixture {
+    before: RowSet,
+    after: RowSet,
+}
+
+/// Net row effects of one SQLite statement after repeated touches are folded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowChanges {
+    table: TableChanges,
+}
+
+/// One table's rules and row-lineage-preserving before/after images.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableChanges {
+    rules: RowRules,
+    rows: Vec<RowDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowDelta {
+    before: Option<Row>,
+    after: Option<Row>,
 }
 
 /// Homebase mutations and conflict footprint for one row operation.
@@ -254,172 +383,90 @@ pub struct IndexBackfillEntry {
     pub value: Vec<u8>,
 }
 
-impl InsertRows {
-    pub fn from_captured(
-        connection: &Connection,
-        captured: &[CapturedRow],
-    ) -> Result<Option<Self>> {
-        let catalog = CatalogSnapshot::load(connection)?;
-        Self::from_catalog(&catalog, captured)
-    }
-
-    pub(crate) fn from_catalog(
-        catalog: &CatalogSnapshot,
-        captured: &[CapturedRow],
-    ) -> Result<Option<Self>> {
-        let Some(first) = captured.first() else {
-            return Ok(None);
-        };
-        if captured.iter().any(|row| row.table != first.table) {
-            return Err(Error::CaptureInvariant(
-                "one row operation changed more than one table",
-            ));
-        }
-        let Some(created) = catalog.by_name(&first.table) else {
-            return Ok(None);
-        };
-        let columns = created.columns();
-        if captured.iter().any(|row| row.values.len() != columns.len()) {
-            return Err(Error::CaptureInvariant(
-                "captured row width does not match its schema catalog",
-            ));
-        }
-        let key_parts = created
-            .primary_key_columns()
-            .map(|column| KeyPartRules {
-                column: column.id(),
-                affinity: column.affinity(created.mode()),
-                rowid_alias: created.is_rowid_alias(column.id()),
-            })
-            .collect::<Vec<_>>();
-        let indexes = index_rules(created);
-        let foreign_keys = foreign_key_rules(catalog, created)?;
-        let incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
-        let rows = captured
-            .iter()
-            .map(|captured| {
-                let values = columns
-                    .iter()
-                    .zip(&captured.values)
-                    .map(|(column, value)| {
-                        (
-                            column.id(),
-                            normalize_captured_value(value, column.affinity(created.mode())),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                if created.storage() == TableStorage::Rowid {
-                    let alias = created
-                        .primary_key_columns()
-                        .next()
-                        .filter(|column| created.is_rowid_alias(column.id()))
-                        .ok_or(Error::CaptureInvariant(
-                            "rowid table is missing its INTEGER PRIMARY KEY alias",
-                        ))?;
-                    if !values.iter().any(|(column, value)| {
-                        *column == alias.id() && *value == StoredValue::Integer(captured.rowid)
-                    }) {
-                        return Err(Error::CaptureInvariant(
-                            "captured rowid contradicts its INTEGER PRIMARY KEY",
-                        ));
-                    }
-                }
-                Ok(Row { values })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let inserted = Self {
+impl RowRules {
+    fn from_table(catalog: &CatalogSnapshot, created: &CreateTable) -> Result<Self> {
+        Ok(Self {
             table: created.table_id(),
             schema_revision: created.schema_revision_id(),
             primary_index: created.primary_index_id(),
             storage: created.storage(),
-            key_parts,
-            indexes,
-            foreign_keys,
-            incoming_foreign_keys,
-            rows,
-        };
-        inserted.validate_against_catalog(catalog, created)?;
-        Ok(Some(inserted))
-    }
-
-    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
-        self.validate_structure()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(
-            self.rows.len() * (self.indexes.len() + self.foreign_keys.len() + 1),
-        );
-        let mut guards = GuardPlan::for_operation(OperationFamily::InsertRows);
-        for row in &self.rows {
-            let key = self
-                .row_key(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            guards.invariant(key.clone(), GuardReason::RowIdentity)?;
-            guards.write(key.clone(), GuardReason::RowIdentity)?;
-            mutations.push(Mutation::Set {
-                key,
-                value: self.encode_row(row),
-            });
-        }
-        for row in &self.rows {
-            for entry in self
-                .index_entries(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                guards.invariant(entry.key.clone(), GuardReason::UniqueOwnership)?;
-                guards.write(entry.key.clone(), GuardReason::UniqueOwnership)?;
-                mutations.push(Mutation::Set {
-                    key: entry.key,
-                    value: entry.value,
-                });
-            }
-            for reference in self
-                .foreign_references(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                guards.invariant(reference.key.clone(), GuardReason::ForeignReference)?;
-                guards.write(reference.key.clone(), GuardReason::ForeignReference)?;
-                mutations.push(Mutation::Set {
-                    key: reference.key,
-                    value: reference.owner,
-                });
-            }
-        }
-        guards.invariant(
-            active_primary_index_key(self.table),
-            GuardReason::PrimaryIndex,
-        )?;
-        guards.invariant(write_revision_key(self.table), GuardReason::WriteContract)?;
-        let footprint = guards.footprint();
-        Ok(RowHomebaseOp {
-            mutations,
-            footprint,
-            guards,
+            key_parts: created
+                .primary_key_columns()
+                .map(|column| KeyPartRules {
+                    column: column.id(),
+                    affinity: column.affinity(created.mode()),
+                    rowid_alias: created.is_rowid_alias(column.id()),
+                })
+                .collect(),
+            indexes: index_rules(created),
+            foreign_keys: foreign_key_rules(catalog, created)?,
+            incoming_foreign_keys: incoming_foreign_key_rules(catalog, created)?,
         })
     }
 
-    #[cfg(test)]
-    fn validate_homebase(
-        &self,
-        batch: &AdmittedBatch<Vec<u8>>,
-    ) -> std::result::Result<(), RowCodecError> {
-        batch.validate().map_err(|_| RowCodecError::InvalidBatch)?;
-        let expected = self
-            .to_homebase()
-            .map_err(|_| RowCodecError::InvalidBatch)?
-            .mutations;
-        if expected.len() != batch.entries.len()
-            || expected
-                .iter()
-                .zip(&batch.entries)
-                .any(|(expected, admitted)| expected != &admitted.device_entry.mutation)
-        {
-            return Err(RowCodecError::InvalidBatch);
+    fn capture(&self, created: &CreateTable, captured: &CapturedRow) -> Result<Row> {
+        if captured.values.len() != created.columns().len() {
+            return Err(Error::CaptureInvariant(
+                "captured row width does not match its schema catalog",
+            ));
         }
-        Ok(())
+        let values = created
+            .columns()
+            .iter()
+            .zip(&captured.values)
+            .map(|(column, value)| {
+                (
+                    column.id(),
+                    normalize_captured_value(value, column.affinity(created.mode())),
+                )
+            })
+            .collect::<Vec<_>>();
+        if self.storage == TableStorage::Rowid {
+            let alias = created
+                .primary_key_columns()
+                .next()
+                .filter(|column| created.is_rowid_alias(column.id()))
+                .ok_or(Error::CaptureInvariant(
+                    "rowid table is missing its INTEGER PRIMARY KEY alias",
+                ))?;
+            if !values.iter().any(|(column, value)| {
+                *column == alias.id() && *value == StoredValue::Integer(captured.rowid)
+            }) {
+                return Err(Error::CaptureInvariant(
+                    "captured rowid contradicts its INTEGER PRIMARY KEY",
+                ));
+            }
+        }
+        let row = Row { values };
+        if created.mode() == TableMode::Strict
+            && created.columns().iter().any(|column| {
+                row.value(column.id())
+                    .is_some_and(|value| !strict_value_matches(column, value))
+            })
+        {
+            return Err(Error::InvalidMultiliteOp(
+                "row value has an invalid STRICT storage class".into(),
+            ));
+        }
+        self.key_images(&row).map_err(|error| {
+            Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
+        })?;
+        self.index_entries(&row).map_err(|error| {
+            Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
+        })?;
+        self.foreign_references(&row).map_err(|error| {
+            Error::InvalidMultiliteOp(format!("invalid foreign-key image: {error}"))
+        })?;
+        Ok(row)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
+        self.encode_into(&mut writer);
+        writer.finish()
+    }
+
+    fn encode_into(&self, writer: &mut Writer) {
         writer.u8(ROW_SET_FRAME_VERSION);
         writer
             .field(TAG_SET_TABLE, &self.table.as_bytes())
@@ -456,402 +503,36 @@ impl InsertRows {
                 )
                 .expect("row field length fits in u32");
         }
-        for row in &self.rows {
-            writer
-                .field(TAG_SET_ROW, &encode_row_image(row))
-                .expect("row field length fits in u32");
-        }
-        writer.finish()
     }
 
-    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
-        let mut reader = Reader::new(frame);
-        if reader.u8() != Some(ROW_SET_FRAME_VERSION) {
-            return Err(RowCodecError::UnknownVersion);
+    fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        let (rules, rows) = decode_row_rules(frame, false)?;
+        if !rows.is_empty() {
+            return Err(RowCodecError::InvalidRow);
         }
-        let mut table = None;
-        let mut schema_revision = None;
-        let mut primary_index = None;
-        let mut storage = None;
-        let mut key_parts = Vec::new();
-        let mut indexes = Vec::new();
-        let mut foreign_keys = Vec::new();
-        let mut incoming_foreign_keys = Vec::new();
-        let mut rows = Vec::new();
-        while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
-            match tag {
-                TAG_SET_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
-                TAG_SET_SCHEMA_REVISION => set_once(
-                    &mut schema_revision,
-                    SchemaRevisionId::from_bytes(uuid_bytes(value)?),
-                )?,
-                TAG_SET_PRIMARY_INDEX => {
-                    set_once(&mut primary_index, IndexId::from_bytes(uuid_bytes(value)?))?
-                }
-                TAG_SET_TABLE_STORAGE => {
-                    let [value] = value else {
-                        return Err(RowCodecError::InvalidLength);
-                    };
-                    set_once(
-                        &mut storage,
-                        TableStorage::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
-                    )?;
-                }
-                TAG_SET_KEY_PART => key_parts.push(decode_key_part(value)?),
-                TAG_SET_INDEX_RULES => indexes.push(decode_index_rules(value)?),
-                TAG_SET_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
-                TAG_SET_INCOMING_FOREIGN_KEY => {
-                    incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
-                }
-                TAG_SET_ROW => rows.push(decode_row_image(value)?),
-                _ => {}
-            }
-        }
-        if rows.is_empty() {
-            return Err(RowCodecError::MissingField(TAG_SET_ROW));
-        }
-        let operation = Self {
-            table: table.ok_or(RowCodecError::MissingField(TAG_SET_TABLE))?,
-            schema_revision: schema_revision
-                .ok_or(RowCodecError::MissingField(TAG_SET_SCHEMA_REVISION))?,
-            primary_index: primary_index
-                .ok_or(RowCodecError::MissingField(TAG_SET_PRIMARY_INDEX))?,
-            storage: storage.ok_or(RowCodecError::MissingField(TAG_SET_TABLE_STORAGE))?,
-            key_parts,
-            indexes,
-            foreign_keys,
-            incoming_foreign_keys,
+        Ok(rules)
+    }
+
+    fn with_rows(&self, rows: Vec<Row>) -> RowSet {
+        RowSet {
+            rules: self.clone(),
             rows,
-        };
-        operation.validate_structure()?;
-        Ok(operation)
+        }
     }
 
-    pub fn primary_values<'a>(&self, row: &'a Row) -> Result<Vec<&'a StoredValue>> {
+    fn primary_values<'a>(&self, row: &'a Row) -> Result<Vec<&'a StoredValue>> {
         self.key_parts
             .iter()
             .map(|part| {
-                row.values
-                    .iter()
-                    .find(|(column, _)| *column == part.column)
-                    .map(|(_, value)| value)
-                    .ok_or(Error::InvalidDatabase(
-                        "pending row is missing a primary-key value",
-                    ))
+                row.value(part.column).ok_or(Error::InvalidDatabase(
+                    "pending row is missing a primary-key value",
+                ))
             })
             .collect()
     }
 
-    pub fn apply(&self, connection: &Connection) -> Result<()> {
-        let created = self.catalog_definition(connection)?;
-        let table_name = materialized_table_name(connection, self.table)?;
-        let columns = created
-            .columns()
-            .iter()
-            .filter(|column| self.rows[0].value(column.id()).is_some())
-            .collect::<Vec<_>>();
-        let column_names = columns
-            .iter()
-            .map(|column| materialized_column_name(connection, self.table, column.id()))
-            .collect::<Result<Vec<_>>>()?;
-        let names = column_names
-            .iter()
-            .map(|name| quote_identifier(name.value()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let placeholders = std::iter::repeat_n("?", columns.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({names}) VALUES ({placeholders})",
-            quote_identifier(&table_name)
-        );
-        let mut statement = connection.prepare(&sql)?;
-        for row in &self.rows {
-            let values = columns
-                .iter()
-                .map(|column| {
-                    row.value(column.id()).ok_or(Error::InvalidMultiliteOp(
-                        "row is missing a schema column".into(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            statement.execute(params_from_iter(values))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
-        let created = self.catalog_definition(connection)?;
-        self.validate_materialized_against(
-            connection,
-            &created,
-            "canonical INSERT diverged from its captured branch after-image",
-        )
-    }
-
-    pub fn delete_materialized(&self, connection: &Connection) -> Result<()> {
-        self.delete_materialized_with(
-            connection,
-            "pending INSERT row no longer matches SQLite state",
-        )
-    }
-
-    fn delete_materialized_with(
-        &self,
-        connection: &Connection,
-        mismatch: &'static str,
-    ) -> Result<()> {
-        let created = self.catalog_definition(connection)?;
-        let table_name = materialized_table_name(connection, self.table)?;
-        self.validate_materialized_against(connection, &created, mismatch)?;
-        let primary = created.primary_key_columns().collect::<Vec<_>>();
-        let predicates = primary
-            .iter()
-            .map(|column| materialized_column_name(connection, self.table, column.id()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            .collect::<Vec<_>>();
-        let sql = format!(
-            "DELETE FROM {} WHERE {}",
-            quote_identifier(&table_name),
-            predicates.join(" AND ")
-        );
-        let mut delete = connection.prepare(&sql)?;
-        for row in self.rows.iter().rev() {
-            if delete.execute(params_from_iter(self.primary_values(row)?))? != 1 {
-                return Err(Error::InvalidDatabase(mismatch));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_materialized_against(
-        &self,
-        connection: &Connection,
-        created: &CreateTable,
-        mismatch: &'static str,
-    ) -> Result<()> {
-        self.materialized_rows(connection, created, mismatch)
-            .map(|_| ())
-    }
-
-    #[cfg(debug_assertions)]
-    fn validate_materialized_absent(
-        &self,
-        connection: &Connection,
-        mismatch: &'static str,
-    ) -> Result<()> {
-        let created = self.catalog_definition(connection)?;
-        let table_name = materialized_table_name(connection, self.table)?;
-        let predicates = created
-            .primary_key_columns()
-            .map(|column| materialized_column_name(connection, self.table, column.id()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!(
-            "SELECT 1 FROM {} WHERE {predicates}",
-            quote_identifier(&table_name)
-        );
-        let mut select = connection.prepare(&sql)?;
-        for row in &self.rows {
-            if select
-                .query_row(params_from_iter(self.primary_values(row)?), |_| Ok(()))
-                .optional()?
-                .is_some()
-            {
-                return Err(Error::InvalidDatabase(mismatch));
-            }
-        }
-        Ok(())
-    }
-
-    fn materialized_rows(
-        &self,
-        connection: &Connection,
-        created: &CreateTable,
-        mismatch: &'static str,
-    ) -> Result<Vec<Row>> {
-        let table_name = materialized_table_name(connection, self.table)?;
-        let columns = created.columns();
-        let primary = created.primary_key_columns().collect::<Vec<_>>();
-        let predicates = primary
-            .iter()
-            .map(|column| materialized_column_name(connection, self.table, column.id()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            .collect::<Vec<_>>();
-        let predicate = predicates.join(" AND ");
-        let selected = catalog::column_names(connection, created)?
-            .iter()
-            .map(|name| quote_identifier(name.value()))
-            .collect::<Vec<_>>();
-        let select_sql = format!(
-            "SELECT {} FROM {} WHERE {predicate}",
-            selected.join(", "),
-            quote_identifier(&table_name)
-        );
-        let mut select = connection.prepare(&select_sql)?;
-        let mut materialized = Vec::with_capacity(self.rows.len());
-        for row in self.rows.iter().rev() {
-            let actual = select
-                .query_row(params_from_iter(self.primary_values(row)?), |result| {
-                    let values = (0..columns.len())
-                        .zip(columns)
-                        .map(|(index, column)| {
-                            result
-                                .get_ref(index)
-                                .map(StoredValue::capture)
-                                .map(|value| (column.id(), value))
-                        })
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(Row { values })
-                })
-                .optional()?;
-            let Some(actual) = actual else {
-                return Err(Error::InvalidDatabase(mismatch));
-            };
-            if row.values.iter().any(|(column, expected)| {
-                actual
-                    .value(*column)
-                    .is_some_and(|actual| actual != expected)
-            }) {
-                return Err(Error::InvalidDatabase(mismatch));
-            }
-            materialized.push(actual);
-        }
-        materialized.reverse();
-        Ok(materialized)
-    }
-
-    fn catalog_definition(&self, connection: &Connection) -> Result<CreateTable> {
-        let catalog = CatalogSnapshot::load(connection)?;
-        let created = catalog
-            .by_id(self.table)
-            .cloned()
-            .ok_or(Error::InvalidDatabase(
-                "row operation references an unknown table",
-            ))?;
-        self.validate_against_catalog(&catalog, &created)?;
-        Ok(created)
-    }
-
-    fn for_current_rows(
-        connection: &Connection,
-        created: &CreateTable,
-        rows: Vec<Row>,
-    ) -> Result<Self> {
-        let table = materialized_table_name(connection, created.table_id())?;
-        let captured = rows
-            .into_iter()
-            .map(|row| {
-                let values = created
-                    .columns()
-                    .iter()
-                    .map(|column| {
-                        row.value(column.id())
-                            .cloned()
-                            .ok_or(Error::InvalidDatabase(
-                                "materialized row is missing a current schema column",
-                            ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(CapturedRow {
-                    table: table.clone(),
-                    rowid: rowid_from_declared_primary_key(created, &row)?,
-                    values,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Self::from_captured(connection, &captured)?.ok_or(Error::CaptureInvariant(
-            "materialized row projection unexpectedly became empty",
-        ))
-    }
-
-    fn validate_against_catalog(
-        &self,
-        catalog: &CatalogSnapshot,
-        created: &CreateTable,
-    ) -> Result<()> {
-        self.validate_structure()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let expected_key_parts = created
-            .primary_key_columns()
-            .map(|column| KeyPartRules {
-                column: column.id(),
-                affinity: column.affinity(created.mode()),
-                rowid_alias: created.is_rowid_alias(column.id()),
-            })
-            .collect::<Vec<_>>();
-        let expected_indexes = index_rules(created);
-        let known_indexes = known_index_rules(created);
-        let expected_foreign_keys = foreign_key_rules(catalog, created)?;
-        let expected_incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
-        if self.table != created.table_id()
-            || self.primary_index != created.primary_index_id()
-            || self.storage != created.storage()
-            || self.key_parts != expected_key_parts
-            || expected_indexes
-                .iter()
-                .any(|expected| !self.indexes.contains(expected))
-            || self
-                .indexes
-                .iter()
-                .any(|actual| !known_indexes.contains(actual))
-            || self.foreign_keys != expected_foreign_keys
-            || self.incoming_foreign_keys != expected_incoming_foreign_keys
-        {
-            return Err(Error::InvalidMultiliteOp(
-                "row operation contradicts the local schema catalog".into(),
-            ));
-        }
-        for row in &self.rows {
-            if created.mode() == TableMode::Strict
-                && created.columns().iter().any(|column| {
-                    row.value(column.id())
-                        .is_some_and(|value| !strict_value_matches(column, value))
-                })
-            {
-                return Err(Error::InvalidMultiliteOp(
-                    "row value has an invalid STRICT storage class".into(),
-                ));
-            }
-            self.key_images(row).map_err(|error| {
-                Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
-            })?;
-            self.index_entries(row).map_err(|error| {
-                Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
-            })?;
-            self.foreign_references(row).map_err(|error| {
-                Error::InvalidMultiliteOp(format!("invalid foreign-key image: {error}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
-        if self.key_parts.is_empty() || self.rows.is_empty() {
-            return Err(RowCodecError::InvalidRow);
-        }
-        let columns = self.rows[0]
-            .values
-            .iter()
-            .map(|(column, _)| *column)
-            .collect::<Vec<_>>();
-        if self.rows.iter().any(|row| {
-            row.values.len() != columns.len()
-                || row
-                    .values
-                    .iter()
-                    .zip(&columns)
-                    .any(|((column, _), expected)| column != expected)
-        }) {
+    fn validate(&self) -> std::result::Result<(), RowCodecError> {
+        if self.key_parts.is_empty() {
             return Err(RowCodecError::InvalidRow);
         }
         if self.key_parts.iter().enumerate().any(|(index, part)| {
@@ -925,38 +606,20 @@ impl InsertRows {
         {
             return Err(RowCodecError::InvalidRow);
         }
-        let mut keys = BTreeSet::new();
-        let mut indexes = BTreeSet::new();
-        for row in &self.rows {
-            if !keys.insert(self.row_key(row)?) {
-                return Err(RowCodecError::DuplicateRow);
-            }
-            for entry in self.index_entries(row)? {
-                if !indexes.insert(entry.key) {
-                    return Err(RowCodecError::DuplicateUniqueKey);
-                }
-            }
-            self.foreign_references(row)?;
-        }
         Ok(())
     }
 
     fn row_key(&self, row: &Row) -> std::result::Result<Key, RowCodecError> {
-        let images = self.key_images(row)?;
-        row_prefix(self.table, self.primary_index, images)
+        row_prefix(self.table, self.primary_index, self.key_images(row)?)
     }
 
     fn key_images(&self, row: &Row) -> std::result::Result<Vec<Vec<u8>>, RowCodecError> {
         self.key_parts
             .iter()
             .map(|part| {
-                let value = row
-                    .values
-                    .iter()
-                    .find(|(column, _)| *column == part.column)
-                    .map(|(_, value)| value)
-                    .ok_or(RowCodecError::InvalidRow)?;
-                key_image(value, *part)
+                row.value(part.column)
+                    .ok_or(RowCodecError::InvalidRow)
+                    .and_then(|value| key_image(value, *part))
             })
             .collect()
     }
@@ -968,13 +631,7 @@ impl InsertRows {
             let values = index
                 .parts
                 .iter()
-                .map(|part| {
-                    row.values
-                        .iter()
-                        .find(|(column, _)| *column == part.column)
-                        .map(|(_, value)| value)
-                        .ok_or(RowCodecError::InvalidRow)
-                })
+                .map(|part| row.value(part.column).ok_or(RowCodecError::InvalidRow))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             if values
                 .iter()
@@ -993,6 +650,639 @@ impl InsertRows {
             });
         }
         Ok(entries)
+    }
+
+    fn foreign_references(
+        &self,
+        row: &Row,
+    ) -> std::result::Result<Vec<ForeignReference>, RowCodecError> {
+        let owner = self.row_key(row)?.encode();
+        let child_images = self.key_images(row)?;
+        let mut references = Vec::with_capacity(self.foreign_keys.len());
+        for foreign_key in &self.foreign_keys {
+            let values = foreign_key
+                .key_parts
+                .iter()
+                .map(|part| {
+                    row.value(part.child_column)
+                        .ok_or(RowCodecError::InvalidRow)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if values
+                .iter()
+                .any(|value| matches!(value, StoredValue::Null))
+            {
+                continue;
+            }
+            let images = values
+                .into_iter()
+                .zip(&foreign_key.key_parts)
+                .map(|(value, part)| key_image(value, part.parent))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            references.push(ForeignReference {
+                key: foreign_reference_key(
+                    foreign_key.parent_table,
+                    foreign_key.id,
+                    foreign_key.parent_index,
+                    images,
+                    self.primary_index,
+                    child_images.clone(),
+                )?,
+                owner: owner.clone(),
+            });
+        }
+        Ok(references)
+    }
+
+    fn incoming_reference_prefixes(
+        &self,
+        row: &Row,
+    ) -> std::result::Result<Vec<Key>, RowCodecError> {
+        let mut prefixes = Vec::with_capacity(self.incoming_foreign_keys.len());
+        for incoming in &self.incoming_foreign_keys {
+            let values = incoming
+                .parent_key_parts
+                .iter()
+                .map(|part| row.value(part.column).ok_or(RowCodecError::InvalidRow))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if values
+                .iter()
+                .any(|value| matches!(value, StoredValue::Null))
+            {
+                continue;
+            }
+            let images = values
+                .into_iter()
+                .zip(&incoming.parent_key_parts)
+                .map(|(value, rules)| key_image(value, *rules))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            prefixes.push(foreign_reference_prefix(
+                self.table,
+                incoming.id,
+                incoming.parent_index,
+                images,
+            )?);
+        }
+        Ok(prefixes)
+    }
+
+    fn encode_row(&self, row: &Row) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(ROW_FRAME_VERSION);
+        writer
+            .field(TAG_SCHEMA_REVISION, &self.schema_revision.as_bytes())
+            .expect("row field length fits in u32");
+        for (column, value) in &row.values {
+            writer
+                .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
+                .expect("row field length fits in u32");
+        }
+        writer.finish()
+    }
+}
+
+fn decode_row_rules(
+    frame: &[u8],
+    allow_rows: bool,
+) -> std::result::Result<(RowRules, Vec<Row>), RowCodecError> {
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(ROW_SET_FRAME_VERSION) {
+        return Err(RowCodecError::UnknownVersion);
+    }
+    let mut table = None;
+    let mut schema_revision = None;
+    let mut primary_index = None;
+    let mut storage = None;
+    let mut key_parts = Vec::new();
+    let mut indexes = Vec::new();
+    let mut foreign_keys = Vec::new();
+    let mut incoming_foreign_keys = Vec::new();
+    let mut rows = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+        match tag {
+            TAG_SET_TABLE => set_once(&mut table, TableId::from_bytes(uuid_bytes(value)?))?,
+            TAG_SET_SCHEMA_REVISION => set_once(
+                &mut schema_revision,
+                SchemaRevisionId::from_bytes(uuid_bytes(value)?),
+            )?,
+            TAG_SET_PRIMARY_INDEX => {
+                set_once(&mut primary_index, IndexId::from_bytes(uuid_bytes(value)?))?
+            }
+            TAG_SET_TABLE_STORAGE => {
+                let [value] = value else {
+                    return Err(RowCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut storage,
+                    TableStorage::from_u8(*value).ok_or(RowCodecError::InvalidRow)?,
+                )?;
+            }
+            TAG_SET_KEY_PART => key_parts.push(decode_key_part(value)?),
+            TAG_SET_INDEX_RULES => indexes.push(decode_index_rules(value)?),
+            TAG_SET_FOREIGN_KEY => foreign_keys.push(decode_foreign_key(value)?),
+            TAG_SET_INCOMING_FOREIGN_KEY => {
+                incoming_foreign_keys.push(decode_incoming_foreign_key(value)?)
+            }
+            TAG_SET_ROW if allow_rows => rows.push(decode_row_image(value)?),
+            TAG_SET_ROW => return Err(RowCodecError::InvalidRow),
+            _ => {}
+        }
+    }
+    let rules = RowRules {
+        table: table.ok_or(RowCodecError::MissingField(TAG_SET_TABLE))?,
+        schema_revision: schema_revision
+            .ok_or(RowCodecError::MissingField(TAG_SET_SCHEMA_REVISION))?,
+        primary_index: primary_index.ok_or(RowCodecError::MissingField(TAG_SET_PRIMARY_INDEX))?,
+        storage: storage.ok_or(RowCodecError::MissingField(TAG_SET_TABLE_STORAGE))?,
+        key_parts,
+        indexes,
+        foreign_keys,
+        incoming_foreign_keys,
+    };
+    rules.validate()?;
+    Ok((rules, rows))
+}
+
+impl RowSet {
+    pub fn from_captured(
+        connection: &Connection,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(crate) fn from_catalog(
+        catalog: &CatalogSnapshot,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        let Some(first) = captured.first() else {
+            return Ok(None);
+        };
+        if captured.iter().any(|row| row.table != first.table) {
+            return Err(Error::CaptureInvariant(
+                "one row operation changed more than one table",
+            ));
+        }
+        let Some(created) = catalog.by_name(&first.table) else {
+            return Ok(None);
+        };
+        let rules = RowRules::from_table(catalog, created)?;
+        let rows = captured
+            .iter()
+            .map(|captured| rules.capture(created, captured))
+            .collect::<Result<Vec<_>>>()?;
+        let inserted = Self { rules, rows };
+        inserted.validate_against_catalog(catalog, created)?;
+        Ok(Some(inserted))
+    }
+
+    #[cfg(test)]
+    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        self.validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let mut mutations = Vec::with_capacity(
+            self.rows.len() * (self.rules.indexes.len() + self.rules.foreign_keys.len() + 1),
+        );
+        let mut guards = GuardPlan::for_operation(OperationFamily::RowChanges);
+        for row in &self.rows {
+            let key = self
+                .row_key(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+            guards.invariant(key.clone(), GuardReason::RowIdentity)?;
+            guards.write(key.clone(), GuardReason::RowIdentity)?;
+            mutations.push(Mutation::Set {
+                key,
+                value: self.rules.encode_row(row),
+            });
+        }
+        for row in &self.rows {
+            for entry in self
+                .index_entries(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                guards.invariant(entry.key.clone(), GuardReason::UniqueOwnership)?;
+                guards.write(entry.key.clone(), GuardReason::UniqueOwnership)?;
+                mutations.push(Mutation::Set {
+                    key: entry.key,
+                    value: entry.value,
+                });
+            }
+            for reference in self
+                .foreign_references(row)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
+            {
+                guards.invariant(reference.key.clone(), GuardReason::ForeignReference)?;
+                guards.write(reference.key.clone(), GuardReason::ForeignReference)?;
+                mutations.push(Mutation::Set {
+                    key: reference.key,
+                    value: reference.owner,
+                });
+            }
+        }
+        guards.invariant(
+            active_primary_index_key(self.rules.table),
+            GuardReason::PrimaryIndex,
+        )?;
+        guards.invariant(
+            write_revision_key(self.rules.table),
+            GuardReason::WriteContract,
+        )?;
+        let footprint = guards.footprint();
+        Ok(RowHomebaseOp {
+            mutations,
+            footprint,
+            guards,
+        })
+    }
+
+    #[cfg(test)]
+    fn validate_homebase(
+        &self,
+        batch: &AdmittedBatch<Vec<u8>>,
+    ) -> std::result::Result<(), RowCodecError> {
+        batch.validate().map_err(|_| RowCodecError::InvalidBatch)?;
+        let expected = self
+            .to_homebase()
+            .map_err(|_| RowCodecError::InvalidBatch)?
+            .mutations;
+        if expected.len() != batch.entries.len()
+            || expected
+                .iter()
+                .zip(&batch.entries)
+                .any(|(expected, admitted)| expected != &admitted.device_entry.mutation)
+        {
+            return Err(RowCodecError::InvalidBatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        self.rules.encode_into(&mut writer);
+        for row in &self.rows {
+            writer
+                .field(TAG_SET_ROW, &encode_row_image(row))
+                .expect("row field length fits in u32");
+        }
+        writer.finish()
+    }
+
+    #[cfg(test)]
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        let (rules, rows) = decode_row_rules(frame, true)?;
+        if rows.is_empty() {
+            return Err(RowCodecError::MissingField(TAG_SET_ROW));
+        }
+        let operation = Self { rules, rows };
+        operation.validate_structure()?;
+        Ok(operation)
+    }
+
+    fn without_rows(self) -> RowRules {
+        self.rules
+    }
+
+    pub fn primary_values<'a>(&self, row: &'a Row) -> Result<Vec<&'a StoredValue>> {
+        self.rules.primary_values(row)
+    }
+
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.rules.table)?;
+        let columns = created
+            .columns()
+            .iter()
+            .filter(|column| self.rows[0].value(column.id()).is_some())
+            .collect::<Vec<_>>();
+        let column_names = columns
+            .iter()
+            .map(|column| materialized_column_name(connection, self.rules.table, column.id()))
+            .collect::<Result<Vec<_>>>()?;
+        let names = column_names
+            .iter()
+            .map(|name| quote_identifier(name.value()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = std::iter::repeat_n("?", columns.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({names}) VALUES ({placeholders})",
+            quote_identifier(&table_name)
+        );
+        let mut statement = connection.prepare(&sql)?;
+        for row in &self.rows {
+            let values = columns
+                .iter()
+                .map(|column| {
+                    row.value(column.id()).ok_or(Error::InvalidMultiliteOp(
+                        "row is missing a schema column".into(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            statement.execute(params_from_iter(values))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn delete_materialized(&self, connection: &Connection) -> Result<()> {
+        self.delete_materialized_with(
+            connection,
+            "pending INSERT row no longer matches SQLite state",
+        )
+    }
+
+    fn delete_materialized_with(
+        &self,
+        connection: &Connection,
+        mismatch: &'static str,
+    ) -> Result<()> {
+        let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.rules.table)?;
+        self.validate_materialized_against(connection, &created, mismatch)?;
+        let primary = created.primary_key_columns().collect::<Vec<_>>();
+        let predicates = primary
+            .iter()
+            .map(|column| materialized_column_name(connection, self.rules.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "DELETE FROM {} WHERE {}",
+            quote_identifier(&table_name),
+            predicates.join(" AND ")
+        );
+        let mut delete = connection.prepare(&sql)?;
+        for row in self.rows.iter().rev() {
+            if delete.execute(params_from_iter(self.primary_values(row)?))? != 1 {
+                return Err(Error::InvalidDatabase(mismatch));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_materialized_against(
+        &self,
+        connection: &Connection,
+        created: &CreateTable,
+        mismatch: &'static str,
+    ) -> Result<()> {
+        self.materialized_rows(connection, created, mismatch)
+            .map(|_| ())
+    }
+
+    #[cfg(debug_assertions)]
+    fn validate_materialized_absent(
+        &self,
+        connection: &Connection,
+        mismatch: &'static str,
+    ) -> Result<()> {
+        let created = self.catalog_definition(connection)?;
+        let table_name = materialized_table_name(connection, self.rules.table)?;
+        let predicates = created
+            .primary_key_columns()
+            .map(|column| materialized_column_name(connection, self.rules.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE {predicates}",
+            quote_identifier(&table_name)
+        );
+        let mut select = connection.prepare(&sql)?;
+        for row in &self.rows {
+            if select
+                .query_row(params_from_iter(self.primary_values(row)?), |_| Ok(()))
+                .optional()?
+                .is_some()
+            {
+                return Err(Error::InvalidDatabase(mismatch));
+            }
+        }
+        Ok(())
+    }
+
+    fn materialized_rows(
+        &self,
+        connection: &Connection,
+        created: &CreateTable,
+        mismatch: &'static str,
+    ) -> Result<Vec<Row>> {
+        let table_name = materialized_table_name(connection, self.rules.table)?;
+        let columns = created.columns();
+        let primary = created.primary_key_columns().collect::<Vec<_>>();
+        let predicates = primary
+            .iter()
+            .map(|column| materialized_column_name(connection, self.rules.table, column.id()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|name| format!("{} = ?", quote_identifier(name.value())))
+            .collect::<Vec<_>>();
+        let predicate = predicates.join(" AND ");
+        let selected = catalog::column_names(connection, created)?
+            .iter()
+            .map(|name| quote_identifier(name.value()))
+            .collect::<Vec<_>>();
+        let select_sql = format!(
+            "SELECT {} FROM {} WHERE {predicate}",
+            selected.join(", "),
+            quote_identifier(&table_name)
+        );
+        let mut select = connection.prepare(&select_sql)?;
+        let mut materialized = Vec::with_capacity(self.rows.len());
+        for row in self.rows.iter().rev() {
+            let actual = select
+                .query_row(params_from_iter(self.primary_values(row)?), |result| {
+                    let values = (0..columns.len())
+                        .zip(columns)
+                        .map(|(index, column)| {
+                            result
+                                .get_ref(index)
+                                .map(StoredValue::capture)
+                                .map(|value| (column.id(), value))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(Row { values })
+                })
+                .optional()?;
+            let Some(actual) = actual else {
+                return Err(Error::InvalidDatabase(mismatch));
+            };
+            if row.values.iter().any(|(column, expected)| {
+                actual
+                    .value(*column)
+                    .is_some_and(|actual| actual != expected)
+            }) {
+                return Err(Error::InvalidDatabase(mismatch));
+            }
+            materialized.push(actual);
+        }
+        materialized.reverse();
+        Ok(materialized)
+    }
+
+    fn catalog_definition(&self, connection: &Connection) -> Result<CreateTable> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        let created = catalog
+            .by_id(self.rules.table)
+            .cloned()
+            .ok_or(Error::InvalidDatabase(
+                "row operation references an unknown table",
+            ))?;
+        self.validate_against_catalog(&catalog, &created)?;
+        Ok(created)
+    }
+
+    fn for_current_rows(
+        connection: &Connection,
+        created: &CreateTable,
+        rows: Vec<Row>,
+    ) -> Result<Self> {
+        let table = materialized_table_name(connection, created.table_id())?;
+        let captured = rows
+            .into_iter()
+            .map(|row| {
+                let values = created
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        row.value(column.id())
+                            .cloned()
+                            .ok_or(Error::InvalidDatabase(
+                                "materialized row is missing a current schema column",
+                            ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CapturedRow {
+                    table: table.clone(),
+                    rowid: rowid_from_declared_primary_key(created, &row)?,
+                    values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_captured(connection, &captured)?.ok_or(Error::CaptureInvariant(
+            "materialized row projection unexpectedly became empty",
+        ))
+    }
+
+    fn validate_against_catalog(
+        &self,
+        catalog: &CatalogSnapshot,
+        created: &CreateTable,
+    ) -> Result<()> {
+        self.validate_structure()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let expected_key_parts = created
+            .primary_key_columns()
+            .map(|column| KeyPartRules {
+                column: column.id(),
+                affinity: column.affinity(created.mode()),
+                rowid_alias: created.is_rowid_alias(column.id()),
+            })
+            .collect::<Vec<_>>();
+        let expected_indexes = index_rules(created);
+        let known_indexes = known_index_rules(created);
+        let expected_foreign_keys = foreign_key_rules(catalog, created)?;
+        let expected_incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
+        if self.rules.table != created.table_id()
+            || self.rules.primary_index != created.primary_index_id()
+            || self.rules.storage != created.storage()
+            || self.rules.key_parts != expected_key_parts
+            || expected_indexes
+                .iter()
+                .any(|expected| !self.rules.indexes.contains(expected))
+            || self
+                .rules
+                .indexes
+                .iter()
+                .any(|actual| !known_indexes.contains(actual))
+            || self.rules.foreign_keys != expected_foreign_keys
+            || self.rules.incoming_foreign_keys != expected_incoming_foreign_keys
+        {
+            return Err(Error::InvalidMultiliteOp(
+                "row operation contradicts the local schema catalog".into(),
+            ));
+        }
+        for row in &self.rows {
+            if created.mode() == TableMode::Strict
+                && created.columns().iter().any(|column| {
+                    row.value(column.id())
+                        .is_some_and(|value| !strict_value_matches(column, value))
+                })
+            {
+                return Err(Error::InvalidMultiliteOp(
+                    "row value has an invalid STRICT storage class".into(),
+                ));
+            }
+            self.key_images(row).map_err(|error| {
+                Error::InvalidMultiliteOp(format!("invalid primary key image: {error}"))
+            })?;
+            self.index_entries(row).map_err(|error| {
+                Error::InvalidMultiliteOp(format!("invalid UNIQUE key image: {error}"))
+            })?;
+            self.foreign_references(row).map_err(|error| {
+                Error::InvalidMultiliteOp(format!("invalid foreign-key image: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
+        self.validate_rules()?;
+        if self.rows.is_empty() {
+            return Err(RowCodecError::InvalidRow);
+        }
+        let columns = self.rows[0]
+            .values
+            .iter()
+            .map(|(column, _)| *column)
+            .collect::<Vec<_>>();
+        if self.rows.iter().any(|row| {
+            row.values.len() != columns.len()
+                || row
+                    .values
+                    .iter()
+                    .zip(&columns)
+                    .any(|((column, _), expected)| column != expected)
+        }) {
+            return Err(RowCodecError::InvalidRow);
+        }
+        let mut keys = BTreeSet::new();
+        let mut indexes = BTreeSet::new();
+        for row in &self.rows {
+            if !keys.insert(self.row_key(row)?) {
+                return Err(RowCodecError::DuplicateRow);
+            }
+            for entry in self.index_entries(row)? {
+                if !indexes.insert(entry.key) {
+                    return Err(RowCodecError::DuplicateUniqueKey);
+                }
+            }
+            self.foreign_references(row)?;
+        }
+        Ok(())
+    }
+
+    fn validate_rules(&self) -> std::result::Result<(), RowCodecError> {
+        self.rules.validate()
+    }
+
+    fn row_key(&self, row: &Row) -> std::result::Result<Key, RowCodecError> {
+        self.rules.row_key(row)
+    }
+
+    fn key_images(&self, row: &Row) -> std::result::Result<Vec<Vec<u8>>, RowCodecError> {
+        self.rules.key_images(row)
+    }
+
+    fn index_entries(&self, row: &Row) -> std::result::Result<Vec<IndexEntry>, RowCodecError> {
+        self.rules.index_entries(row)
     }
 
     fn index_entry_map(&self) -> std::result::Result<BTreeMap<Key, Vec<u8>>, RowCodecError> {
@@ -1023,84 +1313,14 @@ impl InsertRows {
         &self,
         row: &Row,
     ) -> std::result::Result<Vec<ForeignReference>, RowCodecError> {
-        let owner = self.row_key(row)?.encode();
-        let child_images = self.key_images(row)?;
-        let mut references = Vec::with_capacity(self.foreign_keys.len());
-        for foreign_key in &self.foreign_keys {
-            let values = foreign_key
-                .key_parts
-                .iter()
-                .map(|part| {
-                    row.values
-                        .iter()
-                        .find(|(column, _)| *column == part.child_column)
-                        .map(|(_, value)| value)
-                        .ok_or(RowCodecError::InvalidRow)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if values
-                .iter()
-                .any(|value| matches!(value, StoredValue::Null))
-            {
-                continue;
-            }
-            let images = values
-                .into_iter()
-                .zip(&foreign_key.key_parts)
-                .map(|(value, part)| key_image(value, part.parent))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let key = foreign_reference_key(
-                foreign_key.parent_table,
-                foreign_key.id,
-                foreign_key.parent_index,
-                images,
-                self.primary_index,
-                child_images.clone(),
-            )?;
-            references.push(ForeignReference {
-                key,
-                owner: owner.clone(),
-            });
-        }
-        Ok(references)
+        self.rules.foreign_references(row)
     }
 
     fn incoming_reference_prefixes(
         &self,
         row: &Row,
     ) -> std::result::Result<Vec<Key>, RowCodecError> {
-        let mut prefixes = Vec::with_capacity(self.incoming_foreign_keys.len());
-        for incoming in &self.incoming_foreign_keys {
-            let values = incoming
-                .parent_key_parts
-                .iter()
-                .map(|part| {
-                    row.values
-                        .iter()
-                        .find(|(column, _)| *column == part.column)
-                        .map(|(_, value)| value)
-                        .ok_or(RowCodecError::InvalidRow)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if values
-                .iter()
-                .any(|value| matches!(value, StoredValue::Null))
-            {
-                continue;
-            }
-            let images = values
-                .into_iter()
-                .zip(&incoming.parent_key_parts)
-                .map(|(value, rules)| key_image(value, *rules))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            prefixes.push(foreign_reference_prefix(
-                self.table,
-                incoming.id,
-                incoming.parent_index,
-                images,
-            )?);
-        }
-        Ok(prefixes)
+        self.rules.incoming_reference_prefixes(row)
     }
 
     fn incoming_reference_prefix_set(&self) -> std::result::Result<BTreeSet<Key>, RowCodecError> {
@@ -1109,20 +1329,6 @@ impl InsertRows {
             prefixes.extend(self.incoming_reference_prefixes(row)?);
         }
         Ok(prefixes)
-    }
-
-    fn encode_row(&self, row: &Row) -> Vec<u8> {
-        let mut writer = Writer::new();
-        writer.u8(ROW_FRAME_VERSION);
-        writer
-            .field(TAG_SCHEMA_REVISION, &self.schema_revision.as_bytes())
-            .expect("row field length fits in u32");
-        for (column, value) in &row.values {
-            writer
-                .field(TAG_COLUMN_VALUE, &encode_column_value(*column, value))
-                .expect("row field length fits in u32");
-        }
-        writer.finish()
     }
 }
 
@@ -1366,285 +1572,148 @@ fn decode_incoming_foreign_key(
     })
 }
 
-impl DeleteRows {
-    #[cfg(test)]
-    pub fn from_captured(
-        connection: &Connection,
-        captured: &[CapturedRow],
-    ) -> Result<Option<Self>> {
-        let catalog = CatalogSnapshot::load(connection)?;
-        Self::from_catalog(&catalog, captured)
-    }
-
-    pub(crate) fn from_catalog(
-        catalog: &CatalogSnapshot,
-        captured: &[CapturedRow],
-    ) -> Result<Option<Self>> {
-        Ok(InsertRows::from_catalog(catalog, captured)?.map(|deleted| Self { deleted }))
-    }
-
-    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
-        self.deleted
-            .validate_structure()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(
-            self.deleted.rows.len()
-                * (self.deleted.indexes.len() + self.deleted.foreign_keys.len() + 1),
-        );
-        let mut guards = GuardPlan::for_operation(OperationFamily::DeleteRows);
-        for row in &self.deleted.rows {
-            let key = self
-                .deleted
-                .row_key(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            guards.write(key.clone(), GuardReason::RowIdentity)?;
-            mutations.push(Mutation::Delete { key });
-        }
-        for row in &self.deleted.rows {
-            for entry in self
-                .deleted
-                .index_entries(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                guards.write(entry.key.clone(), GuardReason::UniqueOwnership)?;
-                mutations.push(Mutation::Delete { key: entry.key });
-            }
-            for reference in self
-                .deleted
-                .foreign_references(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                guards.write(reference.key.clone(), GuardReason::ForeignReference)?;
-                mutations.push(Mutation::Delete { key: reference.key });
-            }
-        }
-        for row in &self.deleted.rows {
-            for reference_prefix in self
-                .deleted
-                .incoming_reference_prefixes(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?
-            {
-                guards.write(reference_prefix.clone(), GuardReason::ForeignChildren)?;
-                guards.invariant(reference_prefix.clone(), GuardReason::ForeignChildren)?;
-                mutations.push(Mutation::DeleteRange {
-                    range: Range::Prefix(reference_prefix),
-                });
-            }
-        }
-        guards.invariant(
-            active_primary_index_key(self.deleted.table),
-            GuardReason::PrimaryIndex,
-        )?;
-        guards.invariant(
-            write_revision_key(self.deleted.table),
-            GuardReason::WriteContract,
-        )?;
-        let footprint = guards.footprint();
-        Ok(RowHomebaseOp {
-            mutations,
-            footprint,
-            guards,
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        self.deleted.encode()
-    }
-
-    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
-        InsertRows::decode(frame).map(|deleted| Self { deleted })
-    }
-
-    pub fn apply(&self, connection: &Connection) -> Result<()> {
-        self.deleted
-            .delete_materialized_with(connection, "DELETE row no longer matches SQLite state")
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
-        self.deleted.validate_materialized_absent(
-            connection,
-            "canonical DELETE retained a row removed on its captured branch",
-        )
-    }
-
-    pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
-        self.deleted.apply(connection)
-    }
+struct TableChangesBuilder {
+    rules: RowRules,
+    rows: Vec<RowDelta>,
+    current: BTreeMap<Key, usize>,
+    tombstones: BTreeMap<Key, usize>,
 }
 
-impl UpdateRows {
-    #[cfg(test)]
-    pub fn from_captured(
-        connection: &Connection,
-        captured: &[(CapturedRow, CapturedRow)],
-    ) -> Result<Option<Self>> {
-        let catalog = CatalogSnapshot::load(connection)?;
-        Self::from_catalog(&catalog, captured)
+impl RowChanges {
+    pub(crate) fn inserted(inserted: RowSet) -> Self {
+        let rules = inserted.clone().without_rows();
+        Self {
+            table: TableChanges {
+                rules,
+                rows: inserted
+                    .rows
+                    .into_iter()
+                    .map(|after| RowDelta {
+                        before: None,
+                        after: Some(after),
+                    })
+                    .collect(),
+            },
+        }
     }
 
+    #[cfg(test)]
+    pub(crate) fn deleted(deleted: DeletedRowsFixture) -> Self {
+        let rules = deleted.deleted.clone().without_rows();
+        Self {
+            table: TableChanges {
+                rules,
+                rows: deleted
+                    .deleted
+                    .rows
+                    .into_iter()
+                    .map(|before| RowDelta {
+                        before: Some(before),
+                        after: None,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn updated(updated: UpdatedRowsFixture) -> Self {
+        let rules = updated.before.clone().without_rows();
+        Self {
+            table: TableChanges {
+                rules,
+                rows: updated
+                    .before
+                    .rows
+                    .into_iter()
+                    .zip(updated.after.rows)
+                    .map(|(before, after)| RowDelta {
+                        before: Some(before),
+                        after: Some(after),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// Fold SQLite's ordered preupdate stream into one durable net statement effect.
     pub(crate) fn from_catalog(
         catalog: &CatalogSnapshot,
-        captured: &[(CapturedRow, CapturedRow)],
+        events: Vec<CapturedChange>,
     ) -> Result<Option<Self>> {
-        let Some((first_before, first_after)) = captured.first() else {
-            return Ok(None);
-        };
-        if first_before.table != first_after.table {
-            return Err(Error::CaptureInvariant(
-                "one UPDATE changed rows from different tables",
-            ));
-        }
-        let changed = captured
-            .iter()
-            .filter(|(before, after)| before.table != after.table || before.values != after.values)
-            .collect::<Vec<_>>();
-        if changed.is_empty() {
+        if events.is_empty() {
             return Ok(None);
         }
-        if changed
-            .iter()
-            .any(|(before, after)| before.table != after.table)
-        {
-            return Err(Error::CaptureInvariant(
-                "one UPDATE changed rows from different tables",
-            ));
+        let mut builder = None::<TableChangesBuilder>;
+        for event in events {
+            match event {
+                CapturedChange::Insert(row) => {
+                    let expected = builder.as_ref().map(|builder| &builder.rules);
+                    let (rules, row, key) = captured_image(
+                        catalog,
+                        row,
+                        "INSERT target has no synchronized schema identity",
+                        expected,
+                    )?;
+                    table_builder(&mut builder, rules)?.insert(key, row)?;
+                }
+                CapturedChange::Delete(row) => {
+                    let expected = builder.as_ref().map(|builder| &builder.rules);
+                    let (rules, row, key) = captured_image(
+                        catalog,
+                        row,
+                        "DELETE target has no synchronized schema identity",
+                        expected,
+                    )?;
+                    table_builder(&mut builder, rules)?.delete(key, row)?;
+                }
+                CapturedChange::Update { before, after } => {
+                    let missing = "UPDATE target has no synchronized schema identity";
+                    let expected = builder.as_ref().map(|builder| &builder.rules);
+                    let (before_rules, before, before_key) =
+                        captured_image(catalog, before, missing, expected)?;
+                    let (after_rules, after, after_key) =
+                        captured_image(catalog, after, missing, Some(&before_rules))?;
+                    if before_rules != after_rules {
+                        return Err(Error::CaptureInvariant(
+                            "one row update crossed synchronized table identities",
+                        ));
+                    }
+                    table_builder(&mut builder, before_rules)?
+                        .update(before_key, before, after_key, after)?;
+                }
+            }
         }
 
-        let before_rows = changed
-            .iter()
-            .map(|(before, _)| (*before).clone())
+        let builder = builder.expect("non-empty capture stream produced a table builder");
+        let rows = builder
+            .rows
+            .into_iter()
+            .filter(|change| change.before != change.after)
             .collect::<Vec<_>>();
-        let after_rows = changed
-            .iter()
-            .map(|(_, after)| (*after).clone())
-            .collect::<Vec<_>>();
-        let Some(before) = InsertRows::from_catalog(catalog, &before_rows)? else {
+        if rows.is_empty() {
             return Ok(None);
+        }
+        let changes = Self {
+            table: TableChanges {
+                rules: builder.rules,
+                rows,
+            },
         };
-        let after = InsertRows::from_catalog(catalog, &after_rows)?.ok_or(
-            Error::CaptureInvariant("UPDATE before and after rows resolved differently"),
-        )?;
-        let updated = Self { before, after };
-        updated
+        changes
             .validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        Ok(Some(updated))
+        changes.validate_budget()?;
+        Ok(Some(changes))
     }
 
     pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        self.validate_budget()?;
         self.validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut mutations = Vec::with_capacity(
-            self.after.rows.len()
-                * (self.after.indexes.len() * 2 + self.after.foreign_keys.len() * 2 + 2),
-        );
-        let mut guards = GuardPlan::for_operation(OperationFamily::UpdateRows);
-        let keys = self
-            .before
-            .rows
-            .iter()
-            .zip(&self.after.rows)
-            .map(|(before, after)| {
-                Ok((
-                    self.before
-                        .row_key(before)
-                        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?,
-                    self.after
-                        .row_key(after)
-                        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Remove every moved source before publishing any destination. If one
-        // row moves into another row's former key, the later Set must win.
-        for (before, after) in &keys {
-            guards.write(before.clone(), GuardReason::RowIdentity)?;
-            guards.write(after.clone(), GuardReason::RowIdentity)?;
-            guards.invariant(after.clone(), GuardReason::RowIdentity)?;
-            if before != after {
-                mutations.push(Mutation::Delete {
-                    key: before.clone(),
-                });
-            }
-        }
-        let before_unique = self
-            .before
-            .index_entry_map()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let after_unique = self
-            .after
-            .index_entry_map()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        for (key, owner) in &before_unique {
-            if after_unique.get(key) != Some(owner) {
-                guards.write(key.clone(), GuardReason::UniqueOwnership)?;
-                mutations.push(Mutation::Delete { key: key.clone() });
-            }
-        }
-        let before_references = self
-            .before
-            .foreign_reference_map()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let after_references = self
-            .after
-            .foreign_reference_map()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        for (key, owner) in &before_references {
-            if after_references.get(key) != Some(owner) {
-                guards.write(key.clone(), GuardReason::ForeignReference)?;
-                mutations.push(Mutation::Delete { key: key.clone() });
-            }
-        }
-        for (row, (_, key)) in self.after.rows.iter().zip(&keys) {
-            mutations.push(Mutation::Set {
-                key: key.clone(),
-                value: self.after.encode_row(row),
-            });
-        }
-        for (key, owner) in &after_unique {
-            if before_unique.get(key) != Some(owner) {
-                guards.write(key.clone(), GuardReason::UniqueOwnership)?;
-                guards.invariant(key.clone(), GuardReason::UniqueOwnership)?;
-                mutations.push(Mutation::Set {
-                    key: key.clone(),
-                    value: owner.clone(),
-                });
-            }
-        }
-        for (key, owner) in &after_references {
-            if before_references.get(key) != Some(owner) {
-                guards.write(key.clone(), GuardReason::ForeignReference)?;
-                guards.invariant(key.clone(), GuardReason::ForeignReference)?;
-                mutations.push(Mutation::Set {
-                    key: key.clone(),
-                    value: owner.clone(),
-                });
-            }
-        }
-        let before_incoming = self
-            .before
-            .incoming_reference_prefix_set()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let after_incoming = self
-            .after
-            .incoming_reference_prefix_set()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        for reference_prefix in before_incoming.difference(&after_incoming) {
-            guards.write(reference_prefix.clone(), GuardReason::ForeignChildren)?;
-            guards.invariant(reference_prefix.clone(), GuardReason::ForeignChildren)?;
-            mutations.push(Mutation::DeleteRange {
-                range: Range::Prefix(reference_prefix.clone()),
-            });
-        }
-        guards.invariant(
-            active_primary_index_key(self.after.table),
-            GuardReason::PrimaryIndex,
-        )?;
-        guards.invariant(
-            write_revision_key(self.after.table),
-            GuardReason::WriteContract,
-        )?;
+        let mut mutations = Vec::new();
+        let mut guards = GuardPlan::for_operation(OperationFamily::RowChanges);
+        self.table.lower(&mut mutations, &mut guards)?;
         let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
@@ -1655,242 +1724,857 @@ impl UpdateRows {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.u8(UPDATE_FRAME_VERSION);
+        writer.u8(ROW_CHANGES_FRAME_VERSION);
         writer
-            .field(TAG_UPDATE_BEFORE, &self.before.encode())
-            .expect("row field length fits in u32");
-        writer
-            .field(TAG_UPDATE_AFTER, &self.after.encode())
-            .expect("row field length fits in u32");
+            .field(TAG_CHANGED_TABLE, &self.table.encode())
+            .expect("row-change field length fits in u32");
         writer.finish()
     }
 
     pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        if frame.len() > MAX_ROW_OPERATION_BYTES {
+            return Err(RowCodecError::FrameTooLarge);
+        }
         let mut reader = Reader::new(frame);
-        if reader.u8() != Some(UPDATE_FRAME_VERSION) {
+        if reader.u8() != Some(ROW_CHANGES_FRAME_VERSION) {
+            return Err(RowCodecError::UnknownVersion);
+        }
+        let mut table = None;
+        while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+            if tag == TAG_CHANGED_TABLE {
+                set_once(&mut table, TableChanges::decode(value)?)?;
+            }
+        }
+        let changes = Self {
+            table: table.ok_or(RowCodecError::MissingField(TAG_CHANGED_TABLE))?,
+        };
+        changes.validate_structure()?;
+        changes.validate_budget_codec()?;
+        Ok(changes)
+    }
+
+    fn validate_budget(&self) -> Result<()> {
+        self.validate_budget_with(MAX_CAPTURED_CHANGES, MAX_ROW_OPERATION_BYTES)
+            .map_err(|error| match error {
+                RowCodecError::TooManyChanges => {
+                    capture_limit("normalized row-change count", MAX_CAPTURED_CHANGES)
+                }
+                RowCodecError::FrameTooLarge | RowCodecError::InvalidLength => {
+                    capture_limit("row-operation bytes", MAX_ROW_OPERATION_BYTES)
+                }
+                error => Error::InvalidMultiliteOp(error.to_string()),
+            })
+    }
+
+    fn validate_budget_codec(&self) -> std::result::Result<(), RowCodecError> {
+        self.validate_budget_with(MAX_CAPTURED_CHANGES, MAX_ROW_OPERATION_BYTES)
+    }
+
+    fn validate_budget_with(
+        &self,
+        max_changes: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<(), RowCodecError> {
+        if self.table.rows.len() > max_changes {
+            return Err(RowCodecError::TooManyChanges);
+        }
+        if 1usize
+            .checked_add(field_len(self.table.encoded_len()?)?)
+            .ok_or(RowCodecError::InvalidLength)?
+            > max_bytes
+        {
+            return Err(RowCodecError::FrameTooLarge);
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        self.table.apply(connection, false)
+    }
+
+    pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
+        self.table.apply(connection, true)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        if let Some(after) = self.table.after_rows() {
+            let created = after.catalog_definition(connection)?;
+            after.validate_materialized_against(
+                connection,
+                &created,
+                "canonical row changes diverged from captured after-images",
+            )?;
+        }
+        let after_keys = self.table.keys(false)?;
+        let retired = self
+            .table
+            .rows
+            .iter()
+            .filter_map(|change| change.before.as_ref())
+            .filter(|row| {
+                self.table
+                    .rules
+                    .row_key(row)
+                    .is_ok_and(|key| !after_keys.contains(&key))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !retired.is_empty() {
+            self.table
+                .rules
+                .with_rows(retired)
+                .validate_materialized_absent(
+                    connection,
+                    "canonical row changes retained a retired primary-key image",
+                )?;
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
+        self.table.validate_structure()
+    }
+}
+
+impl TableChangesBuilder {
+    fn insert(&mut self, key: Key, row: Row) -> Result<()> {
+        if self.current.contains_key(&key) {
+            return Err(Error::CaptureInvariant(
+                "SQLite inserted a row key already live in the statement delta",
+            ));
+        }
+        let index = self
+            .tombstones
+            .remove(&key)
+            .filter(|index| self.rows[*index].after.is_none())
+            .unwrap_or_else(|| {
+                let index = self.rows.len();
+                self.rows.push(RowDelta {
+                    before: None,
+                    after: None,
+                });
+                index
+            });
+        self.rows[index].after = Some(row);
+        self.current.insert(key, index);
+        Ok(())
+    }
+
+    fn delete(&mut self, key: Key, row: Row) -> Result<()> {
+        let index = match self.current.remove(&key) {
+            Some(index) => {
+                if self.rows[index].after.as_ref() != Some(&row) {
+                    return Err(Error::CaptureInvariant(
+                        "SQLite delete before-image contradicts the statement delta",
+                    ));
+                }
+                index
+            }
+            None => {
+                let index = self.rows.len();
+                self.rows.push(RowDelta {
+                    before: Some(row),
+                    after: None,
+                });
+                index
+            }
+        };
+        self.rows[index].after = None;
+        self.tombstones.insert(key, index);
+        Ok(())
+    }
+
+    fn update(&mut self, before_key: Key, before: Row, after_key: Key, after: Row) -> Result<()> {
+        let index = match self.current.remove(&before_key) {
+            Some(index) => {
+                if self.rows[index].after.as_ref() != Some(&before) {
+                    return Err(Error::CaptureInvariant(
+                        "SQLite update before-image contradicts the statement delta",
+                    ));
+                }
+                index
+            }
+            None => {
+                let index = self.rows.len();
+                self.rows.push(RowDelta {
+                    before: Some(before),
+                    after: None,
+                });
+                index
+            }
+        };
+        if self
+            .current
+            .get(&after_key)
+            .is_some_and(|other| *other != index)
+        {
+            return Err(Error::CaptureInvariant(
+                "SQLite update produced a duplicate live row key",
+            ));
+        }
+        self.rows[index].after = Some(after);
+        if before_key != after_key {
+            self.tombstones.insert(before_key, index);
+        } else {
+            self.tombstones.remove(&before_key);
+        }
+        self.current.insert(after_key, index);
+        Ok(())
+    }
+}
+
+fn captured_image(
+    catalog: &CatalogSnapshot,
+    captured: CapturedRow,
+    missing_identity: &'static str,
+    expected: Option<&RowRules>,
+) -> Result<(RowRules, Row, Key)> {
+    let created = catalog
+        .by_name(&captured.table)
+        .ok_or(Error::UnsupportedSql(missing_identity))?;
+    let rules = if let Some(expected) = expected {
+        if expected.table != created.table_id() {
+            return Err(Error::CaptureInvariant(
+                "one row statement changed more than one synchronized table",
+            ));
+        }
+        expected.clone()
+    } else {
+        RowRules::from_table(catalog, created)?
+    };
+    let row = rules.capture(created, &captured)?;
+    let key = rules
+        .row_key(&row)
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+    Ok((rules, row, key))
+}
+
+fn table_builder(
+    builder: &mut Option<TableChangesBuilder>,
+    rules: RowRules,
+) -> Result<&mut TableChangesBuilder> {
+    if let Some(existing) = builder {
+        if existing.rules != rules {
+            return Err(Error::CaptureInvariant(
+                "one row statement changed more than one synchronized table",
+            ));
+        }
+        return Ok(existing);
+    }
+    *builder = Some(TableChangesBuilder {
+        rules,
+        rows: Vec::new(),
+        current: BTreeMap::new(),
+        tombstones: BTreeMap::new(),
+    });
+    Ok(builder.as_mut().expect("just installed a table builder"))
+}
+
+impl TableChanges {
+    fn encoded_len(&self) -> std::result::Result<usize, RowCodecError> {
+        let rules = self.rules.encode().len();
+        let mut bytes = 1usize
+            .checked_add(field_len(rules)?)
+            .ok_or(RowCodecError::InvalidLength)?;
+        for row in &self.rows {
+            bytes = bytes
+                .checked_add(field_len(row.encoded_len()?)?)
+                .ok_or(RowCodecError::InvalidLength)?;
+        }
+        Ok(bytes)
+    }
+
+    fn before_rows(&self) -> Option<RowSet> {
+        let rows = self
+            .rows
+            .iter()
+            .filter_map(|change| change.before.clone())
+            .collect::<Vec<_>>();
+        (!rows.is_empty()).then(|| self.rules.with_rows(rows))
+    }
+
+    fn after_rows(&self) -> Option<RowSet> {
+        let rows = self
+            .rows
+            .iter()
+            .filter_map(|change| change.after.clone())
+            .collect::<Vec<_>>();
+        (!rows.is_empty()).then(|| self.rules.with_rows(rows))
+    }
+
+    #[cfg(debug_assertions)]
+    fn keys(&self, before: bool) -> Result<BTreeSet<Key>> {
+        self.rows
+            .iter()
+            .filter_map(|change| {
+                if before {
+                    change.before.as_ref()
+                } else {
+                    change.after.as_ref()
+                }
+            })
+            .map(|row| {
+                self.rules
+                    .row_key(row)
+                    .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+            })
+            .collect()
+    }
+
+    fn lower(&self, mutations: &mut Vec<Mutation>, guards: &mut GuardPlan) -> Result<()> {
+        let before = self.before_rows();
+        let after = self.after_rows();
+        let before_unique = optional_index_map(before.as_ref())?;
+        let after_unique = optional_index_map(after.as_ref())?;
+        let before_references = optional_reference_map(before.as_ref())?;
+        let after_references = optional_reference_map(after.as_ref())?;
+
+        let row_keys = self
+            .rows
+            .iter()
+            .map(|change| {
+                let before = change
+                    .before
+                    .as_ref()
+                    .map(|row| self.rules.row_key(row))
+                    .transpose()?;
+                let after = change
+                    .after
+                    .as_ref()
+                    .map(|row| self.rules.row_key(row))
+                    .transpose()?;
+                Ok((before, after))
+            })
+            .collect::<std::result::Result<Vec<_>, RowCodecError>>()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+
+        // Retire every moved source before publishing any destination. This is
+        // required when one row moves into another row's former primary key.
+        for (before_key, after_key) in &row_keys {
+            if let Some(key) = &before_key {
+                guards.write(key.clone(), GuardReason::RowIdentity)?;
+                if after_key.as_ref() != Some(key) {
+                    mutations.push(Mutation::Delete { key: key.clone() });
+                }
+            }
+        }
+        for (change, (_, after_key)) in self.rows.iter().zip(row_keys) {
+            if let (Some(row), Some(key)) = (&change.after, after_key) {
+                guards.invariant(key.clone(), GuardReason::RowIdentity)?;
+                guards.write(key.clone(), GuardReason::RowIdentity)?;
+                mutations.push(Mutation::Set {
+                    key,
+                    value: self.rules.encode_row(row),
+                });
+            }
+        }
+        lower_map_delta(
+            &before_unique,
+            &after_unique,
+            GuardReason::UniqueOwnership,
+            mutations,
+            guards,
+        )?;
+        lower_map_delta(
+            &before_references,
+            &after_references,
+            GuardReason::ForeignReference,
+            mutations,
+            guards,
+        )?;
+
+        let before_incoming = optional_incoming_set(before.as_ref())?;
+        let after_incoming = optional_incoming_set(after.as_ref())?;
+        for prefix in before_incoming.difference(&after_incoming) {
+            guards.invariant(prefix.clone(), GuardReason::ForeignChildren)?;
+            guards.write(prefix.clone(), GuardReason::ForeignChildren)?;
+            mutations.push(Mutation::DeleteRange {
+                range: Range::Prefix(prefix.clone()),
+            });
+        }
+        guards.invariant(
+            active_primary_index_key(self.rules.table),
+            GuardReason::PrimaryIndex,
+        )?;
+        guards.invariant(
+            write_revision_key(self.rules.table),
+            GuardReason::WriteContract,
+        )?;
+        Ok(())
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(TABLE_CHANGES_FRAME_VERSION);
+        writer
+            .field(TAG_CHANGE_RULES, &self.rules.encode())
+            .expect("row-change rules fit in u32");
+        for row in &self.rows {
+            writer
+                .field(TAG_CHANGE_ROW, &row.encode())
+                .expect("row delta fits in u32");
+        }
+        writer.finish()
+    }
+
+    fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        let mut reader = Reader::new(frame);
+        if reader.u8() != Some(TABLE_CHANGES_FRAME_VERSION) {
+            return Err(RowCodecError::UnknownVersion);
+        }
+        let mut rules = None;
+        let mut rows = Vec::new();
+        while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
+            match tag {
+                TAG_CHANGE_RULES => set_once(&mut rules, RowRules::decode(value)?)?,
+                TAG_CHANGE_ROW => rows.push(RowDelta::decode(value)?),
+                _ => {}
+            }
+        }
+        let table = Self {
+            rules: rules.ok_or(RowCodecError::MissingField(TAG_CHANGE_RULES))?,
+            rows,
+        };
+        table.validate_structure()?;
+        Ok(table)
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
+        self.rules.validate()?;
+        if self.rows.is_empty()
+            || self
+                .rows
+                .iter()
+                .any(|row| row.before.is_none() && row.after.is_none() || row.before == row.after)
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
+        if let Some(before) = self.before_rows() {
+            before.validate_structure()?;
+        }
+        if let Some(after) = self.after_rows() {
+            after.validate_structure()?;
+        }
+        Ok(())
+    }
+
+    fn apply(&self, connection: &Connection, reverse: bool) -> Result<()> {
+        let pairs = self
+            .rows
+            .iter()
+            .map(|change| {
+                if reverse {
+                    (change.after.clone(), change.before.clone())
+                } else {
+                    (change.before.clone(), change.after.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        let before = pairs
+            .iter()
+            .filter_map(|(before, _)| before.clone())
+            .collect::<Vec<_>>();
+        let after = pairs
+            .iter()
+            .filter_map(|(_, after)| after.clone())
+            .collect::<Vec<_>>();
+        let created = if !before.is_empty() {
+            self.rules
+                .with_rows(before.clone())
+                .catalog_definition(connection)?
+        } else {
+            self.rules
+                .with_rows(after.clone())
+                .catalog_definition(connection)?
+        };
+
+        let before_set = self.rules.with_rows(before);
+        let materialized = if before_set.rows.is_empty() {
+            Vec::new()
+        } else {
+            before_set.materialized_rows(
+                connection,
+                &created,
+                if reverse {
+                    "pending row changes no longer match SQLite state"
+                } else {
+                    "row changes no longer match SQLite state"
+                },
+            )?
+        };
+        let mut materialized = materialized.into_iter();
+        let mut stable_before = Vec::new();
+        let mut stable_after = Vec::new();
+        let mut removed = Vec::new();
+        let mut inserted = Vec::new();
+        for (before, after) in pairs {
+            let current = before.as_ref().map(|_| {
+                materialized
+                    .next()
+                    .expect("materialized before rows preserve row-delta order")
+            });
+            match (before, after, current) {
+                (Some(before), Some(after), Some(current)) => {
+                    let before_key = self
+                        .rules
+                        .row_key(&before)
+                        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                    let after_key = self
+                        .rules
+                        .row_key(&after)
+                        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+                    if before_key == after_key {
+                        stable_before.push(before);
+                        stable_after.push(after);
+                    } else {
+                        let mut target = current.clone();
+                        for (column, value) in after.values {
+                            if let Some(slot) = target.value_mut(column) {
+                                *slot = value;
+                            }
+                        }
+                        removed.push(current);
+                        inserted.push(target);
+                    }
+                }
+                (Some(_), None, Some(current)) => removed.push(current),
+                (None, Some(after), None) => inserted.push(after),
+                _ => return Err(Error::CaptureInvariant("invalid row delta while applying")),
+            }
+        }
+        if !removed.is_empty() {
+            RowSet::for_current_rows(connection, &created, removed)?
+                .delete_materialized_with(connection, "row changes no longer match SQLite state")?;
+        }
+        if !stable_before.is_empty() {
+            let before = self.rules.with_rows(stable_before);
+            let after = self.rules.with_rows(stable_after);
+            let stable = (0..before.rows.len()).collect::<Vec<_>>();
+            update_stable_rows(
+                connection,
+                &created,
+                &before,
+                &after,
+                &stable,
+                "row changes no longer match SQLite state",
+            )?;
+        }
+        if !inserted.is_empty() {
+            let rows = if inserted.iter().all(|row| {
+                created
+                    .columns()
+                    .iter()
+                    .all(|column| row.value(column.id()).is_some())
+            }) {
+                RowSet::for_current_rows(connection, &created, inserted)?
+            } else {
+                self.rules.with_rows(inserted)
+            };
+            rows.apply(connection)?;
+        }
+        Ok(())
+    }
+}
+
+impl RowDelta {
+    fn encoded_len(&self) -> std::result::Result<usize, RowCodecError> {
+        let mut bytes = 1usize;
+        for row in [&self.before, &self.after].into_iter().flatten() {
+            bytes = bytes
+                .checked_add(field_len(row_image_len(row)?)?)
+                .ok_or(RowCodecError::InvalidLength)?;
+        }
+        Ok(bytes)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(ROW_DELTA_FRAME_VERSION);
+        if let Some(before) = &self.before {
+            writer
+                .field(TAG_DELTA_BEFORE, &encode_row_image(before))
+                .expect("before image fits in u32");
+        }
+        if let Some(after) = &self.after {
+            writer
+                .field(TAG_DELTA_AFTER, &encode_row_image(after))
+                .expect("after image fits in u32");
+        }
+        writer.finish()
+    }
+
+    fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        let mut reader = Reader::new(frame);
+        if reader.u8() != Some(ROW_DELTA_FRAME_VERSION) {
             return Err(RowCodecError::UnknownVersion);
         }
         let mut before = None;
         let mut after = None;
         while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
             match tag {
-                TAG_UPDATE_BEFORE => set_once(&mut before, InsertRows::decode(value)?)?,
-                TAG_UPDATE_AFTER => set_once(&mut after, InsertRows::decode(value)?)?,
+                TAG_DELTA_BEFORE => set_once(&mut before, decode_row_image(value)?)?,
+                TAG_DELTA_AFTER => set_once(&mut after, decode_row_image(value)?)?,
                 _ => {}
             }
         }
-        let updated = Self {
-            before: before.ok_or(RowCodecError::MissingField(TAG_UPDATE_BEFORE))?,
-            after: after.ok_or(RowCodecError::MissingField(TAG_UPDATE_AFTER))?,
-        };
-        updated.validate_structure()?;
-        Ok(updated)
+        Ok(Self { before, after })
+    }
+}
+
+fn optional_index_map(rows: Option<&RowSet>) -> Result<BTreeMap<Key, Vec<u8>>> {
+    rows.map(RowSet::index_entry_map)
+        .transpose()
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn optional_reference_map(rows: Option<&RowSet>) -> Result<BTreeMap<Key, Vec<u8>>> {
+    rows.map(RowSet::foreign_reference_map)
+        .transpose()
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn optional_incoming_set(rows: Option<&RowSet>) -> Result<BTreeSet<Key>> {
+    rows.map(RowSet::incoming_reference_prefix_set)
+        .transpose()
+        .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn lower_map_delta(
+    before: &BTreeMap<Key, Vec<u8>>,
+    after: &BTreeMap<Key, Vec<u8>>,
+    reason: GuardReason,
+    mutations: &mut Vec<Mutation>,
+    guards: &mut GuardPlan,
+) -> Result<()> {
+    for (key, owner) in before {
+        if after.get(key) != Some(owner) {
+            guards.write(key.clone(), reason)?;
+            mutations.push(Mutation::Delete { key: key.clone() });
+        }
+    }
+    for (key, owner) in after {
+        if before.get(key) != Some(owner) {
+            guards.invariant(key.clone(), reason)?;
+            guards.write(key.clone(), reason)?;
+            mutations.push(Mutation::Set {
+                key: key.clone(),
+                value: owner.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+// These fixtures keep older focused row tests concise while delegating every
+// codec, lowering, replay, and inverse path to the production statement delta.
+#[cfg(test)]
+impl DeletedRowsFixture {
+    pub(crate) fn from_row_set(deleted: RowSet) -> Self {
+        Self { deleted }
+    }
+
+    pub fn from_captured(
+        connection: &Connection,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(crate) fn from_catalog(
+        catalog: &CatalogSnapshot,
+        captured: &[CapturedRow],
+    ) -> Result<Option<Self>> {
+        let events = captured
+            .iter()
+            .cloned()
+            .map(CapturedChange::Delete)
+            .collect();
+        RowChanges::from_catalog(catalog, events)?
+            .map(Self::from_changes)
+            .transpose()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+    }
+
+    fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
+        let rows = changes
+            .table
+            .rows
+            .into_iter()
+            .map(|delta| match (delta.before, delta.after) {
+                (Some(before), None) => Ok(before),
+                _ => Err(RowCodecError::InvalidRow),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self {
+            deleted: changes.table.rules.with_rows(rows),
+        })
+    }
+
+    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        RowChanges::deleted(self.clone()).to_homebase()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RowChanges::deleted(self.clone()).encode()
+    }
+
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        Self::from_changes(RowChanges::decode(frame)?)
     }
 
     pub fn apply(&self, connection: &Connection) -> Result<()> {
-        let created = self.validate_against_catalog(connection)?;
-        self.apply_direction(
-            connection,
-            &created,
-            &self.before,
-            &self.after,
-            "UPDATE row no longer matches SQLite state",
-        )
+        RowChanges::deleted(self.clone()).apply(connection)
     }
 
     #[cfg(debug_assertions)]
     pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
-        let created = self.after.catalog_definition(connection)?;
-        self.after.validate_materialized_against(
-            connection,
-            &created,
-            "canonical UPDATE diverged from its captured branch after-image",
-        )?;
-        let after_keys = self
-            .after
-            .rows
-            .iter()
-            .map(|row| self.after.row_key(row))
-            .collect::<std::result::Result<BTreeSet<_>, _>>()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-        let mut retired_rows = Vec::new();
-        for row in &self.before.rows {
-            let key = self
-                .before
-                .row_key(row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            if !after_keys.contains(&key) {
-                retired_rows.push(row.clone());
-            }
-        }
-        if retired_rows.is_empty() {
-            return Ok(());
-        }
-        let retired = InsertRows {
-            rows: retired_rows,
-            ..self.before.clone()
-        };
-        retired.validate_materialized_absent(
-            connection,
-            "canonical UPDATE retained a retired primary-key image",
-        )
+        RowChanges::deleted(self.clone()).verify_materialized(connection)
     }
 
     pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
-        let created = self.validate_against_catalog(connection)?;
-        self.apply_direction(
-            connection,
-            &created,
-            &self.after,
-            &self.before,
-            "pending UPDATE row no longer matches SQLite state",
-        )
-    }
-
-    fn apply_direction(
-        &self,
-        connection: &Connection,
-        created: &CreateTable,
-        before: &InsertRows,
-        after: &InsertRows,
-        mismatch: &'static str,
-    ) -> Result<()> {
-        let materialized = before.materialized_rows(connection, created, mismatch)?;
-        let mut moved_before = Vec::new();
-        let mut moved_after = Vec::new();
-        let mut stable = Vec::new();
-        for (index, (before_row, after_row)) in before.rows.iter().zip(&after.rows).enumerate() {
-            let before_key = before
-                .row_key(before_row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            let after_key = after
-                .row_key(after_row)
-                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
-            if before_key == after_key {
-                stable.push(index);
-            } else {
-                let current = materialized[index].clone();
-                let mut target = current.clone();
-                for (column, value) in &after_row.values {
-                    if let Some(target) = target.value_mut(*column) {
-                        *target = value.clone();
-                    }
-                }
-                moved_before.push(current);
-                moved_after.push(target);
-            }
-        }
-
-        if !moved_before.is_empty() {
-            InsertRows::for_current_rows(connection, created, moved_before)?
-                .delete_materialized_with(connection, mismatch)?;
-        }
-        self.update_stable_rows(connection, created, before, after, &stable, mismatch)?;
-        if !moved_after.is_empty() {
-            InsertRows::for_current_rows(connection, created, moved_after)?.apply(connection)?;
-        }
-        Ok(())
-    }
-
-    fn update_stable_rows(
-        &self,
-        connection: &Connection,
-        created: &CreateTable,
-        before: &InsertRows,
-        after: &InsertRows,
-        stable: &[usize],
-        mismatch: &'static str,
-    ) -> Result<()> {
-        if stable.is_empty() {
-            return Ok(());
-        }
-        let columns = created
-            .columns()
-            .iter()
-            .filter(|column| {
-                stable.iter().any(|index| {
-                    before.rows[*index].value(column.id()) != after.rows[*index].value(column.id())
-                })
-            })
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
-            return Ok(());
-        }
-        let assignments = columns
-            .iter()
-            .map(|column| {
-                materialized_column_name(connection, created.table_id(), column.id())
-                    .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let predicates = created
-            .primary_key_columns()
-            .map(|column| materialized_column_name(connection, created.table_id(), column.id()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|name| format!("{} = ?", quote_identifier(name.value())))
-            .collect::<Vec<_>>();
-        let sql = format!(
-            "UPDATE {} SET {assignments} WHERE {}",
-            quote_identifier(&materialized_table_name(connection, self.after.table)?),
-            predicates.join(" AND ")
-        );
-        let mut statement = connection.prepare(&sql)?;
-        for index in stable {
-            let before_row = &before.rows[*index];
-            let after_row = &after.rows[*index];
-            let values = columns
-                .iter()
-                .map(|column| {
-                    after_row
-                        .value(column.id())
-                        .ok_or(Error::InvalidMultiliteOp(
-                            "row is missing a schema column".into(),
-                        ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let primary = before.primary_values(before_row)?;
-            let mut parameters = Vec::<&dyn ToSql>::with_capacity(values.len() + primary.len());
-            parameters.extend(values.into_iter().map(|value| value as &dyn ToSql));
-            parameters.extend(primary.into_iter().map(|value| value as &dyn ToSql));
-            if statement.execute(params_from_iter(parameters))? != 1 {
-                return Err(Error::InvalidDatabase(mismatch));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_against_catalog(&self, connection: &Connection) -> Result<CreateTable> {
-        let before = self.before.catalog_definition(connection)?;
-        let after = self.after.catalog_definition(connection)?;
-        if before != after {
-            return Err(Error::InvalidMultiliteOp(
-                "UPDATE before and after rows use different schemas".into(),
-            ));
-        }
-        Ok(before)
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
-        self.before.validate_structure()?;
-        self.after.validate_structure()?;
-        if self.before.table != self.after.table
-            || self.before.schema_revision != self.after.schema_revision
-            || self.before.primary_index != self.after.primary_index
-            || self.before.storage != self.after.storage
-            || self.before.key_parts != self.after.key_parts
-            || self.before.indexes != self.after.indexes
-            || self.before.foreign_keys != self.after.foreign_keys
-            || self.before.incoming_foreign_keys != self.after.incoming_foreign_keys
-            || self.before.rows.len() != self.after.rows.len()
-        {
-            return Err(RowCodecError::InvalidRow);
-        }
-        Ok(())
+        RowChanges::deleted(self.clone()).restore_materialized(connection)
     }
 }
 
+#[cfg(test)]
+impl UpdatedRowsFixture {
+    pub fn from_captured(
+        connection: &Connection,
+        captured: &[(CapturedRow, CapturedRow)],
+    ) -> Result<Option<Self>> {
+        let catalog = CatalogSnapshot::load(connection)?;
+        Self::from_catalog(&catalog, captured)
+    }
+
+    pub(crate) fn from_catalog(
+        catalog: &CatalogSnapshot,
+        captured: &[(CapturedRow, CapturedRow)],
+    ) -> Result<Option<Self>> {
+        let events = captured
+            .iter()
+            .cloned()
+            .map(|(before, after)| CapturedChange::Update { before, after })
+            .collect();
+        RowChanges::from_catalog(catalog, events)?
+            .map(Self::from_changes)
+            .transpose()
+            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))
+    }
+
+    fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
+        let mut before = Vec::with_capacity(changes.table.rows.len());
+        let mut after = Vec::with_capacity(changes.table.rows.len());
+        for delta in changes.table.rows {
+            let (Some(before_row), Some(after_row)) = (delta.before, delta.after) else {
+                return Err(RowCodecError::InvalidRow);
+            };
+            before.push(before_row);
+            after.push(after_row);
+        }
+        Ok(Self {
+            before: changes.table.rules.with_rows(before),
+            after: changes.table.rules.with_rows(after),
+        })
+    }
+
+    pub fn to_homebase(&self) -> Result<RowHomebaseOp> {
+        RowChanges::updated(self.clone()).to_homebase()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RowChanges::updated(self.clone()).encode()
+    }
+
+    pub fn decode(frame: &[u8]) -> std::result::Result<Self, RowCodecError> {
+        Self::from_changes(RowChanges::decode(frame)?)
+    }
+
+    pub fn apply(&self, connection: &Connection) -> Result<()> {
+        RowChanges::updated(self.clone()).apply(connection)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
+        RowChanges::updated(self.clone()).verify_materialized(connection)
+    }
+
+    pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
+        RowChanges::updated(self.clone()).restore_materialized(connection)
+    }
+}
+
+fn update_stable_rows(
+    connection: &Connection,
+    created: &CreateTable,
+    before: &RowSet,
+    after: &RowSet,
+    stable: &[usize],
+    mismatch: &'static str,
+) -> Result<()> {
+    if stable.is_empty() {
+        return Ok(());
+    }
+    let columns = created
+        .columns()
+        .iter()
+        .filter(|column| {
+            stable.iter().any(|index| {
+                before.rows[*index].value(column.id()) != after.rows[*index].value(column.id())
+            })
+        })
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let assignments = columns
+        .iter()
+        .map(|column| {
+            materialized_column_name(connection, created.table_id(), column.id())
+                .map(|name| format!("{} = ?", quote_identifier(name.value())))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let predicates = created
+        .primary_key_columns()
+        .map(|column| materialized_column_name(connection, created.table_id(), column.id()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|name| format!("{} = ?", quote_identifier(name.value())))
+        .collect::<Vec<_>>();
+    let sql = format!(
+        "UPDATE {} SET {assignments} WHERE {}",
+        quote_identifier(&materialized_table_name(connection, after.rules.table)?),
+        predicates.join(" AND ")
+    );
+    let mut statement = connection.prepare(&sql)?;
+    for index in stable {
+        let before_row = &before.rows[*index];
+        let after_row = &after.rows[*index];
+        let values = columns
+            .iter()
+            .map(|column| {
+                after_row
+                    .value(column.id())
+                    .ok_or(Error::InvalidMultiliteOp(
+                        "row is missing a schema column".into(),
+                    ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let primary = before.primary_values(before_row)?;
+        let mut parameters = Vec::<&dyn ToSql>::with_capacity(values.len() + primary.len());
+        parameters.extend(values.into_iter().map(|value| value as &dyn ToSql));
+        parameters.extend(primary.into_iter().map(|value| value as &dyn ToSql));
+        if statement.execute(params_from_iter(parameters))? != 1 {
+            return Err(Error::InvalidDatabase(mismatch));
+        }
+    }
+    Ok(())
+}
 /// Prefix covering every row encoded under a table's active primary index.
 pub fn primary_index_prefix(created: &CreateTable) -> Key {
     row_prefix(created.table_id(), created.primary_index_id(), Vec::new())
@@ -2125,10 +2809,10 @@ pub fn backfill_unique_index(
     if captured.is_empty() {
         return Ok(Vec::new());
     }
-    let mut inserted = InsertRows::from_captured(connection, &captured)?.ok_or(
+    let mut inserted = RowSet::from_captured(connection, &captured)?.ok_or(
         Error::CaptureInvariant("index table is missing its schema catalog"),
     )?;
-    inserted.indexes = vec![IndexRules {
+    inserted.rules.indexes = vec![IndexRules {
         index: index.index_id(),
         parts: index_parts(created, index.columns()),
     }];
@@ -2206,7 +2890,7 @@ pub(crate) fn expected_materialized_cells(
     let mut expected = BTreeMap::new();
     for created in catalog.tables() {
         let captured = capture_table(connection, created)?;
-        let Some(rows) = InsertRows::from_catalog(&catalog, &captured)? else {
+        let Some(rows) = RowSet::from_catalog(&catalog, &captured)? else {
             continue;
         };
         for mutation in rows.to_homebase()?.mutations {
@@ -2578,6 +3262,26 @@ fn set_once<T>(slot: &mut Option<T>, value: T) -> std::result::Result<(), RowCod
     }
 }
 
+fn row_image_len(row: &Row) -> std::result::Result<usize, RowCodecError> {
+    row.values.iter().try_fold(1usize, |bytes, (_, value)| {
+        let column_value = field_len(16)?
+            .checked_add(field_len(value.encoded_len())?)
+            .ok_or(RowCodecError::InvalidLength)?;
+        bytes
+            .checked_add(field_len(column_value)?)
+            .ok_or(RowCodecError::InvalidLength)
+    })
+}
+
+fn field_len(payload: usize) -> std::result::Result<usize, RowCodecError> {
+    u32::try_from(payload).map_err(|_| RowCodecError::InvalidLength)?;
+    payload.checked_add(5).ok_or(RowCodecError::InvalidLength)
+}
+
+fn capture_limit(resource: &'static str, limit: usize) -> Error {
+    Error::CaptureLimitExceeded { resource, limit }
+}
+
 fn uuid_bytes(value: &[u8]) -> std::result::Result<[u8; 16], RowCodecError> {
     let bytes = value.try_into().map_err(|_| RowCodecError::InvalidLength)?;
     let uuid = Uuid::from_bytes(bytes);
@@ -2599,6 +3303,8 @@ pub enum RowCodecError {
     InvalidRow,
     DuplicateRow,
     DuplicateUniqueKey,
+    TooManyChanges,
+    FrameTooLarge,
     NullPrimaryKey,
     InvalidKey(KeyError),
     #[cfg(test)]
@@ -2620,6 +3326,8 @@ impl fmt::Display for RowCodecError {
             Self::DuplicateUniqueKey => {
                 f.write_str("row operation contains a duplicate UNIQUE key")
             }
+            Self::TooManyChanges => f.write_str("row operation contains too many changes"),
+            Self::FrameTooLarge => f.write_str("row operation frame is too large"),
             Self::NullPrimaryKey => f.write_str("primary key value is NULL"),
             Self::InvalidKey(error) => write!(f, "invalid Homebase row key: {error}"),
             #[cfg(test)]
@@ -2639,6 +3347,7 @@ mod tests {
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
     use crate::logical::alter::AlterTableOperation;
+    use crate::logical::guard::MutationKind;
     use crate::logical::index::IndexOperation;
     use crate::logical::schema::{
         CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
@@ -2873,8 +3582,8 @@ mod tests {
         }
     }
 
-    fn inserted(connection: &Connection) -> InsertRows {
-        InsertRows::from_captured(
+    fn inserted(connection: &Connection) -> RowSet {
+        RowSet::from_captured(
             connection,
             &[
                 CapturedRow {
@@ -2899,6 +3608,472 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    fn note(id: i64, body: &str) -> CapturedRow {
+        CapturedRow {
+            table: "notes".into(),
+            rowid: id,
+            values: vec![
+                StoredValue::Integer(id),
+                StoredValue::Text(body.as_bytes().to_vec()),
+                StoredValue::Blob(Vec::new()),
+            ],
+        }
+    }
+
+    #[test]
+    fn capture_budget_fails_deterministically_and_can_be_reused() {
+        let event = CapturedChange::Insert(note(7, "hello"));
+        let retained = event.retained_bytes().unwrap();
+
+        let mut count = CaptureBudget::with_limits(1, usize::MAX);
+        count.record(&event).unwrap();
+        assert!(matches!(
+            count.record(&event),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-change count",
+                limit: 1,
+            })
+        ));
+        count.reset();
+        count.record(&event).unwrap();
+
+        let mut bytes = CaptureBudget::with_limits(usize::MAX, retained - 1);
+        assert!(matches!(
+            bytes.record(&event),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-capture bytes",
+                limit,
+            }) if limit == retained - 1
+        ));
+    }
+
+    #[test]
+    fn normalized_row_changes_enforce_count_and_frame_budgets() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes =
+            RowChanges::from_catalog(&catalog, vec![CapturedChange::Insert(note(7, "hello"))])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            changes.validate_budget_with(0, usize::MAX),
+            Err(RowCodecError::TooManyChanges)
+        );
+        assert_eq!(
+            changes.validate_budget_with(usize::MAX, 1),
+            Err(RowCodecError::FrameTooLarge)
+        );
+        changes
+            .validate_budget_with(changes.table.rows.len(), changes.encode().len())
+            .unwrap();
+    }
+
+    #[test]
+    fn statement_delta_folds_repeated_touches_and_cancels_transient_rows() {
+        let created = definition();
+        let connection = connection(&created);
+        connection
+            .execute("INSERT INTO notes VALUES (7, 'before', x'')", ())
+            .unwrap();
+        let before = note(7, "before");
+        let middle = note(7, "middle");
+        let after = note(7, "after");
+        let transient = note(9, "transient");
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let transient_set = RowSet::from_catalog(&catalog, std::slice::from_ref(&transient))
+            .unwrap()
+            .unwrap();
+        let transient_key = transient_set.row_key(&transient_set.rows[0]).unwrap();
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Update {
+                    before: before.clone(),
+                    after: middle.clone(),
+                },
+                CapturedChange::Update {
+                    before: middle,
+                    after: after.clone(),
+                },
+                CapturedChange::Insert(transient.clone()),
+                CapturedChange::Delete(transient),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(changes.table.rows.len(), 1);
+        assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
+        let lowered = changes.to_homebase().unwrap();
+        assert!(matches!(
+            lowered.mutations.as_slice(),
+            [Mutation::Set { .. }]
+        ));
+        assert!(
+            lowered
+                .guards
+                .entries()
+                .iter()
+                .all(|guard| guard.target() != &transient_key),
+            "a canceled transient row leaked into the guard plan"
+        );
+
+        changes.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes WHERE id = 7", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "after"
+        );
+        changes.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes WHERE id = 7", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn statement_delta_treats_delete_then_insert_as_one_replacement() {
+        let created = definition();
+        let connection = connection(&created);
+        connection
+            .execute("INSERT INTO notes VALUES (7, 'before', x'')", ())
+            .unwrap();
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Delete(note(7, "before")),
+                CapturedChange::Insert(note(7, "after")),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(changes.table.rows.len(), 1);
+        assert!(changes.table.rows[0].before.is_some());
+        assert!(changes.table.rows[0].after.is_some());
+        changes.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            "after"
+        );
+        changes.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn statement_delta_emits_exact_mandatory_guards_for_each_net_row_shape() {
+        let created = definition();
+        let connection = connection(&created);
+        let before = note(7, "before");
+        let after = note(7, "after");
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let rows = RowSet::from_catalog(&catalog, std::slice::from_ref(&after))
+            .unwrap()
+            .unwrap();
+        let row_key = rows.row_key(&rows.rows[0]).unwrap();
+        let required = [
+            (
+                active_primary_index_key(created.table_id()),
+                crate::logical::guard::GuardClass::Invariant,
+                GuardReason::PrimaryIndex,
+            ),
+            (
+                write_revision_key(created.table_id()),
+                crate::logical::guard::GuardClass::Invariant,
+                GuardReason::WriteContract,
+            ),
+        ];
+
+        for (event, mutation_kind, expected_row_classes) in [
+            (
+                CapturedChange::Insert(after.clone()),
+                MutationKind::Set,
+                &[
+                    crate::logical::guard::GuardClass::Invariant,
+                    crate::logical::guard::GuardClass::Write,
+                ][..],
+            ),
+            (
+                CapturedChange::Delete(before.clone()),
+                MutationKind::Delete,
+                &[crate::logical::guard::GuardClass::Write][..],
+            ),
+            (
+                CapturedChange::Update { before, after },
+                MutationKind::Set,
+                &[
+                    crate::logical::guard::GuardClass::Invariant,
+                    crate::logical::guard::GuardClass::Write,
+                ][..],
+            ),
+        ] {
+            let lowered = RowChanges::from_catalog(&catalog, vec![event])
+                .unwrap()
+                .unwrap()
+                .to_homebase()
+                .unwrap();
+            assert_eq!(lowered.mutations.len(), 1);
+            assert_eq!(lowered.mutations[0].key(), &row_key);
+            assert_eq!(
+                match &lowered.mutations[0] {
+                    Mutation::Set { .. } => MutationKind::Set,
+                    Mutation::Delete { .. } => MutationKind::Delete,
+                    Mutation::DeleteRange { .. } => MutationKind::DeletePrefix,
+                },
+                mutation_kind
+            );
+            for class in expected_row_classes {
+                assert!(lowered.guards.entries().iter().any(|guard| {
+                    guard.target() == &row_key
+                        && guard.class() == *class
+                        && guard.reason() == GuardReason::RowIdentity
+                        && guard.family() == TargetFamily::Row
+                }));
+            }
+            for (target, class, reason) in &required {
+                assert!(lowered.guards.entries().iter().any(|guard| {
+                    guard.target() == target && guard.class() == *class && guard.reason() == *reason
+                }));
+            }
+            crate::logical::guard::validate_compiled_output(
+                OperationFamily::RowChanges,
+                &lowered.mutations,
+                &lowered.guards,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn statement_delta_codec_rejects_every_truncated_prefix() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes =
+            RowChanges::from_catalog(&catalog, vec![CapturedChange::Insert(note(7, "hello"))])
+                .unwrap()
+                .unwrap();
+        let encoded = changes.encode();
+
+        for length in 0..encoded.len() {
+            assert!(
+                RowChanges::decode(&encoded[..length]).is_err(),
+                "accepted truncated row-change frame at {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn statement_delta_codec_rejects_malformed_nested_envelopes() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes =
+            RowChanges::from_catalog(&catalog, vec![CapturedChange::Insert(note(7, "hello"))])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            RowChanges::decode(&[ROW_CHANGES_FRAME_VERSION + 1]),
+            Err(RowCodecError::UnknownVersion)
+        );
+        assert_eq!(
+            RowChanges::decode(&[ROW_CHANGES_FRAME_VERSION]),
+            Err(RowCodecError::MissingField(TAG_CHANGED_TABLE))
+        );
+
+        let table = changes.table.encode();
+        let mut duplicate_table = Writer::new();
+        duplicate_table.u8(ROW_CHANGES_FRAME_VERSION);
+        duplicate_table.field(TAG_CHANGED_TABLE, &table).unwrap();
+        duplicate_table.field(TAG_CHANGED_TABLE, &table).unwrap();
+        assert_eq!(
+            RowChanges::decode(&duplicate_table.finish()),
+            Err(RowCodecError::DuplicateField)
+        );
+
+        let mut missing_rules = Writer::new();
+        missing_rules.u8(TABLE_CHANGES_FRAME_VERSION);
+        missing_rules
+            .field(TAG_CHANGE_ROW, &changes.table.rows[0].encode())
+            .unwrap();
+        assert_eq!(
+            TableChanges::decode(&missing_rules.finish()),
+            Err(RowCodecError::MissingField(TAG_CHANGE_RULES))
+        );
+
+        let rules = changes.table.rules.encode();
+        let mut duplicate_rules = Writer::new();
+        duplicate_rules.u8(TABLE_CHANGES_FRAME_VERSION);
+        duplicate_rules.field(TAG_CHANGE_RULES, &rules).unwrap();
+        duplicate_rules.field(TAG_CHANGE_RULES, &rules).unwrap();
+        duplicate_rules
+            .field(TAG_CHANGE_ROW, &changes.table.rows[0].encode())
+            .unwrap();
+        assert_eq!(
+            TableChanges::decode(&duplicate_rules.finish()),
+            Err(RowCodecError::DuplicateField)
+        );
+
+        let mut no_rows = Writer::new();
+        no_rows.u8(TABLE_CHANGES_FRAME_VERSION);
+        no_rows.field(TAG_CHANGE_RULES, &rules).unwrap();
+        assert_eq!(
+            TableChanges::decode(&no_rows.finish()),
+            Err(RowCodecError::InvalidRow)
+        );
+
+        let mut empty_delta = Writer::new();
+        empty_delta.u8(ROW_DELTA_FRAME_VERSION);
+        let mut table_with_empty_delta = Writer::new();
+        table_with_empty_delta.u8(TABLE_CHANGES_FRAME_VERSION);
+        table_with_empty_delta
+            .field(TAG_CHANGE_RULES, &rules)
+            .unwrap();
+        table_with_empty_delta
+            .field(TAG_CHANGE_ROW, &empty_delta.finish())
+            .unwrap();
+        assert_eq!(
+            TableChanges::decode(&table_with_empty_delta.finish()),
+            Err(RowCodecError::InvalidRow)
+        );
+
+        let image = encode_row_image(
+            changes.table.rows[0]
+                .after
+                .as_ref()
+                .expect("insert delta has an after-image"),
+        );
+        let mut duplicate_before = Writer::new();
+        duplicate_before.u8(ROW_DELTA_FRAME_VERSION);
+        duplicate_before.field(TAG_DELTA_BEFORE, &image).unwrap();
+        duplicate_before.field(TAG_DELTA_BEFORE, &image).unwrap();
+        assert_eq!(
+            RowDelta::decode(&duplicate_before.finish()),
+            Err(RowCodecError::DuplicateField)
+        );
+
+        let mut unchanged = Writer::new();
+        unchanged.u8(ROW_DELTA_FRAME_VERSION);
+        unchanged.field(TAG_DELTA_BEFORE, &image).unwrap();
+        unchanged.field(TAG_DELTA_AFTER, &image).unwrap();
+        let mut unchanged_table = Writer::new();
+        unchanged_table.u8(TABLE_CHANGES_FRAME_VERSION);
+        unchanged_table.field(TAG_CHANGE_RULES, &rules).unwrap();
+        unchanged_table
+            .field(TAG_CHANGE_ROW, &unchanged.finish())
+            .unwrap();
+        assert_eq!(
+            TableChanges::decode(&unchanged_table.finish()),
+            Err(RowCodecError::InvalidRow)
+        );
+
+        let mut rules_with_rows = Writer::new();
+        changes.table.rules.encode_into(&mut rules_with_rows);
+        rules_with_rows.field(TAG_SET_ROW, &image).unwrap();
+        assert_eq!(
+            RowRules::decode(&rules_with_rows.finish()),
+            Err(RowCodecError::InvalidRow)
+        );
+    }
+
+    #[test]
+    fn statement_delta_normalizes_lineage_and_rejects_cross_table_streams() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let before = note(7, "before");
+        let middle = note(7, "middle");
+        let after = note(7, "after");
+        let direct = RowChanges::from_catalog(
+            &catalog,
+            vec![CapturedChange::Update {
+                before: before.clone(),
+                after: after.clone(),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let chained = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Update {
+                    before: before.clone(),
+                    after: middle.clone(),
+                },
+                CapturedChange::Update {
+                    before: middle,
+                    after: after.clone(),
+                },
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct.encode(), chained.encode());
+        assert_eq!(
+            direct.to_homebase().unwrap().mutations,
+            chained.to_homebase().unwrap().mutations
+        );
+
+        assert!(matches!(
+            RowChanges::from_catalog(
+                &catalog,
+                vec![
+                    CapturedChange::Update {
+                        before: before.clone(),
+                        after: note(7, "first"),
+                    },
+                    CapturedChange::Update { before, after },
+                ],
+            ),
+            Err(Error::CaptureInvariant(
+                "SQLite update before-image contradicts the statement delta"
+            ))
+        ));
+
+        let sql = "CREATE TABLE tasks (id INTEGER PRIMARY KEY, body TEXT, payload BLOB)";
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let tasks = CreateTable::new(sql, spec);
+        connection.execute(sql, ()).unwrap();
+        catalog::insert(&connection, &tasks).unwrap();
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let mut task = note(8, "task");
+        task.table = "tasks".into();
+        assert!(matches!(
+            RowChanges::from_catalog(
+                &catalog,
+                vec![
+                    CapturedChange::Insert(note(7, "note")),
+                    CapturedChange::Insert(task),
+                ],
+            ),
+            Err(Error::CaptureInvariant(
+                "one row statement changed more than one synchronized table"
+            ))
+        ));
     }
 
     fn foreign_key_tables() -> (Connection, CreateTable, CreateTable) {
@@ -3018,7 +4193,7 @@ mod tests {
         let connection = connection(&created);
         let inserted = inserted(&connection);
 
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
         assert_eq!(lowered.footprint.writes().len(), 2);
@@ -3149,7 +4324,7 @@ mod tests {
                 .map(|(column, value)| 5 + encode_column_value(*column, value).len())
                 .sum::<usize>();
             assert_eq!(value.len(), 1 + 5 + 16 + encoded_values);
-            assert_eq!(value, &inserted.encode_row(row));
+            assert_eq!(value, &inserted.rules.encode_row(row));
         }
     }
 
@@ -3161,14 +4336,14 @@ mod tests {
         let mut malformed = Writer::new();
         malformed.u8(ROW_SET_FRAME_VERSION);
         malformed
-            .field(TAG_SET_TABLE, &inserted.table.as_bytes())
+            .field(TAG_SET_TABLE, &inserted.rules.table.as_bytes())
             .unwrap();
         malformed
-            .field(TAG_SET_TABLE, &inserted.table.as_bytes())
+            .field(TAG_SET_TABLE, &inserted.rules.table.as_bytes())
             .unwrap();
 
         assert_eq!(
-            InsertRows::decode(&malformed.finish()),
+            RowSet::decode(&malformed.finish()),
             Err(RowCodecError::DuplicateField)
         );
     }
@@ -3185,7 +4360,7 @@ mod tests {
                 StoredValue::Text(b"body".to_vec()),
             ],
         };
-        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&child_row))
+        let inserted = RowSet::from_captured(&connection, std::slice::from_ref(&child_row))
             .unwrap()
             .unwrap();
         let child_key = inserted.row_key(&inserted.rows[0]).unwrap();
@@ -3254,17 +4429,18 @@ mod tests {
             Err(RowCodecError::InvalidBatch)
         );
 
-        let deleted = DeleteRows::from_captured(&connection, std::slice::from_ref(&child_row))
-            .unwrap()
-            .unwrap()
-            .to_homebase()
-            .unwrap();
+        let deleted =
+            DeletedRowsFixture::from_captured(&connection, std::slice::from_ref(&child_row))
+                .unwrap()
+                .unwrap()
+                .to_homebase()
+                .unwrap();
         assert!(matches!(
             &deleted.mutations[1],
             Mutation::Delete { key } if key == &reference.key
         ));
 
-        let parent_delete = DeleteRows::from_captured(
+        let parent_delete = DeletedRowsFixture::from_captured(
             &connection,
             &[CapturedRow {
                 table: "parents".into(),
@@ -3306,7 +4482,7 @@ mod tests {
             &row_prefix(child.table_id(), child.primary_index_id(), Vec::new()).unwrap()
         ));
 
-        let parent_move = UpdateRows::from_captured(
+        let parent_move = UpdatedRowsFixture::from_captured(
             &connection,
             &[(
                 CapturedRow {
@@ -3356,7 +4532,7 @@ mod tests {
             )
         }));
 
-        let null_child = InsertRows::from_captured(
+        let null_child = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "children".into(),
@@ -3394,7 +4570,7 @@ mod tests {
                 StoredValue::Text(b"user@example.com".to_vec()),
             ],
         };
-        let inserted = InsertRows::from_captured(&connection, &[child_row])
+        let inserted = RowSet::from_captured(&connection, &[child_row])
             .unwrap()
             .unwrap();
         let reference = inserted
@@ -3446,7 +4622,7 @@ mod tests {
         assert!(lowered.footprint.writes().contains(&reference.key));
         assert!(lowered.footprint.constraints().contains(&reference.key));
         assert!(!lowered.footprint.constraints().contains(&parent_ownership));
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
 
         let before = CapturedRow {
             table: "accounts".into(),
@@ -3465,7 +4641,7 @@ mod tests {
             ],
             ..before.clone()
         };
-        let updated = UpdateRows::from_captured(&connection, &[(before.clone(), after)])
+        let updated = UpdatedRowsFixture::from_captured(&connection, &[(before.clone(), after)])
             .unwrap()
             .unwrap();
         let old_reference = updated
@@ -3523,7 +4699,7 @@ mod tests {
             ],
             ..before_three.clone()
         };
-        let updated = UpdateRows::from_captured(
+        let updated = UpdatedRowsFixture::from_captured(
             &connection,
             &[(before_two, after_one), (before_three, after_two)],
         )
@@ -3590,7 +4766,7 @@ mod tests {
         connection.execute(child_sql, ()).unwrap();
         catalog::insert(&connection, &child).unwrap();
 
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "families".into(),
@@ -3654,7 +4830,7 @@ mod tests {
                 StoredValue::Text(b"after".to_vec()),
             ],
         };
-        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+        let updated = UpdatedRowsFixture::from_captured(&connection, &[(before, after)])
             .unwrap()
             .unwrap();
         let before_reference = updated.before.foreign_reference_map().unwrap();
@@ -3665,8 +4841,8 @@ mod tests {
             &lowered.footprint,
             &[
                 after_reference_key,
-                active_primary_index_key(updated.after.table),
-                write_revision_key(updated.after.table),
+                active_primary_index_key(updated.after.rules.table),
+                write_revision_key(updated.after.rules.table),
             ],
         );
 
@@ -3703,27 +4879,28 @@ mod tests {
                 StoredValue::Text(b"body".to_vec()),
             ],
         };
-        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&captured))
+        let inserted = RowSet::from_captured(&connection, std::slice::from_ref(&captured))
             .unwrap()
             .unwrap();
 
-        assert_eq!(inserted.storage, TableStorage::WithoutRowid);
+        assert_eq!(inserted.rules.storage, TableStorage::WithoutRowid);
         assert_eq!(
             inserted
+                .rules
                 .key_parts
                 .iter()
                 .map(|part| part.column)
                 .collect::<Vec<_>>(),
             [created.columns()[1].id(), created.columns()[0].id(),]
         );
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations[0].key().components().len(), 7);
 
         let mut same_row = captured.clone();
         same_row.rowid = 999;
         assert!(
-            UpdateRows::from_captured(&connection, &[(captured, same_row)])
+            UpdatedRowsFixture::from_captured(&connection, &[(captured, same_row)])
                 .unwrap()
                 .is_none()
         );
@@ -3771,11 +4948,11 @@ mod tests {
                 ],
             },
         ];
-        let inserted = InsertRows::from_captured(&connection, &captured)
+        let inserted = RowSet::from_captured(&connection, &captured)
             .unwrap()
             .unwrap();
 
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 6);
         assert_eq!(lowered.footprint.writes().len(), 6);
@@ -3808,7 +4985,7 @@ mod tests {
         inserted
             .validate_homebase(&admit(lowered.mutations))
             .unwrap();
-        let deleted = DeleteRows::from_captured(&connection, &captured)
+        let deleted = DeletedRowsFixture::from_captured(&connection, &captured)
             .unwrap()
             .unwrap()
             .to_homebase()
@@ -3846,7 +5023,7 @@ mod tests {
                 ],
             },
         ];
-        let baseline = InsertRows::from_captured(&connection, &captured)
+        let baseline = RowSet::from_captured(&connection, &captured)
             .unwrap()
             .unwrap()
             .to_homebase()
@@ -3857,12 +5034,12 @@ mod tests {
             &connection,
             "CREATE INDEX notes_payload_body ON notes (payload, body)",
         );
-        let inserted = InsertRows::from_captured(&connection, &captured)
+        let inserted = RowSet::from_captured(&connection, &captured)
             .unwrap()
             .unwrap();
 
-        assert!(inserted.indexes.is_empty());
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert!(inserted.rules.indexes.is_empty());
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert!(
             lowered
@@ -3876,7 +5053,7 @@ mod tests {
             .validate_homebase(&admit(lowered.mutations))
             .unwrap();
 
-        let deleted = DeleteRows::from_captured(&connection, &captured)
+        let deleted = DeletedRowsFixture::from_captured(&connection, &captured)
             .unwrap()
             .unwrap()
             .to_homebase()
@@ -3888,7 +5065,7 @@ mod tests {
                 .all(|mutation| mutation.key().components()[3].as_bytes() != codes::INDEXES)
         );
 
-        let updated = UpdateRows::from_captured(
+        let updated = UpdatedRowsFixture::from_captured(
             &connection,
             &[(
                 captured[0].clone(),
@@ -3920,11 +5097,11 @@ mod tests {
         let created = overlapping_unique_definition();
         let connection = connection(&created);
         let captured = profile(1, "acme", "same", "same");
-        let inserted = InsertRows::from_captured(&connection, std::slice::from_ref(&captured))
+        let inserted = RowSet::from_captured(&connection, std::slice::from_ref(&captured))
             .unwrap()
             .unwrap();
 
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 5);
         assert_eq!(lowered.footprint.writes().len(), 5);
@@ -3958,16 +5135,30 @@ mod tests {
             .validate_homebase(&admit(lowered.mutations.clone()))
             .unwrap();
 
-        let deleted = DeleteRows::from_captured(&connection, &[captured])
+        let deleted = DeletedRowsFixture::from_captured(&connection, &[captured])
             .unwrap()
             .unwrap()
             .to_homebase()
             .unwrap();
         assert_eq!(deleted.mutations.len(), lowered.mutations.len());
-        for (inserted, deleted) in lowered.mutations.iter().zip(&deleted.mutations) {
-            assert_eq!(inserted.key(), deleted.key());
-            assert!(matches!(deleted, Mutation::Delete { .. }));
-        }
+        assert_eq!(
+            lowered
+                .mutations
+                .iter()
+                .map(|mutation| mutation.key().clone())
+                .collect::<BTreeSet<_>>(),
+            deleted
+                .mutations
+                .iter()
+                .map(|mutation| mutation.key().clone())
+                .collect()
+        );
+        assert!(
+            deleted
+                .mutations
+                .iter()
+                .all(|mutation| matches!(mutation, Mutation::Delete { .. }))
+        );
     }
 
     #[test]
@@ -3980,22 +5171,21 @@ mod tests {
             profile(3, "acme", "third@example.com", "alpha"),
         ];
         assert!(matches!(
-            InsertRows::from_captured(&connection, &captured),
+            RowSet::from_captured(&connection, &captured),
             Err(Error::InvalidMultiliteOp(message))
                 if message == "row operation contains a duplicate UNIQUE key"
         ));
 
-        let mut inserted =
-            InsertRows::from_captured(&connection, std::slice::from_ref(&captured[0]))
-                .unwrap()
-                .unwrap();
-        let duplicate = InsertRows::from_captured(&connection, std::slice::from_ref(&captured[1]))
+        let mut inserted = RowSet::from_captured(&connection, std::slice::from_ref(&captured[0]))
+            .unwrap()
+            .unwrap();
+        let duplicate = RowSet::from_captured(&connection, std::slice::from_ref(&captured[1]))
             .unwrap()
             .unwrap();
         inserted.rows.extend(duplicate.rows);
 
         assert_eq!(
-            InsertRows::decode(&inserted.encode()),
+            RowSet::decode(&inserted.encode()),
             Err(RowCodecError::DuplicateUniqueKey)
         );
         assert!(matches!(
@@ -4010,7 +5200,7 @@ mod tests {
         let created = overlapping_unique_definition();
         let connection = connection(&created);
         let inserted =
-            InsertRows::from_captured(&connection, &[profile(1, "acme", "email", "username")])
+            RowSet::from_captured(&connection, &[profile(1, "acme", "email", "username")])
                 .unwrap()
                 .unwrap();
         let lowered = inserted.to_homebase().unwrap().mutations;
@@ -4052,11 +5242,14 @@ mod tests {
         let created = definition();
         let connection = connection(&created);
         let inserted = inserted(&connection);
-        let deleted = DeleteRows {
+        let deleted = DeletedRowsFixture {
             deleted: inserted.clone(),
         };
 
-        assert_eq!(DeleteRows::decode(&deleted.encode()).unwrap(), deleted);
+        assert_eq!(
+            DeletedRowsFixture::decode(&deleted.encode()).unwrap(),
+            deleted
+        );
         let lowered = deleted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
         assert!(
@@ -4137,7 +5330,7 @@ mod tests {
     fn historical_inserts_project_through_added_and_dropped_columns() {
         let created = definition();
         let source = connection(&created);
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &source,
             &[CapturedRow {
                 table: "notes".into(),
@@ -4192,7 +5385,7 @@ mod tests {
     fn historical_updates_preserve_columns_added_after_capture() {
         let created = definition();
         let source = connection(&created);
-        let stable = UpdateRows::from_captured(
+        let stable = UpdatedRowsFixture::from_captured(
             &source,
             &[(
                 CapturedRow {
@@ -4217,7 +5410,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let moved = UpdateRows::from_captured(
+        let moved = UpdatedRowsFixture::from_captured(
             &source,
             &[(
                 CapturedRow {
@@ -4294,7 +5487,7 @@ mod tests {
     fn stable_update_codec_replaces_rows_and_restores_before_images() {
         let created = definition();
         let connection = connection(&created);
-        let updated = UpdateRows::from_captured(
+        let updated = UpdatedRowsFixture::from_captured(
             &connection,
             &[
                 (
@@ -4342,7 +5535,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(UpdateRows::decode(&updated.encode()).unwrap(), updated);
+        assert_eq!(
+            UpdatedRowsFixture::decode(&updated.encode()).unwrap(),
+            updated
+        );
         let lowered = updated.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
         assert!(
@@ -4432,7 +5628,7 @@ mod tests {
                 StoredValue::Text(b"after@example.com".to_vec()),
             ],
         };
-        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+        let updated = UpdatedRowsFixture::from_captured(&connection, &[(before, after)])
             .unwrap()
             .unwrap();
 
@@ -4500,7 +5696,7 @@ mod tests {
         let connection = connection(&created);
         let before = profile(1, "acme", "same@example.com", "before");
         let after = profile(1, "other", "same@example.com", "after");
-        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+        let updated = UpdatedRowsFixture::from_captured(&connection, &[(before, after)])
             .unwrap()
             .unwrap();
 
@@ -4551,7 +5747,7 @@ mod tests {
                 StoredValue::Text(b"owner@example.com".to_vec()),
             ],
         };
-        let updated = UpdateRows::from_captured(&connection, &[(before, after)])
+        let updated = UpdatedRowsFixture::from_captured(&connection, &[(before, after)])
             .unwrap()
             .unwrap();
 
@@ -4597,11 +5793,12 @@ mod tests {
             ],
         };
 
-        let removed = UpdateRows::from_captured(&connection, &[(present.clone(), absent.clone())])
-            .unwrap()
-            .unwrap()
-            .to_homebase()
-            .unwrap();
+        let removed =
+            UpdatedRowsFixture::from_captured(&connection, &[(present.clone(), absent.clone())])
+                .unwrap()
+                .unwrap()
+                .to_homebase()
+                .unwrap();
         assert_eq!(
             removed
                 .mutations
@@ -4612,7 +5809,7 @@ mod tests {
             1
         );
 
-        let created = UpdateRows::from_captured(&connection, &[(absent, present)])
+        let created = UpdatedRowsFixture::from_captured(&connection, &[(absent, present)])
             .unwrap()
             .unwrap()
             .to_homebase()
@@ -4632,7 +5829,7 @@ mod tests {
     fn primary_key_update_moves_the_row_and_restores_the_before_image() {
         let created = definition();
         let notes_connection = connection(&created);
-        let moved = UpdateRows::from_captured(
+        let moved = UpdatedRowsFixture::from_captured(
             &notes_connection,
             &[(
                 CapturedRow {
@@ -4694,7 +5891,7 @@ mod tests {
         );
 
         assert!(matches!(
-            UpdateRows::from_captured(
+            UpdatedRowsFixture::from_captured(
                 &notes_connection,
                 &[(
                     CapturedRow {
@@ -4736,11 +5933,11 @@ mod tests {
                 StoredValue::Blob(Vec::new()),
             ],
         };
-        let updated = UpdateRows::from_captured(
+        let updated = UpdatedRowsFixture::from_captured(
             &connection,
             &[
-                (row(1, "one"), row(2, "one-moved")),
                 (row(2, "two"), row(3, "two-moved")),
+                (row(1, "one"), row(2, "one-moved")),
             ],
         )
         .unwrap()
@@ -4762,12 +5959,13 @@ mod tests {
         else {
             panic!("key moves did not lower as deletes followed by sets")
         };
-        assert_eq!(second_source, first_destination);
+        assert_eq!(first_source, second_destination);
         assert_ne!(first_source, first_destination);
         assert_ne!(second_source, second_destination);
 
         updated.before.apply(&connection).unwrap();
         updated.apply(&connection).unwrap();
+        #[cfg(debug_assertions)]
         updated.verify_materialized(&connection).unwrap();
         assert_eq!(
             connection
@@ -4800,7 +5998,7 @@ mod tests {
     fn update_validates_every_before_image_before_changing_any_row() {
         let created = definition();
         let connection = connection(&created);
-        let updated = UpdateRows::from_captured(
+        let updated = UpdatedRowsFixture::from_captured(
             &connection,
             &[
                 (
@@ -4855,7 +6053,7 @@ mod tests {
         assert!(matches!(
             updated.apply(&connection),
             Err(Error::InvalidDatabase(
-                "UPDATE row no longer matches SQLite state"
+                "row changes no longer match SQLite state"
             ))
         ));
         assert_eq!(
@@ -4880,7 +6078,7 @@ mod tests {
         inserted.rows.push(inserted.rows[0].clone());
 
         assert_eq!(
-            InsertRows::decode(&inserted.encode()),
+            RowSet::decode(&inserted.encode()),
             Err(RowCodecError::DuplicateRow)
         );
         assert!(matches!(
@@ -4895,7 +6093,7 @@ mod tests {
         let created = definition();
         let connection = connection(&created);
         let inserted = inserted(&connection);
-        let deleted = DeleteRows {
+        let deleted = DeletedRowsFixture {
             deleted: inserted.clone(),
         };
         inserted.apply(&connection).unwrap();
@@ -4906,7 +6104,7 @@ mod tests {
         assert!(matches!(
             deleted.apply(&connection),
             Err(Error::InvalidDatabase(
-                "DELETE row no longer matches SQLite state"
+                "row changes no longer match SQLite state"
             ))
         ));
         assert_eq!(
@@ -4939,12 +6137,13 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn delete_verifier_rejects_a_reappeared_primary_key() {
         let created = definition();
         let connection = connection(&created);
         let inserted = inserted(&connection);
-        let deleted = DeleteRows {
+        let deleted = DeletedRowsFixture {
             deleted: inserted.clone(),
         };
 
@@ -4958,7 +6157,7 @@ mod tests {
         assert!(matches!(
             deleted.verify_materialized(&connection),
             Err(Error::InvalidDatabase(
-                "canonical DELETE retained a row removed on its captured branch"
+                "canonical row changes retained a retired primary-key image"
             ))
         ));
     }
@@ -5106,13 +6305,13 @@ mod tests {
             ]
         );
 
-        let inserted = InsertRows::from_captured(&connection, &[captured])
+        let inserted = RowSet::from_captured(&connection, &[captured])
             .unwrap()
             .unwrap();
         let lowered = inserted.to_homebase().unwrap();
         assert_eq!(lowered.mutations.len(), 2);
         assert_eq!(lowered.footprint.writes().len(), 2);
-        assert_eq!(InsertRows::decode(&inserted.encode()).unwrap(), inserted);
+        assert_eq!(RowSet::decode(&inserted.encode()).unwrap(), inserted);
     }
 
     #[test]
@@ -5182,10 +6381,10 @@ mod tests {
         );
         assert_eq!(captured[1].values[5], StoredValue::Integer(123));
 
-        let inserted = InsertRows::from_captured(&connection, &captured)
+        let inserted = RowSet::from_captured(&connection, &captured)
             .unwrap()
             .unwrap();
-        assert_eq!(inserted.indexes[0].parts[0].affinity, Affinity::Blob);
+        assert_eq!(inserted.rules.indexes[0].parts[0].affinity, Affinity::Blob);
         assert_eq!(inserted.to_homebase().unwrap().mutations.len(), 4);
 
         let mut invalid = inserted;

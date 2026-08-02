@@ -34,7 +34,7 @@ use crate::commit::snapshot::SnapshotDescriptor;
 use crate::connection::with_savepoint;
 use crate::logical::isolation::IsolationLevel;
 use crate::logical::operation::MultiliteOp;
-use crate::logical::row::{CapturedRow, InsertRows};
+use crate::logical::row::{CapturedRow, RowChanges, RowSet};
 use crate::logical::transaction::{CompiledTransaction, MultiliteTransaction};
 use crate::{Error, Result};
 
@@ -945,12 +945,12 @@ fn lower_insert_operations(
     }
     let mut operations = Vec::with_capacity(tables.len());
     for rows in tables.into_values() {
-        let inserted = InsertRows::from_captured(connection, &rows)?.ok_or_else(|| {
+        let inserted = RowSet::from_captured(connection, &rows)?.ok_or_else(|| {
             Error::InvalidCommitProposal(
                 "captured INSERT target has no synchronized schema identity".into(),
             )
         })?;
-        operations.push(MultiliteOp::InsertRows(inserted));
+        operations.push(MultiliteOp::ChangeRows(RowChanges::inserted(inserted)));
     }
     if operations.is_empty() {
         return Err(Error::InvalidCommitProposal(

@@ -37,9 +37,7 @@ pub enum TargetFamily {
 pub enum OperationFamily {
     TransactionEnvelope,
     CreateTable,
-    InsertRows,
-    DeleteRows,
-    UpdateRows,
+    RowChanges,
     CreateIndex,
     DropIndex,
     RenameTable,
@@ -86,20 +84,13 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(CreateTable, Set, IndexDefinition),
     mutation_contract!(CreateTable, Set, ColumnName),
     mutation_contract!(CreateTable, Set, WriteRevision),
-    mutation_contract!(InsertRows, Set, Row),
-    mutation_contract!(InsertRows, Set, UniqueOwner),
-    mutation_contract!(InsertRows, Set, ForeignReference),
-    mutation_contract!(DeleteRows, Delete, Row),
-    mutation_contract!(DeleteRows, Delete, UniqueOwner),
-    mutation_contract!(DeleteRows, Delete, ForeignReference),
-    mutation_contract!(DeleteRows, DeletePrefix, ForeignReference),
-    mutation_contract!(UpdateRows, Set, Row),
-    mutation_contract!(UpdateRows, Set, UniqueOwner),
-    mutation_contract!(UpdateRows, Set, ForeignReference),
-    mutation_contract!(UpdateRows, Delete, Row),
-    mutation_contract!(UpdateRows, Delete, UniqueOwner),
-    mutation_contract!(UpdateRows, Delete, ForeignReference),
-    mutation_contract!(UpdateRows, DeletePrefix, ForeignReference),
+    mutation_contract!(RowChanges, Set, Row),
+    mutation_contract!(RowChanges, Set, UniqueOwner),
+    mutation_contract!(RowChanges, Set, ForeignReference),
+    mutation_contract!(RowChanges, Delete, Row),
+    mutation_contract!(RowChanges, Delete, UniqueOwner),
+    mutation_contract!(RowChanges, Delete, ForeignReference),
+    mutation_contract!(RowChanges, DeletePrefix, ForeignReference),
     mutation_contract!(CreateIndex, Set, SchemaLog),
     mutation_contract!(CreateIndex, Set, SchemaObjectName),
     mutation_contract!(CreateIndex, Set, TableSchema),
@@ -135,9 +126,7 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RejectionKind {
     DropTable,
-    DeleteRows,
-    RestoreRows,
-    RestoreUpdatedRows,
+    RestoreRowChanges,
     RevertIndex,
     RevertAlterTable,
 }
@@ -161,9 +150,7 @@ macro_rules! rejection_contract {
 /// Central allowlist for speculative rejection repair.
 pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
     rejection_contract!(CreateTable, DropTable),
-    rejection_contract!(InsertRows, DeleteRows),
-    rejection_contract!(DeleteRows, RestoreRows),
-    rejection_contract!(UpdateRows, RestoreUpdatedRows),
+    rejection_contract!(RowChanges, RestoreRowChanges),
     rejection_contract!(CreateIndex, RevertIndex),
     rejection_contract!(DropIndex, RevertIndex),
     rejection_contract!(RenameTable, RevertAlterTable),
@@ -287,31 +274,16 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Invariant, SchemaRevision, ActiveSchemaRevision),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
-    contract!(InsertRows, Invariant, RowIdentity, Row),
-    contract!(InsertRows, Write, RowIdentity, Row),
-    contract!(InsertRows, Invariant, UniqueOwnership, UniqueOwner),
-    contract!(InsertRows, Write, UniqueOwnership, UniqueOwner),
-    contract!(InsertRows, Invariant, ForeignReference, ForeignReference),
-    contract!(InsertRows, Write, ForeignReference, ForeignReference),
-    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
-    contract!(DeleteRows, Write, RowIdentity, Row),
-    contract!(DeleteRows, Write, UniqueOwnership, UniqueOwner),
-    contract!(DeleteRows, Write, ForeignReference, ForeignReference),
-    contract!(DeleteRows, Invariant, ForeignChildren, ForeignReference),
-    contract!(DeleteRows, Write, ForeignChildren, ForeignReference),
-    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
-    contract!(UpdateRows, Invariant, RowIdentity, Row),
-    contract!(UpdateRows, Write, RowIdentity, Row),
-    contract!(UpdateRows, Invariant, UniqueOwnership, UniqueOwner),
-    contract!(UpdateRows, Write, UniqueOwnership, UniqueOwner),
-    contract!(UpdateRows, Invariant, ForeignReference, ForeignReference),
-    contract!(UpdateRows, Write, ForeignReference, ForeignReference),
-    contract!(UpdateRows, Invariant, ForeignChildren, ForeignReference),
-    contract!(UpdateRows, Write, ForeignChildren, ForeignReference),
-    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(RowChanges, Invariant, RowIdentity, Row),
+    contract!(RowChanges, Write, RowIdentity, Row),
+    contract!(RowChanges, Invariant, UniqueOwnership, UniqueOwner),
+    contract!(RowChanges, Write, UniqueOwnership, UniqueOwner),
+    contract!(RowChanges, Invariant, ForeignReference, ForeignReference),
+    contract!(RowChanges, Write, ForeignReference, ForeignReference),
+    contract!(RowChanges, Invariant, ForeignChildren, ForeignReference),
+    contract!(RowChanges, Write, ForeignChildren, ForeignReference),
+    contract!(RowChanges, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(RowChanges, Invariant, WriteContract, WriteRevision),
     contract!(CreateIndex, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
     contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
@@ -352,12 +324,8 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
 pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
-    contract!(InsertRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(InsertRows, Invariant, WriteContract, WriteRevision),
-    contract!(DeleteRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(DeleteRows, Invariant, WriteContract, WriteRevision),
-    contract!(UpdateRows, Invariant, PrimaryIndex, ActivePrimaryIndex),
-    contract!(UpdateRows, Invariant, WriteContract, WriteRevision),
+    contract!(RowChanges, Invariant, PrimaryIndex, ActivePrimaryIndex),
+    contract!(RowChanges, Invariant, WriteContract, WriteRevision),
     contract!(CreateIndex, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
     contract!(CreateIndex, Write, SchemaRevision, ActiveSchemaRevision),
@@ -603,8 +571,8 @@ fn mutation_guard_requirements(
     };
     use MutationKind::{Delete, DeletePrefix, Set};
     use OperationFamily::{
-        AddColumn, CreateIndex, CreateTable, DeleteRows, DropColumn, DropIndex, InsertRows,
-        RenameColumn, RenameTable, UpdateRows,
+        AddColumn, CreateIndex, CreateTable, DropColumn, DropIndex, RenameColumn, RenameTable,
+        RowChanges,
     };
     use TargetFamily::{
         ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
@@ -628,19 +596,15 @@ fn mutation_guard_requirements(
         | (DropIndex | DropColumn, Delete | DeletePrefix, ColumnDependencyTarget) => {
             &[(Invariant, ColumnDependency), (Write, ColumnDependency)]
         }
-        (InsertRows, Set, Row) | (UpdateRows, Set, Row) => {
-            &[(Invariant, RowIdentity), (Write, RowIdentity)]
-        }
-        (DeleteRows | UpdateRows, Delete, Row) => &[(Write, RowIdentity)],
-        (InsertRows | UpdateRows, Set, UniqueOwner) => {
-            &[(Invariant, UniqueOwnership), (Write, UniqueOwnership)]
-        }
-        (DeleteRows | UpdateRows, Delete, UniqueOwner) => &[(Write, UniqueOwnership)],
-        (InsertRows | UpdateRows, Set, ForeignReferenceTarget) => {
+        (RowChanges, Set, Row) => &[(Invariant, RowIdentity), (Write, RowIdentity)],
+        (RowChanges, Delete, Row) => &[(Write, RowIdentity)],
+        (RowChanges, Set, UniqueOwner) => &[(Invariant, UniqueOwnership), (Write, UniqueOwnership)],
+        (RowChanges, Delete, UniqueOwner) => &[(Write, UniqueOwnership)],
+        (RowChanges, Set, ForeignReferenceTarget) => {
             &[(Invariant, ForeignReference), (Write, ForeignReference)]
         }
-        (DeleteRows | UpdateRows, Delete, ForeignReferenceTarget) => &[(Write, ForeignReference)],
-        (DeleteRows | UpdateRows, DeletePrefix, ForeignReferenceTarget) => {
+        (RowChanges, Delete, ForeignReferenceTarget) => &[(Write, ForeignReference)],
+        (RowChanges, DeletePrefix, ForeignReferenceTarget) => {
             &[(Invariant, ForeignChildren), (Write, ForeignChildren)]
         }
         _ => &[],
@@ -1100,7 +1064,7 @@ mod tests {
         }
         .render()
         .unwrap();
-        let mut plan = GuardPlan::for_operation(OperationFamily::UpdateRows);
+        let mut plan = GuardPlan::for_operation(OperationFamily::RowChanges);
         plan.write(row, GuardReason::RowIdentity).unwrap();
         plan.invariant(reference, GuardReason::ForeignChildren)
             .unwrap();
@@ -1120,7 +1084,7 @@ mod tests {
         merged.extend(reads);
 
         assert_eq!(merged.entries().len(), 4);
-        assert_eq!(merged.entries()[0].operation(), OperationFamily::UpdateRows);
+        assert_eq!(merged.entries()[0].operation(), OperationFamily::RowChanges);
         assert_eq!(merged.entries()[0].family(), TargetFamily::Row);
         assert_eq!(merged.entries()[1].class(), GuardClass::Invariant);
         assert_eq!(merged.entries()[2].reason(), GuardReason::ForeignChildren);
@@ -1155,7 +1119,7 @@ mod tests {
 
     #[test]
     fn plans_reject_targets_outside_the_registry() {
-        let mut plan = GuardPlan::for_operation(OperationFamily::InsertRows);
+        let mut plan = GuardPlan::for_operation(OperationFamily::RowChanges);
         let unknown = Key::from_bytes([b"other".as_slice(), b"key".as_slice()]).unwrap();
         assert!(matches!(
             plan.write(unknown, GuardReason::RowIdentity),
@@ -1194,7 +1158,7 @@ mod tests {
         .render()
         .unwrap();
         validate_mutations(
-            OperationFamily::InsertRows,
+            OperationFamily::RowChanges,
             &[Mutation::Set {
                 key: row.clone(),
                 value: Vec::new(),
@@ -1203,7 +1167,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             validate_mutations(
-                OperationFamily::InsertRows,
+                OperationFamily::CreateTable,
                 &[Mutation::Delete { key: row.clone() }]
             ),
             Err(Error::CaptureInvariant(
@@ -1212,15 +1176,19 @@ mod tests {
         ));
         assert!(matches!(
             validate_mutations(
-                OperationFamily::DeleteRows,
+                OperationFamily::RowChanges,
                 &[Mutation::DeleteRange { range: Range::Full }]
             ),
             Err(Error::CaptureInvariant(
                 "Multilite operations cannot delete the full Homebase keyspace"
             ))
         ));
-        validate_rejection(OperationFamily::InsertRows, RejectionKind::DeleteRows).unwrap();
-        assert!(validate_rejection(OperationFamily::InsertRows, RejectionKind::DropTable).is_err());
+        validate_rejection(
+            OperationFamily::RowChanges,
+            RejectionKind::RestoreRowChanges,
+        )
+        .unwrap();
+        assert!(validate_rejection(OperationFamily::RowChanges, RejectionKind::DropTable).is_err());
     }
 
     #[test]
@@ -1238,10 +1206,10 @@ mod tests {
             key: row.clone(),
             value: Vec::new(),
         }];
-        let mut guards = GuardPlan::for_operation(OperationFamily::InsertRows);
+        let mut guards = GuardPlan::for_operation(OperationFamily::RowChanges);
 
         assert!(matches!(
-            validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards),
+            validate_compiled_output(OperationFamily::RowChanges, &mutations, &guards),
             Err(Error::CaptureInvariant(
                 "compiler omitted a required operation guard"
             ))
@@ -1263,14 +1231,14 @@ mod tests {
             .unwrap();
         guards.write(row.clone(), GuardReason::RowIdentity).unwrap();
         assert!(matches!(
-            validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards),
+            validate_compiled_output(OperationFamily::RowChanges, &mutations, &guards),
             Err(Error::CaptureInvariant(
                 "compiler omitted a guard required by a mutation"
             ))
         ));
 
         guards.invariant(row, GuardReason::RowIdentity).unwrap();
-        validate_compiled_output(OperationFamily::InsertRows, &mutations, &guards).unwrap();
+        validate_compiled_output(OperationFamily::RowChanges, &mutations, &guards).unwrap();
     }
 
     #[test]
@@ -1307,9 +1275,7 @@ mod tests {
 
         let logical_operations = BTreeSet::from([
             OperationFamily::CreateTable,
-            OperationFamily::InsertRows,
-            OperationFamily::DeleteRows,
-            OperationFamily::UpdateRows,
+            OperationFamily::RowChanges,
             OperationFamily::CreateIndex,
             OperationFamily::DropIndex,
             OperationFamily::RenameTable,

@@ -55,6 +55,9 @@ struct Coverage {
     push_orders: [bool; 2],
     reopened_before_push: bool,
     reopened_before_repair: bool,
+    insert_or_ignore: bool,
+    update_or_ignore: bool,
+    upsert_do_nothing: bool,
 }
 
 impl Coverage {
@@ -67,6 +70,9 @@ impl Coverage {
         }
         self.reopened_before_push |= other.reopened_before_push;
         self.reopened_before_repair |= other.reopened_before_repair;
+        self.insert_or_ignore |= other.insert_or_ignore;
+        self.update_or_ignore |= other.update_or_ignore;
+        self.upsert_do_nothing |= other.upsert_do_nothing;
     }
 }
 
@@ -88,6 +94,9 @@ fn seeded_two_replica_workloads_preserve_logical_and_sqlite_integrity() {
     );
     assert!(coverage.reopened_before_push);
     assert!(coverage.reopened_before_repair);
+    assert!(coverage.insert_or_ignore);
+    assert!(coverage.update_or_ignore);
+    assert!(coverage.upsert_do_nothing);
 }
 
 fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
@@ -212,17 +221,18 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 true
             }
             2 => {
+                coverage.update_or_ignore = true;
                 first
                     .execute(
                         &first_runtime,
-                        "UPDATE children SET body = 'first' WHERE id = ?1",
+                        "UPDATE OR IGNORE children SET body = 'first' WHERE id = ?1",
                         [child],
                     )
                     .unwrap();
                 second
                     .execute(
                         &second_runtime,
-                        "UPDATE children SET body = 'second' WHERE id = ?1",
+                        "UPDATE OR IGNORE children SET body = 'second' WHERE id = ?1",
                         [child],
                     )
                     .unwrap();
@@ -297,6 +307,7 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 true
             }
             7 => {
+                coverage.insert_or_ignore = true;
                 first
                     .update(&first_runtime, |transaction| {
                         transaction.execute(
@@ -313,12 +324,12 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 second
                     .update(&second_runtime, |transaction| {
                         transaction.execute(
-                            "INSERT INTO parents (id, code, body)
+                            "INSERT OR IGNORE INTO parents (id, code, body)
                              VALUES (?1, ?2, 'new parent')",
                             rusqlite::params![base + 3, format!("p{round}-c")],
                         )?;
                         transaction.execute(
-                            "INSERT INTO children VALUES (?1, ?2, 'new child')",
+                            "INSERT OR IGNORE INTO children VALUES (?1, ?2, 'new child')",
                             rusqlite::params![base + 12, format!("p{round}-c")],
                         )?;
                         Ok(())
@@ -327,11 +338,13 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 false
             }
             8 => {
+                coverage.insert_or_ignore = true;
+                coverage.upsert_do_nothing = true;
                 let shared = format!("p{round}-shared");
                 first
                     .execute(
                         &first_runtime,
-                        "INSERT INTO parents (id, code, body)
+                        "INSERT OR IGNORE INTO parents (id, code, body)
                          VALUES (?1, ?2, 'first owner')",
                         rusqlite::params![base + 3, shared],
                     )
@@ -340,7 +353,8 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                     .execute(
                         &second_runtime,
                         "INSERT INTO parents (id, code, body)
-                         VALUES (?1, ?2, 'second owner')",
+                         VALUES (?1, ?2, 'second owner')
+                         ON CONFLICT(code) DO NOTHING",
                         rusqlite::params![base + 4, shared],
                     )
                     .unwrap();

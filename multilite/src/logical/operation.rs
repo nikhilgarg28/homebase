@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
 use super::guard::{GuardPlan, RejectionKind, validate_compiled_output, validate_rejection};
 use super::index::{IndexHomebaseOp, IndexOperation};
-use super::row::{DeleteRows, InsertRows, RowHomebaseOp, UpdateRows};
+use super::row::{RowChanges, RowHomebaseOp};
 use super::schema::CreateTable;
 #[cfg(test)]
 use super::schema::{CreateTableSpec, write_revision_key};
@@ -20,9 +20,7 @@ use crate::commit::footprint::ConflictFootprint;
 
 const OPERATION_FRAME_VERSION: u8 = 1;
 const CREATE_TABLE_OPERATION: u8 = 1;
-const INSERT_ROWS_OPERATION: u8 = 2;
-const DELETE_ROWS_OPERATION: u8 = 3;
-const UPDATE_ROWS_OPERATION: u8 = 4;
+const ROW_CHANGES_OPERATION: u8 = 2;
 const INDEX_OPERATION: u8 = 5;
 const ALTER_TABLE_OPERATION: u8 = 6;
 
@@ -31,9 +29,7 @@ const ALTER_TABLE_OPERATION: u8 = 6;
 pub enum MultiliteOp {
     AlterTable(AlterTableOperation),
     CreateTable(CreateTable),
-    InsertRows(InsertRows),
-    DeleteRows(DeleteRows),
-    UpdateRows(UpdateRows),
+    ChangeRows(RowChanges),
     Index(IndexOperation),
 }
 
@@ -50,9 +46,7 @@ pub struct HomebaseOp {
 pub enum RejectionEffect {
     RevertAlterTable { operation: AlterTableOperation },
     DropTable { created: CreateTable },
-    DeleteRows { inserted: InsertRows },
-    RestoreRows { deleted: DeleteRows },
-    RestoreUpdatedRows { updated: UpdateRows },
+    RestoreRowChanges { changes: RowChanges },
     RevertIndex { operation: IndexOperation },
 }
 
@@ -114,17 +108,9 @@ impl MultiliteOp {
                 writer.u8(CREATE_TABLE_OPERATION);
                 writer.bytes(&created.encode());
             }
-            Self::InsertRows(inserted) => {
-                writer.u8(INSERT_ROWS_OPERATION);
-                writer.bytes(&inserted.encode());
-            }
-            Self::DeleteRows(deleted) => {
-                writer.u8(DELETE_ROWS_OPERATION);
-                writer.bytes(&deleted.encode());
-            }
-            Self::UpdateRows(updated) => {
-                writer.u8(UPDATE_ROWS_OPERATION);
-                writer.bytes(&updated.encode());
+            Self::ChangeRows(changes) => {
+                writer.u8(ROW_CHANGES_OPERATION);
+                writer.bytes(&changes.encode());
             }
             Self::Index(index) => {
                 writer.u8(INDEX_OPERATION);
@@ -148,14 +134,8 @@ impl MultiliteOp {
             CREATE_TABLE_OPERATION => CreateTable::decode_operation(reader.rest())
                 .map(Self::CreateTable)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
-            INSERT_ROWS_OPERATION => InsertRows::decode(reader.rest())
-                .map(Self::InsertRows)
-                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
-            DELETE_ROWS_OPERATION => DeleteRows::decode(reader.rest())
-                .map(Self::DeleteRows)
-                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
-            UPDATE_ROWS_OPERATION => UpdateRows::decode(reader.rest())
-                .map(Self::UpdateRows)
+            ROW_CHANGES_OPERATION => RowChanges::decode(reader.rest())
+                .map(Self::ChangeRows)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             INDEX_OPERATION => IndexOperation::decode(reader.rest())
                 .map(Self::Index)
@@ -180,23 +160,11 @@ impl MultiliteOp {
                 },
                 RejectionKind::DropTable,
             ),
-            Self::InsertRows(inserted) => (
-                RejectionEffect::DeleteRows {
-                    inserted: inserted.clone(),
+            Self::ChangeRows(changes) => (
+                RejectionEffect::RestoreRowChanges {
+                    changes: changes.clone(),
                 },
-                RejectionKind::DeleteRows,
-            ),
-            Self::DeleteRows(deleted) => (
-                RejectionEffect::RestoreRows {
-                    deleted: deleted.clone(),
-                },
-                RejectionKind::RestoreRows,
-            ),
-            Self::UpdateRows(updated) => (
-                RejectionEffect::RestoreUpdatedRows {
-                    updated: updated.clone(),
-                },
-                RejectionKind::RestoreUpdatedRows,
+                RejectionKind::RestoreRowChanges,
             ),
             Self::Index(operation) => (
                 RejectionEffect::RevertIndex {
@@ -236,28 +204,12 @@ impl MultiliteOp {
                 let schema = created.to_homebase()?;
                 (schema.mutations, schema.footprint, schema.guards)
             }
-            Self::InsertRows(inserted) => {
+            Self::ChangeRows(changes) => {
                 let RowHomebaseOp {
                     mutations,
                     footprint,
                     guards,
-                } = inserted.to_homebase()?;
-                (mutations, footprint, guards)
-            }
-            Self::DeleteRows(deleted) => {
-                let RowHomebaseOp {
-                    mutations,
-                    footprint,
-                    guards,
-                } = deleted.to_homebase()?;
-                (mutations, footprint, guards)
-            }
-            Self::UpdateRows(updated) => {
-                let RowHomebaseOp {
-                    mutations,
-                    footprint,
-                    guards,
-                } = updated.to_homebase()?;
+                } = changes.to_homebase()?;
                 (mutations, footprint, guards)
             }
             Self::Index(index) => {
@@ -294,9 +246,7 @@ impl MultiliteOp {
                 connection.execute(&created.materialization_sql(connection)?, ())?;
                 catalog::insert(connection, created)
             }
-            Self::InsertRows(inserted) => inserted.apply(connection),
-            Self::DeleteRows(deleted) => deleted.apply(connection),
-            Self::UpdateRows(updated) => updated.apply(connection),
+            Self::ChangeRows(changes) => changes.apply(connection),
             Self::Index(index) => index.apply(connection),
         }
     }
@@ -305,9 +255,7 @@ impl MultiliteOp {
     #[cfg(debug_assertions)]
     pub(super) fn verify_materialized(&self, connection: &Connection) -> Result<()> {
         match self {
-            Self::InsertRows(inserted) => inserted.verify_materialized(connection),
-            Self::DeleteRows(deleted) => deleted.verify_materialized(connection),
-            Self::UpdateRows(updated) => updated.verify_materialized(connection),
+            Self::ChangeRows(changes) => changes.verify_materialized(connection),
             Self::AlterTable(altered) => {
                 crate::physical::verify_table(connection, altered.table_id())
             }
@@ -347,7 +295,9 @@ mod tests {
 
     use super::*;
     use crate::catalog;
-    use crate::logical::row::{CapturedRow, DeleteRows, StoredValue, UpdateRows};
+    use crate::logical::row::{
+        CapturedRow, DeletedRowsFixture, RowSet, StoredValue, UpdatedRowsFixture,
+    };
     use crate::logical::schema::{CreateColumn, SqlName, TypeDeclaration};
 
     fn table() -> CreateTableSpec {
@@ -407,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn operation_codec_roundtrips_insert_rows() {
+    fn operation_codec_roundtrips_insert_shaped_row_changes() {
         let connection = Connection::open_in_memory().unwrap();
         catalog::initialize(&connection).unwrap();
         let created = CreateTable::new("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
         connection.execute(created.sql(), ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
-        let inserted = InsertRows::from_captured(
+        let inserted = RowSet::from_captured(
             &connection,
             &[CapturedRow {
                 table: "notes".into(),
@@ -423,7 +373,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let operation = MultiliteOp::InsertRows(inserted);
+        let operation = MultiliteOp::ChangeRows(RowChanges::inserted(inserted));
 
         assert_eq!(MultiliteOp::decode(&operation.encode()).unwrap(), operation);
         assert_eq!(
@@ -435,8 +385,8 @@ mod tests {
             Err(OperationCodecError::UnknownVersion(2))
         );
 
-        let deleted = MultiliteOp::DeleteRows(
-            DeleteRows::from_captured(
+        let deleted = MultiliteOp::ChangeRows(RowChanges::deleted(
+            DeletedRowsFixture::from_captured(
                 &connection,
                 &[CapturedRow {
                     table: "notes".into(),
@@ -446,7 +396,7 @@ mod tests {
             )
             .unwrap()
             .unwrap(),
-        );
+        ));
         assert_eq!(MultiliteOp::decode(&deleted.encode()).unwrap(), deleted);
         let (mutations, footprint) = deleted.to_homebase().unwrap().into_parts();
         assert!(matches!(mutations.as_slice(), [Mutation::Delete { .. }]));
@@ -485,8 +435,8 @@ mod tests {
         );
         connection.execute(update_table.sql(), ()).unwrap();
         catalog::insert(&connection, &update_table).unwrap();
-        let updated = MultiliteOp::UpdateRows(
-            UpdateRows::from_captured(
+        let updated = MultiliteOp::ChangeRows(RowChanges::updated(
+            UpdatedRowsFixture::from_captured(
                 &connection,
                 &[(
                     CapturedRow {
@@ -509,7 +459,7 @@ mod tests {
             )
             .unwrap()
             .unwrap(),
-        );
+        ));
         assert_eq!(MultiliteOp::decode(&updated.encode()).unwrap(), updated);
         let (mutations, footprint) = updated.to_homebase().unwrap().into_parts();
         assert!(matches!(mutations.as_slice(), [Mutation::Set { .. }]));

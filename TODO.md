@@ -21,19 +21,28 @@ multilite
   partial, custom-collation, or otherwise decorated UNIQUE indexes. Rich
   non-UNIQUE indexes remain synchronized schema and physical access paths only.
 
-- Keep conflict clauses, `REPLACE`, UPSERT, triggers, and mutating foreign-key
-  actions outside the grammar until capture has one statement-delta compiler.
-  That compiler must normalize mixed and repeated preupdate events into one
-  deterministic ordered net effect, derive guards for every affected table,
-  materialize procedural effects exactly once, and produce an exact inverse.
-  Specify OCC behavior independently for each conflict mode before admitting it.
+- The statement-delta compiler now normalizes mixed and repeated preupdate
+  events into one deterministic net effect, derives operation-wide guards, and
+  produces one exact inverse. `OR ABORT`, `OR IGNORE`, and UPSERT chains made
+  entirely of `DO NOTHING` are admitted. Keep `REPLACE`, `OR FAIL`,
+  `OR ROLLBACK`, UPSERT `DO UPDATE`, triggers, and mutating foreign-key actions
+  outside the grammar until each has an explicit OCC contract plus codec,
+  rejection-repair, operation-pair, and two-replica convergence coverage.
 
-- Make every durable operation encoder fallible and enforce one deterministic
-  capture budget across row count, row bytes, key components, operation bytes,
-  transaction bytes, DELETE repair, DROP COLUMN repair, and UNIQUE backfill.
-  Oversized statements must roll back atomically with stable typed errors.
-  Large values may later use chunked or sidecar storage, but must never reach an
-  allocation failure or `u32` conversion panic.
+- Row DML now has a deterministic 100,000-event / 64 MiB capture fence inside
+  the preupdate hook, normalized operation-size validation, and a 64 MiB
+  transaction-frame limit on encode and decode. Before launch, replace this
+  practical rejection boundary with bounded-memory spill/chunk support for
+  much larger atomic statements: append capture and before-images to private
+  spill storage, normalize across all chunks, encode chunked pending and
+  authority payloads under one transaction manifest, admit or reject the
+  complete statement as one unit, and recover or clean partial spill state
+  after crashes. Chunking must never expose partial statement commits. Keep a
+  configurable deterministic hard cap for disk/CPU/transport abuse, and add
+  boundary, crash, rejection-repair, reopen, and convergence tests. Extend the
+  same typed, fallible boundary to DROP COLUMN repair and UNIQUE backfill. No
+  remaining durable encoder may reach an allocation failure or `u32`
+  conversion panic.
 
 - Column rename/add/drop now preserve stable table and column identities and
   project old row frames through the folded catalog. DROP COLUMN still captures

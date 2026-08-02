@@ -17,20 +17,13 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateTable` | `Set` | `IndexDefinition` |
 | `CreateTable` | `Set` | `ColumnName` |
 | `CreateTable` | `Set` | `WriteRevision` |
-| `InsertRows` | `Set` | `Row` |
-| `InsertRows` | `Set` | `UniqueOwner` |
-| `InsertRows` | `Set` | `ForeignReference` |
-| `DeleteRows` | `Delete` | `Row` |
-| `DeleteRows` | `Delete` | `UniqueOwner` |
-| `DeleteRows` | `Delete` | `ForeignReference` |
-| `DeleteRows` | `DeletePrefix` | `ForeignReference` |
-| `UpdateRows` | `Set` | `Row` |
-| `UpdateRows` | `Set` | `UniqueOwner` |
-| `UpdateRows` | `Set` | `ForeignReference` |
-| `UpdateRows` | `Delete` | `Row` |
-| `UpdateRows` | `Delete` | `UniqueOwner` |
-| `UpdateRows` | `Delete` | `ForeignReference` |
-| `UpdateRows` | `DeletePrefix` | `ForeignReference` |
+| `RowChanges` | `Set` | `Row` |
+| `RowChanges` | `Set` | `UniqueOwner` |
+| `RowChanges` | `Set` | `ForeignReference` |
+| `RowChanges` | `Delete` | `Row` |
+| `RowChanges` | `Delete` | `UniqueOwner` |
+| `RowChanges` | `Delete` | `ForeignReference` |
+| `RowChanges` | `DeletePrefix` | `ForeignReference` |
 | `CreateIndex` | `Set` | `SchemaLog` |
 | `CreateIndex` | `Set` | `SchemaObjectName` |
 | `CreateIndex` | `Set` | `TableSchema` |
@@ -68,31 +61,16 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateTable` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
-| `InsertRows` | `Invariant` | `RowIdentity` | `Row` |
-| `InsertRows` | `Write` | `RowIdentity` | `Row` |
-| `InsertRows` | `Invariant` | `UniqueOwnership` | `UniqueOwner` |
-| `InsertRows` | `Write` | `UniqueOwnership` | `UniqueOwner` |
-| `InsertRows` | `Invariant` | `ForeignReference` | `ForeignReference` |
-| `InsertRows` | `Write` | `ForeignReference` | `ForeignReference` |
-| `InsertRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `InsertRows` | `Invariant` | `WriteContract` | `WriteRevision` |
-| `DeleteRows` | `Write` | `RowIdentity` | `Row` |
-| `DeleteRows` | `Write` | `UniqueOwnership` | `UniqueOwner` |
-| `DeleteRows` | `Write` | `ForeignReference` | `ForeignReference` |
-| `DeleteRows` | `Invariant` | `ForeignChildren` | `ForeignReference` |
-| `DeleteRows` | `Write` | `ForeignChildren` | `ForeignReference` |
-| `DeleteRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `DeleteRows` | `Invariant` | `WriteContract` | `WriteRevision` |
-| `UpdateRows` | `Invariant` | `RowIdentity` | `Row` |
-| `UpdateRows` | `Write` | `RowIdentity` | `Row` |
-| `UpdateRows` | `Invariant` | `UniqueOwnership` | `UniqueOwner` |
-| `UpdateRows` | `Write` | `UniqueOwnership` | `UniqueOwner` |
-| `UpdateRows` | `Invariant` | `ForeignReference` | `ForeignReference` |
-| `UpdateRows` | `Write` | `ForeignReference` | `ForeignReference` |
-| `UpdateRows` | `Invariant` | `ForeignChildren` | `ForeignReference` |
-| `UpdateRows` | `Write` | `ForeignChildren` | `ForeignReference` |
-| `UpdateRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `UpdateRows` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `RowChanges` | `Invariant` | `RowIdentity` | `Row` |
+| `RowChanges` | `Write` | `RowIdentity` | `Row` |
+| `RowChanges` | `Invariant` | `UniqueOwnership` | `UniqueOwner` |
+| `RowChanges` | `Write` | `UniqueOwnership` | `UniqueOwner` |
+| `RowChanges` | `Invariant` | `ForeignReference` | `ForeignReference` |
+| `RowChanges` | `Write` | `ForeignReference` | `ForeignReference` |
+| `RowChanges` | `Invariant` | `ForeignChildren` | `ForeignReference` |
+| `RowChanges` | `Write` | `ForeignChildren` | `ForeignReference` |
+| `RowChanges` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
+| `RowChanges` | `Invariant` | `WriteContract` | `WriteRevision` |
 | `CreateIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateIndex` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `CreateIndex` | `Write` | `SchemaRevision` | `ActiveSchemaRevision` |
@@ -124,9 +102,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | Operation | Local inverse |
 | --- | --- |
 | `CreateTable` | `DropTable` |
-| `InsertRows` | `DeleteRows` |
-| `DeleteRows` | `RestoreRows` |
-| `UpdateRows` | `RestoreUpdatedRows` |
+| `RowChanges` | `RestoreRowChanges` |
 | `CreateIndex` | `RevertIndex` |
 | `DropIndex` | `RevertIndex` |
 | `RenameTable` | `RevertAlterTable` |
@@ -142,12 +118,8 @@ These family-level guards must occur at least once. In addition, the compiler re
 | --- | --- | --- | --- |
 | `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
-| `InsertRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `InsertRows` | `Invariant` | `WriteContract` | `WriteRevision` |
-| `DeleteRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `DeleteRows` | `Invariant` | `WriteContract` | `WriteRevision` |
-| `UpdateRows` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
-| `UpdateRows` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `RowChanges` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
+| `RowChanges` | `Invariant` | `WriteContract` | `WriteRevision` |
 | `CreateIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateIndex` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `CreateIndex` | `Write` | `SchemaRevision` | `ActiveSchemaRevision` |

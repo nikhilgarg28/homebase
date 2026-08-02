@@ -20,7 +20,7 @@ use crate::logical::alter::AlterTableOperation;
 use crate::logical::guard::{GuardPlan, GuardReason, OperationFamily};
 use crate::logical::index::IndexOperation;
 use crate::logical::operation::{CompiledOperation, MultiliteOp};
-use crate::logical::row::{CapturedChange, DeleteRows, InsertRows, UpdateRows};
+use crate::logical::row::{CaptureBudget, CapturedChange, RowChanges};
 use crate::logical::schema::{CreateTable, TableId, table_prefix};
 use crate::logical::transaction::MultiliteTransaction;
 use crate::runtime::ExecutionMode;
@@ -196,9 +196,9 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 self.record_operation(compiled);
                 Ok(changed)
             }
-            ValidatedExecute::Insert => self.execute_captured(sql, params, compile_insert_changes),
-            ValidatedExecute::Delete => self.execute_captured(sql, params, compile_delete_changes),
-            ValidatedExecute::Update => self.execute_captured(sql, params, compile_update_changes),
+            ValidatedExecute::Insert | ValidatedExecute::Delete | ValidatedExecute::Update => {
+                self.execute_captured(sql, params, compile_row_changes)
+            }
         }
     }
 
@@ -275,87 +275,18 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     }
 }
 
-fn compile_insert_changes(
+fn compile_row_changes(
     catalog: &CatalogSnapshot,
     events: Vec<CapturedChange>,
 ) -> Result<Option<CompiledOperation>> {
-    let had_events = !events.is_empty();
-    let captured = events
-        .into_iter()
-        .map(|event| match event {
-            CapturedChange::Insert(row) => Ok(row),
-            CapturedChange::Delete(_) | CapturedChange::Update { .. } => Err(
-                Error::CaptureInvariant("INSERT captured a non-insert application row"),
-            ),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let inserted = InsertRows::from_catalog(catalog, &captured)?;
-    if inserted.is_none() && had_events {
-        return Err(Error::UnsupportedSql(
-            "INSERT target has no synchronized schema identity",
-        ));
-    }
-    inserted
-        .map(|inserted| MultiliteOp::InsertRows(inserted).compile())
-        .transpose()
-}
-
-fn compile_delete_changes(
-    catalog: &CatalogSnapshot,
-    events: Vec<CapturedChange>,
-) -> Result<Option<CompiledOperation>> {
-    let had_events = !events.is_empty();
-    let captured = events
-        .into_iter()
-        .map(|event| match event {
-            CapturedChange::Delete(row) => Ok(row),
-            CapturedChange::Insert(_) | CapturedChange::Update { .. } => Err(
-                Error::CaptureInvariant("DELETE captured a non-delete application row"),
-            ),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let deleted = DeleteRows::from_catalog(catalog, &captured)?;
-    if deleted.is_none() && had_events {
-        return Err(Error::UnsupportedSql(
-            "DELETE target has no synchronized schema identity",
-        ));
-    }
-    deleted
-        .map(|deleted| MultiliteOp::DeleteRows(deleted).compile())
-        .transpose()
-}
-
-fn compile_update_changes(
-    catalog: &CatalogSnapshot,
-    events: Vec<CapturedChange>,
-) -> Result<Option<CompiledOperation>> {
-    let had_events = !events.is_empty();
-    let captured = events
-        .into_iter()
-        .map(|event| match event {
-            CapturedChange::Update { before, after } => Ok((before, after)),
-            CapturedChange::Insert(_) | CapturedChange::Delete(_) => Err(Error::CaptureInvariant(
-                "UPDATE captured a non-update application row",
-            )),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let updated = UpdateRows::from_catalog(catalog, &captured)?;
-    if updated.is_none()
-        && had_events
-        && let Some((before, _)) = captured.first()
-        && catalog.by_name(&before.table).is_none()
-    {
-        return Err(Error::UnsupportedSql(
-            "UPDATE target has no synchronized schema identity",
-        ));
-    }
-    updated
-        .map(|updated| MultiliteOp::UpdateRows(updated).compile())
+    RowChanges::from_catalog(catalog, events)?
+        .map(|changes| MultiliteOp::ChangeRows(changes).compile())
         .transpose()
 }
 
 struct BranchHookState {
     events: Vec<CapturedChange>,
+    capture_budget: CaptureBudget,
     error: Option<Error>,
     internal_depth: usize,
     read_trace_suppression_depth: usize,
@@ -372,9 +303,18 @@ struct BranchHooks<'connection> {
 
 impl<'connection> BranchHooks<'connection> {
     fn install(connection: &'connection Connection, trace_reads: bool) -> Result<Self> {
+        Self::install_with_budget(connection, trace_reads, CaptureBudget::default())
+    }
+
+    fn install_with_budget(
+        connection: &'connection Connection,
+        trace_reads: bool,
+        capture_budget: CaptureBudget,
+    ) -> Result<Self> {
         let catalog = CatalogSnapshot::load(connection)?;
         let state = Arc::new(Mutex::new(BranchHookState {
             events: Vec::new(),
+            capture_budget,
             error: None,
             internal_depth: 0,
             read_trace_suppression_depth: 0,
@@ -421,7 +361,10 @@ impl<'connection> BranchHooks<'connection> {
                     return;
                 }
                 match super::capture_change(ExecutionMode::Public, database, table, update) {
-                    Ok(Some(event)) => state.events.push(event),
+                    Ok(Some(event)) => match state.capture_budget.record(&event) {
+                        Ok(()) => state.events.push(event),
+                        Err(error) => state.error = Some(error),
+                    },
                     Ok(None) => {}
                     Err(error) => state.error = Some(error),
                 }
@@ -453,7 +396,11 @@ impl<'connection> BranchHooks<'connection> {
         finalize: impl FnOnce(&mut Vec<CapturedChange>) -> Result<()>,
         refresh_bindings: bool,
     ) -> Result<(T, Vec<CapturedChange>)> {
-        let checkpoint = lock(&self.state).events.len();
+        let checkpoint = {
+            let mut state = lock(&self.state);
+            state.capture_budget.reset();
+            state.events.len()
+        };
         self.with_internal(|| {
             self.connection
                 .execute_batch("SAVEPOINT __multilite__branch_statement")?;
@@ -703,6 +650,41 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_limit_rolls_back_the_complete_sqlite_statement() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        let hooks = BranchHooks::install_with_budget(
+            &connection,
+            false,
+            CaptureBudget::with_limits(1, usize::MAX),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            hooks.run(
+                || {
+                    connection.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            ),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-change count",
+                limit: 1,
+            })
+        ));
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn rollback_failure_preserves_both_errors() {

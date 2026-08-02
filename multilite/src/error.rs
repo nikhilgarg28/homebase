@@ -37,6 +37,13 @@ pub enum Error {
     Checkpoint(String),
     /// A SQLite hook observed a state that violates its capture contract.
     CaptureInvariant(&'static str),
+    /// A statement exceeded a deterministic capture or durable-frame limit.
+    CaptureLimitExceeded {
+        /// The bounded resource.
+        resource: &'static str,
+        /// Maximum accepted value for that resource.
+        limit: usize,
+    },
     /// Durable Homebase metadata storage failed.
     Storage(StorageError),
     /// The file violates the one-space Multilite schema or metadata contract.
@@ -107,6 +114,9 @@ impl fmt::Display for Error {
             Self::CaptureInvariant(message) => {
                 write!(f, "SQLite capture invariant failed: {message}")
             }
+            Self::CaptureLimitExceeded { resource, limit } => {
+                write!(f, "Multilite {resource} limit exceeded (max {limit})")
+            }
             Self::Storage(error) => write!(f, "metadata storage error: {error}"),
             Self::InvalidDatabase(message) => write!(f, "invalid Multilite database: {message}"),
             Self::DatabaseIdMismatch { expected, actual } => write!(
@@ -155,7 +165,7 @@ impl std::error::Error for Error {
             | Self::BackgroundWorker(_)
             | Self::Committer(_)
             | Self::Checkpoint(_) => None,
-            Self::CaptureInvariant(_) => None,
+            Self::CaptureInvariant(_) | Self::CaptureLimitExceeded { .. } => None,
             Self::Storage(error) => Some(error),
             Self::InvalidDatabase(_)
             | Self::DatabaseIdMismatch { .. }

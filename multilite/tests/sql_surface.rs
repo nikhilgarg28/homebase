@@ -1442,6 +1442,8 @@ fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
 
     for sql in [
         "UPDATE OR REPLACE notes SET body = 'x'",
+        "UPDATE OR FAIL notes SET body = 'x'",
+        "UPDATE OR ROLLBACK notes SET body = 'x'",
         "UPDATE main.notes SET body = 'x'",
         "UPDATE notes AS old SET body = 'x'",
         "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
@@ -1749,7 +1751,7 @@ fn trigger_generated_update_effects_abort_the_whole_statement() {
 }
 
 #[test]
-fn replace_and_every_insert_conflict_clause_are_rejected_without_mutation() {
+fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("conflicts.sqlite")).unwrap();
     db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
@@ -1760,14 +1762,53 @@ fn replace_and_every_insert_conflict_clause_are_rejected_without_mutation() {
     for sql in [
         "REPLACE INTO notes VALUES (1, 'replaced')",
         "INSERT OR REPLACE INTO notes VALUES (1, 'replaced')",
-        "INSERT OR IGNORE INTO notes VALUES (1, 'ignored')",
+        "INSERT OR FAIL INTO notes VALUES (1, 'failed')",
+        "INSERT OR ROLLBACK INTO notes VALUES (1, 'rolled-back')",
         "INSERT INTO notes VALUES (1, 'updated')
          ON CONFLICT(id) DO UPDATE SET body = excluded.body",
-        "INSERT INTO notes VALUES (1, 'ignored') ON CONFLICT DO NOTHING",
     ] {
         assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
         assert_eq!(read_note(&db), "original");
     }
+
+    assert_eq!(
+        db.execute("INSERT OR IGNORE INTO notes VALUES (1, 'ignored')", ())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "INSERT INTO notes VALUES (1, 'ignored') ON CONFLICT DO NOTHING",
+            (),
+        )
+        .unwrap(),
+        0
+    );
+    assert!(matches!(
+        db.execute("INSERT OR ABORT INTO notes VALUES (1, 'aborted')", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(read_note(&db), "original");
+
+    db.execute("INSERT INTO notes VALUES (2, 'second')", ())
+        .unwrap();
+    assert_eq!(
+        db.execute("UPDATE OR IGNORE notes SET id = 1 WHERE id = 2", ())
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        db.execute("UPDATE OR ABORT notes SET id = 1 WHERE id = 2", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id, body FROM notes ORDER BY id", (), |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+        )),)
+            .unwrap(),
+        [(1, "original".into()), (2, "second".into())]
+    );
 }
 
 #[test]
