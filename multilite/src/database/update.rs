@@ -17,6 +17,7 @@ use crate::commit::committer::{CommitSnapshot, HistoryPin};
 use crate::commit::footprint::ConflictFootprint;
 use crate::commit::proposal::CommitProposal;
 use crate::logical::alter::AlterTableOperation;
+use crate::logical::drop_table::DropTableOperation;
 use crate::logical::guard::{GuardPlan, GuardReason, OperationFamily};
 use crate::logical::index::IndexOperation;
 use crate::logical::operation::{CompiledOperation, MultiliteOp};
@@ -147,6 +148,29 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     ));
                 }
                 self.record_operation(operation);
+                Ok(changed)
+            }
+            ValidatedExecute::DropTable(spec) => {
+                let operation = self
+                    .hooks
+                    .with_internal(|| DropTableOperation::prepare(self.connection, sql, &spec))?;
+                let compiled = MultiliteOp::DropTable(operation.clone()).compile()?;
+                let (changed, events) = self.hooks.run_schema(
+                    || {
+                        let changed = self.connection.execute(sql, params)?;
+                        self.hooks.with_internal(|| {
+                            catalog::remove_by_id(self.connection, operation.table_id())
+                        })?;
+                        Ok(changed)
+                    },
+                    |_| Ok(()),
+                )?;
+                if !events.is_empty() {
+                    return Err(Error::CaptureInvariant(
+                        "DROP TABLE captured application rows",
+                    ));
+                }
+                self.record_operation(compiled);
                 Ok(changed)
             }
             ValidatedExecute::CreateIndex(spec) => {

@@ -555,6 +555,9 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         AuthAction::CreateTable { table_name } => {
             authorize_user_table(context.database_name, table_name)
         }
+        AuthAction::DropTable { table_name } => {
+            authorize_user_table(context.database_name, table_name)
+        }
         AuthAction::AlterTable {
             database_name,
             table_name,

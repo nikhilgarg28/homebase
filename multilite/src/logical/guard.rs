@@ -37,6 +37,7 @@ pub enum TargetFamily {
 pub enum OperationFamily {
     TransactionEnvelope,
     CreateTable,
+    DropTable,
     RowChanges,
     CreateIndex,
     DropIndex,
@@ -84,6 +85,10 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(CreateTable, Set, IndexDefinition),
     mutation_contract!(CreateTable, Set, ColumnName),
     mutation_contract!(CreateTable, Set, WriteRevision),
+    mutation_contract!(DropTable, Set, SchemaLog),
+    mutation_contract!(DropTable, Delete, SchemaObjectName),
+    mutation_contract!(DropTable, DeletePrefix, TableRoot),
+    mutation_contract!(DropTable, DeletePrefix, ForeignReference),
     mutation_contract!(RowChanges, Set, Row),
     mutation_contract!(RowChanges, Set, UniqueOwner),
     mutation_contract!(RowChanges, Set, ForeignReference),
@@ -125,7 +130,8 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
 /// Local materialized-state repair selected when authority rejects an op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RejectionKind {
-    DropTable,
+    RemoveCreatedTable,
+    RestoreDroppedTable,
     RestoreRowChanges,
     RevertIndex,
     RevertAlterTable,
@@ -149,7 +155,8 @@ macro_rules! rejection_contract {
 
 /// Central allowlist for speculative rejection repair.
 pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
-    rejection_contract!(CreateTable, DropTable),
+    rejection_contract!(CreateTable, RemoveCreatedTable),
+    rejection_contract!(DropTable, RestoreDroppedTable),
     rejection_contract!(RowChanges, RestoreRowChanges),
     rejection_contract!(CreateIndex, RevertIndex),
     rejection_contract!(DropIndex, RevertIndex),
@@ -246,6 +253,7 @@ pub enum GuardReason {
     ForeignChildren,
     ColumnDependency,
     ExistingRows,
+    TableExistence,
     SerializableRead,
 }
 
@@ -274,6 +282,11 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Invariant, SchemaRevision, ActiveSchemaRevision),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
+    contract!(DropTable, Invariant, TableExistence, TableRoot),
+    contract!(DropTable, Write, TableExistence, TableRoot),
+    contract!(DropTable, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropTable, Invariant, ForeignReference, ForeignReference),
+    contract!(DropTable, Write, ForeignReference, ForeignReference),
     contract!(RowChanges, Invariant, RowIdentity, Row),
     contract!(RowChanges, Write, RowIdentity, Row),
     contract!(RowChanges, Invariant, UniqueOwnership, UniqueOwner),
@@ -324,6 +337,9 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
 pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
+    contract!(DropTable, Invariant, TableExistence, TableRoot),
+    contract!(DropTable, Write, TableExistence, TableRoot),
+    contract!(DropTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(RowChanges, Invariant, PrimaryIndex, ActivePrimaryIndex),
     contract!(RowChanges, Invariant, WriteContract, WriteRevision),
     contract!(CreateIndex, Invariant, SchemaObjectName, SchemaObjectName),
@@ -567,21 +583,22 @@ fn mutation_guard_requirements(
     use GuardClass::{Invariant, Write};
     use GuardReason::{
         ColumnDependency, ColumnNameBinding, ForeignChildren, ForeignReference, RowIdentity,
-        SchemaObjectName, SchemaRevision, UniqueOwnership, WriteContract,
+        SchemaObjectName, SchemaRevision, TableExistence, UniqueOwnership, WriteContract,
     };
     use MutationKind::{Delete, DeletePrefix, Set};
     use OperationFamily::{
-        AddColumn, CreateIndex, CreateTable, DropColumn, DropIndex, RenameColumn, RenameTable,
-        RowChanges,
+        AddColumn, CreateIndex, CreateTable, DropColumn, DropIndex, DropTable, RenameColumn,
+        RenameTable, RowChanges,
     };
     use TargetFamily::{
         ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
         ForeignReference as ForeignReferenceTarget, Row,
-        SchemaObjectName as SchemaObjectNameTarget, UniqueOwner, WriteRevision,
+        SchemaObjectName as SchemaObjectNameTarget, TableRoot, UniqueOwner, WriteRevision,
     };
 
     match (operation, kind, family) {
         (CreateTable, Set, SchemaObjectNameTarget)
+        | (DropTable, Delete, SchemaObjectNameTarget)
         | (RenameTable, Set | Delete, SchemaObjectNameTarget)
         | (CreateIndex, Set, SchemaObjectNameTarget)
         | (DropIndex, Delete, SchemaObjectNameTarget) => &[(Invariant, SchemaObjectName)],
@@ -606,6 +623,12 @@ fn mutation_guard_requirements(
         (RowChanges, Delete, ForeignReferenceTarget) => &[(Write, ForeignReference)],
         (RowChanges, DeletePrefix, ForeignReferenceTarget) => {
             &[(Invariant, ForeignChildren), (Write, ForeignChildren)]
+        }
+        (DropTable, DeletePrefix, TableRoot) => {
+            &[(Invariant, TableExistence), (Write, TableExistence)]
+        }
+        (DropTable, DeletePrefix, ForeignReferenceTarget) => {
+            &[(Invariant, ForeignReference), (Write, ForeignReference)]
         }
         _ => &[],
     }
@@ -1188,7 +1211,13 @@ mod tests {
             RejectionKind::RestoreRowChanges,
         )
         .unwrap();
-        assert!(validate_rejection(OperationFamily::RowChanges, RejectionKind::DropTable).is_err());
+        assert!(
+            validate_rejection(
+                OperationFamily::RowChanges,
+                RejectionKind::RemoveCreatedTable,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1275,6 +1304,7 @@ mod tests {
 
         let logical_operations = BTreeSet::from([
             OperationFamily::CreateTable,
+            OperationFamily::DropTable,
             OperationFamily::RowChanges,
             OperationFamily::CreateIndex,
             OperationFamily::DropIndex,

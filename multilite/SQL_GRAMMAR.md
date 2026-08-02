@@ -4,7 +4,7 @@ Multilite's SQL grammar grows only through the completion gate below. The
 logical-operation compiler, verifier, and guard registry are now the stable
 path for admitting compatible syntax. The current executable families are
 restricted `CREATE TABLE`, `ALTER TABLE` rename/add/drop forms,
-`CREATE [UNIQUE] INDEX`, `DROP INDEX`, `SELECT`, `INSERT`, `DELETE`, and
+`DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `SELECT`, `INSERT`, `DELETE`, and
 `UPDATE`. Exact accepted forms are defined by tests and the parser; accepting a
 SQLite statement does not imply that every SQLite spelling is supported.
 
@@ -27,10 +27,13 @@ images. The normalized row operation and enclosing transaction frame enforce
 the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls
 back the complete SQLite statement with a typed error.
 
-`DROP COLUMN` replicates metadata only. Its originating replica streams the
-dropped values into a local repair sidecar, currently bounded at 100,000 rows
-and 64 MiB. Crossing either limit refuses the statement before schema,
-pending-journal, or sidecar state becomes durable.
+`DROP COLUMN` and `DROP TABLE` replicate metadata only. Their originating
+replica streams dropped values or complete row images into a local repair
+sidecar, currently bounded at 100,000 rows and 64 MiB. `DROP TABLE` supports
+declared composite primary keys and restores explicit indexes, but rejects a
+table still targeted by a synchronized foreign key. Crossing either limit
+refuses the statement before schema, pending-journal, or sidecar state becomes
+durable.
 
 ## Completion Gate
 

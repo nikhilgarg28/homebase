@@ -1830,7 +1830,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     assert_eq!(pending[0].seq, DeviceSeq(1));
     assert!(matches!(
         pending[0].rejection().unwrap().as_slice(),
-        [crate::logical::operation::RejectionEffect::DropTable { created }]
+        [crate::logical::operation::RejectionEffect::RemoveCreatedTable { created }]
             if created.table_name() == "notes"
     ));
 

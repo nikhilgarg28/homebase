@@ -328,8 +328,13 @@ impl MultiliteTransaction {
     }
 
     /// Local repair jobs that must exist while this transaction is pending.
+    #[cfg(test)]
     pub(crate) fn repair_ids(&self) -> impl Iterator<Item = crate::repair::RepairId> + '_ {
         self.operations.iter().filter_map(MultiliteOp::repair_id)
+    }
+
+    pub(crate) fn repair_specs(&self) -> impl Iterator<Item = crate::repair::RepairSpec> + '_ {
+        self.operations.iter().filter_map(MultiliteOp::repair_spec)
     }
 
     /// Raise and authenticate one complete admitted transaction batch.
@@ -543,7 +548,7 @@ mod tests {
             compiled.rejection(),
             [
                 RejectionEffect::RestoreRowChanges { .. },
-                RejectionEffect::DropTable { .. }
+                RejectionEffect::RemoveCreatedTable { .. }
             ]
         ));
         assert_eq!(lowered.mutations.len(), 10);

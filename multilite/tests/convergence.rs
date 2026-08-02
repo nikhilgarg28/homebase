@@ -4167,6 +4167,114 @@ fn composite_without_rowid_rows_converge_and_repair_conflicts() {
 }
 
 #[test]
+fn rejected_drop_table_restores_composite_rows_indexes_across_restart_and_converges() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let second_path = directory.path().join("drop-table-second.sqlite");
+    let first = MultiliteConnection::open_with(
+        directory.path().join("drop-table-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE inventory (
+                    tenant TEXT,
+                    sku INTEGER,
+                    body ANY,
+                    PRIMARY KEY (tenant, sku)
+                ) WITHOUT ROWID",
+                (),
+            )?;
+            transaction.execute("CREATE INDEX inventory_body ON inventory(body)", ())?;
+            transaction.execute(
+                "INSERT INTO inventory VALUES
+                    ('north', 1, X'CAFE'),
+                    ('south', 2, NULL)",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("INSERT INTO inventory VALUES ('west', 3, 7.5)", ())
+        .unwrap();
+    second.execute("DROP TABLE inventory", ()).unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+        panic!("stale DROP TABLE was not rejected")
+    };
+    drop(second);
+
+    let second = MultiliteConnection::open_with(
+        &second_path,
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(
+        second
+            .query("SELECT * FROM inventory", (), |_| Ok(()))
+            .is_err()
+    );
+    second.rollback(&rejection).unwrap();
+    assert_eq!(
+        second
+            .query(
+                "SELECT tenant, sku, typeof(body), body IS NULL
+                 FROM inventory ORDER BY tenant, sku",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        [
+            ("north".into(), 1, "blob".into(), false),
+            ("south".into(), 2, "null".into(), true),
+        ]
+    );
+    assert_eq!(index_names(&second), ["inventory_body"]);
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query(
+                    "SELECT tenant, sku FROM inventory ORDER BY tenant, sku",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            [("north".into(), 1), ("south".into(), 2), ("west".into(), 3),]
+        );
+        assert_eq!(index_names(database), ["inventory_body"]);
+    }
+}
+
+#[test]
 fn composite_update_and_delete_repairs_survive_restart_and_converge() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

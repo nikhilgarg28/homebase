@@ -95,15 +95,17 @@ the Homebase submit window. Capture is fenced at 100,000 direct row events and
 with a typed error rather than retaining unbounded memory or reaching a codec
 length panic.
 
-`DROP COLUMN` follows the same logical/pending lifecycle but keeps destroyed
-column values in local SQLite repair tables. Capture uses a streaming
-`INSERT ... SELECT`, so user-space memory is constant and the replicated frame
-contains only mutation identity plus before/after schema IR. Acceptance retires
-the repair job with its pending prefix; rejection restores values by declared
-primary-key identity before rebuilding the original table definition. Reopen
-requires repair jobs to match pending destructive operations exactly. The
-current sidecar copy is refused above 100,000 rows or 64 MiB with a typed,
-atomic error; spillable larger captures remain launch work.
+`DROP COLUMN` and `DROP TABLE` follow the same logical/pending lifecycle but
+keep destroyed values in local SQLite repair tables. Capture streams directly
+from the user table into the sidecar, so user-space memory is bounded by one
+row and replicated frames contain schema metadata only. Acceptance retires the
+repair job with its pending prefix; rejection restores values by declared
+primary-key identity before rebuilding the original column or complete table,
+including explicit indexes and the exact local catalog fold. Reopen requires
+repair jobs to match pending destructive operations exactly. Dropping a table
+still referenced by a synchronized foreign key is rejected. The current
+sidecar copy is refused above 100,000 rows or 64 MiB with a typed, atomic error;
+spillable larger captures remain launch work.
 
 Ordinary secondary indexes are synchronized schema and physical SQLite access
 paths only. Their names and definitions converge across replicas, but row

@@ -7,6 +7,7 @@
 
 pub(crate) mod alter;
 pub(crate) mod codes;
+pub(crate) mod drop_table;
 pub(crate) mod guard;
 pub(crate) mod index;
 pub(crate) mod isolation;

@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use homebase_core::reader::Reader;
+use homebase_core::writer::Writer;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::logical::schema::{
@@ -13,6 +15,73 @@ use crate::{Error, Result};
 const TABLE: &str = "__multilite__schema";
 const COLUMN_TABLE: &str = "__multilite__schema_columns";
 const MAIN_SCHEMA: &str = "main";
+const TABLE_STATE_VERSION: u8 = 1;
+const TAG_TABLE_NAME: u8 = 1;
+const TAG_DEFINITION: u8 = 2;
+const TAG_COLUMN: u8 = 3;
+const TAG_COLUMN_ID: u8 = 1;
+const TAG_PREDECESSOR_ID: u8 = 2;
+const TAG_COLUMN_NAME: u8 = 3;
+
+/// Complete local catalog fold retained only for rejected table destruction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableState {
+    name: SqlName,
+    definition: CreateTable,
+    columns: Vec<ColumnState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnState {
+    id: ColumnId,
+    predecessor: Option<ColumnId>,
+    name: Option<Vec<u8>>,
+}
+
+impl TableState {
+    pub(crate) fn name(&self) -> &SqlName {
+        &self.name
+    }
+
+    pub(crate) fn definition(&self) -> &CreateTable {
+        &self.definition
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        writer.u8(TABLE_STATE_VERSION);
+        writer
+            .field(TAG_TABLE_NAME, self.name.canonical())
+            .map_err(|_| Error::CaptureInvariant("catalog repair name is too large"))?;
+        writer
+            .field(TAG_DEFINITION, &self.definition.encode())
+            .map_err(|_| Error::CaptureInvariant("catalog repair definition is too large"))?;
+        for column in &self.columns {
+            let mut encoded = Writer::new();
+            encoded
+                .field(TAG_COLUMN_ID, &column.id.as_bytes())
+                .map_err(|_| Error::CaptureInvariant("catalog repair column is too large"))?;
+            if let Some(predecessor) = column.predecessor {
+                encoded
+                    .field(TAG_PREDECESSOR_ID, &predecessor.as_bytes())
+                    .map_err(|_| Error::CaptureInvariant("catalog repair column is too large"))?;
+            }
+            if let Some(name) = &column.name {
+                encoded
+                    .field(TAG_COLUMN_NAME, name)
+                    .map_err(|_| Error::CaptureInvariant("catalog repair column is too large"))?;
+            }
+            writer
+                .field(TAG_COLUMN, &encoded.finish())
+                .map_err(|_| Error::CaptureInvariant("catalog repair state is too large"))?;
+        }
+        Ok(writer.finish())
+    }
+
+    pub(crate) fn decode(frame: &[u8]) -> Result<Self> {
+        decode_table_state(frame)
+    }
+}
 
 /// One validated, immutable view of the logical schema catalog.
 ///
@@ -342,6 +411,101 @@ pub fn replace(connection: &Connection, definition: &CreateTable) -> Result<()> 
         return Err(Error::InvalidDatabase(
             "schema catalog table changed during DDL",
         ));
+    }
+    Ok(())
+}
+
+/// Capture the exact local fold, including retired column-order nodes.
+pub(crate) fn capture_table_state(connection: &Connection, table: TableId) -> Result<TableState> {
+    let (encoded_name, encoded_definition) = connection
+        .query_row(
+            &format!(
+                "SELECT table_name, definition FROM {TABLE}
+                 WHERE schema_name = ?1 AND table_id = ?2"
+            ),
+            params![MAIN_SCHEMA, table.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+        .ok_or(Error::InvalidDatabase(
+            "DROP TABLE identity is missing from the schema catalog",
+        ))?;
+    let name = decode_binding(&encoded_name)?;
+    let definition = decode_definition(&encoded_definition)?;
+    if definition.table_id() != table || name.canonical() != encoded_name {
+        return Err(Error::InvalidDatabase(
+            "DROP TABLE catalog binding contradicts its definition",
+        ));
+    }
+    let mut statement = connection.prepare(&format!(
+        "SELECT column_id, predecessor_id, column_name FROM {COLUMN_TABLE}
+         WHERE table_id = ?1 ORDER BY column_id"
+    ))?;
+    let columns = statement
+        .query_map([table.as_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (id, predecessor, name) = row?;
+            Ok(ColumnState {
+                id: decode_column_id(&id)?,
+                predecessor: predecessor.as_deref().map(decode_column_id).transpose()?,
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(Error::InvalidDatabase(
+            "DROP TABLE catalog has no column-order state",
+        ));
+    }
+    let state = TableState {
+        name,
+        definition,
+        columns,
+    };
+    validate_table_state(&state)?;
+    Ok(state)
+}
+
+/// Restore one exact local catalog fold after rejected table destruction.
+pub(crate) fn restore_table_state(connection: &Connection, state: &TableState) -> Result<()> {
+    validate_table_state(state)?;
+    let table = state.definition.table_id();
+    if by_id(connection, table)?.is_some() || by_name(connection, state.name.value())?.is_some() {
+        return Err(Error::InvalidDatabase(
+            "pending DROP TABLE catalog identity or name is already occupied",
+        ));
+    }
+    connection.execute(
+        &format!(
+            "INSERT INTO {TABLE} (schema_name, table_name, table_id, definition)
+             VALUES (?1, ?2, ?3, ?4)"
+        ),
+        params![
+            MAIN_SCHEMA,
+            state.name.canonical(),
+            table.as_bytes().as_slice(),
+            state.definition.encode(),
+        ],
+    )?;
+    let mut insert = connection.prepare(&format!(
+        "INSERT INTO {COLUMN_TABLE}
+            (table_id, column_id, predecessor_id, column_name)
+         VALUES (?1, ?2, ?3, ?4)"
+    ))?;
+    for column in &state.columns {
+        let predecessor = column.predecessor.map(ColumnId::as_bytes);
+        insert.execute(params![
+            table.as_bytes().as_slice(),
+            column.id.as_bytes().as_slice(),
+            predecessor.as_ref().map(<[u8; 16]>::as_slice),
+            column.name.as_deref(),
+        ])?;
     }
     Ok(())
 }
@@ -774,6 +938,134 @@ fn decode_column_id(bytes: &[u8]) -> Result<ColumnId> {
     Ok(ColumnId::from_bytes(bytes))
 }
 
+fn decode_table_state(frame: &[u8]) -> Result<TableState> {
+    let mut reader = Reader::new(frame);
+    if reader.u8() != Some(TABLE_STATE_VERSION) {
+        return Err(invalid_table_state());
+    }
+    let mut name = None;
+    let mut definition = None;
+    let mut columns = Vec::new();
+    while let Some((tag, value)) = reader.field().map_err(|_| invalid_table_state())? {
+        match tag {
+            TAG_TABLE_NAME => set_once(&mut name, decode_binding(value)?)?,
+            TAG_DEFINITION => set_once(&mut definition, decode_definition(value)?)?,
+            TAG_COLUMN => columns.push(decode_column_state(value)?),
+            _ => {}
+        }
+    }
+    let state = TableState {
+        name: name.ok_or_else(invalid_table_state)?,
+        definition: definition.ok_or_else(invalid_table_state)?,
+        columns,
+    };
+    validate_table_state(&state)?;
+    Ok(state)
+}
+
+fn decode_column_state(frame: &[u8]) -> Result<ColumnState> {
+    let mut reader = Reader::new(frame);
+    let mut id = None;
+    let mut predecessor = None;
+    let mut name = None;
+    while let Some((tag, value)) = reader.field().map_err(|_| invalid_table_state())? {
+        match tag {
+            TAG_COLUMN_ID => set_once(&mut id, decode_column_id(value)?)?,
+            TAG_PREDECESSOR_ID => set_once(&mut predecessor, Some(decode_column_id(value)?))?,
+            TAG_COLUMN_NAME => {
+                let decoded = decode_column_binding(value)?;
+                set_once(&mut name, Some(decoded.canonical().to_vec()))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(ColumnState {
+        id: id.ok_or_else(invalid_table_state)?,
+        predecessor: predecessor.unwrap_or(None),
+        name: name.unwrap_or(None),
+    })
+}
+
+fn validate_table_state(state: &TableState) -> Result<()> {
+    state
+        .definition
+        .validate_ir()
+        .map_err(|_| invalid_table_state())?;
+    if state.columns.is_empty() {
+        return Err(invalid_table_state());
+    }
+    let mut nodes = BTreeMap::<ColumnId, (Option<ColumnId>, bool)>::new();
+    let mut active_names = BTreeSet::new();
+    for column in &state.columns {
+        if column.name.as_ref().is_some_and(|name| {
+            decode_column_binding(name).is_err() || !active_names.insert(name.clone())
+        }) || nodes
+            .insert(column.id, (column.predecessor, column.name.is_some()))
+            .is_some()
+        {
+            return Err(invalid_table_state());
+        }
+    }
+    let mut children = BTreeMap::<Option<ColumnId>, Vec<ColumnId>>::new();
+    for (column, (predecessor, _)) in &nodes {
+        if predecessor.is_some_and(|predecessor| !nodes.contains_key(&predecessor)) {
+            return Err(invalid_table_state());
+        }
+        children.entry(*predecessor).or_default().push(*column);
+    }
+    if children.get(&None).is_none_or(|roots| roots.len() != 1) {
+        return Err(invalid_table_state());
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_unstable();
+    }
+    fn visit(
+        parent: Option<ColumnId>,
+        nodes: &BTreeMap<ColumnId, (Option<ColumnId>, bool)>,
+        children: &BTreeMap<Option<ColumnId>, Vec<ColumnId>>,
+        visited: &mut BTreeSet<ColumnId>,
+        active: &mut Vec<ColumnId>,
+    ) -> Result<()> {
+        for column in children.get(&parent).into_iter().flatten() {
+            if !visited.insert(*column) {
+                return Err(invalid_table_state());
+            }
+            if nodes[column].1 {
+                active.push(*column);
+            }
+            visit(Some(*column), nodes, children, visited, active)?;
+        }
+        Ok(())
+    }
+    let mut visited = BTreeSet::new();
+    let mut active = Vec::new();
+    visit(None, &nodes, &children, &mut visited, &mut active)?;
+    if visited.len() != nodes.len()
+        || active
+            != state
+                .definition
+                .columns()
+                .iter()
+                .map(|column| column.id())
+                .collect::<Vec<_>>()
+    {
+        return Err(invalid_table_state());
+    }
+    Ok(())
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
+    if slot.replace(value).is_some() {
+        Err(invalid_table_state())
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_table_state() -> Error {
+    Error::InvalidDatabase("DROP TABLE catalog repair state is malformed")
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
@@ -864,6 +1156,39 @@ mod tests {
                 .unwrap()
                 .encode(),
             encoded
+        );
+        validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn table_state_roundtrips_retired_column_order_nodes_exactly() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection).unwrap();
+        let created = created();
+        let body = created.columns()[1].id();
+        insert(&connection, &created).unwrap();
+        retire_column_binding(&connection, created.table_id(), body).unwrap();
+        let order = column_order(&connection, created.table_id()).unwrap();
+        let folded = created.fold_removed_column(body, &order).unwrap();
+        replace(&connection, &folded).unwrap();
+
+        let captured = capture_table_state(&connection, created.table_id()).unwrap();
+        let decoded = TableState::decode(&captured.encode().unwrap()).unwrap();
+        assert_eq!(decoded, captured);
+        remove_by_id(&connection, created.table_id()).unwrap();
+        restore_table_state(&connection, &decoded).unwrap();
+
+        assert_eq!(
+            by_id(&connection, created.table_id()).unwrap(),
+            Some(folded)
+        );
+        assert_eq!(
+            column_name_by_id(&connection, created.table_id(), body).unwrap(),
+            None
+        );
+        assert_eq!(
+            column_order(&connection, created.table_id()).unwrap(),
+            order
         );
         validate(&connection).unwrap();
     }

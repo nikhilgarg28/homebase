@@ -17,6 +17,10 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateTable` | `Set` | `IndexDefinition` |
 | `CreateTable` | `Set` | `ColumnName` |
 | `CreateTable` | `Set` | `WriteRevision` |
+| `DropTable` | `Set` | `SchemaLog` |
+| `DropTable` | `Delete` | `SchemaObjectName` |
+| `DropTable` | `DeletePrefix` | `TableRoot` |
+| `DropTable` | `DeletePrefix` | `ForeignReference` |
 | `RowChanges` | `Set` | `Row` |
 | `RowChanges` | `Set` | `UniqueOwner` |
 | `RowChanges` | `Set` | `ForeignReference` |
@@ -61,6 +65,11 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateTable` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
+| `DropTable` | `Invariant` | `TableExistence` | `TableRoot` |
+| `DropTable` | `Write` | `TableExistence` | `TableRoot` |
+| `DropTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `DropTable` | `Invariant` | `ForeignReference` | `ForeignReference` |
+| `DropTable` | `Write` | `ForeignReference` | `ForeignReference` |
 | `RowChanges` | `Invariant` | `RowIdentity` | `Row` |
 | `RowChanges` | `Write` | `RowIdentity` | `Row` |
 | `RowChanges` | `Invariant` | `UniqueOwnership` | `UniqueOwner` |
@@ -101,7 +110,8 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 
 | Operation | Local inverse |
 | --- | --- |
-| `CreateTable` | `DropTable` |
+| `CreateTable` | `RemoveCreatedTable` |
+| `DropTable` | `RestoreDroppedTable` |
 | `RowChanges` | `RestoreRowChanges` |
 | `CreateIndex` | `RevertIndex` |
 | `DropIndex` | `RevertIndex` |
@@ -118,6 +128,9 @@ These family-level guards must occur at least once. In addition, the compiler re
 | --- | --- | --- | --- |
 | `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
+| `DropTable` | `Invariant` | `TableExistence` | `TableRoot` |
+| `DropTable` | `Write` | `TableExistence` | `TableRoot` |
+| `DropTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `RowChanges` | `Invariant` | `PrimaryIndex` | `ActivePrimaryIndex` |
 | `RowChanges` | `Invariant` | `WriteContract` | `WriteRevision` |
 | `CreateIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |

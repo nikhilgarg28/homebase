@@ -144,14 +144,20 @@ projection ignores inactive identities.
   object. Identifier lookup is not an application-data read. Multilite does not
   promise strict real-time namespace consistency to an offline stale device.
 
-## Future Grammar
-
 ### DROP TABLE
 
-Drop writes a table tombstone and advances the write contract so stale DML
-cannot apply. Rejection requires retained rows/schema or delayed physical
-destruction; recreating from CREATE SQL alone is insufficient. Reusing the old
-name always mints a new `TableId`.
+Drop deletes the table's complete stable-ID namespace and global name binding,
+so stale DML conflicts through the table-root guard. The replicated operation
+contains only mutation identity, provenance SQL, and the structured table IR.
+The origin streams complete rows plus its exact local catalog fold into the
+UUID-joined repair sidecar before physical destruction. Acceptance retires the
+sidecar; rejection recreates the table, active explicit indexes, catalog
+tombstones/order, and rows by the full declared primary key. Reusing the old
+name always mints a new `TableId`. Tables with incoming synchronized foreign
+keys remain unsupported until relationship retirement or cascading behavior is
+defined.
+
+## Future Grammar
 
 ### Constraint and Relationship Evolution
 

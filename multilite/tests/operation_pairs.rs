@@ -65,6 +65,7 @@ struct RegisteredOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SqlShape {
     CreateTable,
+    DropTable,
     Insert,
     Upsert,
     Replace,
@@ -78,8 +79,9 @@ enum SqlShape {
     DropColumn,
 }
 
-const SQL_SHAPES: [SqlShape; 12] = [
+const SQL_SHAPES: [SqlShape; 13] = [
     SqlShape::CreateTable,
+    SqlShape::DropTable,
     SqlShape::Insert,
     SqlShape::Upsert,
     SqlShape::Replace,
@@ -428,6 +430,25 @@ const PAIR_CASES: &[PairCase] = &[
         ),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "drop_table_and_stale_insert",
+        relationship: "table-root destruction and a stale row write",
+        left: operation!(DropTable, "DROP TABLE notes"),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "drop_table_and_disjoint_parent_insert",
+        relationship: "different table-owned roots",
+        left: operation!(DropTable, "DROP TABLE notes"),
+        right: operation!(
+            Insert,
+            "INSERT INTO parents VALUES (30, 'p30', 'parent-thirty')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
     },
     PairCase {
         name: "table_and_index_name_collision",

@@ -8,6 +8,7 @@ use homebase_core::writer::Writer;
 use rusqlite::Connection;
 
 use super::alter::{AlterTableHomebaseOp, AlterTableOperation};
+use super::drop_table::{DropTableHomebaseOp, DropTableOperation};
 use super::guard::{GuardPlan, RejectionKind, validate_compiled_output, validate_rejection};
 use super::index::{IndexHomebaseOp, IndexOperation};
 use super::row::{RowChanges, RowHomebaseOp};
@@ -23,12 +24,14 @@ const CREATE_TABLE_OPERATION: u8 = 1;
 const ROW_CHANGES_OPERATION: u8 = 2;
 const INDEX_OPERATION: u8 = 5;
 const ALTER_TABLE_OPERATION: u8 = 6;
+const DROP_TABLE_OPERATION: u8 = 7;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MultiliteOp {
     AlterTable(AlterTableOperation),
     CreateTable(CreateTable),
+    DropTable(DropTableOperation),
     ChangeRows(RowChanges),
     Index(IndexOperation),
 }
@@ -45,7 +48,8 @@ pub struct HomebaseOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectionEffect {
     RevertAlterTable { operation: AlterTableOperation },
-    DropTable { created: CreateTable },
+    RemoveCreatedTable { created: CreateTable },
+    RestoreDroppedTable { operation: DropTableOperation },
     RestoreRowChanges { changes: RowChanges },
     RevertIndex { operation: IndexOperation },
 }
@@ -108,6 +112,10 @@ impl MultiliteOp {
                 writer.u8(CREATE_TABLE_OPERATION);
                 writer.bytes(&created.encode());
             }
+            Self::DropTable(dropped) => {
+                writer.u8(DROP_TABLE_OPERATION);
+                writer.bytes(&dropped.encode());
+            }
             Self::ChangeRows(changes) => {
                 writer.u8(ROW_CHANGES_OPERATION);
                 writer.bytes(&changes.encode());
@@ -134,6 +142,9 @@ impl MultiliteOp {
             CREATE_TABLE_OPERATION => CreateTable::decode_operation(reader.rest())
                 .map(Self::CreateTable)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            DROP_TABLE_OPERATION => DropTableOperation::decode(reader.rest())
+                .map(Self::DropTable)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             ROW_CHANGES_OPERATION => RowChanges::decode(reader.rest())
                 .map(Self::ChangeRows)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
@@ -155,10 +166,16 @@ impl MultiliteOp {
                 RejectionKind::RevertAlterTable,
             ),
             Self::CreateTable(created) => (
-                RejectionEffect::DropTable {
+                RejectionEffect::RemoveCreatedTable {
                     created: created.clone(),
                 },
-                RejectionKind::DropTable,
+                RejectionKind::RemoveCreatedTable,
+            ),
+            Self::DropTable(operation) => (
+                RejectionEffect::RestoreDroppedTable {
+                    operation: operation.clone(),
+                },
+                RejectionKind::RestoreDroppedTable,
             ),
             Self::ChangeRows(changes) => (
                 RejectionEffect::RestoreRowChanges {
@@ -204,6 +221,14 @@ impl MultiliteOp {
                 let schema = created.to_homebase()?;
                 (schema.mutations, schema.footprint, schema.guards)
             }
+            Self::DropTable(dropped) => {
+                let DropTableHomebaseOp {
+                    mutations,
+                    footprint,
+                    guards,
+                } = dropped.to_homebase()?;
+                (mutations, footprint, guards)
+            }
             Self::ChangeRows(changes) => {
                 let RowHomebaseOp {
                     mutations,
@@ -246,6 +271,7 @@ impl MultiliteOp {
                 connection.execute(&created.materialization_sql(connection)?, ())?;
                 catalog::insert(connection, created)
             }
+            Self::DropTable(dropped) => dropped.apply(connection),
             Self::ChangeRows(changes) => changes.apply(connection),
             Self::Index(index) => index.apply(connection),
         }
@@ -255,14 +281,25 @@ impl MultiliteOp {
     pub(crate) fn capture_local_repair(&self, connection: &Connection) -> Result<()> {
         match self {
             Self::AlterTable(altered) => altered.capture_local_repair(connection),
+            Self::DropTable(dropped) => dropped.capture_local_repair(connection),
             Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => Ok(()),
         }
     }
 
     /// Sidecar identity required while this operation remains pending.
+    #[cfg(test)]
     pub(crate) fn repair_id(&self) -> Option<crate::repair::RepairId> {
         match self {
             Self::AlterTable(altered) => altered.repair_id(),
+            Self::DropTable(dropped) => Some(dropped.repair_spec().id),
+            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => None,
+        }
+    }
+
+    pub(crate) fn repair_spec(&self) -> Option<crate::repair::RepairSpec> {
+        match self {
+            Self::AlterTable(altered) => altered.repair_spec(),
+            Self::DropTable(dropped) => Some(dropped.repair_spec()),
             Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => None,
         }
     }
@@ -278,6 +315,7 @@ impl MultiliteOp {
             Self::CreateTable(created) => {
                 crate::physical::verify_table(connection, created.table_id())
             }
+            Self::DropTable(dropped) => dropped.verify_materialized(connection),
             Self::Index(index) => crate::physical::verify_table(connection, index.table_id()),
         }
     }
@@ -368,7 +406,7 @@ mod tests {
         assert_eq!(compiled.homebase(), &expected);
         assert!(matches!(
             &compiled.rejection,
-            RejectionEffect::DropTable { created } if created.table_name() == "notes"
+            RejectionEffect::RemoveCreatedTable { created } if created.table_name() == "notes"
         ));
     }
 

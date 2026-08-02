@@ -195,14 +195,14 @@ pub fn insert(
     seq: DeviceSeq,
     transaction: &MultiliteTransaction,
 ) -> Result<()> {
-    let repair_ids = transaction.repair_ids().collect::<BTreeSet<_>>();
-    if repair_ids.len() != transaction.repair_ids().count() {
+    let repair_specs = transaction.repair_specs().collect::<BTreeSet<_>>();
+    if repair_specs.len() != transaction.repair_specs().count() {
         return Err(Error::InvalidMultiliteTransaction(
             "transaction reuses a destructive repair identity".into(),
         ));
     }
-    for repair_id in repair_ids {
-        if !repair::contains(connection, repair_id)? {
+    for repair in repair_specs {
+        if !repair::contains(connection, repair.id)? {
             return Err(Error::CaptureInvariant(
                 "destructive operation was journaled without its repair sidecar",
             ));
@@ -250,11 +250,11 @@ pub fn accept_through(connection: &Connection, through: DeviceSeq) -> Result<()>
         .take_while(|pending| pending.seq <= through)
         .collect::<Vec<_>>();
     if !accepted.is_empty() {
-        for repair_id in accepted
+        for repair in accepted
             .iter()
-            .flat_map(|pending| pending.transaction.repair_ids())
+            .flat_map(|pending| pending.transaction.repair_specs())
         {
-            repair::retire(connection, repair_id)?;
+            repair::retire(connection, repair.id)?;
         }
         connection.execute(
             &format!("DELETE FROM {TABLE} WHERE device_seq <= ?1"),
@@ -329,13 +329,13 @@ pub fn validate_active_from(connection: &Connection, neck: DeviceSeq) -> Result<
             "accepted pending transaction was not finalized with its submit trim",
         ));
     }
-    let repair_ids = pending
+    let repair_specs = pending
         .iter()
-        .flat_map(|pending| pending.transaction.repair_ids())
+        .flat_map(|pending| pending.transaction.repair_specs())
         .collect::<Vec<_>>();
     if repair::is_initialized(connection)? {
-        repair::validate_expected(connection, repair_ids)?;
-    } else if !repair_ids.is_empty() {
+        repair::validate_expected(connection, repair_specs)?;
+    } else if !repair_specs.is_empty() {
         return Err(Error::InvalidDatabase(
             "pending destructive operation has no repair sidecar tables",
         ));
@@ -347,7 +347,7 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
     for effect in effects {
         match effect {
             RejectionEffect::RevertAlterTable { operation } => operation.rollback(connection)?,
-            RejectionEffect::DropTable { created } => {
+            RejectionEffect::RemoveCreatedTable { created } => {
                 if catalog::by_id(connection, created.table_id())?.as_ref() != Some(created) {
                     return Err(Error::InvalidDatabase(
                         "pending CREATE TABLE no longer matches SQLite state",
@@ -360,6 +360,7 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
                     .execute_batch(&format!("DROP TABLE {}", quote_identifier(name.value())))?;
                 catalog::remove_by_id(connection, created.table_id())?;
             }
+            RejectionEffect::RestoreDroppedTable { operation } => operation.rollback(connection)?,
             RejectionEffect::RestoreRowChanges { changes } => {
                 changes.restore_materialized(connection)?
             }
@@ -778,7 +779,7 @@ mod tests {
             pending[0].rejection().unwrap().as_slice(),
             [
                 RejectionEffect::RestoreRowChanges { .. },
-                RejectionEffect::DropTable { created }
+                RejectionEffect::RemoveCreatedTable { created }
             ] if created.table_name() == "notes"
         ));
         let active = vec![(
@@ -826,7 +827,7 @@ mod tests {
         assert!(matches!(
             apply_rejection(
                 &connection,
-                &[RejectionEffect::DropTable { created: original }],
+                &[RejectionEffect::RemoveCreatedTable { created: original }],
             ),
             Err(Error::InvalidDatabase(
                 "pending CREATE TABLE no longer matches SQLite state"
@@ -865,7 +866,7 @@ mod tests {
 
         apply_rejection(
             &connection,
-            &[RejectionEffect::DropTable {
+            &[RejectionEffect::RemoveCreatedTable {
                 created: original.clone(),
             }],
         )

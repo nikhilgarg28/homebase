@@ -36,6 +36,7 @@ pub enum ValidatedExecute {
     AddColumn(AddColumnSpec),
     DropColumn(DropColumnSpec),
     CreateTable(CreateTableSpec),
+    DropTable(DropTableSpec),
     CreateIndex(CreateIndexSpec),
     DropIndex(DropIndexSpec),
     Insert,
@@ -67,6 +68,11 @@ pub struct AddColumnSpec {
 pub struct DropColumnSpec {
     pub table: SqlName,
     pub column: SqlName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTableSpec {
+    pub name: SqlName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +371,28 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_create_table(identifier(&tbl_name.name)?, body)
+        }
+        Stmt::DropTable {
+            if_exists,
+            tbl_name,
+        } => {
+            if if_exists {
+                return Err(Error::UnsupportedSql(
+                    "DROP TABLE IF EXISTS is not supported",
+                ));
+            }
+            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified DROP TABLE names are not supported",
+                ));
+            }
+            let name = identifier(&tbl_name.name)?;
+            if has_multilite_prefix(name.value()) || is_sqlite_internal_table(name.value()) {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::DropTable(DropTableSpec { name }))
         }
         Stmt::DropIndex {
             if_exists,

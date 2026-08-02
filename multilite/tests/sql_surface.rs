@@ -2,6 +2,117 @@ use multilite::{Error, MultiliteConnection};
 use rusqlite::Connection;
 
 #[test]
+fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("drop-table.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE inventory (
+            tenant TEXT,
+            sku INTEGER,
+            body ANY,
+            PRIMARY KEY (tenant, sku)
+        ) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX inventory_body ON inventory(body)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO inventory VALUES
+            ('a', 1, X'00FF'),
+            ('a', 2, NULL),
+            ('b', 1, 3.5)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("DROP TABLE inventory", ()).unwrap();
+    assert!(db.query("SELECT * FROM inventory", (), |_| Ok(())).is_err());
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert!(
+        reopened
+            .query("SELECT * FROM inventory", (), |_| Ok(()))
+            .is_err()
+    );
+    drop(reopened);
+
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row("SELECT kind FROM __multilite__repair", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT key_parts, value_parts, row_count
+             FROM __multilite__repair",
+            (),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        (2, 3, 3)
+    );
+}
+
+#[test]
+fn drop_table_rejects_referenced_parents_but_allows_child_then_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("drop-foreign-key.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE parents (tenant TEXT, id INTEGER, PRIMARY KEY (tenant, id)) WITHOUT ROWID",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            parent_id INTEGER,
+            FOREIGN KEY (tenant, parent_id) REFERENCES parents (tenant, id)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO parents VALUES ('north', 1)", ())
+        .unwrap();
+    db.execute("INSERT INTO children VALUES (1, 'north', 1)", ())
+        .unwrap();
+
+    assert!(matches!(
+        db.execute("DROP TABLE parents", ()),
+        Err(Error::UnsupportedSql(
+            "DROP TABLE of a referenced parent table is not supported"
+        ))
+    ));
+    assert_eq!(
+        db.query("SELECT count(*) FROM parents", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert_eq!(
+        db.query("SELECT count(*) FROM children", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+
+    db.execute("DROP TABLE children", ()).unwrap();
+    db.execute("DROP TABLE parents", ()).unwrap();
+    assert!(db.query("SELECT * FROM parents", (), |_| Ok(())).is_err());
+    assert!(db.query("SELECT * FROM children", (), |_| Ok(())).is_err());
+}
+
+#[test]
 fn defaults_checks_and_named_constraints_follow_sqlite_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("defaults-and-checks.sqlite");
@@ -1389,7 +1500,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
         .unwrap();
 
     for sql in [
-        "DROP TABLE notes",
         "CREATE VIEW note_view AS SELECT * FROM notes",
         "PRAGMA user_version = 9",
         "ATTACH DATABASE ':memory:' AS attached",

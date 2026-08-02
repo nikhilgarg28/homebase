@@ -386,9 +386,20 @@ impl AlterTableOperation {
     }
 
     /// Local sidecar identity required while this destructive operation is pending.
+    #[cfg(test)]
     pub(crate) fn repair_id(&self) -> Option<repair::RepairId> {
         matches!(self.delta, AlterTableDelta::DropColumn { .. })
             .then(|| self.mutation_id.as_bytes())
+    }
+
+    pub(crate) fn repair_spec(&self) -> Option<repair::RepairSpec> {
+        let AlterTableDelta::DropColumn { before, .. } = &self.delta else {
+            return None;
+        };
+        Some(repair::drop_column_spec(
+            self.mutation_id.as_bytes(),
+            before.primary_key_columns().count(),
+        ))
     }
 
     /// Stream destroyed values into local durable storage before canonical apply.
