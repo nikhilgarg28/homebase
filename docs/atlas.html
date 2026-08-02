@@ -223,6 +223,7 @@
   .lc-status.s-wip { background: #17324e; color: #8ec5ff; }
   .lc-status.s-todo { background: none; border: 1px solid var(--line); color: var(--muted); }
   .lc-status.s-decision { background: #2c2347; color: #c4aaff; }
+  .lc-status.s-partial { background: #33290f; color: #ffd479; }
   .lc-body { flex: 1; min-width: 0; }
   .lc-title { font-size: 13.8px; font-weight: 600; line-height: 1.35; }
   .lc-title s { color: var(--muted); }
@@ -244,7 +245,7 @@
     <button data-view="roadmap">Roadmap</button>
     <button data-view="launch">Launch</button>
   </nav>
-  <div class="stamp">curated snapshot &middot; Aug 1, 2026 &middot; main @ 8212653</div>
+  <div class="stamp">curated snapshot &middot; Aug 1, 2026 &middot; code through ebb6ae9</div>
 </header>
 
 <!-- ==================== SYSTEM ==================== -->
@@ -352,7 +353,7 @@ components: [
   behavior:[
     "Measures the managed SQL surface against stock SQLite behavior on the accepted grammar.",
     "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape.",
-    "The typed operation-pair registry runs 44 DML, UPSERT, replacement, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (176 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
+    "The typed operation-pair registry runs 58 DML, UPSERT, replacement, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (232 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
   invariants:[
     "Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures.",
     "The pair registry covers every current logical operation family and includes commutative, conflicting, isolation-dependent, and directional relationships."],
@@ -987,7 +988,7 @@ for client_batch in &req.batches {
   summary:"Seeded single-threaded stepper, fault-injecting stores, crash-restart torture, brute-force invariant oracles over (possibly crash-recovered) state.",
   behavior:[
     "Layer 1: in-memory store faults. Layer 3: object-store faults under real slatedb with power-loss reopen.",
-    "Multilite's seeded two-replica integrity simulation landed Aug 1 (tests/integrity.rs): parent/child inserts, retargets, PK moves, UNIQUE conflicts, mixed DDL/DML, reordered pushes, rejection repair, and restarts. Every round checks converged rows, catalog validity, integrity_check/foreign_key_check, an empty pending journal, projected authority row frames, and exact UNIQUE/FK cells. The separate 48-case pair registry covers both admission orders and isolation levels, including CASCADE and SET NULL relationships.",
+    "Multilite's seeded two-replica integrity simulation landed Aug 1 (tests/integrity.rs): parent/child inserts, retargets, PK moves, UNIQUE conflicts, ON UPDATE CASCADE, ON DELETE SET NULL, mixed DDL/DML, reordered pushes, rejection repair, and restarts. Every round checks converged rows, catalog validity, integrity_check/foreign_key_check, an empty pending journal, projected authority row frames, and exact UNIQUE/FK cells. The separate 58-case pair registry covers both admission orders and isolation levels.",
     "The deterministic operation-pair registry complements the seeded workload: concrete pair contracts run both admission orders and both isolation levels, with normalized order-independence checks for every pair declared commutative.",
     "Full DST integration (seeded scheduler, fault injection, crash points) is the next step \u2014 current restarts occur only between completed operations."],
   invariants:["Every seed reproducible through reopen and recovery."], health:[] },
@@ -1119,8 +1120,8 @@ grammar: [
   { name:"NOT NULL / DEFAULT (incl. non-deterministic)", status:"supported", note:"Duplicate NOT NULL/DEFAULT constraints rejected; NULL/NOT NULL conflict clauses rejected. CURRENT_TIMESTAMP / random() defaults work because the preupdate hook captures evaluated values \u2014 replicas replay values, not expressions." },
   { name:"UNIQUE (plain column tuples)", status:"supported", note:"Distributed uniqueness via owner cells + OCC constraints. \u201cUNIQUE expressions and collations are not supported\u201d; conflict clauses rejected. Column tuples only \u2014 the durable product boundary." },
   { name:"CHECK constraints", status:"supported", note:"Expressions bound to stable ColumnIds; \u201cCHECK constraints reference unknown table columns\u201d is a typed error; conflict clauses rejected." },
-  { name:"FOREIGN KEY \u2026 REFERENCES (simple & composite, immediate)", status:"supported", note:"All five ON DELETE actions use reverse-reference handshake cells + parent range fences. SQLite chooses CASCADE / SET NULL / SET DEFAULT victims once; the multi-table delta is what replicates. RESTRICT retains its immediate statement timing." },
-  { name:"FK declaration rules \u2014 what a REFERENCES clause must satisfy", status:"partial", note:"The parent must already exist as a synchronized table (no forward references \u2014 mutually-referencing table pairs cannot be declared); the FK must reference the parent's complete PRIMARY KEY or a complete UNIQUE key in declared order (partial-key and reordered references rejected); child and parent affinities must match; columns must be distinct on both sides; at most one ON DELETE clause; MATCH and ON INSERT rejected; the combined parent+child key must fit the Homebase component budget." },
+  { name:"FOREIGN KEY \u2026 REFERENCES (simple & composite, immediate)", status:"supported", note:"All five ON DELETE and ON UPDATE actions use reverse-reference handshake cells + parent range fences. SQLite chooses CASCADE / SET NULL / SET DEFAULT victims once; the captured multi-table delta is what replicates, replays, and repairs. RESTRICT retains its immediate statement timing." },
+  { name:"FK declaration rules \u2014 what a REFERENCES clause must satisfy", status:"partial", note:"The parent must already exist as a synchronized table (no forward references \u2014 mutually-referencing table pairs cannot be declared); the FK must reference the parent's complete PRIMARY KEY or a complete UNIQUE key in declared order (partial-key and reordered references rejected); child and parent affinities must match; columns must be distinct on both sides; at most one ON DELETE and one ON UPDATE clause; MATCH and ON INSERT rejected; the combined parent+child key must fit the Homebase component budget." },
   { name:"column constraint set: PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK, REFERENCES", status:"supported", note:"The exact allowlist \u2014 \u201conly PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK, and REFERENCES column constraints are supported.\u201d COLLATE and GENERATED are therefore out (below)." },
   { name:"key width limits (PK / UNIQUE / FK / index)", status:"partial", note:"Logical keys must fit Homebase's 256-component key: up to 251 columns per PK/UNIQUE/index (256 minus the 5-component key prefix); an FK's parent+child key images share one budget (7 fixed components + both images \u2264 256). Generous, but a real typed refusal: \u201cPRIMARY KEY has too many columns\u201d, \u201cforeign-key reference key exceeds the Homebase component limit.\u201d" },
   { name:"ON CONFLICT clauses (PK / UNIQUE / NOT NULL / CHECK)", status:"fenced", note:"Every conflict-clause position is individually rejected. Each conflict mode needs its own OCC spec and the statement-delta compiler first." },
@@ -1128,8 +1129,8 @@ grammar: [
   { name:"COLLATE on columns", status:"never", note:"Not in the column-constraint allowlist. Key images must exactly match SQLite comparison semantics; no parallel collation evaluator will be grown (product boundary)." },
   { name:"generated columns (GENERATED ALWAYS AS)", status:"future", note:"Not in the constraint allowlist yet." },
   { name:"self-referential / cyclic FKs", status:"fenced", note:"\u201cself-referential foreign keys are not supported\u201d at IR construction, and cycles are structurally impossible because FK parents must pre-exist. Makes fencing-delete ordering provably safe. Revisit with FK evolution." },
-  { name:"ON DELETE actions", status:"supported", note:"NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT are preserved structurally. Direct, multi-level, composite-key, STRICT, and WITHOUT ROWID effects lower as one deterministic multi-table RowChanges operation. Rejection restores every before-image after reopen; concurrent child creation conflicts through exact relationship cells and parent prefixes." },
-  { name:"ON UPDATE actions", status:"supported", note:"NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT are preserved structurally. Composite parent-key movement, child primary-key movement, multi-level cascades, STRICT / WITHOUT ROWID tables, atomic local failures, both admission orders, and restart-before-repair are covered." },
+  { name:"ON DELETE actions", status:"supported", note:"NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT are preserved structurally. Direct, multi-level, mixed-path, composite UNIQUE-parent, STRICT, and WITHOUT ROWID effects lower as one deterministic multi-table RowChanges operation. SET DEFAULT without a declared default follows SQLite to NULL. Rejection restores every before-image after reopen; concurrent child creation conflicts through exact relationship cells and parent prefixes." },
+  { name:"ON UPDATE actions", status:"supported", note:"NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT are preserved structurally. Coverage includes operation-wide multi-row key movement with a reused parent value, child primary-key movement, mixed paths touching one child, multi-level cascades, composite UNIQUE parents, STRICT / WITHOUT ROWID tables, capture-budget rollback, both admission orders, and restart-before-repair. Stable ColumnIds keep actions valid across table/column rename and add/drop rebuilds." },
   { name:"DEFERRABLE INITIALLY DEFERRED", status:"future", note:"\u201cdeferred foreign keys are not supported\u201d; queued behind FK evolution." },
   { name:"CREATE TABLE IF NOT EXISTS", status:"supported", note:"A missing table lowers to ordinary CREATE TABLE. A catalog/SQLite-consistent existing table is a true no-op with no UUID, pending record, or CommitSeq advance; cross-kind namespace collisions remain SQLite errors. The branch-snapshot name observation joins the read footprint of a larger serializable transaction." },
   { name:"CREATE TABLE \u2026 AS SELECT", status:"fenced", note:"Explicitly rejected \u2014 schema must be declared, not inferred." },
@@ -1209,7 +1210,7 @@ roadmap: [
 { id:"r3", title:"Deterministic capture budgets everywhere", themes:["correctness"], layers:["multilite"], horizon:"now",
   detail:"Interim safety is landed: row DML is fenced inside the preupdate hook at 100,000 events / 64 MiB, then rechecked on operation and transaction encode/decode; DROP COLUMN and DROP TABLE local-only repair sidecars have the same typed row/byte refusal. Launch requires bounded-memory spill files plus chunked pending/authority payloads for much larger statements, while preserving one operation-wide normalization and one atomic admission/rejection decision; partial chunks must never become visible. Add crash cleanup, configurable hard-cap tests, and extend the typed boundary to UNIQUE backfill." },
 { id:"r4", title:"Two-replica integrity sim \u2192 full DST", themes:["correctness"], layers:["multilite","sim"], horizon:"now",
-  detail:"The seeded two-replica scenario now audits projected authority row frames, UNIQUE/FK cells, pending cleanup, SQLite integrity, and convergence. Next: a proper deterministic scheduler; authority delay/loss/duplication/partition; VFS short reads/writes, I/O failure, corruption; and crash points around WAL, pending-journal, cursor, and metadata transitions." },
+  detail:"The seeded two-replica scenario now includes referential-action conflicts and audits projected authority row frames, UNIQUE/FK cells, pending cleanup, SQLite integrity, and convergence through randomized push order, reopen, rejection, and repair. Next: a proper deterministic scheduler; authority delay/loss/duplication/partition; VFS short reads/writes, I/O failure, corruption; and crash points around WAL, pending-journal, cursor, and metadata transitions." },
 { id:"r5", title:"Bounded speculative DELETE capture", themes:["correctness","performance"], layers:["multilite"], horizon:"now",
   detail:"The first boundary is landed: DELETE/UPDATE/INSERT capture rolls back at 100,000 hook events or 64 MiB and durable frames are rechecked. The launch requirement in l3 adds spilling restoration images and atomic chunked representation; separately evaluate lowering eligible predicates to Homebase DeleteRange while preserving rollback data and footprints." },
 { id:"r6", title:"Empty key-component validation", themes:["correctness"], layers:["core"], horizon:"now",
@@ -1343,7 +1344,7 @@ launch: {
     { id:"l6", status:"done", title:"Metadata-only destructive DDL with local repair",
       detail:"DROP COLUMN and DROP TABLE send only deterministic schema metadata. A UUID-joined local sidecar is captured atomically with speculative apply and pending insertion, retired with acceptance, consumed by rejection, and certified on reopen. DROP TABLE streams full composite-keyed rows and restores explicit indexes plus the exact catalog fold. Wire size is independent of destroyed row count; spillable capacity remains in l3." },
     { id:"l7", status:"wip", title:"Crash injection in the integrity sim",
-      detail:"The seeded two-replica sim and the 28-pair convergence registry are landed (the convergence evidence). Missing: process-kill points around WAL, pending-journal, cursor, and metadata transitions \u2014 the durability evidence behind any 'crash-safe' claim. Likely the long pole; parallelizes with everything else." }] },
+      detail:"The seeded two-replica sim, 58-case pair registry, and 60-test convergence suite are landed (the convergence evidence). Missing: process-kill points around WAL, pending-journal, cursor, and metadata transitions \u2014 the durability evidence behind any 'crash-safe' claim. Likely the long pole; parallelizes with everything else." }] },
 
   { name:"B. Kernel \u2014 freeze before it's public", blurb:"Homebase items that become compat promises the day of the announcement.",
     items:[
@@ -1369,7 +1370,7 @@ launch: {
     { id:"l14", status:"todo", title:"Crash-injected recovery seeds",
       detail:"N seeds with kill points around WAL/journal/cursor/meta transitions, all recovering to validated state. Publish N." },
     { id:"l15", status:"wip", title:"Randomized two-replica convergence corpus",
-      detail:"Generalize the hand-curated pair registry (44 relationships, 176 executions \u2014 landed) into seeded random DML/DDL programs with random interleavings and rejection patterns, same oracle: converged rows+schema, clean integrity/FK checks, authority reverse-reference agreement. '10,000 random schedules, zero divergence' is a sentence people quote." },
+      detail:"Generalize the hand-curated pair registry (58 relationships, 232 executions \u2014 landed) into seeded random DML/DDL programs with random interleavings and rejection patterns, same oracle: converged rows+schema, clean integrity/FK checks, authority reverse-reference agreement. '10,000 random schedules, zero divergence' is a sentence people quote." },
     { id:"l16", status:"todo", title:"Network-fault DST over the real transport",
       detail:"Run the shipping transport client under the sim's delay/duplication/loss/partition schedule \u2014 tests the code that ships, not the trait. Blocked on l8." },
     { id:"l17", status:"wip", title:"Differential fuzz + SLT coverage numbers",
@@ -1389,11 +1390,39 @@ launch: {
       detail:"Rust + Python paths: install, create db, write/query, run serve --dev, sync two replicas, observe a conflict rejection repair itself. If it takes more than ten minutes, cut scope from the quickstart, not the docs." },
     { id:"l23", status:"decision", title:"npm BigInt rowid policy (decision only)",
       detail:"Allocator rowids exceed 2^53 for nearly every device tag; as Number they corrupt silently. Decide BigInt-only vs re-budgeting tag/slot bits before the binding is written \u2014 the binding itself is a fast-follow, not launch-blocking." }] },
+
+  { name:"E. Grammar \u2014 close the gap or fence it in writing", blurb:"Get the accepted surface to \u2018everything a typical app schema needs\u2019; whatever stays out is a documented decision with a typed error, never a surprise.",
+    items:[
+    { id:"l26", status:"todo", title:"RETURNING on INSERT / UPDATE / DELETE",
+      detail:"The biggest remaining ORM-compatibility gap (SQLite \u2265 3.35 idiom for fetching generated ids). Read-out only: the logical operation, codecs, and wire format are untouched \u2014 the work is the gate's execute-vs-read classification and streaming rows back from a write statement. No replication risk." },
+    { id:"l27", status:"todo", title:"Write ORDER BY / LIMIT (DELETE \u2026 LIMIT, UPDATE \u2026 LIMIT)",
+      detail:"Queue-worker and batch-trim patterns. Safe to unlock under the capture model: which rows got selected is nondeterministic, but replicas receive the captured net effect, not the statement. Gate change plus convergence/pair coverage per the completion gate \u2014 no new operation shape." },
+    { id:"l28", status:"done", title:"DROP TABLE IF EXISTS",
+      detail:"IF EXISTS resolves against the branch snapshot; a tracked table lowers to the ordinary stable-ID drop, absence is a true no-op with a serializable name observation. Catalog/physical consistency and cross-kind namespace collisions are checked, and convergence coverage exercises concurrent conditional drops. This completes the current idempotent-DDL family." },
+    { id:"l29", status:"todo", title:"CREATE VIEW / DROP VIEW",
+      detail:"Common in real app schemas and cheap in this architecture: views are read-only, replicate as pure metadata DDL with no row cells, no OCC footprint beyond the name binding, and no repair payload. Needs name-collision handling with tables (SQLite shared namespace) and reserved-read walking of the view body." },
+    { id:"l30", status:"todo", title:"PRAGMA story: user_version + honest classification",
+      detail:"Migration frameworks (Room, GRDB, most Node/Python runners) key off PRAGMA user_version read/write \u2014 without it, every migration tool breaks on day one. Decide replicated cell vs device-local (recommend replicated: it is schema metadata replicas must agree on). Also fix the dead grammar: argument-less PRAGMA is classified as a read but denied by the authorizer at runtime; allowlist the safe ones and reject the rest at the gate with a typed error." },
+    { id:"l31", status:"done", title:"Complete immediate FK action matrix",
+      detail:"All five SQLite actions are supported for both ON DELETE and ON UPDATE. SQLite selects nested effects once; deterministic multi-table row transitions carry them through admission, replay, rejection repair, and reopen. Hardening covers composite UNIQUE parents, mixed FK paths, reused values in multi-row parent-key shifts, SET DEFAULT-to-NULL, child identity moves, multi-level cascades, schema rebuilds and renamed columns, capture-budget rollback, both isolation levels, and both admission orders." },
+    { id:"l32", status:"decision", title:"The explicit-fence ledger",
+      detail:"One page, linked from every rejection: what is deliberately out at launch and why. Candidates: OR FAIL / OR ROLLBACK (break the atomic-statement model \u2014 recommend permanent), constraint-attached ON CONFLICT clauses, COLLATE on columns and UNIQUE expressions/predicates (key-image product boundary), AUTOINCREMENT (allocator replaces it), generated columns, constraint evolution / DROP CONSTRAINT, triggers, TEMP tables, ATTACH / qualified names, tables without a declared PK, rowid tables with non-alias PKs. Every fence keeps its typed error message and gets a pointer to this ledger \u2014 'not supported' must always read as a choice, not a gap." }] },
+
+  { name:"F. Hardening \u2014 adversarial evidence the engine holds", blurb:"Conformance, concurrency, and cross-device torture beyond the happy path; grows the unit/convergence corpus as the grammar grows.",
+    items:[
+    { id:"l33", status:"wip", title:"SQLite conformance suite: LocalOnly + LocalFirst vs stock",
+      detail:"Run identical statement corpora against stock SQLite and Multilite in both local policies and diff results row-for-row \u2014 same rows, same errors, same constraint outcomes. Seed from sql-logic-test filtered to the accepted grammar plus a hand-built corpus per grammar family. The harness and unsupported-vs-failure reporting are landed (see l17); missing: the full corpus, LocalFirst-under-authority runs, and wiring it as a CI gate so grammar growth cannot regress conformance silently." },
+    { id:"l34", status:"todo", title:"Concurrent local-writer torture",
+      detail:"Many threads and separate processes driving managed closures against one database: mixed DML/DDL, overlapping footprints, forced rejections. Assertions: every admission is serializable, no lost updates, WAL and pending journal stay consistent, integrity_check clean throughout. Two tiers: a seeded deterministic scheduler in the sim for reproducible interleavings, plus a real-thread stress run in CI for the actual locking/actor paths." },
+    { id:"l35", status:"todo", title:"Cross-device operation matrix",
+      detail:"Scripted 2\u20134-replica scenarios covering every operation family \u00d7 {concurrent same-row, concurrent same-table, schema+DML race, offline suffix rebase, rejection repair, reopen mid-sequence}. Extends the 58-relationship pair registry beyond two devices and adds device joins/leaves mid-history. Oracle stays the same: converged rows+schema, clean FK/integrity checks, authority reverse-reference agreement." },
+    { id:"l36", status:"wip", title:"Unit/convergence corpus growth tied to the completion gate",
+      detail:"Every grammar admission already requires pair + rejection + convergence coverage (completion gate #8) \u2014 keep that ratchet, and burn down known thin spots: policy-actor transitions under network failure, capture-budget boundaries (exactly at, one over), sidecar retirement races, IF EXISTS no-op vs concurrent create/drop, codec fuzz on malformed frames, and reopen validation after every destructive-DDL crash point. Track the count; it is also announcement evidence alongside l15." }] },
   ],
   deferred: [
     "Performance debt: bulk-DML footprint collapse, prepare_cached, snapshot/branch startup, indexed journal retirement \u2014 invisible at demo scale; grammar already fences unbounded DML once budgets land.",
-    "Views, ATTACH, generated columns \u2014 documented future cells in the grammar matrix.",
-    "Triggers and mutating FK actions \u2014 the delta compiler makes them possible; announce as a boundary, ship later.",
+    "ATTACH / multi-schema and generated columns \u2014 documented future cells in the grammar matrix (views and PRAGMA user_version moved into launch group E).",
+    "Triggers \u2014 the delta compiler makes them possible and already captures pre-existing trigger effects; announce trigger creation as a boundary, ship later.",
     "Authenticated checkpoints \u2014 new replicas replay history; honest footnote, fine at v0 space sizes.",
     "Live queries / db.watch, npm and Ruby bindings, adoption/promotion of existing tables, device fencing, rotation \u00d7 push ordering (moot until rotation exists \u2014 say so in the threat model)."
   ],
@@ -1710,16 +1739,16 @@ launch: {
   }));
 
   /* ---------- launch ---------- */
-  const LC_STATUS = { done:"done", wip:"in progress", todo:"todo", decision:"decide" };
+  const LC_STATUS = { done:"done", wip:"in progress", partial:"partial", todo:"todo", decision:"decide" };
   function renderLaunch() {
     const host = $("#lc-groups");
     const all = DATA.launch.groups.flatMap(g => g.items);
-    const score = all.reduce((n, i) => n + (i.status === "done" ? 1 : i.status === "wip" ? 0.5 : 0), 0);
+    const score = all.reduce((n, i) => n + (i.status === "done" ? 1 : (i.status === "wip" || i.status === "partial") ? 0.5 : 0), 0);
     const pct = Math.round(100 * score / all.length);
-    $("#lc-pct").textContent = `${pct}% \u00b7 ${all.filter(i=>i.status==="done").length} done, ${all.filter(i=>i.status==="wip").length} in progress, ${all.length} total`;
-    const counts = { done:0, wip:0, todo:0, decision:0 };
+    $("#lc-pct").textContent = `${pct}% \u00b7 ${all.filter(i=>i.status==="done").length} done, ${all.filter(i=>i.status==="wip"||i.status==="partial").length} in progress, ${all.length} total`;
+    const counts = { done:0, wip:0, partial:0, todo:0, decision:0 };
     all.forEach(i => counts[i.status]++);
-    $("#lc-bar").innerHTML = [["done","#2f9e63"],["wip","#5aa9ff"],["decision","#9d7bff"],["todo","#2a3447"]]
+    $("#lc-bar").innerHTML = [["done","#2f9e63"],["wip","#5aa9ff"],["partial","#d9a441"],["decision","#9d7bff"],["todo","#2a3447"]]
       .map(([s, c]) => counts[s] ? `<div style="flex:${counts[s]};background:${c}"></div>` : "").join("");
     host.innerHTML = "";
     DATA.launch.groups.forEach(g => {
