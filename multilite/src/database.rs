@@ -483,7 +483,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             return Err(Error::StatementModeMismatch);
         }
         match validated {
-            sql::ValidatedStatement::Read => {
+            sql::ValidatedStatement::Read(_) => {
                 self.view(runtime, |view| view.query_prevalidated(sql, params, map))
             }
             sql::ValidatedStatement::Write(validated) => {
@@ -616,6 +616,9 @@ fn authorize_database(mode: ExecutionMode, context: &AuthContext<'_>) -> Authori
         } if pragma_name.eq_ignore_ascii_case("quick_check") => {
             authorize_user_table(Some("main"), table_name)
         }
+        AuthAction::Pragma { pragma_name, .. } if sql::is_public_pragma(pragma_name) => {
+            Authorization::Allow
+        }
         AuthAction::Insert { table_name } if is_schema_table(table_name) => {
             authorize_schema(context.database_name)
         }
@@ -747,7 +750,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
             return Err(Error::StatementModeMismatch);
         }
         match &self.validated {
-            sql::ValidatedStatement::Read => self.database.view(&self.runtime, |view| {
+            sql::ValidatedStatement::Read(_) => self.database.view(&self.runtime, |view| {
                 view.query_prevalidated(&self.sql, params, map)
             }),
             sql::ValidatedStatement::Write(validated) => self.database.query_write_validated(
@@ -772,7 +775,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
             return Err(Error::StatementModeMismatch);
         }
         match &self.validated {
-            sql::ValidatedStatement::Read => {
+            sql::ValidatedStatement::Read(_) => {
                 self.database
                     .view_async(move |view| view.query_prevalidated(&sql, params, map))
                     .await

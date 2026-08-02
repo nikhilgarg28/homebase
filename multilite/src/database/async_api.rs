@@ -219,7 +219,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             return Err(Error::StatementModeMismatch);
         }
         match validated {
-            sql::ValidatedStatement::Read => {
+            sql::ValidatedStatement::Read(_) => {
                 self.view_async(move |view| view.query_prevalidated(&sql, params, map))
                     .await
             }

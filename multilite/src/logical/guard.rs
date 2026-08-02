@@ -30,6 +30,7 @@ pub enum TargetFamily {
     UniqueOwner,
     ForeignReference,
     TransactionLog,
+    UserVersion,
 }
 
 /// Logical operation family whose conflict contract emitted a guard.
@@ -46,6 +47,7 @@ pub enum OperationFamily {
     AddColumn,
     DropColumn,
     TransactionRead,
+    SetUserVersion,
 }
 
 /// Mutation shape permitted against one logical target family.
@@ -77,6 +79,7 @@ macro_rules! mutation_contract {
 /// Central allowlist for every Homebase mutation emitted by the compiler.
 pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(TransactionEnvelope, Set, TransactionLog),
+    mutation_contract!(SetUserVersion, Set, UserVersion),
     mutation_contract!(CreateTable, Set, SchemaLog),
     mutation_contract!(CreateTable, Set, SchemaObjectName),
     mutation_contract!(CreateTable, Set, TableSchema),
@@ -135,6 +138,7 @@ pub enum RejectionKind {
     RestoreRowChanges,
     RevertIndex,
     RevertAlterTable,
+    RestoreUserVersion,
 }
 
 /// One operation-to-repair mapping in the checked compiler contract.
@@ -164,6 +168,7 @@ pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
     rejection_contract!(RenameColumn, RevertAlterTable),
     rejection_contract!(AddColumn, RevertAlterTable),
     rejection_contract!(DropColumn, RevertAlterTable),
+    rejection_contract!(SetUserVersion, RestoreUserVersion),
 ];
 
 impl TargetFamily {
@@ -225,6 +230,13 @@ impl TargetFamily {
             {
                 Some(Self::TransactionLog)
             }
+            value
+                if value == codes::METADATA
+                    && component(2) == Some(codes::USER_VERSION)
+                    && parts.len() == 3 =>
+            {
+                Some(Self::UserVersion)
+            }
             _ => None,
         }
     }
@@ -255,6 +267,7 @@ pub enum GuardReason {
     ExistingRows,
     TableExistence,
     SerializableRead,
+    UserVersion,
 }
 
 /// One permitted guard shape in the checked compiler contract.
@@ -333,6 +346,13 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
         SerializableRead,
         SchemaObjectName
     ),
+    contract!(SetUserVersion, Write, UserVersion, UserVersion),
+    contract!(
+        TransactionRead,
+        SerializableRead,
+        SerializableRead,
+        UserVersion
+    ),
 ];
 
 /// Guards that every operation in a family must emit at least once.
@@ -358,6 +378,7 @@ pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(SetUserVersion, Write, UserVersion, UserVersion),
 ];
 
 /// One unpruned, reviewable conflict dependency emitted by the compiler.
@@ -589,17 +610,19 @@ fn mutation_guard_requirements(
     use GuardClass::{Invariant, Write};
     use GuardReason::{
         ColumnDependency, ColumnNameBinding, ForeignChildren, ForeignReference, RowIdentity,
-        SchemaObjectName, SchemaRevision, TableExistence, UniqueOwnership, WriteContract,
+        SchemaObjectName, SchemaRevision, TableExistence, UniqueOwnership,
+        UserVersion as UserVersionReason, WriteContract,
     };
     use MutationKind::{Delete, DeletePrefix, Set};
     use OperationFamily::{
         AddColumn, CreateIndex, CreateTable, DropColumn, DropIndex, DropTable, RenameColumn,
-        RenameTable, RowChanges,
+        RenameTable, RowChanges, SetUserVersion,
     };
     use TargetFamily::{
         ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
         ForeignReference as ForeignReferenceTarget, Row,
-        SchemaObjectName as SchemaObjectNameTarget, TableRoot, UniqueOwner, WriteRevision,
+        SchemaObjectName as SchemaObjectNameTarget, TableRoot, UniqueOwner,
+        UserVersion as UserVersionTarget, WriteRevision,
     };
 
     match (operation, kind, family) {
@@ -636,6 +659,7 @@ fn mutation_guard_requirements(
         (DropTable, DeletePrefix, ForeignReferenceTarget) => {
             &[(Invariant, ForeignReference), (Write, ForeignReference)]
         }
+        (SetUserVersion, Set, UserVersionTarget) => &[(Write, UserVersionReason)],
         _ => &[],
     }
 }
@@ -799,6 +823,7 @@ pub enum LogicalTarget {
     TransactionLog {
         transaction: [u8; 16],
     },
+    UserVersion,
 }
 
 impl LogicalTarget {
@@ -823,6 +848,7 @@ impl LogicalTarget {
                 TargetFamily::ForeignReference
             }
             Self::TransactionLog { .. } => TargetFamily::TransactionLog,
+            Self::UserVersion => TargetFamily::UserVersion,
         }
     }
 
@@ -953,6 +979,11 @@ impl LogicalTarget {
                 codes::TRANSACTIONS.to_vec(),
                 codes::LOG.to_vec(),
                 transaction.to_vec(),
+            ],
+            Self::UserVersion => vec![
+                codes::ROOT.to_vec(),
+                codes::METADATA.to_vec(),
+                codes::USER_VERSION.to_vec(),
             ],
         };
         let key = Key::from_bytes(components)?;
@@ -1141,9 +1172,11 @@ mod tests {
             GuardReason::ForeignChildren,
             GuardReason::ColumnDependency,
             GuardReason::ExistingRows,
+            GuardReason::TableExistence,
             GuardReason::SerializableRead,
+            GuardReason::UserVersion,
         ];
-        assert_eq!(reasons.len(), 12);
+        assert_eq!(reasons.len(), 14);
     }
 
     #[test]
@@ -1318,6 +1351,7 @@ mod tests {
             OperationFamily::RenameColumn,
             OperationFamily::AddColumn,
             OperationFamily::DropColumn,
+            OperationFamily::SetUserVersion,
         ]);
         assert_eq!(
             REJECTION_CONTRACTS

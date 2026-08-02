@@ -27,6 +27,51 @@ fn local_write_state(path: &Path) -> (i64, String, Option<String>) {
 }
 
 #[test]
+fn user_version_is_a_durable_write_and_schema_pragmas_are_explicit_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pragma.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("CREATE INDEX notes_body ON notes(body)", ())
+        .unwrap();
+    db.execute("PRAGMA user_version = -17", ()).unwrap();
+    assert_eq!(
+        db.query("PRAGMA user_version", (), |row| row.get::<_, i32>(0))
+            .unwrap(),
+        [-17]
+    );
+    assert_eq!(
+        db.query("PRAGMA table_info(notes)", (), |row| row
+            .get::<_, String>(1))
+            .unwrap(),
+        ["id", "body"]
+    );
+    assert_eq!(
+        db.query("PRAGMA index_list(notes)", (), |row| row
+            .get::<_, String>(1))
+            .unwrap(),
+        ["notes_body"]
+    );
+    assert!(matches!(
+        db.query("PRAGMA journal_mode", (), |_| Ok(())),
+        Err(Error::UnsupportedSql(_))
+    ));
+    let pending = local_write_state(&path).0;
+    db.execute("PRAGMA user_version = -17", ()).unwrap();
+    assert_eq!(local_write_state(&path).0, pending);
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query("PRAGMA main.user_version", (), |row| row.get::<_, i32>(0))
+            .unwrap(),
+        [-17]
+    );
+}
+
+#[test]
 fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("drop-table.sqlite");

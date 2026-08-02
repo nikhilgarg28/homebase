@@ -41,7 +41,23 @@ Status: complete.
 
 ## PRAGMA policy
 
-Status: pending.
+Status: complete.
+
+- `PRAGMA [main.]user_version` is a replicated application-metadata cell, not
+  a device-local setting. Signed 32-bit literal assignments compile to one
+  durable operation with exact write guards and rejection repair; same-value
+  assignments are true logical no-ops.
+- Reads admit only `user_version` and deterministic schema introspection:
+  `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, and
+  `foreign_key_list`. Everything else fails at the SQL gate instead of later
+  surfacing as raw `SQLITE_AUTH`.
+- Serializable managed updates record the exact user-version cell or the
+  schema-object name plus owning table root inspected by a PRAGMA. Snapshot
+  isolation retains only mandatory write guards.
+- Physical, connection-local, or environment-sensitive PRAGMAs such as
+  `journal_mode`, `data_version`, `schema_version`, and `page_count` remain
+  fenced. Supporting operational configuration belongs on open options rather
+  than in replicated SQL.
 
 ## Views
 

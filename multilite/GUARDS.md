@@ -9,6 +9,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | Operation | Mutation | Target family |
 | --- | --- | --- |
 | `TransactionEnvelope` | `Set` | `TransactionLog` |
+| `SetUserVersion` | `Set` | `UserVersion` |
 | `CreateTable` | `Set` | `SchemaLog` |
 | `CreateTable` | `Set` | `SchemaObjectName` |
 | `CreateTable` | `Set` | `TableSchema` |
@@ -106,6 +107,8 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `DropColumn` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `TableRoot` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `SchemaObjectName` |
+| `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |
+| `TransactionRead` | `SerializableRead` | `SerializableRead` | `UserVersion` |
 
 ## Rejection Repair
 
@@ -120,6 +123,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameColumn` | `RevertAlterTable` |
 | `AddColumn` | `RevertAlterTable` |
 | `DropColumn` | `RevertAlterTable` |
+| `SetUserVersion` | `RestoreUserVersion` |
 
 ## Required Guards
 
@@ -144,3 +148,4 @@ These family-level guards must occur at least once. In addition, the compiler re
 | `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `DropColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |

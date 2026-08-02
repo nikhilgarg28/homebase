@@ -15,6 +15,7 @@ use super::row::{RowChanges, RowHomebaseOp};
 use super::schema::CreateTable;
 #[cfg(test)]
 use super::schema::{CreateTableSpec, write_revision_key};
+use super::user_version::{SetUserVersion, UserVersionHomebaseOp};
 use crate::Result;
 use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
@@ -25,6 +26,7 @@ const ROW_CHANGES_OPERATION: u8 = 2;
 const INDEX_OPERATION: u8 = 5;
 const ALTER_TABLE_OPERATION: u8 = 6;
 const DROP_TABLE_OPERATION: u8 = 7;
+const SET_USER_VERSION_OPERATION: u8 = 8;
 
 /// One logical Multilite operation, independent of its Homebase envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub enum MultiliteOp {
     DropTable(DropTableOperation),
     ChangeRows(RowChanges),
     Index(IndexOperation),
+    SetUserVersion(SetUserVersion),
 }
 
 /// Homebase mutations and conflict footprint for one [`MultiliteOp`].
@@ -52,6 +55,7 @@ pub enum RejectionEffect {
     RestoreDroppedTable { operation: DropTableOperation },
     RestoreRowChanges { changes: RowChanges },
     RevertIndex { operation: IndexOperation },
+    RestoreUserVersion { operation: SetUserVersion },
 }
 
 /// One logical operation and every deterministic artifact derived from it.
@@ -124,6 +128,10 @@ impl MultiliteOp {
                 writer.u8(INDEX_OPERATION);
                 writer.bytes(&index.encode());
             }
+            Self::SetUserVersion(operation) => {
+                writer.u8(SET_USER_VERSION_OPERATION);
+                writer.bytes(&operation.encode());
+            }
         }
         writer.finish()
     }
@@ -150,6 +158,9 @@ impl MultiliteOp {
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             INDEX_OPERATION => IndexOperation::decode(reader.rest())
                 .map(Self::Index)
+                .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
+            SET_USER_VERSION_OPERATION => SetUserVersion::decode(reader.rest())
+                .map(Self::SetUserVersion)
                 .map_err(|error| OperationCodecError::InvalidPayload(error.to_string())),
             kind => Err(OperationCodecError::UnknownKind(kind)),
         }
@@ -188,6 +199,12 @@ impl MultiliteOp {
                     operation: operation.clone(),
                 },
                 RejectionKind::RevertIndex,
+            ),
+            Self::SetUserVersion(operation) => (
+                RejectionEffect::RestoreUserVersion {
+                    operation: operation.clone(),
+                },
+                RejectionKind::RestoreUserVersion,
             ),
         };
         validate_rejection(
@@ -245,6 +262,14 @@ impl MultiliteOp {
                 } = index.to_homebase()?;
                 (mutations, footprint, guards)
             }
+            Self::SetUserVersion(operation) => {
+                let UserVersionHomebaseOp {
+                    mutations,
+                    footprint,
+                    guards,
+                } = operation.to_homebase()?;
+                (mutations, footprint, guards)
+            }
         };
         let operation = guards.operation().ok_or(crate::Error::CaptureInvariant(
             "operation lowering produced an unscoped guard plan",
@@ -274,6 +299,7 @@ impl MultiliteOp {
             Self::DropTable(dropped) => dropped.apply(connection),
             Self::ChangeRows(changes) => changes.apply(connection),
             Self::Index(index) => index.apply(connection),
+            Self::SetUserVersion(operation) => operation.apply(connection),
         }
     }
 
@@ -282,7 +308,10 @@ impl MultiliteOp {
         match self {
             Self::AlterTable(altered) => altered.capture_local_repair(connection),
             Self::DropTable(dropped) => dropped.capture_local_repair(connection),
-            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => Ok(()),
+            Self::CreateTable(_)
+            | Self::ChangeRows(_)
+            | Self::Index(_)
+            | Self::SetUserVersion(_) => Ok(()),
         }
     }
 
@@ -292,7 +321,10 @@ impl MultiliteOp {
         match self {
             Self::AlterTable(altered) => altered.repair_id(),
             Self::DropTable(dropped) => Some(dropped.repair_spec().id),
-            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => None,
+            Self::CreateTable(_)
+            | Self::ChangeRows(_)
+            | Self::Index(_)
+            | Self::SetUserVersion(_) => None,
         }
     }
 
@@ -300,7 +332,10 @@ impl MultiliteOp {
         match self {
             Self::AlterTable(altered) => altered.repair_spec(),
             Self::DropTable(dropped) => Some(dropped.repair_spec()),
-            Self::CreateTable(_) | Self::ChangeRows(_) | Self::Index(_) => None,
+            Self::CreateTable(_)
+            | Self::ChangeRows(_)
+            | Self::Index(_)
+            | Self::SetUserVersion(_) => None,
         }
     }
 
@@ -317,6 +352,7 @@ impl MultiliteOp {
             }
             Self::DropTable(dropped) => dropped.verify_materialized(connection),
             Self::Index(index) => crate::physical::verify_table(connection, index.table_id()),
+            Self::SetUserVersion(operation) => operation.verify_materialized(connection),
         }
     }
 }

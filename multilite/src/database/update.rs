@@ -27,7 +27,7 @@ use crate::logical::schema::{
 };
 use crate::logical::transaction::MultiliteTransaction;
 use crate::runtime::ExecutionMode;
-use crate::sql::{StatementOutput, ValidatedExecute, ValidatedStatement};
+use crate::sql::{StatementOutput, ValidatedExecute, ValidatedRead, ValidatedStatement};
 use crate::{Error, Params, Result};
 
 /// One managed update accumulating a single durable transaction.
@@ -93,7 +93,8 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             return Err(Error::StatementModeMismatch);
         }
         match validated {
-            ValidatedStatement::Read => {
+            ValidatedStatement::Read(read) => {
+                self.record_explicit_read(&read)?;
                 let mut statement = TransactionStatement::new_prevalidated(self.connection, sql)?;
                 statement.query_map(params, map)
             }
@@ -212,6 +213,9 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 } else {
                     self.execute_drop_index(sql, params, spec)
                 }
+            }
+            ValidatedExecute::SetUserVersion(value) => {
+                self.execute_set_user_version(sql, params, value)
             }
             ValidatedExecute::Insert(StatementOutput::Changes)
             | ValidatedExecute::Delete(StatementOutput::Changes)
@@ -364,6 +368,73 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             .run_schema(|| Ok(self.connection.execute(sql, params)?), |_| Ok(()))?;
         ensure_no_schema_rows(&events, capture_error)?;
         Ok(changed)
+    }
+
+    fn execute_set_user_version<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        value: i32,
+    ) -> Result<usize> {
+        let operation = self.hooks.with_internal(|| {
+            crate::logical::user_version::SetUserVersion::prepare(self.connection, value)
+        })?;
+        let (changed, events) = self
+            .hooks
+            .run_schema(|| Ok(self.connection.execute(sql, params)?), |_| Ok(()))?;
+        ensure_no_schema_rows(&events, "PRAGMA user_version captured application rows")?;
+        if crate::logical::user_version::read(self.connection)? != value {
+            return Err(Error::CaptureInvariant(
+                "SQLite did not materialize the validated user_version",
+            ));
+        }
+        if let Some(operation) = operation {
+            self.record_operation(MultiliteOp::SetUserVersion(operation).compile()?);
+        }
+        Ok(changed)
+    }
+
+    fn record_explicit_read(&mut self, read: &ValidatedRead) -> Result<()> {
+        let mut guards = GuardPlan::for_operation(OperationFamily::TransactionRead);
+        match read {
+            ValidatedRead::Select => return Ok(()),
+            ValidatedRead::UserVersion => guards.serializable_read(
+                crate::logical::user_version::key(),
+                GuardReason::SerializableRead,
+            )?,
+            ValidatedRead::TablePragma(name) => {
+                guards.serializable_read(
+                    schema_object_name_scope_key(name),
+                    GuardReason::SerializableRead,
+                )?;
+                if let Some(table) = self
+                    .hooks
+                    .with_internal(|| catalog::by_name(self.connection, name.value()))?
+                {
+                    guards.serializable_read(
+                        table_prefix(table.table_id()),
+                        GuardReason::SerializableRead,
+                    )?;
+                }
+            }
+            ValidatedRead::IndexPragma(name) => {
+                guards.serializable_read(
+                    schema_object_name_scope_key(name),
+                    GuardReason::SerializableRead,
+                )?;
+                if let Some((table, _)) = self
+                    .hooks
+                    .with_internal(|| catalog::index_by_name(self.connection, name))?
+                {
+                    guards.serializable_read(
+                        table_prefix(table.table_id()),
+                        GuardReason::SerializableRead,
+                    )?;
+                }
+            }
+        }
+        self.footprint.extend(guards.footprint());
+        Ok(())
     }
 
     fn execute_conditional_schema_noop<Q: Params>(

@@ -365,6 +365,7 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
                 changes.restore_materialized(connection)?
             }
             RejectionEffect::RevertIndex { operation } => operation.rollback(connection)?,
+            RejectionEffect::RestoreUserVersion { operation } => operation.rollback(connection)?,
         }
     }
     Ok(())

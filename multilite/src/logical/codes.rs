@@ -17,6 +17,8 @@ pub const UNIQUE: &[u8] = b"unique";
 pub const FOREIGN_REFERENCES: &[u8] = b"foreign-references";
 pub const WRITE_REVISION: &[u8] = b"write-revision";
 pub const TRANSACTIONS: &[u8] = b"transactions";
+pub const METADATA: &[u8] = b"metadata";
+pub const USER_VERSION: &[u8] = b"user-version";
 
 /// Components before the value images in row and UNIQUE keys.
 pub const VALUE_KEY_PREFIX_COMPONENTS: usize = 5;

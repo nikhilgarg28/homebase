@@ -77,9 +77,10 @@ enum SqlShape {
     RenameColumn,
     AddColumn,
     DropColumn,
+    SetUserVersion,
 }
 
-const SQL_SHAPES: [SqlShape; 13] = [
+const SQL_SHAPES: [SqlShape; 14] = [
     SqlShape::CreateTable,
     SqlShape::DropTable,
     SqlShape::Insert,
@@ -93,6 +94,7 @@ const SQL_SHAPES: [SqlShape; 13] = [
     SqlShape::RenameColumn,
     SqlShape::AddColumn,
     SqlShape::DropColumn,
+    SqlShape::SetUserVersion,
 ];
 
 macro_rules! operation {
@@ -130,6 +132,25 @@ enum AdmissionOrder {
 }
 
 const PAIR_CASES: &[PairCase] = &[
+    PairCase {
+        name: "user_version_conflict",
+        relationship: "same replicated application metadata cell",
+        left: operation!(SetUserVersion, "PRAGMA user_version = 11"),
+        right: operation!(SetUserVersion, "PRAGMA user_version = 12"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "user_version_and_row_insert",
+        relationship: "disjoint metadata and row targets",
+        left: operation!(SetUserVersion, "PRAGMA user_version = 11"),
+        right: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (3, 'three', 'right', 'd3')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
     PairCase {
         name: "insert_disjoint_rows",
         relationship: "different primary and unique keys",
@@ -1086,6 +1107,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseState {
+    user_version: i32,
     tables: Vec<TableState>,
 }
 
@@ -1130,6 +1152,9 @@ struct ForeignKeyState {
 }
 
 fn observe(connection: &Connection) -> DatabaseState {
+    let user_version = connection
+        .query_row("PRAGMA user_version", (), |row| row.get(0))
+        .unwrap();
     let tables = connection
         .prepare(
             "SELECT name FROM sqlite_schema
@@ -1146,7 +1171,10 @@ fn observe(connection: &Connection) -> DatabaseState {
         .into_iter()
         .map(|name| observe_table(connection, name))
         .collect();
-    DatabaseState { tables }
+    DatabaseState {
+        user_version,
+        tables,
+    }
 }
 
 fn observe_table(connection: &Connection, name: String) -> TableState {

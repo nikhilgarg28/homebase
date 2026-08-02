@@ -72,6 +72,127 @@ where
         .unwrap()
 }
 
+fn user_version<H>(database: &MultiliteConnection<H>) -> i32
+where
+    H: ServerHandle + Send + Sync + 'static,
+{
+    database
+        .query("PRAGMA user_version", (), |row| row.get(0))
+        .unwrap()[0]
+}
+
+#[test]
+fn concurrent_user_versions_reject_repair_and_converge_at_both_isolation_levels() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let second_path = directory
+            .path()
+            .join(format!("pragma-second-{isolation:?}.sqlite"));
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("pragma-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first.execute("PRAGMA user_version = 11", ()).unwrap();
+        second.execute("PRAGMA user_version = 12", ()).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("concurrent user_version unexpectedly admitted")
+        };
+        assert_eq!(user_version(&second), 12);
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert_eq!(user_version(&second), 12);
+        second.rollback(&rejection).unwrap();
+        assert_eq!(user_version(&second), 0);
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        assert_eq!(user_version(&first), 11);
+        assert_eq!(user_version(&second), 11);
+    }
+}
+
+#[test]
+fn pragma_reads_join_only_serializable_conflict_footprints() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("pragma-read-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("pragma-read-second-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        first
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .update(|transaction| {
+                let columns = transaction.query("PRAGMA table_info(notes)", (), |row| {
+                    row.get::<_, String>(1)
+                })?;
+                assert_eq!(columns, ["id", "body"]);
+                transaction.execute("INSERT INTO notes VALUES (3, 'three')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        second
+            .execute("CREATE INDEX notes_body ON notes(body)", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        match (isolation, first.push().unwrap()) {
+            (IsolationLevel::Snapshot, PushOutcome::Drained) => {}
+            (IsolationLevel::Serializable, PushOutcome::Rejected(rejection)) => {
+                first.rollback(&rejection).unwrap();
+                assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            }
+            (_, outcome) => panic!("unexpected PRAGMA read disposition: {outcome:?}"),
+        }
+    }
+}
+
 #[test]
 fn public_sql_create_and_insert_converge_across_two_replicas() {
     let directory = tempfile::tempdir().unwrap();

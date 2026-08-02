@@ -4,9 +4,9 @@ use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, FrameBound,
     FromClause, FunctionCallOrder, FunctionTail, Indexed, IndexedColumn, InsertBody,
-    JoinConstraint, Limit, Literal, Name, OneSelect, Over, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type,
-    TypeSize, UnaryOperator, Upsert, UpsertDo, Window, With,
+    JoinConstraint, Limit, Literal, Name, OneSelect, Over, PragmaBody, QualifiedName, RefAct,
+    RefArg, ResolveType, ResultColumn, Select, SelectTable, SortedColumn, Stmt, TabFlags,
+    TableConstraint, Type, TypeSize, UnaryOperator, Upsert, UpsertDo, Window, With,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -46,6 +46,7 @@ pub enum ValidatedExecute {
     Insert(StatementOutput),
     Delete(StatementOutput),
     Update(StatementOutput),
+    SetUserVersion(i32),
 }
 
 /// Result shape of one validated statement.
@@ -73,7 +74,8 @@ impl ValidatedExecute {
             | Self::CreateIndex(_)
             | Self::CreateIndexIfNotExists(_)
             | Self::DropIndex(_)
-            | Self::DropIndexIfExists(_) => StatementOutput::Changes,
+            | Self::DropIndexIfExists(_)
+            | Self::SetUserVersion(_) => StatementOutput::Changes,
         }
     }
 }
@@ -138,8 +140,16 @@ pub struct DropIndexSpec {
 
 #[derive(Clone)]
 pub enum ValidatedStatement {
-    Read,
+    Read(ValidatedRead),
     Write(Box<ValidatedExecute>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValidatedRead {
+    Select,
+    UserVersion,
+    TablePragma(SqlName),
+    IndexPragma(SqlName),
 }
 
 /// SQLite access required to execute one validated statement.
@@ -152,14 +162,14 @@ pub enum StatementAccess {
 impl ValidatedStatement {
     pub fn access(&self) -> StatementAccess {
         match self {
-            Self::Read => StatementAccess::Read,
+            Self::Read(_) => StatementAccess::Read,
             Self::Write(_) => StatementAccess::Write,
         }
     }
 
     pub fn output(&self) -> StatementOutput {
         match self {
-            Self::Read => StatementOutput::Rows,
+            Self::Read(_) => StatementOutput::Rows,
             Self::Write(validated) => validated.output(),
         }
     }
@@ -623,6 +633,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             Ok(ValidatedExecute::Update(output))
         }
+        Stmt::Pragma(name, body) => match validate_pragma(name, body)? {
+            ValidatedStatement::Write(write) => Ok(*write),
+            ValidatedStatement::Read(_) => Err(Error::StatementModeMismatch),
+        },
         _ => Err(Error::UnsupportedSql(
             "execute accepts only supported schema changes, INSERT, DELETE, and UPDATE",
         )),
@@ -641,10 +655,10 @@ pub fn validate_statement(sql: &str) -> Result<ValidatedStatement> {
                     "reserved Multilite tables are not readable",
                 ))
             } else {
-                Ok(ValidatedStatement::Read)
+                Ok(ValidatedStatement::Read(ValidatedRead::Select))
             }
         }
-        Cmd::Stmt(Stmt::Pragma(_, None)) => Ok(ValidatedStatement::Read),
+        Cmd::Stmt(Stmt::Pragma(name, body)) => validate_pragma(name, body),
         Cmd::Stmt(
             Stmt::Begin(..)
             | Stmt::Commit(..)
@@ -694,7 +708,10 @@ pub fn validate_read_statement(sql: &str) -> Result<()> {
         {
             Ok(())
         }
-        Cmd::Stmt(Stmt::Pragma(_, None)) => Ok(()),
+        Cmd::Stmt(Stmt::Pragma(name, body)) => match validate_pragma(name, body)? {
+            ValidatedStatement::Read(_) => Ok(()),
+            ValidatedStatement::Write(_) => Err(Error::StatementModeMismatch),
+        },
         Cmd::Stmt(
             Stmt::Begin(..)
             | Stmt::Commit(..)
@@ -706,6 +723,94 @@ pub fn validate_read_statement(sql: &str) -> Result<()> {
         )),
         _ => Err(Error::StatementModeMismatch),
     }
+}
+
+fn validate_pragma(name: QualifiedName, body: Option<PragmaBody>) -> Result<ValidatedStatement> {
+    let schema_is_main = match name.db_name.as_ref() {
+        None => true,
+        Some(schema) => identifier(schema)?.canonical() == b"main",
+    };
+    if name.alias.is_some() || !schema_is_main {
+        return Err(Error::UnsupportedSql(
+            "only main-schema PRAGMAs are supported",
+        ));
+    }
+    let pragma = identifier(&name.name)?;
+    match (pragma.canonical(), body) {
+        (b"user_version", None) => Ok(ValidatedStatement::Read(ValidatedRead::UserVersion)),
+        (b"user_version", Some(body)) => parse_pragma_i32(body)
+            .map(ValidatedExecute::SetUserVersion)
+            .map(Box::new)
+            .map(ValidatedStatement::Write),
+        (b"table_info" | b"table_xinfo" | b"index_list" | b"foreign_key_list", Some(body)) => {
+            parse_pragma_object(body)
+                .map(ValidatedRead::TablePragma)
+                .map(ValidatedStatement::Read)
+        }
+        (b"index_info" | b"index_xinfo", Some(body)) => parse_pragma_object(body)
+            .map(ValidatedRead::IndexPragma)
+            .map(ValidatedStatement::Read),
+        _ => Err(Error::UnsupportedSql(
+            "only deterministic schema introspection and user_version PRAGMAs are supported",
+        )),
+    }
+}
+
+fn pragma_value(body: PragmaBody) -> Expr {
+    match body {
+        PragmaBody::Equals(value) | PragmaBody::Call(value) => value,
+    }
+}
+
+fn parse_pragma_object(body: PragmaBody) -> Result<SqlName> {
+    match pragma_value(body) {
+        Expr::Id(id) => identifier(&Name(id.0)),
+        Expr::Name(name) => identifier(&name),
+        Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value),
+        Expr::Parenthesized(mut values) if values.len() == 1 => match values.pop().unwrap() {
+            Expr::Id(id) => identifier(&Name(id.0)),
+            Expr::Name(name) => identifier(&name),
+            Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value),
+            _ => Err(Error::UnsupportedSql(
+                "PRAGMA object names must be literals",
+            )),
+        },
+        _ => Err(Error::UnsupportedSql(
+            "PRAGMA object names must be literals",
+        )),
+    }
+}
+
+fn parse_pragma_i32(body: PragmaBody) -> Result<i32> {
+    fn parse(expression: Expr) -> Option<i64> {
+        match expression {
+            Expr::Literal(Literal::Numeric(value)) => value.parse().ok(),
+            Expr::Unary(UnaryOperator::Negative, value) => parse(*value)?.checked_neg(),
+            Expr::Unary(UnaryOperator::Positive, value) => parse(*value),
+            Expr::Parenthesized(mut values) if values.len() == 1 => parse(values.pop()?),
+            _ => None,
+        }
+    }
+    let value = parse(pragma_value(body)).ok_or(Error::UnsupportedSql(
+        "user_version must be a signed 32-bit decimal integer literal",
+    ))?;
+    i32::try_from(value).map_err(|_| {
+        Error::UnsupportedSql("user_version must be a signed 32-bit decimal integer literal")
+    })
+}
+
+pub(crate) fn is_public_pragma(name: &str) -> bool {
+    [
+        "user_version",
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+    ]
+    .iter()
+    .any(|allowed| name.eq_ignore_ascii_case(allowed))
 }
 
 fn select_reads_reserved(select: &Select) -> bool {
@@ -2150,9 +2255,75 @@ mod tests {
         ] {
             assert!(matches!(
                 validate_statement(sql),
-                Ok(ValidatedStatement::Read)
+                Ok(ValidatedStatement::Read(ValidatedRead::Select))
             ));
             validate_read_statement(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn pragma_surface_is_explicit_and_user_version_is_typed() {
+        assert!(matches!(
+            validate_statement("PRAGMA user_version").unwrap(),
+            ValidatedStatement::Read(ValidatedRead::UserVersion)
+        ));
+        for (sql, expected) in [
+            ("PRAGMA user_version = 7", 7),
+            ("PRAGMA main.user_version(-9)", -9),
+            ("PRAGMA user_version = +2147483647", i32::MAX),
+            ("PRAGMA user_version = -2147483648", i32::MIN),
+        ] {
+            assert!(matches!(
+                validate_statement(sql).unwrap(),
+                ValidatedStatement::Write(write)
+                    if matches!(*write, ValidatedExecute::SetUserVersion(value) if value == expected)
+            ));
+        }
+        for sql in [
+            "PRAGMA user_version = 2147483648",
+            "PRAGMA user_version = 1.5",
+            "PRAGMA user_version = '7'",
+            "PRAGMA temp.user_version",
+            "PRAGMA journal_mode",
+            "PRAGMA foreign_keys = ON",
+            "PRAGMA schema_version",
+        ] {
+            assert!(
+                matches!(validate_statement(sql), Err(Error::UnsupportedSql(_))),
+                "unsupported PRAGMA was accepted: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_schema_introspection_pragmas_are_reads() {
+        for (sql, table) in [
+            ("PRAGMA table_info(notes)", true),
+            ("PRAGMA main.table_xinfo('notes')", true),
+            ("PRAGMA index_list(notes)", true),
+            ("PRAGMA foreign_key_list(notes)", true),
+            ("PRAGMA index_info(notes_by_body)", false),
+            ("PRAGMA index_xinfo('notes_by_body')", false),
+        ] {
+            let validated = validate_statement(sql).unwrap();
+            assert!(if table {
+                matches!(
+                    validated,
+                    ValidatedStatement::Read(ValidatedRead::TablePragma(_))
+                )
+            } else {
+                matches!(
+                    validated,
+                    ValidatedStatement::Read(ValidatedRead::IndexPragma(_))
+                )
+            });
+            validate_read_statement(sql).unwrap();
+        }
+        for sql in ["PRAGMA table_info", "PRAGMA index_info(1 + 2)"] {
+            assert!(matches!(
+                validate_statement(sql),
+                Err(Error::UnsupportedSql(_))
+            ));
         }
     }
 
