@@ -302,11 +302,6 @@ fn capture_change(
     }
     let event = match update {
         PreUpdateCase::Insert(values) => {
-            if values.get_query_depth() != 0 {
-                return Err(Error::CaptureInvariant(
-                    "writes caused by triggers are not supported",
-                ));
-            }
             let captured = (0..values.get_column_count())
                 .map(|index| {
                     values
@@ -322,11 +317,6 @@ fn capture_change(
             })
         }
         PreUpdateCase::Delete(values) => {
-            if values.get_query_depth() != 0 {
-                return Err(Error::CaptureInvariant(
-                    "writes caused by triggers are not supported",
-                ));
-            }
             let captured = (0..values.get_column_count())
                 .map(|index| {
                     values
@@ -345,11 +335,6 @@ fn capture_change(
             old_value_accessor: old,
             new_value_accessor: new,
         } => {
-            if old.get_query_depth() != 0 || new.get_query_depth() != 0 {
-                return Err(Error::CaptureInvariant(
-                    "writes caused by triggers are not supported",
-                ));
-            }
             if old.get_column_count() != new.get_column_count() {
                 return Err(Error::CaptureInvariant(
                     "UPDATE before and after row widths differ",

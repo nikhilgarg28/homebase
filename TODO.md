@@ -22,11 +22,12 @@ multilite
   non-UNIQUE indexes remain synchronized schema and physical access paths only.
 
 - The statement-delta compiler now normalizes mixed and repeated preupdate
-  events into one deterministic net effect, derives operation-wide guards, and
-  produces one exact inverse. `OR ABORT`, `OR IGNORE`, and UPSERT chains made
-  entirely of `DO NOTHING` are admitted. Keep `REPLACE`, `OR FAIL`,
-  `OR ROLLBACK`, UPSERT `DO UPDATE`, triggers, and mutating foreign-key actions
-  outside the grammar until each has an explicit OCC contract plus codec,
+  events across every synchronized table touched by one SQLite statement,
+  derives operation-wide guards, and produces one exact inverse. Conflict
+  modes through REPLACE and UPSERT DO UPDATE, plus ON DELETE CASCADE and SET
+  NULL, are admitted. Keep `OR FAIL`, `OR ROLLBACK`, public CREATE TRIGGER, ON
+  DELETE SET DEFAULT/RESTRICT, and mutating ON UPDATE actions outside the
+  grammar until each has an explicit OCC contract plus codec,
   rejection-repair, operation-pair, and two-replica convergence coverage.
 
 - Row DML now has a deterministic 100,000-event / 64 MiB capture fence inside

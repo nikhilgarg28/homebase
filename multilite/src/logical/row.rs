@@ -84,7 +84,8 @@ pub struct CapturedRow {
     pub values: Vec<StoredValue>,
 }
 
-/// One direct application-row change observed by SQLite's preupdate hook.
+/// One application-row change observed by SQLite's preupdate hook, including
+/// nested foreign-key and trigger effects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapturedChange {
     Insert(CapturedRow),
@@ -295,7 +296,7 @@ pub struct UpdatedRowsFixture {
 /// Net row effects of one SQLite statement after repeated touches are folded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowChanges {
-    table: TableChanges,
+    tables: Vec<TableChanges>,
 }
 
 /// One table's rules and row-lineage-preserving before/after images.
@@ -1525,7 +1526,7 @@ impl RowChanges {
     pub(crate) fn inserted(inserted: RowSet) -> Self {
         let rules = inserted.clone().without_rows();
         Self {
-            table: TableChanges {
+            tables: vec![TableChanges {
                 rules,
                 rows: inserted
                     .rows
@@ -1535,7 +1536,7 @@ impl RowChanges {
                         after: Some(after),
                     })
                     .collect(),
-            },
+            }],
         }
     }
 
@@ -1543,7 +1544,7 @@ impl RowChanges {
     pub(crate) fn deleted(deleted: DeletedRowsFixture) -> Self {
         let rules = deleted.deleted.clone().without_rows();
         Self {
-            table: TableChanges {
+            tables: vec![TableChanges {
                 rules,
                 rows: deleted
                     .deleted
@@ -1554,7 +1555,7 @@ impl RowChanges {
                         after: None,
                     })
                     .collect(),
-            },
+            }],
         }
     }
 
@@ -1562,7 +1563,7 @@ impl RowChanges {
     pub(crate) fn updated(updated: UpdatedRowsFixture) -> Self {
         let rules = updated.before.clone().without_rows();
         Self {
-            table: TableChanges {
+            tables: vec![TableChanges {
                 rules,
                 rows: updated
                     .before
@@ -1574,7 +1575,7 @@ impl RowChanges {
                         after: Some(after),
                     })
                     .collect(),
-            },
+            }],
         }
     }
 
@@ -1586,34 +1587,31 @@ impl RowChanges {
         if events.is_empty() {
             return Ok(None);
         }
-        let mut builder = None::<TableChangesBuilder>;
+        let mut builders = BTreeMap::<[u8; 16], TableChangesBuilder>::new();
         for event in events {
             match event {
                 CapturedChange::Insert(row) => {
-                    let expected = builder.as_ref().map(|builder| &builder.rules);
                     let (rules, row, key) = captured_image(
                         catalog,
                         row,
                         "INSERT target has no synchronized schema identity",
-                        expected,
+                        None,
                     )?;
-                    table_builder(&mut builder, rules)?.insert(key, row)?;
+                    table_builder(&mut builders, rules)?.insert(key, row)?;
                 }
                 CapturedChange::Delete(row) => {
-                    let expected = builder.as_ref().map(|builder| &builder.rules);
                     let (rules, row, key) = captured_image(
                         catalog,
                         row,
                         "DELETE target has no synchronized schema identity",
-                        expected,
+                        None,
                     )?;
-                    table_builder(&mut builder, rules)?.delete(key, row)?;
+                    table_builder(&mut builders, rules)?.delete(key, row)?;
                 }
                 CapturedChange::Update { before, after } => {
                     let missing = "UPDATE target has no synchronized schema identity";
-                    let expected = builder.as_ref().map(|builder| &builder.rules);
                     let (before_rules, before, before_key) =
-                        captured_image(catalog, before, missing, expected)?;
+                        captured_image(catalog, before, missing, None)?;
                     let (after_rules, after, after_key) =
                         captured_image(catalog, after, missing, Some(&before_rules))?;
                     if before_rules != after_rules {
@@ -1621,27 +1619,30 @@ impl RowChanges {
                             "one row update crossed synchronized table identities",
                         ));
                     }
-                    table_builder(&mut builder, before_rules)?
+                    table_builder(&mut builders, before_rules)?
                         .update(before_key, before, after_key, after)?;
                 }
             }
         }
 
-        let builder = builder.expect("non-empty capture stream produced a table builder");
-        let rows = builder
-            .rows
-            .into_iter()
-            .filter(|change| change.before != change.after)
+        let tables = builders
+            .into_values()
+            .filter_map(|builder| {
+                let rows = builder
+                    .rows
+                    .into_iter()
+                    .filter(|change| change.before != change.after)
+                    .collect::<Vec<_>>();
+                (!rows.is_empty()).then_some(TableChanges {
+                    rules: builder.rules,
+                    rows,
+                })
+            })
             .collect::<Vec<_>>();
-        if rows.is_empty() {
+        if tables.is_empty() {
             return Ok(None);
         }
-        let changes = Self {
-            table: TableChanges {
-                rules: builder.rules,
-                rows,
-            },
-        };
+        let changes = Self { tables };
         changes
             .validate_structure()
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
@@ -1655,7 +1656,9 @@ impl RowChanges {
             .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
         let mut mutations = Vec::new();
         let mut guards = GuardPlan::for_operation(OperationFamily::RowChanges);
-        self.table.lower(&mut mutations, &mut guards)?;
+        for table in &self.tables {
+            table.lower(&mut mutations, &mut guards)?;
+        }
         let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
@@ -1667,9 +1670,11 @@ impl RowChanges {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.u8(ROW_CHANGES_FRAME_VERSION);
-        writer
-            .field(TAG_CHANGED_TABLE, &self.table.encode())
-            .expect("row-change field length fits in u32");
+        for table in &self.tables {
+            writer
+                .field(TAG_CHANGED_TABLE, &table.encode())
+                .expect("row-change field length fits in u32");
+        }
         writer.finish()
     }
 
@@ -1681,15 +1686,16 @@ impl RowChanges {
         if reader.u8() != Some(ROW_CHANGES_FRAME_VERSION) {
             return Err(RowCodecError::UnknownVersion);
         }
-        let mut table = None;
+        let mut tables = Vec::new();
         while let Some((tag, value)) = reader.field().map_err(|_| RowCodecError::Truncated)? {
             if tag == TAG_CHANGED_TABLE {
-                set_once(&mut table, TableChanges::decode(value)?)?;
+                tables.push(TableChanges::decode(value)?);
             }
         }
-        let changes = Self {
-            table: table.ok_or(RowCodecError::MissingField(TAG_CHANGED_TABLE))?,
-        };
+        if tables.is_empty() {
+            return Err(RowCodecError::MissingField(TAG_CHANGED_TABLE));
+        }
+        let changes = Self { tables };
         changes.validate_structure()?;
         changes.validate_budget_codec()?;
         Ok(changes)
@@ -1717,65 +1723,98 @@ impl RowChanges {
         max_changes: usize,
         max_bytes: usize,
     ) -> std::result::Result<(), RowCodecError> {
-        if self.table.rows.len() > max_changes {
+        let changes = self.tables.iter().try_fold(0usize, |count, table| {
+            count
+                .checked_add(table.rows.len())
+                .ok_or(RowCodecError::InvalidLength)
+        })?;
+        if changes > max_changes {
             return Err(RowCodecError::TooManyChanges);
         }
-        if 1usize
-            .checked_add(field_len(self.table.encoded_len()?)?)
-            .ok_or(RowCodecError::InvalidLength)?
-            > max_bytes
-        {
+        let bytes = self.tables.iter().try_fold(1usize, |bytes, table| {
+            bytes
+                .checked_add(field_len(table.encoded_len()?)?)
+                .ok_or(RowCodecError::InvalidLength)
+        })?;
+        if bytes > max_bytes {
             return Err(RowCodecError::FrameTooLarge);
         }
         Ok(())
     }
 
     pub fn apply(&self, connection: &Connection) -> Result<()> {
-        apply_final_row_state(connection, || self.table.apply(connection, false))
+        apply_final_row_state(connection, || {
+            for table in &self.tables {
+                table.apply(connection, false)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
-        apply_final_row_state(connection, || self.table.apply(connection, true))
+        apply_final_row_state(connection, || {
+            for table in self.tables.iter().rev() {
+                table.apply(connection, true)?;
+            }
+            Ok(())
+        })
     }
 
     #[cfg(debug_assertions)]
     pub fn verify_materialized(&self, connection: &Connection) -> Result<()> {
-        if let Some(after) = self.table.after_rows() {
-            let created = after.catalog_definition(connection)?;
-            after.validate_materialized_against(
-                connection,
-                &created,
-                "canonical row changes diverged from captured after-images",
-            )?;
-        }
-        let after_keys = self.table.keys(false)?;
-        let retired = self
-            .table
-            .rows
-            .iter()
-            .filter_map(|change| change.before.as_ref())
-            .filter(|row| {
-                self.table
-                    .rules
-                    .row_key(row)
-                    .is_ok_and(|key| !after_keys.contains(&key))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !retired.is_empty() {
-            self.table
-                .rules
-                .with_rows(retired)
-                .validate_materialized_absent(
+        for table in &self.tables {
+            if let Some(after) = table.after_rows() {
+                let created = after.catalog_definition(connection)?;
+                after.validate_materialized_against(
                     connection,
-                    "canonical row changes retained a retired primary-key image",
+                    &created,
+                    "canonical row changes diverged from captured after-images",
                 )?;
+            }
+            let after_keys = table.keys(false)?;
+            let retired = table
+                .rows
+                .iter()
+                .filter_map(|change| change.before.as_ref())
+                .filter(|row| {
+                    table
+                        .rules
+                        .row_key(row)
+                        .is_ok_and(|key| !after_keys.contains(&key))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !retired.is_empty() {
+                table
+                    .rules
+                    .with_rows(retired)
+                    .validate_materialized_absent(
+                        connection,
+                        "canonical row changes retained a retired primary-key image",
+                    )?;
+            }
         }
         Ok(())
     }
 
     fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
-        self.table.validate_structure()
+        if self.tables.is_empty()
+            || self.tables.iter().enumerate().any(|(index, table)| {
+                self.tables[..index]
+                    .iter()
+                    .any(|seen| seen.rules.table == table.rules.table)
+            })
+            || self
+                .tables
+                .windows(2)
+                .any(|pair| pair[0].rules.table.as_bytes() >= pair[1].rules.table.as_bytes())
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
+        for table in &self.tables {
+            table.validate_structure()?;
+        }
+        Ok(())
     }
 }
 
@@ -1904,24 +1943,28 @@ fn captured_image(
 }
 
 fn table_builder(
-    builder: &mut Option<TableChangesBuilder>,
+    builders: &mut BTreeMap<[u8; 16], TableChangesBuilder>,
     rules: RowRules,
 ) -> Result<&mut TableChangesBuilder> {
-    if let Some(existing) = builder {
-        if existing.rules != rules {
-            return Err(Error::CaptureInvariant(
-                "one row statement changed more than one synchronized table",
-            ));
+    use std::collections::btree_map::Entry;
+
+    let table = rules.table.as_bytes();
+    match builders.entry(table) {
+        Entry::Occupied(entry) => {
+            if entry.get().rules != rules {
+                return Err(Error::CaptureInvariant(
+                    "one row statement used inconsistent rules for one synchronized table",
+                ));
+            }
+            Ok(entry.into_mut())
         }
-        return Ok(existing);
+        Entry::Vacant(entry) => Ok(entry.insert(TableChangesBuilder {
+            rules,
+            rows: Vec::new(),
+            current: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        })),
     }
-    *builder = Some(TableChangesBuilder {
-        rules,
-        rows: Vec::new(),
-        current: BTreeMap::new(),
-        tombstones: BTreeMap::new(),
-    });
-    Ok(builder.as_mut().expect("just installed a table builder"))
 }
 
 impl TableChanges {
@@ -2354,8 +2397,11 @@ impl DeletedRowsFixture {
     }
 
     fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
-        let rows = changes
-            .table
+        let [table] = changes
+            .tables
+            .try_into()
+            .map_err(|_| RowCodecError::InvalidRow)?;
+        let rows = table
             .rows
             .into_iter()
             .map(|delta| match (delta.before, delta.after) {
@@ -2364,7 +2410,7 @@ impl DeletedRowsFixture {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
-            deleted: changes.table.rules.with_rows(rows),
+            deleted: table.rules.with_rows(rows),
         })
     }
 
@@ -2420,9 +2466,13 @@ impl UpdatedRowsFixture {
     }
 
     fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
-        let mut before = Vec::with_capacity(changes.table.rows.len());
-        let mut after = Vec::with_capacity(changes.table.rows.len());
-        for delta in changes.table.rows {
+        let [table] = changes
+            .tables
+            .try_into()
+            .map_err(|_| RowCodecError::InvalidRow)?;
+        let mut before = Vec::with_capacity(table.rows.len());
+        let mut after = Vec::with_capacity(table.rows.len());
+        for delta in table.rows {
             let (Some(before_row), Some(after_row)) = (delta.before, delta.after) else {
                 return Err(RowCodecError::InvalidRow);
             };
@@ -2430,8 +2480,8 @@ impl UpdatedRowsFixture {
             after.push(after_row);
         }
         Ok(Self {
-            before: changes.table.rules.with_rows(before),
-            after: changes.table.rules.with_rows(after),
+            before: table.rules.with_rows(before),
+            after: table.rules.with_rows(after),
         })
     }
 
@@ -3622,7 +3672,7 @@ mod tests {
             Err(RowCodecError::FrameTooLarge)
         );
         changes
-            .validate_budget_with(changes.table.rows.len(), changes.encode().len())
+            .validate_budget_with(changes.tables[0].rows.len(), changes.encode().len())
             .unwrap();
     }
 
@@ -3660,7 +3710,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(changes.table.rows.len(), 1);
+        assert_eq!(changes.tables[0].rows.len(), 1);
         assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
         let lowered = changes.to_homebase().unwrap();
         assert!(matches!(
@@ -3716,9 +3766,9 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(changes.table.rows.len(), 1);
-        assert!(changes.table.rows[0].before.is_none());
-        assert!(changes.table.rows[0].after.is_some());
+        assert_eq!(changes.tables[0].rows.len(), 1);
+        assert!(changes.tables[0].rows[0].before.is_none());
+        assert!(changes.tables[0].rows[0].after.is_some());
         assert!(matches!(
             changes.to_homebase().unwrap().mutations.as_slice(),
             [Mutation::Set { .. }]
@@ -3792,9 +3842,9 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(changes.table.rows.len(), 1);
-        assert!(changes.table.rows[0].before.is_some());
-        assert!(changes.table.rows[0].after.is_some());
+        assert_eq!(changes.tables[0].rows.len(), 1);
+        assert!(changes.tables[0].rows[0].before.is_some());
+        assert!(changes.tables[0].rows[0].after.is_some());
         changes.apply(&connection).unwrap();
         assert_eq!(
             connection
@@ -3835,7 +3885,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(changes.table.rows.len(), 3);
+        assert_eq!(changes.tables[0].rows.len(), 3);
         assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
         let lowered = changes.to_homebase().unwrap();
         let mut asserted = lowered
@@ -4147,33 +4197,33 @@ mod tests {
             Err(RowCodecError::MissingField(TAG_CHANGED_TABLE))
         );
 
-        let table = changes.table.encode();
+        let table = changes.tables[0].encode();
         let mut duplicate_table = Writer::new();
         duplicate_table.u8(ROW_CHANGES_FRAME_VERSION);
         duplicate_table.field(TAG_CHANGED_TABLE, &table).unwrap();
         duplicate_table.field(TAG_CHANGED_TABLE, &table).unwrap();
         assert_eq!(
             RowChanges::decode(&duplicate_table.finish()),
-            Err(RowCodecError::DuplicateField)
+            Err(RowCodecError::InvalidRow)
         );
 
         let mut missing_rules = Writer::new();
         missing_rules.u8(TABLE_CHANGES_FRAME_VERSION);
         missing_rules
-            .field(TAG_CHANGE_ROW, &changes.table.rows[0].encode())
+            .field(TAG_CHANGE_ROW, &changes.tables[0].rows[0].encode())
             .unwrap();
         assert_eq!(
             TableChanges::decode(&missing_rules.finish()),
             Err(RowCodecError::MissingField(TAG_CHANGE_RULES))
         );
 
-        let rules = changes.table.rules.encode();
+        let rules = changes.tables[0].rules.encode();
         let mut duplicate_rules = Writer::new();
         duplicate_rules.u8(TABLE_CHANGES_FRAME_VERSION);
         duplicate_rules.field(TAG_CHANGE_RULES, &rules).unwrap();
         duplicate_rules.field(TAG_CHANGE_RULES, &rules).unwrap();
         duplicate_rules
-            .field(TAG_CHANGE_ROW, &changes.table.rows[0].encode())
+            .field(TAG_CHANGE_ROW, &changes.tables[0].rows[0].encode())
             .unwrap();
         assert_eq!(
             TableChanges::decode(&duplicate_rules.finish()),
@@ -4204,7 +4254,7 @@ mod tests {
         );
 
         let image = encode_row_image(
-            changes.table.rows[0]
+            changes.tables[0].rows[0]
                 .after
                 .as_ref()
                 .expect("insert delta has an after-image"),
@@ -4234,7 +4284,7 @@ mod tests {
         );
 
         let mut rules_with_rows = Writer::new();
-        changes.table.rules.encode_into(&mut rules_with_rows);
+        changes.tables[0].rules.encode_into(&mut rules_with_rows);
         rules_with_rows.field(TAG_SET_ROW, &image).unwrap();
         assert_eq!(
             RowRules::decode(&rules_with_rows.finish()),
@@ -4243,7 +4293,7 @@ mod tests {
     }
 
     #[test]
-    fn statement_delta_normalizes_lineage_and_rejects_cross_table_streams() {
+    fn statement_delta_normalizes_lineage_and_groups_cross_table_streams() {
         let created = definition();
         let connection = connection(&created);
         let catalog = CatalogSnapshot::load(&connection).unwrap();
@@ -4308,18 +4358,56 @@ mod tests {
         let catalog = CatalogSnapshot::load(&connection).unwrap();
         let mut task = note(8, "task");
         task.table = "tasks".into();
-        assert!(matches!(
-            RowChanges::from_catalog(
-                &catalog,
-                vec![
-                    CapturedChange::Insert(note(7, "note")),
-                    CapturedChange::Insert(task),
-                ],
-            ),
-            Err(Error::CaptureInvariant(
-                "one row statement changed more than one synchronized table"
-            ))
-        ));
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Insert(note(7, "note")),
+                CapturedChange::Insert(task),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(changes.tables.len(), 2);
+        assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
+        let lowered = changes.to_homebase().unwrap();
+        for table in &changes.tables {
+            assert!(
+                lowered
+                    .guards
+                    .entries()
+                    .iter()
+                    .any(|guard| { guard.target() == &write_revision_key(table.rules.table) })
+            );
+        }
+        changes.apply(&connection).unwrap();
+        for table in ["notes", "tasks"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1
+            );
+        }
+        changes.restore_materialized(&connection).unwrap();
+        for table in ["notes", "tasks"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+
+        let mut noncanonical = changes;
+        noncanonical.tables.reverse();
+        assert_eq!(
+            RowChanges::decode(&noncanonical.encode()),
+            Err(RowCodecError::InvalidRow)
+        );
     }
 
     fn foreign_key_tables() -> (Connection, CreateTable, CreateTable) {

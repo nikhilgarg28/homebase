@@ -12,8 +12,8 @@ use sqlite3_parser::lexer::sql::Parser;
 
 use crate::logical::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
-    DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName, TableMode,
-    TableStorage, TypeDeclaration,
+    DefaultDefinition, ForeignKeyAction, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName,
+    TableMode, TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
 
@@ -1514,15 +1514,31 @@ fn validate_foreign_key(
             "deferred foreign keys are not supported",
         ));
     }
-    let mut on_delete = false;
+    let mut on_delete = None;
     let mut on_update = false;
     for argument in clause.args {
         match argument {
-            RefArg::OnDelete(RefAct::NoAction) if !on_delete => on_delete = true,
+            RefArg::OnDelete(action) if on_delete.is_none() => {
+                on_delete = Some(match action {
+                    RefAct::NoAction => ForeignKeyAction::NoAction,
+                    RefAct::Cascade => ForeignKeyAction::Cascade,
+                    RefAct::SetNull => ForeignKeyAction::SetNull,
+                    RefAct::SetDefault | RefAct::Restrict => {
+                        return Err(Error::UnsupportedSql(
+                            "ON DELETE SET DEFAULT and RESTRICT are not supported",
+                        ));
+                    }
+                });
+            }
             RefArg::OnUpdate(RefAct::NoAction) if !on_update => on_update = true,
-            RefArg::OnDelete(_) | RefArg::OnUpdate(_) => {
+            RefArg::OnDelete(_) => {
                 return Err(Error::UnsupportedSql(
-                    "foreign-key actions other than NO ACTION are not supported",
+                    "foreign keys cannot contain more than one ON DELETE clause",
+                ));
+            }
+            RefArg::OnUpdate(_) => {
+                return Err(Error::UnsupportedSql(
+                    "foreign-key ON UPDATE actions other than NO ACTION are not supported",
                 ));
             }
             RefArg::OnInsert(_) | RefArg::Match(_) => {
@@ -1549,6 +1565,7 @@ fn validate_foreign_key(
         columns,
         referenced_table: identifier(&clause.tbl_name)?,
         referenced_columns,
+        on_delete: on_delete.unwrap_or_default(),
     })
 }
 
@@ -2185,6 +2202,7 @@ mod tests {
         assert_eq!(spec.foreign_keys[0].columns[0].value(), "parent");
         assert_eq!(spec.foreign_keys[0].referenced_table.value(), "parents");
         assert!(spec.foreign_keys[0].referenced_columns.is_none());
+        assert_eq!(spec.foreign_keys[0].on_delete, ForeignKeyAction::NoAction);
         assert_eq!(
             spec.foreign_keys[1].name.as_ref().map(SqlName::value),
             Some("composite_parent")
@@ -2207,13 +2225,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tenant", "member"]
         );
+        assert_eq!(spec.foreign_keys[1].on_delete, ForeignKeyAction::NoAction);
     }
 
     #[test]
-    fn rejects_foreign_key_extensions_outside_the_initial_slice() {
+    fn accepts_cascade_and_set_null_delete_actions() {
+        for (sql, expected) in [
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
+                ForeignKeyAction::Cascade,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id) ON DELETE SET NULL ON UPDATE NO ACTION)",
+                ForeignKeyAction::SetNull,
+            ),
+        ] {
+            let ValidatedExecute::CreateTable(spec) = validate_execute(sql).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(spec.foreign_keys[0].on_delete, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_foreign_key_extensions_outside_the_supported_slice() {
         for sql in [
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE SET NULL)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE SET DEFAULT)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE RESTRICT)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE ON DELETE SET NULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) MATCH FULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id, tenant))",

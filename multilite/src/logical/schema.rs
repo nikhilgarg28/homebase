@@ -83,6 +83,10 @@ const TAG_FOREIGN_KEY_PARENT_TABLE_NAME: u8 = 5;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_ID: u8 = 7;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_NAME: u8 = 8;
 const TAG_FOREIGN_KEY_PARENT_INDEX_ID: u8 = 9;
+const TAG_FOREIGN_KEY_ON_DELETE: u8 = 10;
+const FOREIGN_KEY_NO_ACTION: u8 = 0;
+const FOREIGN_KEY_CASCADE: u8 = 1;
+const FOREIGN_KEY_SET_NULL: u8 = 2;
 const INDEX_DEFINITION_FRAME_VERSION: u8 = 1;
 const TAG_INDEX_ID: u8 = 1;
 const TAG_INDEX_KIND: u8 = 2;
@@ -387,13 +391,50 @@ pub struct CreateUnique {
     pub columns: Vec<SqlName>,
 }
 
-/// One validated immediate `NO ACTION` foreign-key declaration.
+/// Action applied to child rows when a referenced parent row is deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    #[default]
+    NoAction,
+    Cascade,
+    SetNull,
+}
+
+impl ForeignKeyAction {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::NoAction => FOREIGN_KEY_NO_ACTION,
+            Self::Cascade => FOREIGN_KEY_CASCADE,
+            Self::SetNull => FOREIGN_KEY_SET_NULL,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            FOREIGN_KEY_NO_ACTION => Some(Self::NoAction),
+            FOREIGN_KEY_CASCADE => Some(Self::Cascade),
+            FOREIGN_KEY_SET_NULL => Some(Self::SetNull),
+            _ => None,
+        }
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+        }
+    }
+}
+
+/// One validated immediate foreign-key declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateForeignKey {
     pub name: Option<SqlName>,
     pub columns: Vec<SqlName>,
     pub referenced_table: SqlName,
     pub referenced_columns: Option<Vec<SqlName>>,
+    pub on_delete: ForeignKeyAction,
 }
 
 /// One optional SQLite default owned by a column.
@@ -780,7 +821,7 @@ pub struct NamedIndex {
     dependencies: Vec<ColumnId>,
 }
 
-/// One stable immediate `NO ACTION` relationship owned by the child table.
+/// One stable immediate relationship owned by the child table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignKeyDefinition {
     id: ForeignKeyId,
@@ -791,6 +832,7 @@ pub struct ForeignKeyDefinition {
     referenced_index: IndexId,
     referenced_columns: Vec<ColumnId>,
     referenced_column_names: Vec<SqlName>,
+    on_delete: ForeignKeyAction,
 }
 
 /// One SQLite CHECK declaration owned by a table schema.
@@ -1006,6 +1048,11 @@ impl ForeignKeyDefinition {
 
     pub fn referenced_columns(&self) -> &[ColumnId] {
         &self.referenced_columns
+    }
+
+    #[cfg(test)]
+    pub fn on_delete(&self) -> ForeignKeyAction {
+        self.on_delete
     }
 
     #[cfg(test)]
@@ -2207,6 +2254,10 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         declaration.push_str(" (");
         declaration.push_str(&parent_columns);
         declaration.push(')');
+        if foreign_key.on_delete != ForeignKeyAction::NoAction {
+            declaration.push_str(" ON DELETE ");
+            declaration.push_str(foreign_key.on_delete.sql());
+        }
         declarations.push(declaration.trim_start().to_owned());
     }
 
@@ -2534,6 +2585,7 @@ fn build_create_table(
                     .iter()
                     .map(|column| column.name().clone())
                     .collect(),
+                on_delete: resolved.spec.on_delete,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3014,6 +3066,9 @@ fn encode_foreign_key_definition(foreign_key: &ForeignKeyDefinition) -> Vec<u8> 
             &foreign_key.referenced_index.as_bytes(),
         )
         .expect("foreign-key field length must fit in u32");
+    writer
+        .field(TAG_FOREIGN_KEY_ON_DELETE, &[foreign_key.on_delete.to_u8()])
+        .expect("foreign-key field length must fit in u32");
     for (column, name) in foreign_key
         .referenced_columns
         .iter()
@@ -3269,6 +3324,7 @@ fn decode_foreign_key_definition(
     let mut referenced_table = None;
     let mut referenced_table_name = None;
     let mut referenced_index = None;
+    let mut on_delete = None;
     let mut referenced_columns = Vec::new();
     let mut referenced_column_names = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
@@ -3284,6 +3340,15 @@ fn decode_foreign_key_definition(
             }
             TAG_FOREIGN_KEY_PARENT_INDEX_ID => {
                 set_once(&mut referenced_index, IndexId(uuid_bytes(value)?))?
+            }
+            TAG_FOREIGN_KEY_ON_DELETE => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut on_delete,
+                    ForeignKeyAction::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)?,
+                )?;
             }
             TAG_FOREIGN_KEY_PARENT_COLUMN_ID => {
                 referenced_columns.push(ColumnId(uuid_bytes(value)?))
@@ -3314,6 +3379,7 @@ fn decode_foreign_key_definition(
         referenced_index,
         referenced_columns,
         referenced_column_names,
+        on_delete: on_delete.ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ON_DELETE))?,
     })
 }
 
@@ -3787,6 +3853,7 @@ fn validate_initial_provenance_sql(
             .ok_or(SchemaCodecError::SqlMismatch)?;
         if parsed.name != encoded.name
             || parsed.columns.as_slice() != columns.as_slice()
+            || parsed.on_delete != encoded.on_delete
             || parsed.referenced_table.canonical() != encoded.referenced_table_name.canonical()
             || parsed.referenced_columns.as_ref().is_some_and(|columns| {
                 columns.len() != encoded.referenced_column_names.len()
@@ -4430,6 +4497,7 @@ mod tests {
             id INTEGER PRIMARY KEY,
             parent INTEGER,
             CONSTRAINT parent_fk FOREIGN KEY (parent) REFERENCES parents (id)
+                ON DELETE CASCADE
         )";
         let crate::sql::ValidatedExecute::CreateTable(spec) =
             crate::sql::validate_execute(sql).unwrap()
@@ -4442,6 +4510,7 @@ mod tests {
         assert_eq!(foreign_key.name().map(SqlName::value), Some("parent_fk"));
         assert_eq!(foreign_key.referenced_table(), parent.table_id());
         assert_eq!(foreign_key.referenced_index(), parent.primary_index_id());
+        assert_eq!(foreign_key.on_delete(), ForeignKeyAction::Cascade);
         assert_eq!(
             foreign_key
                 .referenced_column_names()
@@ -4451,6 +4520,34 @@ mod tests {
             ["id"]
         );
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
+
+        let encoded_foreign_key = encode_foreign_key_definition(foreign_key);
+        let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
+        let mut malformed_action = Writer::new();
+        while let Some((tag, value)) = reader.field().unwrap() {
+            malformed_action
+                .field(
+                    tag,
+                    if tag == TAG_FOREIGN_KEY_ON_DELETE {
+                        &[99]
+                    } else {
+                        value
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            decode_foreign_key_definition(&malformed_action.finish()),
+            Err(SchemaCodecError::InvalidSchema)
+        );
+
+        let mut contradictory_action = child.clone();
+        contradictory_action.schema.foreign_keys[0].on_delete = ForeignKeyAction::SetNull;
+        contradictory_action.refresh_schema_revision();
+        assert_eq!(
+            CreateTable::decode_operation(&contradictory_action.encode()),
+            Err(SchemaCodecError::SqlMismatch)
+        );
 
         let lowered = child.to_homebase().unwrap();
         assert_explicit_range_assertions(
@@ -4590,6 +4687,7 @@ mod tests {
                             .map(|index| SqlName::new(format!("key_{index}")))
                             .collect(),
                     ),
+                    on_delete: ForeignKeyAction::NoAction,
                 }],
                 primary_key_name: None,
                 checks: Vec::new(),

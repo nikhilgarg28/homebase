@@ -403,9 +403,17 @@ const PAIR_CASES: &[PairCase] = &[
     },
     PairCase {
         name: "parent_delete_and_child_insert",
-        relationship: "parent key and its incoming-reference range",
+        relationship: "cascading parent key and its incoming-reference range",
         left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
         right: operation!(Insert, "INSERT INTO children VALUES (101, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "set_null_parent_delete_and_child_insert",
+        relationship: "SET NULL parent key and its incoming-reference range",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO labels VALUES (201, 'p20', 'late')"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -881,7 +889,15 @@ where
             transaction.execute(
                 "CREATE TABLE children (
                     id INTEGER PRIMARY KEY,
-                    parent_code TEXT REFERENCES parents(code),
+                    parent_code TEXT REFERENCES parents(code) ON DELETE CASCADE,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE labels (
+                    id INTEGER PRIMARY KEY,
+                    parent_code TEXT REFERENCES parents(code) ON DELETE SET NULL,
                     body TEXT NOT NULL
                 )",
                 (),

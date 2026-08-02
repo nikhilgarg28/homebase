@@ -1160,6 +1160,157 @@ fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
 }
 
 #[test]
+fn rejected_cascade_restores_every_table_then_converges_when_retried() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory.path().join("cascade-first.sqlite");
+        let first_options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server)))
+        };
+        let first = MultiliteConnection::open_with(&first_path, first_options()).unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory.path().join("cascade-second.sqlite"),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+                transaction.execute(
+                    "CREATE TABLE children (
+                        id INTEGER PRIMARY KEY,
+                        parent INTEGER REFERENCES parents(id) ON DELETE CASCADE
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE grandchildren (
+                        id INTEGER PRIMARY KEY,
+                        child INTEGER REFERENCES children(id) ON DELETE CASCADE
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE labels (
+                        id INTEGER PRIMARY KEY,
+                        parent INTEGER REFERENCES parents(id) ON DELETE SET NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO parents VALUES (1)", ())?;
+                transaction.execute("INSERT INTO children VALUES (10, 1)", ())?;
+                transaction.execute("INSERT INTO grandchildren VALUES (100, 10)", ())?;
+                transaction.execute("INSERT INTO labels VALUES (1000, 1)", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("DELETE FROM parents WHERE id = 1", ())
+            .unwrap();
+        second
+            .execute("INSERT INTO children VALUES (11, 1)", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+            panic!("cascade did not conflict with an admitted child insert")
+        };
+        drop(first);
+        let first = MultiliteConnection::open_with(&first_path, first_options()).unwrap();
+        first.rollback(&rejection).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id FROM parents", (), |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                [1]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT id FROM children ORDER BY id", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                [10, 11]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT id FROM grandchildren", (), |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                [100]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT id, parent FROM labels", (), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .unwrap(),
+                [(1000, 1)]
+            );
+        }
+
+        first
+            .execute("DELETE FROM parents WHERE id = 1", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT count(*) FROM parents", (), |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                [0]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT count(*) FROM children", (), |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                [0]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT count(*) FROM grandchildren", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                [0]
+            );
+            assert_eq!(
+                database
+                    .query("SELECT id, parent FROM labels", (), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                    })
+                    .unwrap(),
+                [(1000, None)]
+            );
+        }
+    }
+}
+
+#[test]
 fn unique_parent_relationships_conflict_symmetrically_and_allow_sibling_inserts() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

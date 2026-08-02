@@ -190,7 +190,7 @@ fn idempotent_ddl_noops_create_no_pending_operations_and_survive_reopen() {
             .query(
                 "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'notes'",
                 (),
-                |row| { row.get::<_, String>(0) }
+                |row| row.get::<_, String>(0),
             )
             .unwrap(),
         ["notes"]
@@ -757,6 +757,209 @@ fn immediate_composite_foreign_keys_follow_sqlite_match_simple_semantics() {
         )
         .unwrap(),
         [2, 3]
+    );
+}
+
+#[test]
+fn delete_actions_capture_complete_multi_table_transitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("foreign-actions.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                parent_id INTEGER NOT NULL,
+                body TEXT,
+                PRIMARY KEY (tenant, parent_id)
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                child_id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                parent_id INTEGER,
+                body TEXT,
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON DELETE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE grandchildren (
+                id INTEGER PRIMARY KEY,
+                child_id INTEGER REFERENCES children(child_id) ON DELETE CASCADE,
+                body TEXT
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE labels (
+                tenant TEXT,
+                label_id INTEGER,
+                parent_tenant TEXT,
+                parent_id INTEGER,
+                body TEXT,
+                PRIMARY KEY (tenant, label_id),
+                FOREIGN KEY (parent_tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON DELETE SET NULL
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO parents VALUES
+                ('north', 1, 'remove'),
+                ('south', 2, 'keep')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO children VALUES
+                (10, 'north', 1, 'remove'),
+                (20, 'south', 2, 'keep')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO grandchildren VALUES
+                (100, 10, 'remove'),
+                (200, 20, 'keep')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO labels VALUES
+                ('labels', 1, 'north', 1, 'detach'),
+                ('labels', 2, 'south', 2, 'keep')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.execute("ALTER TABLE children RENAME COLUMN body TO payload", ())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE labels ADD COLUMN extra TEXT DEFAULT 'preserved'",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "DELETE FROM parents WHERE tenant = 'north' AND parent_id = 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, parent_id FROM parents ORDER BY tenant",
+            (),
+            |row| { Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)) }
+        )
+        .unwrap(),
+        [("south".into(), 2)]
+    );
+    assert_eq!(
+        db.query("SELECT child_id FROM children", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [20]
+    );
+    assert_eq!(
+        db.query("SELECT id FROM grandchildren", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [200]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT label_id, parent_tenant, parent_id FROM labels ORDER BY label_id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(1, None, None), (2, Some("south".into()), Some(2)),]
+    );
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query("SELECT extra FROM labels ORDER BY label_id", (), |row| {
+                row.get::<_, String>(0)
+            },)
+            .unwrap(),
+        ["preserved", "preserved"]
+    );
+    drop(reopened);
+
+    let physical = Connection::open(&path).unwrap();
+    assert_eq!(
+        physical
+            .query_row(
+                "SELECT \"table\", on_delete
+                 FROM pragma_foreign_key_list('children')",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("parents".into(), "CASCADE".into())
+    );
+    assert_eq!(
+        physical
+            .query_row(
+                "SELECT DISTINCT \"table\", on_delete
+                 FROM pragma_foreign_key_list('labels')",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("parents".into(), "SET NULL".into())
+    );
+}
+
+#[test]
+fn set_null_respects_child_not_null_constraints_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("set-null-not-null.sqlite")).unwrap();
+    db.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent INTEGER NOT NULL REFERENCES parents(id) ON DELETE SET NULL
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO parents VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO children VALUES (10, 1)", ())
+        .unwrap();
+
+    assert!(matches!(
+        db.execute("DELETE FROM parents WHERE id = 1", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id FROM parents", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert_eq!(
+        db.query("SELECT id, parent FROM children", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap(),
+        [(10, 1)]
     );
 }
 
@@ -1891,7 +2094,7 @@ fn caught_adopted_table_write_errors_rollback_their_statement_savepoints() {
 }
 
 #[test]
-fn trigger_generated_delete_effects_abort_the_whole_statement() {
+fn trigger_generated_delete_effects_join_the_same_atomic_transition() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("trigger-delete.sqlite");
     let db = MultiliteConnection::open(&path).unwrap();
@@ -1923,83 +2126,78 @@ fn trigger_generated_delete_effects_abort_the_whole_statement() {
         .unwrap();
     let db = MultiliteConnection::open(&path).unwrap();
 
-    assert!(matches!(
-        db.execute("DELETE FROM notes WHERE id = 1", ()),
-        Err(Error::CaptureInvariant(
-            "writes caused by triggers are not supported"
-        ))
-    ));
+    assert_eq!(db.execute("DELETE FROM notes WHERE id = 1", ()).unwrap(), 1);
     for table in ["notes", "audit"] {
         assert_eq!(
             db.query(&format!("SELECT count(*) FROM {table}"), (), |row| row
                 .get::<_, i64>(0),)
                 .unwrap(),
-            [1]
+            [0]
         );
     }
 }
 
 #[test]
-fn trigger_generated_update_effects_abort_the_whole_statement() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("trigger-update.sqlite");
-    let db = MultiliteConnection::open(&path).unwrap();
-    db.update(|transaction| {
-        transaction.execute(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
-            (),
-        )?;
-        transaction.execute("INSERT INTO notes VALUES (1, 'note')", ())?;
-        transaction.execute("INSERT INTO audit VALUES (1, 'audit')", ())?;
-        Ok(())
-    })
-    .unwrap();
-    drop(db);
-
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER update_audit
-             AFTER UPDATE ON notes
-             BEGIN
-                 UPDATE audit SET body = new.body WHERE id = new.id;
-             END;
-             CREATE TRIGGER insert_audit
-             AFTER INSERT ON notes
-             BEGIN
-                 UPDATE audit SET body = new.body WHERE id = new.id;
-             END",
-        )
-        .unwrap();
-    let db = MultiliteConnection::open(&path).unwrap();
-
-    for sql in [
+fn trigger_generated_update_effects_replay_exactly_once_for_richer_dml() {
+    for (index, sql) in [
         "UPDATE notes SET body = 'changed' WHERE id = 1",
         "UPDATE OR REPLACE notes SET body = 'changed' WHERE id = 1",
         "REPLACE INTO notes VALUES (1, 'changed')",
         "INSERT OR REPLACE INTO notes VALUES (1, 'changed')",
         "INSERT INTO notes VALUES (1, 'changed')
          ON CONFLICT(id) DO UPDATE SET body = excluded.body",
-    ] {
-        assert!(matches!(
-            db.execute(sql, ()),
-            Err(Error::CaptureInvariant(
-                "writes caused by triggers are not supported"
-            ))
-        ));
-    }
-    assert_eq!(read_note(&db), "note");
-    assert_eq!(
-        db.query("SELECT body FROM audit WHERE id = 1", (), |row| {
-            row.get::<_, String>(0)
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(format!("trigger-update-{index}.sqlite"));
+        let db = MultiliteConnection::open(&path).unwrap();
+        db.update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            transaction.execute("INSERT INTO notes VALUES (1, 'note')", ())?;
+            transaction.execute("INSERT INTO audit VALUES (1, 'audit')", ())?;
+            Ok(())
         })
-        .unwrap(),
-        ["audit"]
-    );
+        .unwrap();
+        drop(db);
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER update_audit
+                 AFTER UPDATE ON notes
+                 BEGIN
+                     UPDATE audit SET body = new.body || '-trigger' WHERE id = new.id;
+                 END;
+                 CREATE TRIGGER insert_audit
+                 AFTER INSERT ON notes
+                 BEGIN
+                     UPDATE audit SET body = new.body || '-trigger' WHERE id = new.id;
+                 END",
+            )
+            .unwrap();
+        let db = MultiliteConnection::open(&path).unwrap();
+
+        assert_eq!(db.execute(sql, ()).unwrap(), 1);
+        assert_eq!(read_note(&db), "changed");
+        assert_eq!(
+            db.query("SELECT body FROM audit WHERE id = 1", (), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            ["changed-trigger"]
+        );
+    }
 }
 
 #[test]
