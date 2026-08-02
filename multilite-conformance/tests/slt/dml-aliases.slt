@@ -1,0 +1,36 @@
+statement ok
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)
+
+statement ok
+INSERT INTO notes VALUES (1, 'one'), (2, 'two')
+
+statement ok
+INSERT INTO notes AS target VALUES (1, 'next') ON CONFLICT(id) DO UPDATE SET body = target.body || ':' || excluded.body
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+1
+one:next
+2
+two
+
+statement ok
+UPDATE notes AS target SET body = upper(target.body) WHERE target.id = 2
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+1
+one:next
+2
+TWO
+
+statement ok
+DELETE FROM notes AS target WHERE target.id = 1
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+2
+TWO

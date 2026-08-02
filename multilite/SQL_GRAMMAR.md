@@ -60,6 +60,13 @@ FROM`, tuple assignments, `INDEXED BY` / `NOT INDEXED`, and native limited-write
 selection. These spellings produce the same statement-delta operation as
 simpler DML.
 
+`INSERT INTO table AS alias`, `UPDATE table AS alias`, and `DELETE FROM table
+AS alias` use SQLite's native alias scoping, including UPSERT, `UPDATE ...
+FROM`, subqueries, limited writes, and `RETURNING`. Aliases affect only local
+name resolution; captured row changes retain the synchronized table identity
+and produce the same wire operations and guards as unaliased statements.
+Qualified targets such as `main.table` remain unsupported.
+
 Each statement may capture at most 100,000 direct row events and 64 MiB of row
 images. The normalized row operation and enclosing transaction frame enforce
 the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls

@@ -416,6 +416,17 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "aliased_update_and_delete_same_row",
+        relationship: "target aliases preserve the same row and read guards",
+        left: operation!(
+            Update,
+            "UPDATE notes AS target SET body = 'left' WHERE target.id = 1"
+        ),
+        right: operation!(Delete, "DELETE FROM notes AS target WHERE target.id = 1"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "sibling_foreign_key_inserts",
         relationship: "different children referencing one live parent",
         left: operation!(Insert, "INSERT INTO children VALUES (101, 'p10', 'left')"),

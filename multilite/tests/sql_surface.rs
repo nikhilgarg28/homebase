@@ -2309,6 +2309,89 @@ fn captured_dml_supports_ctes_update_from_tuples_and_index_hints() {
 }
 
 #[test]
+fn dml_target_aliases_cover_upsert_update_from_delete_and_returning() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("dml-aliases.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                score INTEGER NOT NULL,
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE modifiers (
+                id INTEGER PRIMARY KEY,
+                suffix TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO notes VALUES (1, 10, 'one'), (2, 20, 'two')",
+            (),
+        )?;
+        transaction.execute("INSERT INTO modifiers VALUES (1, '-a'), (2, '-b')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.query(
+            "INSERT INTO notes AS target VALUES (1, 30, 'next')
+             ON CONFLICT(id) DO UPDATE
+             SET score = excluded.score,
+                 body = target.body || ':' || excluded.body
+             RETURNING id, score, body",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(1, 30, "one:next".into())]
+    );
+    assert_eq!(
+        db.query(
+            "UPDATE notes AS target
+             SET body = target.body || source.suffix
+             FROM modifiers AS source
+             WHERE target.id = source.id
+             RETURNING id, body",
+            (),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap(),
+        [(1, "one:next-a".into()), (2, "two-b".into())]
+    );
+    assert_eq!(
+        db.query(
+            "DELETE FROM notes AS target WHERE target.id = 2 RETURNING id, body",
+            (),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap(),
+        [(2, "two-b".into())]
+    );
+    assert_eq!(
+        db.query("SELECT id, score, body FROM notes", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(1, 30, "one:next-a".into())]
+    );
+}
+
+#[test]
 fn limited_writes_use_native_order_limit_and_offset_selection() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("limited-writes.sqlite");
@@ -3078,7 +3161,6 @@ fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
         "UPDATE OR FAIL notes SET body = 'x'",
         "UPDATE OR ROLLBACK notes SET body = 'x'",
         "UPDATE main.notes SET body = 'x'",
-        "UPDATE notes AS old SET body = 'x'",
         "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
         "UPDATE notes SET body = 'x' ORDER BY id",
         "UPDATE __multilite__pending SET record = x''",
@@ -3103,7 +3185,6 @@ fn delete_extensions_and_reserved_targets_are_rejected_without_mutation() {
 
     for sql in [
         "DELETE FROM main.notes",
-        "DELETE FROM notes AS old",
         "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
         "DELETE FROM notes ORDER BY id",
         "DELETE FROM __multilite__pending",

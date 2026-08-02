@@ -89,6 +89,20 @@ fn limited_writes_fixture_matches_sqlite() {
 }
 
 #[test]
+fn dml_aliases_fixture_matches_sqlite() {
+    let report = run_file(
+        "tests/slt/dml-aliases.slt",
+        &RunOptions {
+            engine: multilite_conformance::Engine::Both,
+            max_records: None,
+        },
+    );
+
+    assert_eq!(report.record_count(), 8);
+    assert_eq!(report.failed_count(), 0);
+}
+
+#[test]
 fn both_mode_classifies_unsupported_grammar_as_coverage_not_divergence() {
     let report = run_file(
         "tests/slt/unsupported.slt",
@@ -126,6 +140,7 @@ fn corpus_walker_discovers_sqllogictest_files() {
             .iter()
             .any(|file| file.ends_with("limited-writes.slt"))
     );
+    assert!(files.iter().any(|file| file.ends_with("dml-aliases.slt")));
     assert!(files.iter().any(|file| file.ends_with("unsupported.slt")));
 
     let report = run_paths(&paths, &RunOptions::sqlite());

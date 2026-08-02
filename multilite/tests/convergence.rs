@@ -172,6 +172,108 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn aliased_dml_replays_repairs_and_converges_at_both_isolation_levels() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("alias-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("alias-second-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE notes (
+                        id INTEGER PRIMARY KEY,
+                        body TEXT NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "INSERT INTO notes AS target VALUES (1, 'upserted')
+                 ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        second
+            .execute(
+                "UPDATE notes AS target SET body = 'updated' WHERE target.id = 2",
+                (),
+            )
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+
+        first
+            .execute(
+                "UPDATE notes AS target SET body = 'winner' WHERE target.id = 1",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "UPDATE notes AS target SET body = 'loser' WHERE target.id = 1",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("aliased same-row update was not rejected")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        second
+            .execute("DELETE FROM notes AS target WHERE target.id = 2", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        let expected = vec![(1, String::from("winner"))];
+        assert_eq!(rows(&first), expected);
+        assert_eq!(rows(&second), expected);
+    }
+}
+
+#[test]
 fn idempotent_ddl_lowers_missing_objects_and_repeats_as_convergent_noops() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

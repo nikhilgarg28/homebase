@@ -503,10 +503,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 InsertBody::DefaultValues => None,
             };
             let output = write_output(returning.as_deref());
-            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+            if tbl_name.db_name.is_some() {
                 return Err(Error::UnsupportedSql(
-                    "qualified and aliased INSERT targets are not supported",
+                    "qualified INSERT targets are not supported",
                 ));
+            }
+            if let Some(alias) = &tbl_name.alias {
+                identifier(alias)?;
             }
             let table = identifier(&tbl_name.name)?;
             if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
@@ -539,10 +542,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             order_by,
             limit,
         } => {
-            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+            if tbl_name.db_name.is_some() {
                 return Err(Error::UnsupportedSql(
-                    "qualified and aliased DELETE targets are not supported",
+                    "qualified DELETE targets are not supported",
                 ));
+            }
+            if let Some(alias) = &tbl_name.alias {
+                identifier(alias)?;
             }
             let table = identifier(&tbl_name.name)?;
             if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
@@ -584,10 +590,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "UPDATE supports only ABORT, IGNORE, and REPLACE conflict resolution",
                 ));
             }
-            if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
+            if tbl_name.db_name.is_some() {
                 return Err(Error::UnsupportedSql(
-                    "qualified and aliased UPDATE targets are not supported",
+                    "qualified UPDATE targets are not supported",
                 ));
+            }
+            if let Some(alias) = &tbl_name.alias {
+                identifier(alias)?;
             }
             let table = identifier(&tbl_name.name)?;
             if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
@@ -2042,6 +2051,11 @@ mod tests {
             "UPDATE OR ABORT notes SET body = 'next'",
             "UPDATE OR IGNORE notes SET body = 'next'",
             "UPDATE OR REPLACE notes SET body = 'next'",
+            "INSERT INTO notes AS target VALUES (1, 'next')
+             ON CONFLICT(id) DO UPDATE SET body = target.body || excluded.body",
+            "UPDATE notes AS target SET body = target.body || '-next'
+             WHERE target.id = 1",
+            "DELETE FROM notes AS target WHERE target.id = 1",
         ] {
             validate_execute(sql).unwrap_or_else(|error| panic!("rejected {sql}: {error}"));
         }
@@ -2063,7 +2077,6 @@ mod tests {
     fn rejects_qualified_reserved_and_reserved_reading_inserts() {
         for sql in [
             "INSERT INTO main.notes VALUES (1)",
-            "INSERT INTO notes AS target VALUES (1)",
             "INSERT INTO __multilite__meta VALUES (x'01', x'02')",
             "INSERT INTO sqlite_schema VALUES ('table', 'x', 'x', 1, '')",
             "WITH hidden AS (SELECT value FROM __multilite__meta)
@@ -2780,7 +2793,6 @@ mod tests {
     fn rejects_delete_extensions_without_owned_semantics() {
         for sql in [
             "DELETE FROM main.notes",
-            "DELETE FROM notes AS old",
             "DELETE FROM notes INDEXED BY __multilite__internal",
             "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
             "DELETE FROM notes ORDER BY id",
@@ -2794,7 +2806,6 @@ mod tests {
     fn rejects_update_extensions_without_owned_semantics() {
         for sql in [
             "UPDATE main.notes SET body = 'x'",
-            "UPDATE notes AS old SET body = 'x'",
             "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",
             "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
             "UPDATE notes SET body = 'x' ORDER BY id",
