@@ -101,6 +101,7 @@ pub struct AddColumnSpec {
     pub table: SqlName,
     pub column: CreateColumn,
     pub checks: Vec<CreateCheckConstraint>,
+    pub foreign_key: Option<CreateForeignKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,6 +274,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             let mut not_null_conflict = ConflictPolicy::Abort;
             let mut default = None;
             let mut checks = Vec::new();
+            let mut foreign_key = None;
             for constraint in column.constraints {
                 let constraint_name = constraint.name.map(|name| identifier(&name)).transpose()?;
                 match constraint.constraint {
@@ -297,6 +299,22 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                             expression: schema_expression(expression),
                         });
                     }
+                    ColumnConstraint::ForeignKey {
+                        clause,
+                        defer_clause,
+                    } if foreign_key.is_none() => {
+                        foreign_key = Some(validate_foreign_key(
+                            constraint_name,
+                            vec![name.clone()],
+                            clause,
+                            defer_clause,
+                        )?);
+                    }
+                    ColumnConstraint::ForeignKey { .. } => {
+                        return Err(Error::UnsupportedSql(
+                            "ADD COLUMN supports at most one REFERENCES constraint",
+                        ));
+                    }
                     ColumnConstraint::NotNull { .. } => {
                         return Err(Error::UnsupportedSql(
                             "duplicate and nullable NOT NULL forms are not supported",
@@ -309,7 +327,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     }
                     _ => {
                         return Err(Error::UnsupportedSql(
-                            "ADD COLUMN supports NOT NULL, DEFAULT, and CHECK constraints",
+                            "ADD COLUMN supports NOT NULL, DEFAULT, CHECK, and REFERENCES constraints",
                         ));
                     }
                 }
@@ -326,6 +344,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     primary_key: None,
                 },
                 checks,
+                foreign_key,
             }))
         }
         Stmt::AlterTable(table, AlterTableBody::DropColumn(column)) => {
@@ -2392,6 +2411,25 @@ mod tests {
         assert_eq!(spec.column.name, SqlName::new("summary".into()));
         assert!(spec.column.default.is_some());
         assert_eq!(spec.checks.len(), 1);
+        assert!(spec.foreign_key.is_none());
+
+        let ValidatedExecute::AddColumn(spec) = validate_execute(
+            "ALTER TABLE notes ADD COLUMN parent INTEGER
+             CONSTRAINT notes_parent REFERENCES parents(code)
+             ON DELETE CASCADE ON UPDATE SET NULL",
+        )
+        .unwrap() else {
+            panic!("ADD COLUMN REFERENCES parsed as another statement kind")
+        };
+        let foreign_key = spec.foreign_key.unwrap();
+        assert_eq!(foreign_key.name, Some(SqlName::new("notes_parent".into())));
+        assert_eq!(foreign_key.columns, [SqlName::new("parent".into())]);
+        assert_eq!(
+            foreign_key.referenced_columns,
+            Some(vec![SqlName::new("code".into())])
+        );
+        assert_eq!(foreign_key.actions.on_delete, ReferentialAction::Cascade);
+        assert_eq!(foreign_key.actions.on_update, ReferentialAction::SetNull);
 
         let ValidatedExecute::DropColumn(spec) =
             validate_execute("ALTER TABLE notes DROP COLUMN summary").unwrap()
@@ -2408,7 +2446,10 @@ mod tests {
             "ALTER TABLE notes RENAME TO sqlite_notes",
             "ALTER TABLE notes RENAME COLUMN body TO BODY",
             "ALTER TABLE notes ADD COLUMN extra TEXT UNIQUE",
-            "ALTER TABLE notes ADD COLUMN extra TEXT REFERENCES parents(id)",
+            "ALTER TABLE notes ADD COLUMN extra INTEGER REFERENCES parents(id, code)",
+            "ALTER TABLE notes ADD COLUMN extra INTEGER REFERENCES parents(id) DEFERRABLE",
+            "ALTER TABLE notes ADD COLUMN extra INTEGER REFERENCES parents(id) MATCH FULL",
+            "ALTER TABLE notes ADD COLUMN extra INTEGER REFERENCES parents(id) REFERENCES parents(id)",
         ] {
             assert_unsupported(sql);
         }

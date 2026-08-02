@@ -11,11 +11,12 @@ use rusqlite::config::DbConfig;
 use uuid::{Uuid, Variant, Version};
 
 use super::guard::{GuardPlan, GuardReason, OperationFamily, view_dependency_prefix};
-use super::row::primary_index_prefix;
+use super::row::{primary_index_prefix, table_row_prefix};
 use super::schema::{
     ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
-    column_check_dependency_key, column_dependency_prefix, column_name_scope_key, schema_log_key,
-    schema_object_name_scope_key, table_schema_key, write_revision_key,
+    active_schema_revision_key, column_check_dependency_key, column_dependency_prefix,
+    column_name_scope_key, schema_log_key, schema_object_name_scope_key, table_schema_key,
+    write_revision_key,
 };
 use super::view;
 use crate::catalog;
@@ -174,7 +175,12 @@ impl AlterTableOperation {
                 "ALTER TABLE target column name is already bound",
             ));
         }
-        let (after, column) = before.with_added_column(&spec.column, &spec.checks)?;
+        let (after, column) = before.with_added_column(
+            connection,
+            &spec.column,
+            &spec.checks,
+            spec.foreign_key.as_ref(),
+        )?;
         let predecessor = before
             .columns()
             .last()
@@ -259,6 +265,8 @@ impl AlterTableOperation {
                 let changes_write_contract =
                     matches!(&self.delta, AlterTableDelta::AddColumn { .. })
                         && after.added_column_changes_write_contract(*column);
+                let added_foreign_keys =
+                    after.added_column_foreign_keys(*column).collect::<Vec<_>>();
                 let mut guards = GuardPlan::for_operation(match &self.delta {
                     AlterTableDelta::AddColumn { .. } => OperationFamily::AddColumn,
                     AlterTableDelta::DropColumn { .. } => OperationFamily::DropColumn,
@@ -301,6 +309,28 @@ impl AlterTableOperation {
                             mutations.push(Mutation::Set {
                                 key,
                                 value: column.as_bytes().to_vec(),
+                            });
+                        }
+                        for foreign_key in &added_foreign_keys {
+                            guards.invariant(
+                                schema_object_name_scope_key(foreign_key.referenced_table_name()),
+                                GuardReason::SchemaObjectName,
+                            )?;
+                            guards.invariant(
+                                active_schema_revision_key(foreign_key.referenced_table()),
+                                GuardReason::SchemaRevision,
+                            )?;
+                            guards.invariant(
+                                table_row_prefix(foreign_key.referenced_table()),
+                                GuardReason::ExistingRows,
+                            )?;
+                            let parent_write_revision =
+                                write_revision_key(foreign_key.referenced_table());
+                            guards
+                                .write(parent_write_revision.clone(), GuardReason::WriteContract)?;
+                            mutations.push(Mutation::Set {
+                                key: parent_write_revision,
+                                value: self.mutation_id.as_bytes().to_vec(),
                             });
                         }
                     }
@@ -560,7 +590,7 @@ impl AlterTableOperation {
                     ))?;
                 catalog::retire_column_binding(connection, self.table, *column)?;
                 let order = catalog::column_order(connection, self.table)?;
-                let folded = current.fold_removed_column(*column, &order)?;
+                let folded = current.fold_reverted_added_column(*column, &order)?;
                 catalog::replace(connection, &folded)?;
                 rebuild_table_if_needed(connection, &folded, false)
             }
@@ -844,7 +874,20 @@ impl AlterTableOperation {
                     .last()
                     .is_some_and(|column| column.id() == *predecessor)
                 && before
-                    .with_added_column_identity(*column, &spec.column, &spec.checks)
+                    .with_added_column_identity_and_foreign_key(
+                        *column,
+                        &spec.column,
+                        &spec.checks,
+                        spec.foreign_key.as_ref(),
+                        {
+                            let mut foreign_keys = after.added_column_foreign_keys(*column);
+                            let foreign_key = foreign_keys.next();
+                            if foreign_keys.next().is_some() {
+                                return Err(AlterTableCodecError::InvalidSchema);
+                            }
+                            foreign_key
+                        },
+                    )
                     .is_ok_and(|expected| expected == *after) => {}
             (
                 AlterTableDelta::DropColumn {
@@ -900,7 +943,12 @@ impl AlterTableOperation {
                     ));
                 }
             }
-            AlterTableDelta::AddColumn { column, name, .. } => {
+            AlterTableDelta::AddColumn {
+                column,
+                name,
+                after,
+                ..
+            } => {
                 if catalog::by_id(connection, self.table)?.is_none()
                     || catalog::column_id_by_name(connection, self.table, name)?.is_some()
                     || catalog::column_name_by_id(connection, self.table, *column)?.is_some()
@@ -908,6 +956,39 @@ impl AlterTableOperation {
                     return Err(Error::InvalidDatabase(
                         "ADD COLUMN no longer matches the schema catalog",
                     ));
+                }
+                after.validate_foreign_key_parents(connection)?;
+                for foreign_key in after.added_column_foreign_keys(*column) {
+                    let parent_name =
+                        catalog::name_by_id(connection, foreign_key.referenced_table())?.ok_or(
+                            Error::InvalidDatabase(
+                                "ADD COLUMN foreign-key parent has no current name binding",
+                            ),
+                        )?;
+                    if parent_name.canonical() != foreign_key.referenced_table_name().canonical() {
+                        return Err(Error::InvalidDatabase(
+                            "ADD COLUMN foreign-key parent was renamed",
+                        ));
+                    }
+                    for (parent_column, expected_name) in foreign_key
+                        .referenced_columns()
+                        .iter()
+                        .zip(foreign_key.referenced_column_names())
+                    {
+                        let current_name = catalog::column_name_by_id(
+                            connection,
+                            foreign_key.referenced_table(),
+                            *parent_column,
+                        )?
+                        .ok_or(Error::InvalidDatabase(
+                            "ADD COLUMN foreign-key parent column is missing",
+                        ))?;
+                        if current_name.canonical() != expected_name.canonical() {
+                            return Err(Error::InvalidDatabase(
+                                "ADD COLUMN foreign-key parent column was renamed",
+                            ));
+                        }
+                    }
                 }
             }
             AlterTableDelta::DropColumn { column, name, .. } => {
@@ -1299,13 +1380,18 @@ mod tests {
         repair::register(&connection).unwrap();
         repair::initialize(&connection).unwrap();
         catalog::initialize(&connection).unwrap();
+        let created = install_table(&connection, sql);
+        (connection, created)
+    }
+
+    fn install_table(connection: &Connection, sql: &str) -> CreateTable {
         let ValidatedExecute::CreateTable(spec) = crate::sql::validate_execute(sql).unwrap() else {
             unreachable!()
         };
         let created = CreateTable::new(sql, spec);
         connection.execute(sql, ()).unwrap();
         catalog::insert(&connection, &created).unwrap();
-        (connection, created)
+        created
     }
 
     fn prepare_drop(connection: &Connection, sql: &str) -> AlterTableOperation {
@@ -1569,6 +1655,97 @@ mod tests {
             1
         );
         catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn add_column_foreign_key_explicitly_guards_both_row_sets_and_parent_schema() {
+        let (connection, _parent) = connection_with(
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                code INTEGER NOT NULL,
+                PRIMARY KEY (tenant, code)
+             ) WITHOUT ROWID",
+        );
+        let _child = install_table(
+            &connection,
+            "CREATE TABLE children (
+                tenant TEXT NOT NULL,
+                child INTEGER NOT NULL,
+                PRIMARY KEY (tenant, child)
+             ) WITHOUT ROWID",
+        );
+        let sql = "ALTER TABLE children ADD COLUMN parent_code INTEGER
+                   CONSTRAINT children_parent REFERENCES parents(code)";
+        let ValidatedExecute::AddColumn(spec) = crate::sql::validate_execute(sql).unwrap() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            AlterTableOperation::prepare_add_column(&connection, sql, &spec),
+            Err(Error::UnsupportedSql(
+                "foreign keys must reference a complete primary or UNIQUE key in order"
+            ))
+        ));
+
+        let connection = Connection::open_in_memory().unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
+        catalog::initialize(&connection).unwrap();
+        let parent = install_table(
+            &connection,
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                code INTEGER NOT NULL UNIQUE,
+                PRIMARY KEY (tenant, code)
+             ) WITHOUT ROWID",
+        );
+        let child = install_table(
+            &connection,
+            "CREATE TABLE children (
+                tenant TEXT NOT NULL,
+                child INTEGER NOT NULL,
+                PRIMARY KEY (tenant, child)
+             ) WITHOUT ROWID",
+        );
+        let operation = AlterTableOperation::prepare_add_column(&connection, sql, &spec).unwrap();
+        let AlterTableDelta::AddColumn { column, after, .. } = &operation.delta else {
+            unreachable!()
+        };
+        assert!(after.added_column_changes_write_contract(*column));
+        assert_eq!(
+            AlterTableOperation::decode(&operation.encode()).unwrap(),
+            operation
+        );
+        let lowered = operation.to_homebase().unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                primary_index_prefix(&child),
+                table_row_prefix(parent.table_id()),
+                active_schema_revision_key(parent.table_id()),
+                schema_object_name_scope_key(parent.table_name_identity()),
+            ],
+        );
+        assert!(
+            lowered
+                .footprint
+                .writes()
+                .contains(&write_revision_key(child.table_id()))
+        );
+        assert!(
+            lowered
+                .footprint
+                .writes()
+                .contains(&write_revision_key(parent.table_id()))
+        );
+
+        let mut mismatched = operation.clone();
+        mismatched.sql = "ALTER TABLE children ADD COLUMN parent_code INTEGER
+                          REFERENCES parents(tenant)"
+            .into();
+        assert_eq!(
+            AlterTableOperation::decode(&mismatched.encode()),
+            Err(AlterTableCodecError::InvalidRename)
+        );
     }
 
     #[test]

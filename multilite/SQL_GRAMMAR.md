@@ -105,6 +105,19 @@ transaction's read footprint. Otherwise it lowers to the same operation,
 codec, and guards as the clause-free spelling. Cross-kind names retain
 SQLite's shared-namespace behavior.
 
+`ALTER TABLE ... ADD COLUMN ... REFERENCES` supports one inline, immediate
+foreign key on the new column. The parent must already be synchronized and the
+reference must resolve to one complete single-column PRIMARY KEY or UNIQUE
+key with matching affinity. Named constraints and all five `ON DELETE` / `ON
+UPDATE` actions are retained. Introducing the relationship advances the child
+and parent write contracts and explicitly guards both tables' row namespaces,
+so stale child writes and stale parent writes conflict under both isolation
+levels. This is intentionally conservative: it keeps pre-relationship row
+operations from being replayed against a future relationship envelope. Existing
+child rows project `NULL` through SQLite's native ADD COLUMN semantics. Self
+references, composite targets from a single added column, `MATCH`, and deferred
+constraints remain fenced.
+
 `PRAGMA [main.]user_version` is supported for reads and signed 32-bit literal
 assignments. A changing assignment is one replicated metadata operation with
 write conflict detection under both isolation levels and local rejection

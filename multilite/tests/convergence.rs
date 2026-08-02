@@ -305,6 +305,149 @@ fn views_conflict_by_shared_name_repair_and_converge_at_both_isolation_levels() 
 }
 
 #[test]
+fn add_column_references_converges_and_repairs_both_winning_and_losing_ddl() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("add-fk-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("add-fk-second-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE parents (
+                        id INTEGER PRIMARY KEY,
+                        code TEXT NOT NULL UNIQUE
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE children (id INTEGER PRIMARY KEY, body TEXT)",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO parents VALUES (1, 'one'), (2, 'two')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "ALTER TABLE children ADD COLUMN parent_code TEXT
+                 REFERENCES parents(code) ON DELETE CASCADE",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "ALTER TABLE children ADD COLUMN parent_code TEXT DEFAULT 'local'",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-name ADD COLUMN operations unexpectedly both admitted")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        second
+            .execute("INSERT INTO children VALUES (10, 'child', 'one')", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+        first
+            .execute("DELETE FROM parents WHERE code = 'one'", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        assert!(
+            first
+                .query("SELECT * FROM children", (), |_| Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            second
+                .query("SELECT * FROM children", (), |_| Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+
+        first
+            .execute(
+                "ALTER TABLE children ADD COLUMN tag TEXT DEFAULT 'free'",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "ALTER TABLE children ADD COLUMN tag TEXT REFERENCES parents(code)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("losing ADD COLUMN REFERENCES unexpectedly admitted")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        second
+            .execute(
+                "INSERT INTO children VALUES (20, 'ordinary tag', 'two', 'not-a-parent')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT parent_code, tag FROM children", (), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap(),
+                [("two".into(), "not-a-parent".into())]
+            );
+            assert_eq!(
+                database
+                    .query("PRAGMA foreign_key_list(children)", (), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap(),
+                ["parent_code"]
+            );
+        }
+    }
+}
+
+#[test]
 fn public_sql_create_and_insert_converge_across_two_replicas() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

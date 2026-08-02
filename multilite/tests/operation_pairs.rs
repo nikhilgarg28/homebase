@@ -736,6 +736,30 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::COMMUTE,
     },
     PairCase {
+        name: "add_foreign_key_and_stale_child_insert",
+        relationship: "new child write contract and the pre-existing child row range",
+        left: operation!(
+            AddColumn,
+            "ALTER TABLE fk_base ADD COLUMN parent_id INTEGER
+             REFERENCES parents(id) ON DELETE CASCADE"
+        ),
+        right: operation!(Insert, "INSERT INTO fk_base VALUES (2, 'new')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "add_foreign_key_and_stale_parent_delete",
+        relationship: "new incoming relationship and its parent write contract",
+        left: operation!(
+            AddColumn,
+            "ALTER TABLE fk_base ADD COLUMN parent_id INTEGER
+             REFERENCES parents(id) ON DELETE CASCADE"
+        ),
+        right: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "add_and_drop_disjoint_columns",
         relationship: "new column and unrelated existing column",
         left: operation!(
@@ -1068,7 +1092,7 @@ fn run_case(case: PairCase, isolation: IsolationLevel, order: AdmissionOrder) ->
         ),
     }
 
-    synchronize(&left, &right);
+    synchronize(&left, &right, case, isolation, order);
     drop(left);
     drop(right);
 
@@ -1107,6 +1131,10 @@ where
                 (),
             )?;
             transaction.execute("CREATE VIEW base_view AS SELECT id FROM view_base", ())?;
+            transaction.execute(
+                "CREATE TABLE fk_base (id INTEGER PRIMARY KEY, body TEXT)",
+                (),
+            )?;
             transaction.execute(
                 "CREATE TABLE parents (
                     id INTEGER PRIMARY KEY,
@@ -1158,6 +1186,7 @@ where
                     (2, 'two', 'body-two', 'd2')",
                 (),
             )?;
+            transaction.execute("INSERT INTO fk_base VALUES (1, 'base')", ())?;
             transaction.execute(
                 "INSERT INTO parents VALUES
                     (10, 'p10', 'parent-ten'),
@@ -1172,15 +1201,30 @@ where
         .unwrap();
 }
 
-fn synchronize<H1, H2>(left: &MultiliteConnection<H1>, right: &MultiliteConnection<H2>)
-where
+fn synchronize<H1, H2>(
+    left: &MultiliteConnection<H1>,
+    right: &MultiliteConnection<H2>,
+    case: PairCase,
+    isolation: IsolationLevel,
+    order: AdmissionOrder,
+) where
     H1: ServerHandle + Send + Sync + 'static,
     H2: ServerHandle + Send + Sync + 'static,
 {
     left.pull().unwrap();
     right.pull().unwrap();
-    left.rebase().unwrap();
-    right.rebase().unwrap();
+    left.rebase().unwrap_or_else(|error| {
+        panic!(
+            "left rebase failed: case={} relationship={} isolation={isolation:?} order={order:?}: {error}",
+            case.name, case.relationship
+        )
+    });
+    right.rebase().unwrap_or_else(|error| {
+        panic!(
+            "right rebase failed: case={} relationship={} isolation={isolation:?} order={order:?}: {error}",
+            case.name, case.relationship
+        )
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

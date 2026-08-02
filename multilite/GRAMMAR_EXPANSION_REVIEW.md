@@ -93,7 +93,29 @@ Status: complete for synchronized base-table views.
 
 ## ADD COLUMN REFERENCES
 
-Status: pending.
+Status: complete for one inline relationship on the added column.
+
+- Parent table, target key, columns, affinities, names, actions, and optional
+  constraint name resolve into the same stable-ID FK IR used by CREATE TABLE.
+  Decode authenticates the SQL projection and canonical apply revalidates every
+  current parent binding before materializing it.
+- The operation advances both child and parent write revisions. Mandatory
+  guards cover the child primary-index generation, the parent's complete row
+  namespace, parent active schema revision, and parent schema-name binding.
+  Thus stale child writes and stale parent writes reject symmetrically under
+  Snapshot and Serializable isolation; no historical row operation is replayed
+  against a relationship envelope it did not encode.
+- Rejection removes both the column and the relationship from physical SQLite,
+  name bindings, and the folded catalog. Admission on another device folds the
+  stable relationship and preserves it across reopen and later table rebuilds.
+- Coverage includes all action plumbing, named constraints, UNIQUE parents,
+  STRICT tables, composite-primary-key WITHOUT ROWID children, malformed
+  provenance, both admission orders and isolation levels, winning and losing
+  DDL repair, and atomic refusal of SQLite-invalid non-NULL defaults.
+- Deliberate boundaries: one added column cannot establish a composite FK;
+  parent and target must already exist; self references, MATCH, and deferred
+  constraints remain fenced. The table-wide parent guard is conservative and
+  can be narrowed only together with historical relationship-aware row replay.
 
 ## Dropping named constraints
 

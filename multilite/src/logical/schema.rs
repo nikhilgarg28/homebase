@@ -1120,6 +1120,10 @@ impl ForeignKeyDefinition {
         self.referenced_table
     }
 
+    pub(crate) fn referenced_table_name(&self) -> &SqlName {
+        &self.referenced_table_name
+    }
+
     pub fn referenced_index(&self) -> IndexId {
         self.referenced_index
     }
@@ -1133,8 +1137,7 @@ impl ForeignKeyDefinition {
         self.actions
     }
 
-    #[cfg(test)]
-    pub fn referenced_column_names(&self) -> &[SqlName] {
+    pub(crate) fn referenced_column_names(&self) -> &[SqlName] {
         &self.referenced_column_names
     }
 }
@@ -1827,8 +1830,10 @@ impl CreateTable {
 
     pub fn with_added_column(
         &self,
+        connection: &Connection,
         spec: &CreateColumn,
         checks: &[CreateCheckConstraint],
+        foreign_key: Option<&CreateForeignKey>,
     ) -> Result<(Self, ColumnId)> {
         if self.mode() == TableMode::Strict && spec.declared_type.strict_type().is_none() {
             return Err(Error::UnsupportedSql(
@@ -1836,7 +1841,12 @@ impl CreateTable {
             ));
         }
         let id = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
-        let evolved = self.with_added_column_identity(id, spec, checks)?;
+        let mut evolved = self.with_added_column_identity(id, spec, checks)?;
+        if let Some(foreign_key) = foreign_key {
+            let resolved = resolve_added_foreign_key(connection, &evolved, id, foreign_key)?;
+            evolved.schema.foreign_keys.push(resolved);
+            evolved = evolved.refresh_and_validate_evolution()?;
+        }
         Ok((evolved, id))
     }
 
@@ -1872,6 +1882,42 @@ impl CreateTable {
             .collect::<Result<Vec<_>>>()?;
         evolved.schema.checks.extend(checks);
         evolved.refresh_and_validate_evolution()
+    }
+
+    pub fn with_added_column_identity_and_foreign_key(
+        &self,
+        id: ColumnId,
+        spec: &CreateColumn,
+        checks: &[CreateCheckConstraint],
+        parsed: Option<&CreateForeignKey>,
+        encoded: Option<&ForeignKeyDefinition>,
+    ) -> Result<Self> {
+        let mut evolved = self.with_added_column_identity(id, spec, checks)?;
+        match (parsed, encoded) {
+            (None, None) => return Ok(evolved),
+            (Some(parsed), Some(encoded))
+                if encoded.columns == [id]
+                    && parsed.columns.len() == 1
+                    && parsed.columns[0].canonical() == spec.name.canonical()
+                    && parsed.name == encoded.name
+                    && parsed.actions == encoded.actions
+                    && parsed.referenced_table.canonical()
+                        == encoded.referenced_table_name.canonical()
+                    && encoded.referenced_columns.len() == 1
+                    && encoded.referenced_column_names.len() == 1
+                    && parsed.referenced_columns.as_ref().is_none_or(|columns| {
+                        columns.len() == 1
+                            && columns[0].canonical()
+                                == encoded.referenced_column_names[0].canonical()
+                    }) =>
+            {
+                evolved.schema.foreign_keys.push(encoded.clone());
+                evolved.refresh_and_validate_evolution()
+            }
+            _ => Err(Error::InvalidMultiliteOp(
+                "ADD COLUMN REFERENCES provenance contradicts its schema delta".into(),
+            )),
+        }
     }
 
     /// Names read by constraints introduced with one column.
@@ -1921,6 +1967,21 @@ impl CreateTable {
                 .checks
                 .iter()
                 .any(|check| check.column == Some(column.id()))
+            || self
+                .schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.columns.contains(&column.id()))
+    }
+
+    pub fn added_column_foreign_keys(
+        &self,
+        column: ColumnId,
+    ) -> impl Iterator<Item = &ForeignKeyDefinition> {
+        self.schema
+            .foreign_keys
+            .iter()
+            .filter(move |foreign_key| foreign_key.columns.contains(&column))
     }
 
     pub fn with_removed_column(&self, column: ColumnId) -> Result<Self> {
@@ -2004,6 +2065,38 @@ impl CreateTable {
                 .filter(|check| check.column == Some(column))
                 .cloned(),
         );
+        folded.schema.foreign_keys.extend(
+            source
+                .schema
+                .foreign_keys
+                .iter()
+                .filter(|foreign_key| foreign_key.columns.contains(&column))
+                .cloned(),
+        );
+        folded.reorder_columns(order)?;
+        folded.refresh_and_validate_evolution()
+    }
+
+    /// Reverse a speculative ADD COLUMN, including constraints it introduced.
+    pub fn fold_reverted_added_column(&self, column: ColumnId, order: &[ColumnId]) -> Result<Self> {
+        let mut folded = self.clone();
+        folded
+            .schema
+            .foreign_keys
+            .retain(|foreign_key| !foreign_key.columns.contains(&column));
+        folded
+            .schema
+            .checks
+            .retain(|check| check.column != Some(column));
+        let position = folded
+            .schema
+            .columns
+            .iter()
+            .position(|candidate| candidate.id() == column)
+            .ok_or(Error::InvalidDatabase(
+                "column rollback references an unknown identity",
+            ))?;
+        folded.schema.columns.remove(position);
         folded.reorder_columns(order)?;
         folded.refresh_and_validate_evolution()
     }
@@ -2396,6 +2489,86 @@ struct ResolvedForeignKey {
     spec: CreateForeignKey,
     parent: CreateTable,
     target: IndexId,
+}
+
+fn resolve_added_foreign_key(
+    connection: &Connection,
+    child: &CreateTable,
+    child_column: ColumnId,
+    spec: &CreateForeignKey,
+) -> Result<ForeignKeyDefinition> {
+    let column = child
+        .columns()
+        .iter()
+        .find(|column| column.id() == child_column)
+        .ok_or(Error::CaptureInvariant(
+            "ADD COLUMN foreign key references its missing column",
+        ))?;
+    if spec.columns.len() != 1 || spec.columns[0].canonical() != column.name().canonical() {
+        return Err(Error::InvalidMultiliteOp(
+            "ADD COLUMN foreign key contradicts its child column".into(),
+        ));
+    }
+    let parent = catalog::by_name(connection, spec.referenced_table.value())?.ok_or(
+        Error::UnsupportedSql("foreign-key parent must already be a synchronized table"),
+    )?;
+    if parent.table_id() == child.table_id() {
+        return Err(Error::UnsupportedSql(
+            "self-referential foreign keys are not supported",
+        ));
+    }
+    let requested = spec
+        .referenced_columns
+        .as_ref()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|name| {
+                    catalog::column_id_by_name(connection, parent.table_id(), name)?.ok_or(
+                        Error::UnsupportedSql("foreign key references an unknown parent column"),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let (target, parent_columns) = parent
+        .resolve_foreign_key_target(requested.as_deref())
+        .ok_or(Error::UnsupportedSql(
+            "foreign keys must reference a complete primary or UNIQUE key in order",
+        ))?;
+    if parent_columns.len() != 1
+        || column.affinity(child.mode()) != parent_columns[0].affinity(parent.mode())
+    {
+        return Err(Error::UnsupportedSql(
+            "foreign-key child and parent columns must have matching affinities",
+        ));
+    }
+    if !foreign_reference_key_fits(parent_columns.len(), child.primary_key_columns().count()) {
+        return Err(Error::UnsupportedSql(
+            "foreign-key reference key exceeds the Homebase component limit",
+        ));
+    }
+    let referenced_column_names = parent_columns
+        .iter()
+        .map(|column| {
+            catalog::column_name_by_id(connection, parent.table_id(), column.id())?.ok_or(
+                Error::InvalidDatabase("foreign-key parent column has no current name binding"),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let definition = ForeignKeyDefinition {
+        id: ForeignKeyId::from_bytes(Uuid::new_v4().into_bytes()),
+        name: spec.name.clone(),
+        columns: vec![child_column],
+        referenced_table: parent.table_id(),
+        referenced_table_name: spec.referenced_table.clone(),
+        referenced_index: target,
+        referenced_columns: parent_columns.iter().map(|column| column.id()).collect(),
+        referenced_column_names,
+        actions: spec.actions,
+    };
+    validate_foreign_key_link(child, &definition, &parent)?;
+    Ok(definition)
 }
 
 fn resolve_foreign_keys(

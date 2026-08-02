@@ -2638,8 +2638,19 @@ fn update_stable_rows(
 }
 /// Prefix covering every row encoded under a table's active primary index.
 pub fn primary_index_prefix(created: &CreateTable) -> Key {
-    row_prefix(created.table_id(), created.primary_index_id(), Vec::new())
-        .expect("table row prefix is bounded and non-empty")
+    primary_index_identity_prefix(created.table_id(), created.primary_index_id())
+}
+
+/// Prefix covering every primary-index generation owned by one table.
+pub fn table_row_prefix(table: TableId) -> Key {
+    LogicalTarget::RowPrefix { table }
+        .render()
+        .expect("table row namespace is bounded and non-empty")
+}
+
+/// Prefix covering every row encoded under a known primary-index identity.
+pub fn primary_index_identity_prefix(table: TableId, primary_index: IndexId) -> Key {
+    row_prefix(table, primary_index, Vec::new()).expect("table row prefix is bounded and non-empty")
 }
 
 /// Exact row prefix produced by one complete primary-key value tuple.

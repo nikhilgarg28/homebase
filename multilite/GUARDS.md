@@ -106,6 +106,9 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `AddColumn` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `AddColumn` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `AddColumn` | `Invariant` | `ExistingRows` | `TableRows` |
 | `AddColumn` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `AddColumn` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `AddColumn` | `Write` | `WriteContract` | `WriteRevision` |

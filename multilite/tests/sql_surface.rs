@@ -177,6 +177,222 @@ fn views_track_multiple_nested_sources_and_release_ddl_fences_on_drop() {
 }
 
 #[test]
+fn add_column_references_folds_relationships_and_enforces_actions_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("add-column-references.sqlite");
+    let database = MultiliteConnection::open(&path).unwrap();
+    database
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, body TEXT)",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (1, 'one'), (2, 'two')", ())?;
+            transaction.execute("INSERT INTO children VALUES (10, 'existing')", ())?;
+            transaction.execute(
+                "ALTER TABLE children ADD COLUMN parent_code TEXT
+                 CONSTRAINT children_parent REFERENCES parents(code)
+                 ON DELETE CASCADE ON UPDATE SET NULL",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        database
+            .query(
+                "SELECT id, parent_code FROM children ORDER BY id",
+                (),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        [(10, None)]
+    );
+    database
+        .execute("INSERT INTO children VALUES (11, 'valid', 'one')", ())
+        .unwrap();
+    assert!(
+        database
+            .execute("INSERT INTO children VALUES (12, 'invalid', 'missing')", ())
+            .is_err()
+    );
+    database
+        .execute("UPDATE parents SET code = 'renamed' WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(
+        database
+            .query(
+                "SELECT parent_code FROM children WHERE id = 11",
+                (),
+                |row| { row.get::<_, Option<String>>(0) }
+            )
+            .unwrap(),
+        [None]
+    );
+    database
+        .execute("INSERT INTO children VALUES (13, 'cascade', 'two')", ())
+        .unwrap();
+    database
+        .execute("DELETE FROM parents WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(
+        database
+            .query("SELECT id FROM children ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        [10, 11]
+    );
+    drop(database);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query("PRAGMA foreign_key_list(children)", (), |row| {
+                Ok((
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .unwrap(),
+        [(
+            "parents".into(),
+            "parent_code".into(),
+            "code".into(),
+            "SET NULL".into(),
+            "CASCADE".into()
+        )]
+    );
+    assert!(
+        reopened
+            .execute("INSERT INTO children VALUES (14, 'invalid', 'missing')", ())
+            .is_err()
+    );
+
+    for sql in [
+        "ALTER TABLE children ADD COLUMN missing INTEGER REFERENCES absent(id)",
+        "ALTER TABLE children ADD COLUMN wrong BLOB REFERENCES parents(id)",
+        "ALTER TABLE children ADD COLUMN composite TEXT REFERENCES parents(id, code)",
+        "ALTER TABLE children ADD COLUMN self_id INTEGER REFERENCES children(id)",
+    ] {
+        assert!(
+            reopened.execute(sql, ()).is_err(),
+            "accepted invalid FK: {sql}"
+        );
+    }
+}
+
+#[test]
+fn add_column_references_supports_strict_without_rowid_children_and_is_atomic_on_refusal() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("add-fk-strict.sqlite")).unwrap();
+    database
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE parents (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE
+                 ) STRICT",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    tenant TEXT NOT NULL,
+                    child INTEGER NOT NULL,
+                    body TEXT,
+                    PRIMARY KEY (tenant, child)
+                 ) WITHOUT ROWID, STRICT",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (1, 'one')", ())?;
+            transaction.execute("INSERT INTO children VALUES ('north', 7, 'existing')", ())?;
+            transaction.execute(
+                "ALTER TABLE children ADD COLUMN parent_code TEXT
+                 REFERENCES parents(code) ON DELETE SET NULL",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        database
+            .query(
+                "SELECT tenant, child, parent_code FROM children",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        [("north".into(), 7, None)]
+    );
+    database
+        .execute(
+            "INSERT INTO children VALUES ('south', 8, 'valid', 'one')",
+            (),
+        )
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "INSERT INTO children VALUES ('west', 9, 'invalid', 'missing')",
+                (),
+            )
+            .is_err()
+    );
+
+    database
+        .execute(
+            "CREATE TABLE refusing (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    database
+        .execute("INSERT INTO refusing VALUES (1, 'kept')", ())
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "ALTER TABLE refusing ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 1
+                 REFERENCES parents(id)",
+                (),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .query("PRAGMA table_info(refusing)", (), |row| {
+                row.get::<_, String>(1)
+            })
+            .unwrap(),
+        ["id", "body"]
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, body FROM refusing", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [(1, "kept".into())]
+    );
+}
+
+#[test]
 fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("drop-table.sqlite");

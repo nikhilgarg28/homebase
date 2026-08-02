@@ -28,6 +28,7 @@ pub enum TargetFamily {
     ActiveSchemaRevision,
     IndexDefinition,
     WriteRevision,
+    TableRows,
     Row,
     UniqueOwner,
     ForeignReference,
@@ -234,6 +235,7 @@ impl TargetFamily {
                     value if value == codes::VIEW_DEPENDENCIES && matches!(parts.len(), 4 | 5) => {
                         Some(Self::ViewDependency)
                     }
+                    value if value == codes::ROWS && parts.len() == 4 => Some(Self::TableRows),
                     value if value == codes::ROWS && parts.len() >= 5 => Some(Self::Row),
                     value if value == codes::UNIQUE && parts.len() >= 5 => Some(Self::UniqueOwner),
                     value if value == codes::FOREIGN_REFERENCES && parts.len() >= 6 => {
@@ -347,6 +349,9 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(RenameTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(AddColumn, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(AddColumn, Invariant, ExistingRows, TableRows),
     contract!(AddColumn, Invariant, ColumnDependency, ColumnDependency),
     contract!(AddColumn, Write, ColumnDependency, ColumnDependency),
     contract!(AddColumn, Write, WriteContract, WriteRevision),
@@ -843,6 +848,9 @@ pub enum LogicalTarget {
     WriteRevision {
         table: TableId,
     },
+    RowPrefix {
+        table: TableId,
+    },
     Row {
         table: TableId,
         index: IndexId,
@@ -897,6 +905,7 @@ impl LogicalTarget {
             Self::ActiveSchemaRevision { .. } => TargetFamily::ActiveSchemaRevision,
             Self::IndexDefinition { .. } => TargetFamily::IndexDefinition,
             Self::WriteRevision { .. } => TargetFamily::WriteRevision,
+            Self::RowPrefix { .. } => TargetFamily::TableRows,
             Self::Row { .. } => TargetFamily::Row,
             Self::UniqueOwner { .. } => TargetFamily::UniqueOwner,
             Self::ForeignReferencePrefix { .. } | Self::ForeignReference { .. } => {
@@ -1016,6 +1025,12 @@ impl LogicalTarget {
                 codes::TABLES.to_vec(),
                 table.as_bytes().to_vec(),
                 codes::WRITE_REVISION.to_vec(),
+            ],
+            Self::RowPrefix { table } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::ROWS.to_vec(),
             ],
             Self::Row {
                 table,
