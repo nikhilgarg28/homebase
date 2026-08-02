@@ -1180,6 +1180,60 @@ mod tests {
     }
 
     #[test]
+    fn update_cascade_victims_count_toward_the_atomic_capture_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                 CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE
+                 );
+                 INSERT INTO parents VALUES (1);
+                 INSERT INTO children VALUES (10, 1), (11, 1)",
+            )
+            .unwrap();
+        let hooks = BranchHooks::install_with_budget(
+            &connection,
+            false,
+            CaptureBudget::with_limits(2, usize::MAX),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            hooks.run(
+                || {
+                    connection.execute("UPDATE parents SET id = 2 WHERE id = 1", ())?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            ),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-change count",
+                limit: 2,
+            })
+        ));
+        assert_eq!(
+            connection
+                .query_row("SELECT id FROM parents", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .prepare("SELECT parent FROM children ORDER BY id")
+                .unwrap()
+                .query_map((), |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [1, 1]
+        );
+    }
+
+    #[test]
     fn capture_limit_rolls_back_the_complete_sqlite_statement() {
         let connection = Connection::open_in_memory().unwrap();
         crate::catalog::initialize(&connection).unwrap();

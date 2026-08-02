@@ -13,7 +13,7 @@ use crate::logical::codes;
 use crate::logical::guard::TargetFamily;
 
 const SEEDS: &[u64] = &[0x5eed_0001, 0x5eed_0002, 0x5eed_0003];
-const ROUNDS: usize = 12;
+const ROUNDS: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct DeterministicRng(u64);
@@ -45,13 +45,13 @@ impl DeterministicRng {
 struct MaterializedState {
     schema: Vec<(String, String, String, String)>,
     parents: Vec<(i64, String, String)>,
-    children: Vec<(i64, String, String)>,
+    children: Vec<(i64, Option<String>, String)>,
     materialized_cells: BTreeMap<Key, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Coverage {
-    scenarios: [bool; 10],
+    scenarios: [bool; 12],
     push_orders: [bool; 2],
     reopened_before_push: bool,
     reopened_before_repair: bool,
@@ -143,7 +143,8 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
             transaction.execute(
                 "CREATE TABLE children (
                     id INTEGER PRIMARY KEY,
-                    parent_code TEXT REFERENCES parents(code),
+                    parent_code TEXT REFERENCES parents(code)
+                        ON DELETE SET NULL ON UPDATE CASCADE,
                     body TEXT NOT NULL
                 )",
                 (),
@@ -189,7 +190,7 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
         assert_eq!(first.push().unwrap(), PushOutcome::Drained);
         synchronize(&first, &first_runtime, &second, &second_runtime);
 
-        let scenario = random.choose(10);
+        let scenario = random.choose(12);
         coverage.scenarios[scenario] = true;
         let expects_conflict = match scenario {
             0 => {
@@ -393,6 +394,40 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                     )
                     .unwrap();
                 false
+            }
+            10 => {
+                first
+                    .execute(
+                        &first_runtime,
+                        "UPDATE parents SET code = ?1 WHERE id = ?2",
+                        rusqlite::params![format!("{code_a}-cascaded"), parent_a],
+                    )
+                    .unwrap();
+                second
+                    .execute(
+                        &second_runtime,
+                        "UPDATE children SET body = 'concurrent child write' WHERE id = ?1",
+                        [child],
+                    )
+                    .unwrap();
+                true
+            }
+            11 => {
+                first
+                    .execute(
+                        &first_runtime,
+                        "DELETE FROM parents WHERE id = ?1",
+                        [parent_a],
+                    )
+                    .unwrap();
+                second
+                    .execute(
+                        &second_runtime,
+                        "UPDATE children SET body = 'concurrent child write' WHERE id = ?1",
+                        [child],
+                    )
+                    .unwrap();
+                true
             }
             _ => unreachable!(),
         };

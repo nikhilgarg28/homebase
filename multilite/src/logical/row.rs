@@ -86,6 +86,10 @@ pub struct CapturedRow {
 
 /// One application-row change observed by SQLite's preupdate hook, including
 /// nested foreign-key and trigger effects.
+///
+/// SQLite selects and executes referential actions on the writable branch.
+/// Multilite compiles the resulting direct and indirect row events; replay and
+/// repair therefore never dispatch foreign-key actions a second time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapturedChange {
     Insert(CapturedRow),

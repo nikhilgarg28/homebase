@@ -1252,6 +1252,72 @@ fn parent_delete_and_child_insert_conflict_in_either_admission_order() {
 }
 
 #[test]
+fn multi_row_parent_key_shift_with_a_reused_value_converges() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("parent-shift-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("parent-shift-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .update(|transaction| {
+            transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+            transaction.execute(
+                "CREATE TABLE children (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO parents VALUES (2), (3)", ())?;
+            transaction.execute("INSERT INTO children VALUES (20, 2), (30, 3)", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .execute("UPDATE parents SET id = id - 1 WHERE id IN (2, 3)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    first.pull().unwrap();
+    second.pull().unwrap();
+    first.rebase().unwrap();
+    second.rebase().unwrap();
+
+    for database in [&first, &second] {
+        assert_eq!(
+            database
+                .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(
+            database
+                .query("SELECT id, parent FROM children ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            [(20, 1), (30, 2)]
+        );
+    }
+}
+
+#[test]
 fn rejected_cascade_restores_every_table_then_converges_when_retried() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

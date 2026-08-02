@@ -1404,6 +1404,277 @@ fn update_restrict_and_invalid_action_results_are_atomic() {
 }
 
 #[test]
+fn multi_row_parent_key_shifts_preserve_reused_reference_prefixes() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("multi-parent-shift.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (2), (3)", ())?;
+        transaction.execute("INSERT INTO children VALUES (20, 2), (30, 3)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute("UPDATE parents SET id = id - 1 WHERE id IN (2, 3)", ())
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query("SELECT id FROM parents ORDER BY id", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1, 2]
+    );
+    assert_eq!(
+        db.query("SELECT id, parent FROM children ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap(),
+        [(20, 1), (30, 2)]
+    );
+}
+
+#[test]
+fn mixed_foreign_key_paths_fold_repeated_child_events_to_one_final_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("mixed-action-paths.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                cascade_parent INTEGER REFERENCES parents(id)
+                    ON DELETE CASCADE ON UPDATE CASCADE,
+                nullable_parent INTEGER REFERENCES parents(id)
+                    ON DELETE SET NULL ON UPDATE SET NULL
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1), (2)", ())?;
+        transaction.execute("INSERT INTO children VALUES (10, 1, 1), (20, 2, 2)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute("DELETE FROM parents WHERE id = 1", ()).unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT id FROM children", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [20]
+    );
+
+    assert_eq!(
+        db.execute("UPDATE parents SET id = 3 WHERE id = 2", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, cascade_parent, nullable_parent FROM children",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(20, 3, None)]
+    );
+}
+
+#[test]
+fn unique_parent_actions_and_set_default_null_semantics_are_captured() {
+    let directory = tempfile::tempdir().unwrap();
+    let db =
+        MultiliteConnection::open(directory.path().join("unique-parent-actions.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                email TEXT NOT NULL,
+                UNIQUE (tenant, email)
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE default_messages (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT DEFAULT 'fallback',
+                email TEXT DEFAULT 'fallback@example.com',
+                FOREIGN KEY (tenant, email) REFERENCES accounts (tenant, email)
+                    ON DELETE SET DEFAULT ON UPDATE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE nullable_messages (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                email TEXT,
+                FOREIGN KEY (tenant, email) REFERENCES accounts (tenant, email)
+                    ON DELETE SET DEFAULT ON UPDATE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO accounts VALUES
+                (0, 'fallback', 'fallback@example.com'),
+                (1, 'north', 'one@example.com')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO default_messages VALUES (10, 'north', 'one@example.com')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO nullable_messages VALUES (20, 'north', 'one@example.com')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "UPDATE accounts
+             SET tenant = 'west', email = 'moved@example.com'
+             WHERE id = 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    for table in ["default_messages", "nullable_messages"] {
+        assert_eq!(
+            db.query(&format!("SELECT tenant, email FROM {table}"), (), |row| Ok(
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?)
+            ),)
+                .unwrap(),
+            [("west".into(), "moved@example.com".into())]
+        );
+    }
+
+    assert_eq!(
+        db.execute("DELETE FROM accounts WHERE id = 1", ()).unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT tenant, email FROM default_messages", (), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [("fallback".into(), "fallback@example.com".into())]
+    );
+    assert_eq!(
+        db.query("SELECT tenant, email FROM nullable_messages", (), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .unwrap(),
+        [(None, None)]
+    );
+}
+
+#[test]
+fn referential_actions_survive_schema_rebuilds_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("action-rebuilds.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                spare TEXT,
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER DEFAULT 0 REFERENCES parents(id)
+                    ON DELETE SET DEFAULT ON UPDATE CASCADE,
+                spare TEXT
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO parents VALUES (0, 'x', 'fallback'), (1, 'x', 'target')",
+            (),
+        )?;
+        transaction.execute("INSERT INTO children VALUES (10, 1, 'x')", ())?;
+        transaction.execute("ALTER TABLE parents RENAME TO accounts", ())?;
+        transaction.execute("ALTER TABLE accounts RENAME COLUMN id TO account_id", ())?;
+        transaction.execute(
+            "ALTER TABLE children RENAME COLUMN parent TO account_id",
+            (),
+        )?;
+        transaction.execute(
+            "ALTER TABLE accounts ADD COLUMN added TEXT DEFAULT 'account'",
+            (),
+        )?;
+        transaction.execute(
+            "ALTER TABLE children ADD COLUMN added TEXT DEFAULT 'child'",
+            (),
+        )?;
+        transaction.execute("ALTER TABLE accounts DROP COLUMN spare", ())?;
+        transaction.execute("ALTER TABLE children DROP COLUMN spare", ())?;
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .execute(
+                "UPDATE accounts SET account_id = 2 WHERE account_id = 1",
+                ()
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT account_id, added FROM children", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [(2, "child".into())]
+    );
+    assert_eq!(
+        reopened
+            .execute("DELETE FROM accounts WHERE account_id = 2", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT account_id FROM children", (), |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        [0]
+    );
+}
+
+#[test]
 fn blocking_foreign_key_rolls_back_mixed_delete_actions_and_hook_events() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("mixed-actions.sqlite")).unwrap();

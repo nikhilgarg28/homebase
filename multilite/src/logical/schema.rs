@@ -2436,16 +2436,13 @@ fn validate_foreign_key_link(
             "foreign-key reference key exceeds the Homebase component limit",
         ));
     }
+    // The encoded names authenticate the declaration's original SQL. Stable
+    // column IDs own the live relationship after later column renames.
     if parent_columns
         .iter()
         .copied()
         .map(Column::id)
         .ne(foreign_key.referenced_columns.iter().copied())
-        || parent_columns
-            .iter()
-            .copied()
-            .map(Column::name)
-            .ne(foreign_key.referenced_column_names.iter())
     {
         return Err(Error::InvalidDatabase(
             "foreign key parent identity contradicts the schema catalog",
