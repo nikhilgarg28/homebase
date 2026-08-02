@@ -1080,12 +1080,14 @@ mod tests {
                 name: SqlName::new("Notes".into()),
                 mode: Default::default(),
                 storage: crate::logical::schema::TableStorage::Rowid,
+                primary_key_conflict: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: Some(0),
                     },
@@ -1094,6 +1096,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },

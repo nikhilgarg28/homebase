@@ -6565,6 +6565,108 @@ fn rejected_limited_delete_reopens_repairs_exact_row_then_converges() {
     }
 }
 
+#[test]
+fn schema_conflict_policies_repair_stale_replacements_and_converge() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let first_path = directory
+            .path()
+            .join(format!("policy-first-{isolation:?}.sqlite"));
+        let second_path = directory
+            .path()
+            .join(format!("policy-second-{isolation:?}.sqlite"));
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second_options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority)))
+        };
+        let second = MultiliteConnection::open_with(&second_path, second_options()).unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+                    email TEXT UNIQUE ON CONFLICT REPLACE,
+                    body TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'fallback'
+                )",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "INSERT INTO accounts VALUES (1, 'same@example', 'winner')",
+                (),
+            )
+            .unwrap();
+        second
+            .execute("INSERT INTO accounts VALUES (2, 'same@example', NULL)", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("stale UNIQUE replacement was not rejected")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(&second_path, second_options()).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id, body FROM accounts", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [(2, "fallback".into())]
+        );
+        second.rollback(&rejection).unwrap();
+        assert!(
+            second
+                .query("SELECT id FROM accounts", (), |row| row.get::<_, i64>(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        second
+            .execute("INSERT INTO accounts VALUES (2, 'same@example', NULL)", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT id, email, body FROM accounts", (), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap(),
+                [(2, "same@example".into(), "fallback".into())]
+            );
+        }
+    }
+}
+
 fn document<H>(database: &MultiliteConnection<H>) -> (String, String)
 where
     H: ServerHandle + Send + Sync + 'static,

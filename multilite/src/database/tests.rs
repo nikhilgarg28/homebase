@@ -241,11 +241,13 @@ fn create_operation(name: &str) -> MultiliteOp {
             name: schema::SqlName::new(name.into()),
             mode: Default::default(),
             storage: crate::logical::schema::TableStorage::Rowid,
+            primary_key_conflict: Default::default(),
             columns: vec![schema::CreateColumn {
                 name: schema::SqlName::new("id".into()),
                 declared_type: schema::TypeDeclaration::integer(),
                 not_null: false,
                 not_null_name: None,
+                not_null_conflict: Default::default(),
                 default: None,
                 primary_key: Some(0),
             }],

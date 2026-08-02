@@ -74,7 +74,10 @@ pub(super) fn validate_table_schema(
         if !column_names.insert(column.name.canonical()) {
             return Err(SchemaInvariantError::DuplicateColumnName);
         }
-        if !column.not_null && column.not_null_name.is_some() {
+        if !column.not_null
+            && (column.not_null_name.is_some()
+                || column.not_null_conflict != super::ConflictPolicy::Abort)
+        {
             return Err(SchemaInvariantError::InvalidNullability);
         }
         if column.declared_type.name.is_empty()
@@ -307,6 +310,7 @@ mod tests {
             declared_type: TypeDeclaration::text(),
             not_null: false,
             not_null_name: None,
+            not_null_conflict: Default::default(),
             default: None,
             primary_key: None,
         };

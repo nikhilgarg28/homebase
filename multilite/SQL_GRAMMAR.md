@@ -67,6 +67,20 @@ name resolution; captured row changes retain the synchronized table identity
 and produce the same wire operations and guards as unaliased statements.
 Qualified targets such as `main.table` remain unsupported.
 
+Schema constraints accept atomic `ON CONFLICT ABORT`, `IGNORE`, and `REPLACE`
+policies on primary keys, UNIQUE declarations, and NOT NULL declarations.
+Absence and explicit `ABORT` normalize to the same durable policy. The policy
+is part of the stable schema IR and authenticated schema frame, so later table
+rebuilds retain it. SQLite resolves the policy once on the writable branch;
+Multilite replicates the resulting net row transition, including replacement
+victims, rather than selecting conflicts again on replicas. Statement-level
+`INSERT OR ...` / `UPDATE OR ...` keeps SQLite's normal precedence over the
+schema policy. `ALTER TABLE ... ADD COLUMN ... NOT NULL ON CONFLICT ...` uses
+the same policy model. `FAIL` and `ROLLBACK` remain fenced because their
+partial-statement effects do not fit the atomic statement-delta contract;
+CHECK conflict clauses remain unsupported because SQLite does not use them as
+an enforcement policy.
+
 Each statement may capture at most 100,000 direct row events and 64 MiB of row
 images. The normalized row operation and enclosing transaction frame enforce
 the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls

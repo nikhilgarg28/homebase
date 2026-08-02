@@ -28,7 +28,7 @@ use crate::{Error, Result};
 
 pub use self::compiler::SchemaInvariantError;
 
-const SCHEMA_FRAME_VERSION: u8 = 6;
+const SCHEMA_FRAME_VERSION: u8 = 7;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -49,10 +49,12 @@ const TAG_COLUMN_TYPE: u8 = 3;
 const TAG_COLUMN_FLAGS: u8 = 4;
 const TAG_COLUMN_NOT_NULL_NAME: u8 = 5;
 const TAG_COLUMN_DEFAULT: u8 = 6;
+const TAG_COLUMN_NOT_NULL_CONFLICT: u8 = 7;
 const TAG_DEFAULT_NAME: u8 = 1;
 const TAG_DEFAULT_EXPRESSION: u8 = 2;
 const TAG_PRIMARY_INDEX: u8 = 1;
 const TAG_PRIMARY_NAME: u8 = 2;
+const TAG_PRIMARY_CONFLICT: u8 = 3;
 const TAG_CHECK_COLUMN: u8 = 1;
 const TAG_CHECK_NAME: u8 = 2;
 const TAG_CHECK_EXPRESSION: u8 = 3;
@@ -62,6 +64,7 @@ const TAG_TYPE_NAME: u8 = 1;
 const TAG_TYPE_ARGUMENT: u8 = 2;
 const TAG_UNIQUE_INDEX_DEFINITION: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
+const TAG_UNIQUE_CONFLICT: u8 = 3;
 const TAG_NAMED_INDEX_DEFINITION: u8 = 1;
 const TAG_INDEX_NAME: u8 = 2;
 const TAG_INDEX_ACTIVE: u8 = 6;
@@ -102,6 +105,9 @@ const TABLE_MODE_ORDINARY: u8 = 0;
 const TABLE_MODE_STRICT: u8 = 1;
 const TABLE_STORAGE_ROWID: u8 = 0;
 const TABLE_STORAGE_WITHOUT_ROWID: u8 = 1;
+const CONFLICT_ABORT: u8 = 1;
+const CONFLICT_IGNORE: u8 = 2;
+const CONFLICT_REPLACE: u8 = 3;
 
 /// Maximum number of columns in a single logical index definition.
 pub const MAX_INDEX_COLUMNS: usize = MAX_COMPONENTS - codes::VALUE_KEY_PREFIX_COMPONENTS;
@@ -204,6 +210,42 @@ pub enum TableStorage {
     #[default]
     Rowid,
     WithoutRowid,
+}
+
+/// Atomic conflict behavior retained by one SQLite schema constraint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    #[default]
+    Abort,
+    Ignore,
+    Replace,
+}
+
+impl ConflictPolicy {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Abort => CONFLICT_ABORT,
+            Self::Ignore => CONFLICT_IGNORE,
+            Self::Replace => CONFLICT_REPLACE,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            CONFLICT_ABORT => Some(Self::Abort),
+            CONFLICT_IGNORE => Some(Self::Ignore),
+            CONFLICT_REPLACE => Some(Self::Replace),
+            _ => None,
+        }
+    }
+
+    fn sql(self) -> Option<&'static str> {
+        match self {
+            Self::Abort => None,
+            Self::Ignore => Some("IGNORE"),
+            Self::Replace => Some("REPLACE"),
+        }
+    }
 }
 
 impl TableStorage {
@@ -382,6 +424,7 @@ pub struct CreateColumn {
     pub declared_type: TypeDeclaration,
     pub not_null: bool,
     pub not_null_name: Option<SqlName>,
+    pub not_null_conflict: ConflictPolicy,
     pub default: Option<DefaultDefinition>,
     /// Position in the table's ordered primary key, if any.
     pub primary_key: Option<usize>,
@@ -392,6 +435,7 @@ pub struct CreateColumn {
 pub struct CreateUnique {
     pub name: Option<SqlName>,
     pub columns: Vec<SqlName>,
+    pub conflict: ConflictPolicy,
 }
 
 /// Action applied to child rows when a referenced parent identity changes.
@@ -737,6 +781,7 @@ pub struct CreateTableSpec {
     pub storage: TableStorage,
     pub columns: Vec<CreateColumn>,
     pub primary_key_name: Option<SqlName>,
+    pub primary_key_conflict: ConflictPolicy,
     pub unique_constraints: Vec<CreateUnique>,
     pub foreign_keys: Vec<CreateForeignKey>,
     pub checks: Vec<CreateCheckConstraint>,
@@ -767,6 +812,7 @@ pub struct Column {
     declared_type: TypeDeclaration,
     not_null: bool,
     not_null_name: Option<SqlName>,
+    not_null_conflict: ConflictPolicy,
     default: Option<DefaultDefinition>,
 }
 
@@ -774,6 +820,7 @@ pub struct Column {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimaryKey {
     name: Option<SqlName>,
+    conflict: ConflictPolicy,
     index: IndexDefinition,
 }
 
@@ -781,6 +828,7 @@ pub struct PrimaryKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UniqueConstraint {
     name: Option<SqlName>,
+    conflict: ConflictPolicy,
     index: IndexDefinition,
 }
 
@@ -944,6 +992,10 @@ impl Column {
         self.not_null_name.as_ref()
     }
 
+    pub fn not_null_conflict(&self) -> ConflictPolicy {
+        self.not_null_conflict
+    }
+
     pub fn default(&self) -> Option<&DefaultDefinition> {
         self.default.as_ref()
     }
@@ -956,6 +1008,10 @@ impl PrimaryKey {
 
     pub fn columns(&self) -> &[ColumnId] {
         self.index.columns()
+    }
+
+    pub fn conflict(&self) -> ConflictPolicy {
+        self.conflict
     }
 
     pub fn index(&self) -> &IndexDefinition {
@@ -1035,6 +1091,10 @@ impl UniqueConstraint {
 
     pub fn columns(&self) -> &[ColumnId] {
         self.index.columns()
+    }
+
+    pub fn conflict(&self) -> ConflictPolicy {
+        self.conflict
     }
 
     pub fn index(&self) -> &IndexDefinition {
@@ -1793,6 +1853,7 @@ impl CreateTable {
             declared_type: spec.declared_type.clone(),
             not_null: spec.not_null,
             not_null_name: spec.not_null_name.clone(),
+            not_null_conflict: spec.not_null_conflict,
             default: spec.default.clone(),
         });
         let checks = checks
@@ -2198,6 +2259,7 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         if column.is_not_null() {
             push_constraint_name(&mut declaration, column.not_null_name());
             declaration.push_str(" NOT NULL");
+            push_conflict_policy(&mut declaration, column.not_null_conflict());
         }
         if let Some(default) = column.default() {
             push_constraint_name(&mut declaration, default.name.as_ref());
@@ -2220,6 +2282,7 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
     declaration.push_str(" PRIMARY KEY (");
     declaration.push_str(&primary);
     declaration.push(')');
+    push_conflict_policy(&mut declaration, table.schema.primary_key.conflict());
     declarations.push(declaration.trim_start().to_owned());
 
     for unique in table.unique_constraints() {
@@ -2234,6 +2297,7 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         declaration.push_str(" UNIQUE (");
         declaration.push_str(&columns);
         declaration.push(')');
+        push_conflict_policy(&mut declaration, unique.conflict());
         declarations.push(declaration.trim_start().to_owned());
     }
 
@@ -2310,6 +2374,13 @@ fn push_constraint_name(sql: &mut String, name: Option<&SqlName>) {
     if let Some(name) = name {
         sql.push_str(" CONSTRAINT ");
         sql.push_str(&quote_identifier(name.value()));
+    }
+}
+
+fn push_conflict_policy(sql: &mut String, policy: ConflictPolicy) {
+    if let Some(policy) = policy.sql() {
+        sql.push_str(" ON CONFLICT ");
+        sql.push_str(policy);
     }
 }
 
@@ -2512,6 +2583,7 @@ fn build_create_table(
         storage,
         columns: column_specs,
         primary_key_name,
+        primary_key_conflict,
         unique_constraints: unique_specs,
         foreign_keys: _,
         checks: check_specs,
@@ -2528,6 +2600,7 @@ fn build_create_table(
             declared_type: column.declared_type.clone(),
             not_null: column.not_null,
             not_null_name: column.not_null_name.clone(),
+            not_null_conflict: column.not_null_conflict,
             default: column.default.clone(),
         })
         .collect::<Vec<_>>();
@@ -2536,6 +2609,7 @@ fn build_create_table(
     )?;
     let primary_key = PrimaryKey {
         name: primary_key_name,
+        conflict: primary_key_conflict,
         index: IndexDefinition {
             id: row_index_id,
             kind: IndexKind::Primary,
@@ -2561,6 +2635,7 @@ fn build_create_table(
                 .collect::<Result<Vec<_>>>()?;
             Ok(UniqueConstraint {
                 name: unique.name,
+                conflict: unique.conflict,
                 index: IndexDefinition {
                     id: IndexId(mint()),
                     kind: IndexKind::Unique,
@@ -2887,6 +2962,12 @@ fn encode_column(column: &Column) -> Vec<u8> {
             .field(TAG_COLUMN_NOT_NULL_NAME, name.value().as_bytes())
             .expect("schema field length must fit in u32");
     }
+    writer
+        .field(
+            TAG_COLUMN_NOT_NULL_CONFLICT,
+            &[column.not_null_conflict.to_u8()],
+        )
+        .expect("schema field length must fit in u32");
     if let Some(default) = &column.default {
         writer
             .field(TAG_COLUMN_DEFAULT, &encode_default(default))
@@ -2905,6 +2986,9 @@ fn encode_primary_key(primary_key: &PrimaryKey) -> Vec<u8> {
             .field(TAG_PRIMARY_NAME, name.value().as_bytes())
             .expect("primary-key field length must fit in u32");
     }
+    writer
+        .field(TAG_PRIMARY_CONFLICT, &[primary_key.conflict.to_u8()])
+        .expect("primary-key field length must fit in u32");
     writer.finish()
 }
 
@@ -2960,6 +3044,9 @@ fn encode_unique_constraint(unique: &UniqueConstraint) -> Vec<u8> {
             .field(TAG_UNIQUE_NAME, name.value().as_bytes())
             .expect("schema field length must fit in u32");
     }
+    writer
+        .field(TAG_UNIQUE_CONFLICT, &[unique.conflict.to_u8()])
+        .expect("schema field length must fit in u32");
     writer.finish()
 }
 
@@ -3534,10 +3621,12 @@ fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCod
     let mut reader = Reader::new(frame);
     let mut index = None;
     let mut name = None;
+    let mut conflict = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_PRIMARY_INDEX => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_PRIMARY_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_PRIMARY_CONFLICT => set_once(&mut conflict, decode_conflict_policy(value)?)?,
             _ => {}
         }
     }
@@ -3545,7 +3634,11 @@ fn decode_primary_key(frame: &[u8]) -> std::result::Result<PrimaryKey, SchemaCod
     if index.kind != IndexKind::Primary {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(PrimaryKey { name, index })
+    Ok(PrimaryKey {
+        name,
+        conflict: conflict.ok_or(SchemaCodecError::MissingField(TAG_PRIMARY_CONFLICT))?,
+        index,
+    })
 }
 
 fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> {
@@ -3557,6 +3650,7 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
     let mut declared_type = None;
     let mut flags = None;
     let mut not_null_name = None;
+    let mut not_null_conflict = None;
     let mut default = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
@@ -3573,6 +3667,9 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
                 set_once(&mut flags, *value)?;
             }
             TAG_COLUMN_NOT_NULL_NAME => set_once(&mut not_null_name, decode_name(value)?)?,
+            TAG_COLUMN_NOT_NULL_CONFLICT => {
+                set_once(&mut not_null_conflict, decode_conflict_policy(value)?)?
+            }
             TAG_COLUMN_DEFAULT => set_once(&mut default, decode_default(value)?)?,
             _ => {}
         }
@@ -3585,6 +3682,8 @@ fn decode_column(frame: &[u8]) -> std::result::Result<Column, SchemaCodecError> 
         declared_type: declared_type.ok_or(SchemaCodecError::MissingField(TAG_COLUMN_TYPE))?,
         not_null,
         not_null_name,
+        not_null_conflict: not_null_conflict
+            .ok_or(SchemaCodecError::MissingField(TAG_COLUMN_NOT_NULL_CONFLICT))?,
         default,
     })
 }
@@ -3705,8 +3804,10 @@ fn type_declaration_roundtrips(declaration: &TypeDeclaration) -> bool {
                 && value.declared_type == *declaration
                 && !value.not_null
                 && value.not_null_name.is_none()
+                && value.not_null_conflict == ConflictPolicy::Abort
                 && value.default.is_none()
                 && value.primary_key.is_none()
+                && spec.primary_key_conflict == ConflictPolicy::Abort
                 && spec.unique_constraints.is_empty()
                 && spec.foreign_keys.is_empty()
                 && spec.checks.is_empty()
@@ -3721,10 +3822,12 @@ fn decode_unique_constraint(
     let mut reader = Reader::new(frame);
     let mut index = None;
     let mut name = None;
+    let mut conflict = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_UNIQUE_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_UNIQUE_NAME => set_once(&mut name, decode_name(value)?)?,
+            TAG_UNIQUE_CONFLICT => set_once(&mut conflict, decode_conflict_policy(value)?)?,
             _ => {}
         }
     }
@@ -3732,7 +3835,18 @@ fn decode_unique_constraint(
     if index.kind != IndexKind::Unique {
         return Err(SchemaCodecError::InvalidSchema);
     }
-    Ok(UniqueConstraint { name, index })
+    Ok(UniqueConstraint {
+        name,
+        conflict: conflict.ok_or(SchemaCodecError::MissingField(TAG_UNIQUE_CONFLICT))?,
+        index,
+    })
+}
+
+fn decode_conflict_policy(value: &[u8]) -> std::result::Result<ConflictPolicy, SchemaCodecError> {
+    let [value] = value else {
+        return Err(SchemaCodecError::InvalidLength);
+    };
+    ConflictPolicy::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)
 }
 
 fn decode_logical_index(frame: &[u8]) -> std::result::Result<IndexDefinition, SchemaCodecError> {
@@ -3845,6 +3959,7 @@ fn validate_initial_provenance_sql(
         || parsed.storage != created.schema.storage
         || !created.schema.indexes.is_empty()
         || parsed.primary_key_name != created.schema.primary_key.name
+        || parsed.primary_key_conflict != created.schema.primary_key.conflict
         || parsed.columns.len() != created.schema.columns.len()
         || parsed.unique_constraints.len() != created.schema.unique_constraints.len()
         || parsed.foreign_keys.len() != created.schema.foreign_keys.len()
@@ -3864,6 +3979,7 @@ fn validate_initial_provenance_sql(
             || parsed.declared_type != encoded.declared_type
             || parsed.not_null != encoded.not_null
             || parsed.not_null_name != encoded.not_null_name
+            || parsed.not_null_conflict != encoded.not_null_conflict
             || parsed.default != encoded.default
             || parsed.primary_key != primary_key
         {
@@ -3882,7 +3998,10 @@ fn validate_initial_provenance_sql(
             .map(|column| column_name(created, *column))
             .collect::<Option<Vec<_>>>()
             .ok_or(SchemaCodecError::SqlMismatch)?;
-        if parsed.name != encoded.name || parsed.columns.as_slice() != columns.as_slice() {
+        if parsed.name != encoded.name
+            || parsed.columns.as_slice() != columns.as_slice()
+            || parsed.conflict != encoded.conflict
+        {
             return Err(SchemaCodecError::SqlMismatch);
         }
     }
@@ -3962,12 +4081,14 @@ mod tests {
             name: SqlName::new(name.into()),
             mode: TableMode::Ordinary,
             storage: TableStorage::Rowid,
+            primary_key_conflict: Default::default(),
             columns: vec![
                 CreateColumn {
                     name: SqlName::new("id".into()),
                     declared_type: TypeDeclaration::integer(),
                     not_null: false,
                     not_null_name: None,
+                    not_null_conflict: Default::default(),
                     default: None,
                     primary_key: Some(0),
                 },
@@ -3976,6 +4097,7 @@ mod tests {
                     declared_type: TypeDeclaration::text(),
                     not_null: true,
                     not_null_name: None,
+                    not_null_conflict: Default::default(),
                     default: None,
                     primary_key: None,
                 },
@@ -4015,12 +4137,14 @@ mod tests {
                 name: SqlName::new("accounts".into()),
                 mode: TableMode::Ordinary,
                 storage: TableStorage::Rowid,
+                primary_key_conflict: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: Some(0),
                     },
@@ -4029,6 +4153,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },
@@ -4037,6 +4162,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },
@@ -4047,6 +4173,7 @@ mod tests {
                         SqlName::new("organization".into()),
                         SqlName::new("email".into()),
                     ],
+                    conflict: Default::default(),
                 }],
                 foreign_keys: Vec::new(),
                 primary_key_name: None,
@@ -4077,12 +4204,14 @@ mod tests {
                 name: SqlName::new("profiles".into()),
                 mode: TableMode::Ordinary,
                 storage: TableStorage::Rowid,
+                primary_key_conflict: Default::default(),
                 columns: vec![
                     CreateColumn {
                         name: SqlName::new("id".into()),
                         declared_type: TypeDeclaration::integer(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: Some(0),
                     },
@@ -4091,6 +4220,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },
@@ -4099,6 +4229,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },
@@ -4107,6 +4238,7 @@ mod tests {
                         declared_type: TypeDeclaration::text(),
                         not_null: false,
                         not_null_name: None,
+                        not_null_conflict: Default::default(),
                         default: None,
                         primary_key: None,
                     },
@@ -4115,14 +4247,17 @@ mod tests {
                     CreateUnique {
                         name: Some(SqlName::new("email_key".into())),
                         columns: vec![SqlName::new("email".into())],
+                        conflict: Default::default(),
                     },
                     CreateUnique {
                         name: None,
                         columns: vec![SqlName::new("username".into())],
+                        conflict: Default::default(),
                     },
                     CreateUnique {
                         name: Some(SqlName::new("tenant_email".into())),
                         columns: vec![SqlName::new("tenant".into()), SqlName::new("email".into())],
+                        conflict: Default::default(),
                     },
                     CreateUnique {
                         name: Some(SqlName::new("tenant_username".into())),
@@ -4130,6 +4265,7 @@ mod tests {
                             SqlName::new("tenant".into()),
                             SqlName::new("username".into()),
                         ],
+                        conflict: Default::default(),
                     },
                 ],
                 foreign_keys: Vec::new(),
@@ -4196,6 +4332,7 @@ mod tests {
             declared_type: TypeDeclaration::text(),
             not_null: false,
             not_null_name: None,
+            not_null_conflict: Default::default(),
             default: None,
             primary_key: None,
         };
@@ -4399,6 +4536,87 @@ mod tests {
         );
         assert_eq!(created.primary_key_columns().next().unwrap().id(), id);
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
+    }
+
+    #[test]
+    fn schema_conflict_policies_roundtrip_and_render_from_stable_ir() {
+        let sql = "CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+            email TEXT NOT NULL ON CONFLICT IGNORE,
+            handle TEXT UNIQUE ON CONFLICT ABORT,
+            tenant TEXT,
+            UNIQUE (tenant, email) ON CONFLICT REPLACE
+        )";
+        let crate::sql::ValidatedExecute::CreateTable(spec) =
+            crate::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let created = CreateTable::new(sql, spec);
+        let decoded = CreateTable::decode_operation(&created.encode()).unwrap();
+
+        assert_eq!(decoded.schema.primary_key.conflict, ConflictPolicy::Replace);
+        assert_eq!(
+            decoded.schema.columns[1].not_null_conflict,
+            ConflictPolicy::Ignore
+        );
+        assert_eq!(
+            decoded.schema.unique_constraints[0].conflict,
+            ConflictPolicy::Abort
+        );
+        assert_eq!(
+            decoded.schema.unique_constraints[1].conflict,
+            ConflictPolicy::Replace
+        );
+
+        let connection = Connection::open_in_memory().unwrap();
+        catalog::initialize(&connection).unwrap();
+        let rendered = decoded.materialization_sql(&connection).unwrap();
+        assert!(rendered.contains("PRIMARY KEY (\"id\") ON CONFLICT REPLACE"));
+        assert!(rendered.contains("\"email\" TEXT NOT NULL ON CONFLICT IGNORE"));
+        assert!(rendered.contains("UNIQUE (\"tenant\", \"email\") ON CONFLICT REPLACE"));
+        connection.execute(&rendered, ()).unwrap();
+
+        let mut contradicted = decoded.clone();
+        contradicted.schema.primary_key.conflict = ConflictPolicy::Ignore;
+        contradicted.refresh_schema_revision();
+        assert_eq!(
+            CreateTable::decode_operation(&contradicted.encode()),
+            Err(SchemaCodecError::SqlMismatch)
+        );
+
+        let mut contradicted = decoded.clone();
+        contradicted.schema.columns[1].not_null_conflict = ConflictPolicy::Replace;
+        contradicted.refresh_schema_revision();
+        assert_eq!(
+            CreateTable::decode_operation(&contradicted.encode()),
+            Err(SchemaCodecError::SqlMismatch)
+        );
+
+        let mut contradicted = decoded;
+        contradicted.schema.unique_constraints[1].conflict = ConflictPolicy::Ignore;
+        contradicted.refresh_schema_revision();
+        assert_eq!(
+            CreateTable::decode_operation(&contradicted.encode()),
+            Err(SchemaCodecError::SqlMismatch)
+        );
+
+        assert_eq!(
+            decode_conflict_policy(&[CONFLICT_ABORT]),
+            Ok(ConflictPolicy::Abort)
+        );
+        assert_eq!(
+            decode_conflict_policy(&[]),
+            Err(SchemaCodecError::InvalidLength)
+        );
+        assert_eq!(
+            decode_conflict_policy(&[CONFLICT_REPLACE, 0]),
+            Err(SchemaCodecError::InvalidLength)
+        );
+        assert_eq!(
+            decode_conflict_policy(&[0xff]),
+            Err(SchemaCodecError::InvalidSchema)
+        );
     }
 
     #[test]
@@ -4755,6 +4973,7 @@ mod tests {
                 declared_type: TypeDeclaration::integer(),
                 not_null: true,
                 not_null_name: None,
+                not_null_conflict: Default::default(),
                 default: None,
                 primary_key: Some(index),
             });
@@ -4763,6 +4982,7 @@ mod tests {
                 declared_type: TypeDeclaration::integer(),
                 not_null: false,
                 not_null_name: None,
+                not_null_conflict: Default::default(),
                 default: None,
                 primary_key: None,
             });
@@ -4770,6 +4990,7 @@ mod tests {
                 name: SqlName::new("child".into()),
                 mode: TableMode::Ordinary,
                 storage: TableStorage::WithoutRowid,
+                primary_key_conflict: Default::default(),
                 columns: primary_columns.chain(foreign_columns).collect(),
                 unique_constraints: Vec::new(),
                 foreign_keys: vec![CreateForeignKey {

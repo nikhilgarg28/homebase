@@ -11,9 +11,9 @@ use sqlite3_parser::ast::{
 use sqlite3_parser::lexer::sql::Parser;
 
 use crate::logical::schema::{
-    CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
-    DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, ReferentialAction, ReferentialActions,
-    SqlExpression, SqlName, TableMode, TableStorage, TypeDeclaration,
+    ConflictPolicy, CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec,
+    CreateUnique, DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, ReferentialAction,
+    ReferentialActions, SqlExpression, SqlName, TableMode, TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
 
@@ -246,6 +246,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 .and_then(type_declaration)?;
             let mut not_null = false;
             let mut not_null_name = None;
+            let mut not_null_conflict = ConflictPolicy::Abort;
             let mut default = None;
             let mut checks = Vec::new();
             for constraint in column.constraints {
@@ -253,10 +254,11 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 match constraint.constraint {
                     ColumnConstraint::NotNull {
                         nullable: false,
-                        conflict_clause: None,
+                        conflict_clause,
                     } if !not_null => {
                         not_null = true;
                         not_null_name = constraint_name;
+                        not_null_conflict = constraint_conflict_policy(conflict_clause)?;
                     }
                     ColumnConstraint::Default(expression) if default.is_none() => {
                         default = Some(DefaultDefinition {
@@ -273,7 +275,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     }
                     ColumnConstraint::NotNull { .. } => {
                         return Err(Error::UnsupportedSql(
-                            "duplicate, nullable, and conflict-clause NOT NULL forms are not supported",
+                            "duplicate and nullable NOT NULL forms are not supported",
                         ));
                     }
                     ColumnConstraint::Default(_) => {
@@ -295,6 +297,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     declared_type,
                     not_null,
                     not_null_name,
+                    not_null_conflict,
                     default,
                     primary_key: None,
                 },
@@ -1163,6 +1166,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
     };
     let mut inline_primary_keys = 0;
     let mut primary_key_name = None;
+    let mut primary_key_conflict = ConflictPolicy::Abort;
     let mut unique_constraints = Vec::new();
     let mut foreign_keys = Vec::new();
     let mut checks = Vec::new();
@@ -1181,6 +1185,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
             }
             let mut not_null = false;
             let mut not_null_name = None;
+            let mut not_null_conflict = ConflictPolicy::Abort;
             let mut primary_key = None;
             let mut default = None;
             for constraint in column.constraints {
@@ -1197,9 +1202,9 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         if auto_increment {
                             return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
                         }
-                        if order.is_some() || conflict_clause.is_some() {
+                        if order.is_some() {
                             return Err(Error::UnsupportedSql(
-                                "PRIMARY KEY ordering and conflict clauses are not supported",
+                                "PRIMARY KEY ordering is not supported",
                             ));
                         }
                         if primary_key.is_some() {
@@ -1212,10 +1217,11 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         if let Some(name) = constraint_name {
                             primary_key_name = Some(name);
                         }
+                        primary_key_conflict = constraint_conflict_policy(conflict_clause)?;
                     }
                     ColumnConstraint::NotNull {
                         nullable: false,
-                        conflict_clause: None,
+                        conflict_clause,
                     } => {
                         if not_null {
                             return Err(Error::UnsupportedSql(
@@ -1224,6 +1230,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         }
                         not_null = true;
                         not_null_name = constraint_name;
+                        not_null_conflict = constraint_conflict_policy(conflict_clause)?;
                     }
                     ColumnConstraint::NotNull { .. } => {
                         return Err(Error::UnsupportedSql(
@@ -1231,14 +1238,10 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                         ));
                     }
                     ColumnConstraint::Unique(conflict_clause) => {
-                        if conflict_clause.is_some() {
-                            return Err(Error::UnsupportedSql(
-                                "UNIQUE conflict clauses are not supported",
-                            ));
-                        }
                         unique_constraints.push(CreateUnique {
                             name: constraint_name,
                             columns: vec![name.clone()],
+                            conflict: constraint_conflict_policy(conflict_clause)?,
                         });
                     }
                     ColumnConstraint::Default(expression) => {
@@ -1282,6 +1285,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 declared_type,
                 not_null,
                 not_null_name,
+                not_null_conflict,
                 default,
                 primary_key,
             })
@@ -1303,15 +1307,11 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 columns: unique_columns,
                 conflict_clause,
             } => {
-                if conflict_clause.is_some() {
-                    return Err(Error::UnsupportedSql(
-                        "UNIQUE conflict clauses are not supported",
-                    ));
-                }
                 let unique_columns = simple_key_columns(unique_columns, &columns, "UNIQUE")?;
                 unique_constraints.push(CreateUnique {
                     name: constraint.name.map(|name| identifier(&name)).transpose()?,
                     columns: unique_columns,
+                    conflict: constraint_conflict_policy(conflict_clause)?,
                 });
             }
             TableConstraint::PrimaryKey {
@@ -1322,11 +1322,6 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                 let constraint_name = constraint.name.map(|name| identifier(&name)).transpose()?;
                 if auto_increment {
                     return Err(Error::UnsupportedSql("AUTOINCREMENT is not supported"));
-                }
-                if conflict_clause.is_some() {
-                    return Err(Error::UnsupportedSql(
-                        "PRIMARY KEY conflict clauses are not supported",
-                    ));
                 }
                 if table_primary_key.is_some() {
                     return Err(Error::UnsupportedSql(
@@ -1339,6 +1334,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
                     "PRIMARY KEY",
                 )?);
                 primary_key_name = constraint_name;
+                primary_key_conflict = constraint_conflict_policy(conflict_clause)?;
             }
             TableConstraint::Check(expression, conflict_clause) => {
                 if conflict_clause.is_some() {
@@ -1419,6 +1415,7 @@ fn validate_create_table(name: SqlName, body: CreateTableBody) -> Result<Validat
         storage,
         columns,
         primary_key_name,
+        primary_key_conflict,
         unique_constraints,
         foreign_keys,
         checks,
@@ -1607,6 +1604,17 @@ pub(super) fn parse_schema_expression(sql: &str) -> Result<SqlExpression> {
     };
     validate_index_expression(expression)?;
     Ok(schema_expression(expression.clone()))
+}
+
+fn constraint_conflict_policy(policy: Option<ResolveType>) -> Result<ConflictPolicy> {
+    match policy {
+        None | Some(ResolveType::Abort) => Ok(ConflictPolicy::Abort),
+        Some(ResolveType::Ignore) => Ok(ConflictPolicy::Ignore),
+        Some(ResolveType::Replace) => Ok(ConflictPolicy::Replace),
+        Some(ResolveType::Fail | ResolveType::Rollback) => Err(Error::UnsupportedSql(
+            "schema constraints support only ABORT, IGNORE, and REPLACE conflict resolution",
+        )),
+    }
 }
 
 fn validate_foreign_key(
@@ -2202,10 +2210,7 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT COLLATE nocase)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT GENERATED ALWAYS AS (id))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY ON CONFLICT REPLACE)",
-            "CREATE TABLE notes (id INTEGER NOT NULL ON CONFLICT IGNORE)",
             "CREATE TABLE notes (id INTEGER UNIQUE ON CONFLICT FAIL)",
-            "CREATE TABLE notes (id INTEGER, PRIMARY KEY (id) ON CONFLICT ABORT)",
             "CREATE TABLE notes (id INTEGER, UNIQUE (id) ON CONFLICT ROLLBACK)",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body COLLATE NOCASE))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body DESC))",
@@ -2214,6 +2219,43 @@ mod tests {
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, body))",
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, UNIQUE (body, BODY))",
             "CREATE TABLE __MULTILITE__future (id INTEGER PRIMARY KEY)",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn normalizes_atomic_schema_conflict_policies() {
+        let ValidatedExecute::CreateTable(spec) = validate_execute(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+                email TEXT NOT NULL ON CONFLICT IGNORE,
+                handle TEXT UNIQUE ON CONFLICT ABORT,
+                tenant TEXT,
+                CONSTRAINT tenant_email UNIQUE (tenant, email) ON CONFLICT REPLACE
+            )",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(spec.primary_key_conflict, ConflictPolicy::Replace);
+        assert_eq!(spec.columns[1].not_null_conflict, ConflictPolicy::Ignore);
+        assert_eq!(spec.unique_constraints[0].conflict, ConflictPolicy::Abort);
+        assert_eq!(spec.unique_constraints[1].conflict, ConflictPolicy::Replace);
+
+        let ValidatedExecute::AddColumn(added) = validate_execute(
+            "ALTER TABLE accounts ADD COLUMN state TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'new'",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(added.column.not_null_conflict, ConflictPolicy::Replace);
+
+        for sql in [
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY ON CONFLICT FAIL)",
+            "CREATE TABLE notes (id INTEGER NOT NULL ON CONFLICT ROLLBACK PRIMARY KEY)",
+            "ALTER TABLE notes ADD COLUMN body TEXT NOT NULL ON CONFLICT FAIL",
         ] {
             assert_unsupported(sql);
         }

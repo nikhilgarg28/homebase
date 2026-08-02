@@ -4387,33 +4387,208 @@ fn upsert_do_update_covers_strict_composite_and_affinity_key_shapes() {
 }
 
 #[test]
-fn autoincrement_and_schema_conflict_policies_are_rejected_without_schema_changes() {
+fn schema_conflict_policies_match_sqlite_and_survive_schema_rebuilds() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("schema-options.sqlite")).unwrap();
 
+    db.execute(
+        "CREATE TABLE policy_rows (
+            id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+            email TEXT UNIQUE ON CONFLICT IGNORE,
+            body TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'fallback',
+            tenant TEXT,
+            handle TEXT,
+            UNIQUE (tenant, handle) ON CONFLICT REPLACE
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO policy_rows VALUES
+            (1, 'one@example', 'first', 'acme', 'one'),
+            (2, 'two@example', NULL, 'acme', 'two')",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute(
+            "INSERT INTO policy_rows VALUES
+                (3, 'one@example', 'ignored', 'other', 'three')",
+            (),
+        )
+        .unwrap(),
+        0
+    );
+    db.execute(
+        "INSERT INTO policy_rows VALUES
+            (1, 'replacement@example', 'pk replacement', 'other', 'one')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO policy_rows VALUES
+            (4, 'composite@example', 'composite replacement', 'acme', 'two')",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.query(
+            "SELECT id, email, body, tenant, handle FROM policy_rows ORDER BY id",
+            (),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            )),
+        )
+        .unwrap(),
+        [
+            (
+                1,
+                "replacement@example".into(),
+                "pk replacement".into(),
+                "other".into(),
+                "one".into(),
+            ),
+            (
+                4,
+                "composite@example".into(),
+                "composite replacement".into(),
+                "acme".into(),
+                "two".into(),
+            ),
+        ]
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT OR IGNORE INTO policy_rows VALUES
+                (1, 'ignored-by-statement@example', 'ignored', 'x', 'x')",
+            (),
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        db.execute(
+            "INSERT OR ABORT INTO policy_rows VALUES
+                (5, 'five@example', 'aborted', 'acme', 'two')",
+            (),
+        )
+        .is_err()
+    );
+    db.execute(
+        "INSERT OR REPLACE INTO policy_rows VALUES
+            (6, 'replacement@example', 'statement replacement', 'six', 'six')",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "ALTER TABLE policy_rows ADD COLUMN state TEXT
+            NOT NULL ON CONFLICT REPLACE DEFAULT 'new'",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE policy_rows RENAME COLUMN state TO status", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO policy_rows
+            (id, email, body, tenant, handle, status)
+         VALUES (7, 'seven@example', 'seven', 'seven', 'seven', NULL)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT id, body, status FROM policy_rows ORDER BY id",
+            (),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            )),
+        )
+        .unwrap(),
+        [
+            (4, "composite replacement".into(), "new".into()),
+            (6, "statement replacement".into(), "new".into()),
+            (7, "seven".into(), "new".into()),
+        ]
+    );
+
     for sql in [
         "CREATE TABLE auto_notes (id INTEGER PRIMARY KEY AUTOINCREMENT)",
-        "CREATE TABLE replacing_notes (
+        "CREATE TABLE failing_notes (
             id INTEGER PRIMARY KEY,
-            body TEXT UNIQUE ON CONFLICT REPLACE
+            body TEXT UNIQUE ON CONFLICT FAIL
         )",
-        "CREATE TABLE ignoring_notes (
-            id INTEGER PRIMARY KEY,
-            body TEXT NOT NULL ON CONFLICT IGNORE
+        "CREATE TABLE rolling_back_notes (
+            id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK
         )",
     ] {
         assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
     }
 
-    let mut statement = db
-        .prepare(
+    assert_eq!(
+        db.query(
             "SELECT count(*) FROM sqlite_schema
-             WHERE name IN ('auto_notes', 'replacing_notes', 'ignoring_notes', 'sqlite_sequence')",
+             WHERE name IN (
+                'auto_notes', 'failing_notes', 'rolling_back_notes', 'sqlite_sequence'
+             )",
+            (),
+            |row| row.get::<_, i64>(0),
         )
+        .unwrap(),
+        [0],
+    );
+}
+
+#[test]
+fn schema_conflict_policies_cover_strict_composite_without_rowid_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("strict-policies.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE memberships (
+            tenant TEXT,
+            member INTEGER,
+            body TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'fallback',
+            PRIMARY KEY (tenant, member) ON CONFLICT REPLACE,
+            UNIQUE (tenant, body) ON CONFLICT IGNORE
+        ) WITHOUT ROWID, STRICT",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO memberships VALUES ('a', 1, NULL)", ())
+        .unwrap();
+    db.execute("INSERT INTO memberships VALUES ('a', 1, 'replacement')", ())
         .unwrap();
     assert_eq!(
-        statement.query_map((), |row| row.get::<_, i64>(0)).unwrap(),
-        [0]
+        db.execute("INSERT INTO memberships VALUES ('a', 2, 'replacement')", ())
+            .unwrap(),
+        0
+    );
+    db.execute(
+        "INSERT OR REPLACE INTO memberships VALUES ('a', 3, 'replacement')",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.query(
+            "SELECT tenant, member, body FROM memberships",
+            (),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            )),
+        )
+        .unwrap(),
+        [("a".into(), 3, "replacement".into())]
     );
 }
 
