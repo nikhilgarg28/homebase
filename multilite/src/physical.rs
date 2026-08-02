@@ -87,14 +87,16 @@ pub(super) fn verify_table(connection: &Connection, table: TableId) -> Result<()
 
 fn parse_table(sql: &str) -> Result<CreateTableSpec> {
     match crate::sql::validate_execute(sql) {
-        Ok(ValidatedExecute::CreateTable(spec)) => Ok(spec),
+        Ok(ValidatedExecute::CreateTable(spec))
+        | Ok(ValidatedExecute::CreateTableIfNotExists(spec)) => Ok(spec),
         _ => Err(Error::InvalidDatabase(TABLE_MISMATCH)),
     }
 }
 
 fn parse_index(sql: &str) -> Result<CreateIndexSpec> {
     match crate::sql::validate_execute(sql) {
-        Ok(ValidatedExecute::CreateIndex(spec)) => Ok(spec),
+        Ok(ValidatedExecute::CreateIndex(spec))
+        | Ok(ValidatedExecute::CreateIndexIfNotExists(spec)) => Ok(spec),
         _ => Err(Error::InvalidDatabase(INDEX_MISMATCH)),
     }
 }

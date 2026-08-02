@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use homebase_client::ServerHandle;
 use homebase_core::key::Key;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 
 use super::view::TransactionStatement;
 use super::{Database, DatabaseRuntime, IsolationLevel, UpdateOptions, catalog};
@@ -121,34 +121,16 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 })?;
                 self.execute_alter(sql, params, operation)
             }
-            ValidatedExecute::CreateTable(table) => {
-                let operation = MultiliteOp::CreateTable(
-                    self.hooks
-                        .with_internal(|| CreateTable::prepare(self.connection, sql, table))?,
-                );
-                let operation = operation.compile()?;
-                let MultiliteOp::CreateTable(created) = operation.logical() else {
-                    unreachable!("create-table constructor returned another operation")
-                };
-                let materialization_sql = self
+            ValidatedExecute::CreateTable(table) => self.execute_create_table(sql, params, table),
+            ValidatedExecute::CreateTableIfNotExists(table) => {
+                let is_noop = self
                     .hooks
-                    .with_internal(|| created.materialization_sql(self.connection))?;
-                let (changed, events) = self.hooks.run_schema(
-                    || {
-                        let changed = self.connection.execute(&materialization_sql, params)?;
-                        self.hooks
-                            .with_internal(|| catalog::insert(self.connection, created))?;
-                        Ok(changed)
-                    },
-                    |_| Ok(()),
-                )?;
-                if !events.is_empty() {
-                    return Err(Error::CaptureInvariant(
-                        "CREATE TABLE captured application rows",
-                    ));
+                    .with_internal(|| self.create_table_is_noop(&table.name))?;
+                if is_noop {
+                    self.execute_schema_noop(sql, params, "CREATE TABLE captured application rows")
+                } else {
+                    self.execute_create_table(sql, params, table)
                 }
-                self.record_operation(operation);
-                Ok(changed)
             }
             ValidatedExecute::DropTable(spec) => {
                 let operation = self
@@ -173,56 +155,177 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 self.record_operation(compiled);
                 Ok(changed)
             }
-            ValidatedExecute::CreateIndex(spec) => {
-                let mut captured_operation = None;
-                let (changed, events) = self.hooks.run_schema(
-                    || {
-                        let changed = self.connection.execute(sql, params)?;
-                        let operation = self.hooks.with_internal(|| {
-                            IndexOperation::prepare_create(self.connection, sql, &spec)
-                        })?;
-                        self.hooks
-                            .with_internal(|| operation.record_catalog(self.connection))?;
-                        captured_operation = Some(MultiliteOp::Index(operation).compile()?);
-                        Ok(changed)
-                    },
-                    |_| Ok(()),
-                )?;
-                if !events.is_empty() {
-                    return Err(Error::CaptureInvariant(
-                        "CREATE INDEX captured application rows",
-                    ));
-                }
-                let operation =
-                    captured_operation.expect("successful index creation compiled an operation");
-                self.record_operation(operation);
-                Ok(changed)
-            }
-            ValidatedExecute::DropIndex(spec) => {
-                let operation = self
+            ValidatedExecute::CreateIndex(spec) => self.execute_create_index(sql, params, spec),
+            ValidatedExecute::CreateIndexIfNotExists(spec) => {
+                let is_noop = self
                     .hooks
-                    .with_internal(|| IndexOperation::prepare_drop(self.connection, sql, &spec))?;
-                let compiled = MultiliteOp::Index(operation.clone()).compile()?;
-                let (changed, events) = self.hooks.run_schema(
-                    || {
-                        let changed = self.connection.execute(sql, params)?;
-                        self.hooks
-                            .with_internal(|| operation.record_catalog(self.connection))?;
-                        Ok(changed)
-                    },
-                    |_| Ok(()),
-                )?;
-                if !events.is_empty() {
-                    return Err(Error::CaptureInvariant(
-                        "DROP INDEX captured application rows",
-                    ));
+                    .with_internal(|| self.create_index_is_noop(&spec.name))?;
+                if is_noop {
+                    self.execute_schema_noop(sql, params, "CREATE INDEX captured application rows")
+                } else {
+                    self.execute_create_index(sql, params, spec)
                 }
-                self.record_operation(compiled);
-                Ok(changed)
+            }
+            ValidatedExecute::DropIndex(spec) => self.execute_drop_index(sql, params, spec),
+            ValidatedExecute::DropIndexIfExists(spec) => {
+                let is_noop = self
+                    .hooks
+                    .with_internal(|| self.drop_index_is_noop(&spec.name))?;
+                if is_noop {
+                    self.execute_schema_noop(sql, params, "DROP INDEX captured application rows")
+                } else {
+                    self.execute_drop_index(sql, params, spec)
+                }
             }
             ValidatedExecute::Insert | ValidatedExecute::Delete | ValidatedExecute::Update => {
                 self.execute_captured(sql, params, compile_row_changes)
             }
+        }
+    }
+
+    fn execute_create_table<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        table: crate::logical::schema::CreateTableSpec,
+    ) -> Result<usize> {
+        let operation = MultiliteOp::CreateTable(
+            self.hooks
+                .with_internal(|| CreateTable::prepare(self.connection, sql, table))?,
+        );
+        let operation = operation.compile()?;
+        let MultiliteOp::CreateTable(created) = operation.logical() else {
+            unreachable!("create-table constructor returned another operation")
+        };
+        let materialization_sql = self
+            .hooks
+            .with_internal(|| created.materialization_sql(self.connection))?;
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(&materialization_sql, params)?;
+                self.hooks
+                    .with_internal(|| catalog::insert(self.connection, created))?;
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        ensure_no_schema_rows(&events, "CREATE TABLE captured application rows")?;
+        self.record_operation(operation);
+        Ok(changed)
+    }
+
+    fn execute_create_index<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        spec: crate::sql::CreateIndexSpec,
+    ) -> Result<usize> {
+        let mut captured_operation = None;
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(sql, params)?;
+                let operation = self.hooks.with_internal(|| {
+                    IndexOperation::prepare_create(self.connection, sql, &spec)
+                })?;
+                self.hooks
+                    .with_internal(|| operation.record_catalog(self.connection))?;
+                captured_operation = Some(MultiliteOp::Index(operation).compile()?);
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        ensure_no_schema_rows(&events, "CREATE INDEX captured application rows")?;
+        let operation =
+            captured_operation.expect("successful index creation compiled an operation");
+        self.record_operation(operation);
+        Ok(changed)
+    }
+
+    fn execute_drop_index<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        spec: crate::sql::DropIndexSpec,
+    ) -> Result<usize> {
+        let operation = self
+            .hooks
+            .with_internal(|| IndexOperation::prepare_drop(self.connection, sql, &spec))?;
+        let compiled = MultiliteOp::Index(operation.clone()).compile()?;
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(sql, params)?;
+                self.hooks
+                    .with_internal(|| operation.record_catalog(self.connection))?;
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        ensure_no_schema_rows(&events, "DROP INDEX captured application rows")?;
+        self.record_operation(compiled);
+        Ok(changed)
+    }
+
+    fn execute_schema_noop<Q: Params>(
+        &self,
+        sql: &str,
+        params: Q,
+        capture_error: &'static str,
+    ) -> Result<usize> {
+        let (changed, events) = self
+            .hooks
+            .run_schema(|| Ok(self.connection.execute(sql, params)?), |_| Ok(()))?;
+        ensure_no_schema_rows(&events, capture_error)?;
+        Ok(changed)
+    }
+
+    fn create_table_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
+        let physical = schema_object_kind(self.connection, name.value())?;
+        let catalog = catalog::by_name(self.connection, name.value())?;
+        match (physical.as_deref(), catalog) {
+            (Some("table"), Some(table)) => {
+                crate::physical::verify_table(self.connection, table.table_id())?;
+                Ok(true)
+            }
+            (Some("table"), None) => Err(Error::InvalidDatabase(
+                "CREATE TABLE IF NOT EXISTS found an untracked SQLite table",
+            )),
+            (_, Some(_)) => Err(Error::InvalidDatabase(
+                "schema catalog table is missing from SQLite",
+            )),
+            _ => Ok(false),
+        }
+    }
+
+    fn create_index_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
+        let physical = schema_object_kind(self.connection, name.value())?;
+        let catalog = catalog::index_by_name(self.connection, name)?;
+        match (physical.as_deref(), catalog) {
+            (Some("index"), Some((table, _))) => {
+                crate::physical::verify_table(self.connection, table.table_id())?;
+                Ok(true)
+            }
+            (Some("index"), None) => Err(Error::InvalidDatabase(
+                "CREATE INDEX IF NOT EXISTS found an untracked SQLite index",
+            )),
+            (_, Some(_)) => Err(Error::InvalidDatabase(
+                "schema catalog index is missing from SQLite",
+            )),
+            _ => Ok(false),
+        }
+    }
+
+    fn drop_index_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
+        let physical = schema_object_kind(self.connection, name.value())?;
+        let catalog = catalog::index_by_name(self.connection, name)?;
+        match (physical.as_deref(), catalog) {
+            (Some("index"), Some(_)) => Ok(false),
+            (Some("index"), None) => Err(Error::InvalidDatabase(
+                "DROP INDEX IF EXISTS found an untracked SQLite index",
+            )),
+            (_, Some(_)) => Err(Error::InvalidDatabase(
+                "schema catalog index is missing from SQLite",
+            )),
+            _ => Ok(true),
         }
     }
 
@@ -297,6 +400,24 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         self.footprint.extend(read_guards.footprint());
         Ok((self.operations, self.footprint))
     }
+}
+
+fn ensure_no_schema_rows(events: &[CapturedChange], message: &'static str) -> Result<()> {
+    if events.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::CaptureInvariant(message))
+    }
+}
+
+fn schema_object_kind(connection: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT type FROM main.sqlite_schema WHERE name = ?1 COLLATE NOCASE",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 fn compile_row_changes(

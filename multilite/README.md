@@ -64,6 +64,12 @@ schema revision, index definitions, active primary index, and one mutable
 `write-revision` cell whose value is the UUID of the latest DDL operation that
 changed valid row lowering. The inverse translation verifies the complete
 envelope and checks that stored SQL projects to the same structured operation.
+`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and
+`DROP INDEX IF EXISTS` preserve SQLite's idempotent behavior. A missing object
+lowers to the ordinary logical operation; a same-kind existing object (or a
+missing dropped index) is a true no-op that mints no UUID, pending record, or
+local commit. SQLite's shared table/index namespace still rejects cross-kind
+CREATE collisions.
 
 SQLite's preupdate hook captures final inserted, deleted, and updated values
 after affinity and conflict handling have run. One SQL statement becomes one

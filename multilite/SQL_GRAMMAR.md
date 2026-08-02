@@ -35,6 +35,13 @@ table still targeted by a synchronized foreign key. Crossing either limit
 refuses the statement before schema, pending-journal, or sidecar state becomes
 durable.
 
+`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and
+`DROP INDEX IF EXISTS` are supported. If SQLite and the catalog prove the
+requested disposition is already true, the statement contributes no logical
+operation and does not advance local commit or submit state. Otherwise it
+lowers to the same operation, codec, and guards as the clause-free spelling.
+Cross-kind names retain SQLite's shared-namespace behavior.
+
 ## Completion Gate
 
 A new statement family or syntax extension is incomplete until all of these are

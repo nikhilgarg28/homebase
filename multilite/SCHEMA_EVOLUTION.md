@@ -55,6 +55,11 @@ Rejection drops the created table by `TableId`, after proving that the catalog
 still contains the expected created definition. It never drops an object merely
 because it reused the same text name.
 
+`IF NOT EXISTS` is command intent rather than schema identity. If the
+case-insensitive table binding already exists and its catalog/SQLite projection
+is valid, execution is a true no-op. Otherwise the ordinary CREATE operation
+mints the identities above. A same-named index remains a native SQLite error.
+
 ### INSERT, UPDATE, DELETE
 
 Captured rows already carry table and column UUIDs plus complete SQLite storage
@@ -72,6 +77,12 @@ The immutable operation records original SQL and binds it to an owner `TableId`,
 index UUID, and structured terms/predicate. Catalog snapshots store only the
 typed index IR. CREATE, DROP, and rejection render from that IR against current
 table and column bindings; historical SQL is never a second executable source.
+
+`CREATE INDEX IF NOT EXISTS` and `DROP INDEX IF EXISTS` first establish the
+catalog/physical disposition. Same-kind repeats and missing drops emit no
+logical operation; missing creates and existing drops use the ordinary index
+operation unchanged. This check also prevents an untracked physical index from
+being silently adopted or removed.
 
 ### ALTER TABLE RENAME TO
 

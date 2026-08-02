@@ -172,6 +172,67 @@ fn public_sql_create_and_insert_converge_across_two_replicas() {
 }
 
 #[test]
+fn idempotent_ddl_lowers_missing_objects_and_repeats_as_convergent_noops() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("idempotent-first.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("idempotent-second.sqlite"),
+        OpenOptions::new()
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    first
+        .execute("CREATE INDEX IF NOT EXISTS notes_body ON notes(body)", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    second
+        .execute(
+            "CREATE TABLE IF NOT EXISTS NOTES (id INTEGER PRIMARY KEY, other BLOB)",
+            (),
+        )
+        .unwrap();
+    second
+        .execute(
+            "CREATE INDEX IF NOT EXISTS NOTES_BODY ON notes(missing)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    first
+        .execute("DROP INDEX IF EXISTS notes_body", ())
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+    second
+        .execute("DROP INDEX IF EXISTS NOTES_BODY", ())
+        .unwrap();
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+    assert_eq!(tables(&first), tables(&second));
+    assert!(index_names(&first).is_empty());
+    assert_eq!(index_names(&first), index_names(&second));
+}
+
+#[test]
 fn ignored_conflicts_compile_only_the_rows_sqlite_changed_and_converge() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

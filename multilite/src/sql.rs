@@ -36,9 +36,12 @@ pub enum ValidatedExecute {
     AddColumn(AddColumnSpec),
     DropColumn(DropColumnSpec),
     CreateTable(CreateTableSpec),
+    CreateTableIfNotExists(CreateTableSpec),
     DropTable(DropTableSpec),
     CreateIndex(CreateIndexSpec),
+    CreateIndexIfNotExists(CreateIndexSpec),
     DropIndex(DropIndexSpec),
+    DropIndexIfExists(DropIndexSpec),
     Insert,
     Delete,
     Update,
@@ -268,11 +271,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             columns,
             where_clause,
         } => {
-            if if_not_exists {
-                return Err(Error::UnsupportedSql(
-                    "CREATE INDEX IF NOT EXISTS is not supported",
-                ));
-            }
             if idx_name.db_name.is_some() || idx_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified CREATE INDEX names are not supported",
@@ -343,13 +341,18 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     ));
                 }
             }
-            Ok(ValidatedExecute::CreateIndex(CreateIndexSpec {
+            let spec = CreateIndexSpec {
                 unique,
                 name,
                 table,
                 terms,
                 predicate,
-            }))
+            };
+            Ok(if if_not_exists {
+                ValidatedExecute::CreateIndexIfNotExists(spec)
+            } else {
+                ValidatedExecute::CreateIndex(spec)
+            })
         }
         Stmt::CreateTable {
             temporary,
@@ -360,17 +363,21 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             if temporary {
                 return Err(Error::UnsupportedSql("temporary tables are not supported"));
             }
-            if if_not_exists {
-                return Err(Error::UnsupportedSql(
-                    "CREATE TABLE IF NOT EXISTS is not supported",
-                ));
-            }
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified CREATE TABLE names are not supported",
                 ));
             }
-            validate_create_table(identifier(&tbl_name.name)?, body)
+            let ValidatedExecute::CreateTable(spec) =
+                validate_create_table(identifier(&tbl_name.name)?, body)?
+            else {
+                unreachable!("CREATE TABLE validation returned another operation")
+            };
+            Ok(if if_not_exists {
+                ValidatedExecute::CreateTableIfNotExists(spec)
+            } else {
+                ValidatedExecute::CreateTable(spec)
+            })
         }
         Stmt::DropTable {
             if_exists,
@@ -398,11 +405,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             if_exists,
             idx_name,
         } => {
-            if if_exists {
-                return Err(Error::UnsupportedSql(
-                    "DROP INDEX IF EXISTS is not supported",
-                ));
-            }
             if idx_name.db_name.is_some() || idx_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified DROP INDEX names are not supported",
@@ -414,7 +416,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "reserved SQLite and Multilite index names are not supported",
                 ));
             }
-            Ok(ValidatedExecute::DropIndex(DropIndexSpec { name }))
+            let spec = DropIndexSpec { name };
+            Ok(if if_exists {
+                ValidatedExecute::DropIndexIfExists(spec)
+            } else {
+                ValidatedExecute::DropIndex(spec)
+            })
         }
         Stmt::Insert {
             with,
@@ -2051,7 +2058,6 @@ mod tests {
     fn rejects_unnecessary_create_table_grammar() {
         for sql in [
             "CREATE TEMP TABLE notes (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY)",
             "CREATE TABLE main.notes (id INTEGER PRIMARY KEY)",
             "CREATE TABLE notes AS SELECT 1 AS id",
             "CREATE TABLE notes (id)",
@@ -2582,8 +2588,6 @@ mod tests {
     #[test]
     fn rejects_unsafe_or_semantically_unimplemented_index_extensions() {
         for sql in [
-            "CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes (body)",
-            "CREATE INDEX IF NOT EXISTS notes_body ON notes (body)",
             "CREATE UNIQUE INDEX main.notes_body ON notes (body)",
             "CREATE INDEX main.notes_body ON notes (body)",
             "CREATE UNIQUE INDEX notes_body ON notes (body DESC)",
@@ -2594,11 +2598,29 @@ mod tests {
             "CREATE INDEX notes_body ON notes (body NULLS FIRST)",
             "CREATE INDEX notes_body ON notes ((SELECT body FROM notes))",
             "CREATE INDEX notes_body ON notes (?1)",
-            "DROP INDEX IF EXISTS notes_body",
             "DROP INDEX main.notes_body",
         ] {
             assert_unsupported(sql);
         }
+    }
+
+    #[test]
+    fn preserves_idempotent_ddl_intent_without_changing_logical_specs() {
+        assert!(matches!(
+            validate_execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY)"),
+            Ok(ValidatedExecute::CreateTableIfNotExists(spec))
+                if spec.name == SqlName::new("notes".into())
+        ));
+        assert!(matches!(
+            validate_execute("CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes (body)"),
+            Ok(ValidatedExecute::CreateIndexIfNotExists(spec))
+                if spec.unique && spec.name == SqlName::new("notes_body".into())
+        ));
+        assert!(matches!(
+            validate_execute("DROP INDEX IF EXISTS notes_body"),
+            Ok(ValidatedExecute::DropIndexIfExists(spec))
+                if spec.name == SqlName::new("notes_body".into())
+        ));
     }
 
     #[test]

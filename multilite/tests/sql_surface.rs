@@ -113,6 +113,135 @@ fn drop_table_rejects_referenced_parents_but_allows_child_then_parent() {
 }
 
 #[test]
+fn idempotent_ddl_noops_create_no_pending_operations_and_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("idempotent-ddl.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    let local_state = || {
+        let raw = Connection::open(&path).unwrap();
+        (
+            raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            raw.query_row(
+                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+    };
+
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
+        (),
+    )
+    .unwrap();
+    let after_create = local_state();
+    assert_eq!(after_create.0, 1);
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS NOTES (id INTEGER PRIMARY KEY, ignored BLOB)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(local_state(), after_create);
+
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS notes_body ON notes(body)",
+        (),
+    )
+    .unwrap();
+    let after_index = local_state();
+    assert_eq!(after_index.0, 2);
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS NOTES_BODY ON notes(missing)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(local_state(), after_index);
+
+    db.execute("DROP INDEX IF EXISTS absent_index", ()).unwrap();
+    db.execute("DROP INDEX IF EXISTS notes", ()).unwrap();
+    assert_eq!(local_state(), after_index);
+    assert!(
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS notes_body (id INTEGER PRIMARY KEY)",
+            (),
+        )
+        .is_err()
+    );
+    assert!(
+        db.execute("CREATE INDEX IF NOT EXISTS notes ON notes(body)", ())
+            .is_err()
+    );
+    assert_eq!(local_state(), after_index);
+
+    db.execute("DROP INDEX IF EXISTS notes_body", ()).unwrap();
+    let after_drop = local_state();
+    assert_eq!(after_drop.0, 3);
+    db.execute("DROP INDEX IF EXISTS NOTES_BODY", ()).unwrap();
+    assert_eq!(local_state(), after_drop);
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'notes'",
+                (),
+                |row| { row.get::<_, String>(0) }
+            )
+            .unwrap(),
+        ["notes"]
+    );
+    assert!(
+        reopened
+            .query(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'notes_body'",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .is_empty()
+    );
+
+    reopened
+        .update(|transaction| {
+            transaction.execute(
+                "CREATE TABLE IF NOT EXISTS batched (id INTEGER PRIMARY KEY, body TEXT)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE IF NOT EXISTS BATCHED (id INTEGER PRIMARY KEY, ignored BLOB)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE INDEX IF NOT EXISTS batched_body ON batched(body)",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE INDEX IF NOT EXISTS BATCHED_BODY ON batched(missing)",
+                (),
+            )?;
+            transaction.execute("DROP INDEX IF EXISTS never_created", ())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(local_state().0, 4);
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT name FROM sqlite_schema WHERE name IN ('batched', 'batched_body') ORDER BY name",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        ["batched", "batched_body"]
+    );
+}
+
+#[test]
 fn defaults_checks_and_named_constraints_follow_sqlite_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("defaults-and-checks.sqlite");

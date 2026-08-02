@@ -3827,11 +3827,12 @@ fn column_name(created: &CreateTable, id: ColumnId) -> Option<SqlName> {
 }
 
 fn parse_create_table(sql: &str) -> std::result::Result<CreateTableSpec, SchemaCodecError> {
-    let crate::sql::ValidatedExecute::CreateTable(parsed) =
-        crate::sql::validate_execute(sql).map_err(|_| SchemaCodecError::InvalidSql)?
-    else {
-        return Err(SchemaCodecError::InvalidSql);
-    };
+    let parsed =
+        match crate::sql::validate_execute(sql).map_err(|_| SchemaCodecError::InvalidSql)? {
+            crate::sql::ValidatedExecute::CreateTable(parsed)
+            | crate::sql::ValidatedExecute::CreateTableIfNotExists(parsed) => parsed,
+            _ => return Err(SchemaCodecError::InvalidSql),
+        };
     Ok(parsed)
 }
 

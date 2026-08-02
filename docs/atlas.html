@@ -1124,7 +1124,7 @@ grammar: [
   { name:"self-referential / cyclic FKs", status:"fenced", note:"Rejected at IR construction; makes fencing-delete ordering provably safe. Revisit with FK evolution." },
   { name:"cascading / mutating FK actions (CASCADE, SET NULL, SET DEFAULT, RESTRICT)", status:"fenced", note:"Only NO ACTION passes. Blocked on the statement-delta compiler normalizing mixed preupdate events into one deterministic net effect with an exact inverse." },
   { name:"DEFERRABLE INITIALLY DEFERRED", status:"future", note:"\u201cdeferred foreign keys are not supported\u201d; queued behind FK evolution." },
-  { name:"CREATE TABLE IF NOT EXISTS", status:"fenced", note:"Explicitly rejected \u2014 idempotent DDL would blur schema-identity minting." },
+  { name:"CREATE TABLE IF NOT EXISTS", status:"supported", note:"A missing table lowers to ordinary CREATE TABLE. A catalog/SQLite-consistent existing table is a true no-op with no UUID, pending record, or CommitSeq advance; cross-kind namespace collisions remain SQLite errors." },
   { name:"CREATE TABLE \u2026 AS SELECT", status:"fenced", note:"Explicitly rejected \u2014 schema must be declared, not inferred." },
   { name:"TEMPORARY / TEMP tables", status:"fenced", note:"\u201ctemporary tables are not supported\u201d on the public surface." },
   { name:"qualified names (db.table)", status:"future", note:"Rejected everywhere today; unlocks with ATTACH/multi-schema work." } ] },
@@ -1143,7 +1143,7 @@ grammar: [
   { name:"NULLS FIRST / NULLS LAST", status:"fenced", note:"Explicitly rejected in index term ordering." },
   { name:"DROP INDEX", status:"partial", note:"Schema head advances; retired owner cells stay inert by design \u2014 GC needs an explicit device/frontier retirement protocol (TODO)." },
   { name:"dropping a referenced unique index", status:"fenced", note:"A parent index backing FK fences cannot be dropped until relationship retirement exists." },
-  { name:"IF NOT EXISTS / IF EXISTS", status:"fenced", note:"Both \u201cCREATE INDEX IF NOT EXISTS\u201d and \u201cDROP INDEX IF EXISTS\u201d are rejected \u2014 idempotent DDL blurs identity minting." } ] },
+  { name:"IF NOT EXISTS / IF EXISTS", status:"supported", note:"CREATE INDEX IF NOT EXISTS and DROP INDEX IF EXISTS lower missing/existing work through the ordinary index operation and otherwise emit no operation. Catalog/physical consistency is checked before a no-op." } ] },
 { family:"INSERT", items:[
   { name:"INSERT INTO t [(cols)] VALUES \u2026 (single & multi-row)", status:"supported", note:"Full row images captured per row via the preupdate hook; rules stored once per operation." },
   { name:"omitted / NULL INTEGER PRIMARY KEY", status:"supported", note:"Durable allocator supplies collision-partitioned ids; SQLite still probes uniqueness and retries." },

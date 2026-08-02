@@ -310,10 +310,14 @@ impl IndexOperation {
     }
 
     fn create_dependencies(&self) -> Result<Vec<super::schema::SqlName>> {
-        let ValidatedExecute::CreateIndex(spec) = crate::sql::validate_execute(&self.sql)? else {
-            return Err(Error::InvalidMultiliteOp(
-                "CREATE index operation has invalid SQL provenance".into(),
-            ));
+        let spec = match crate::sql::validate_execute(&self.sql)? {
+            ValidatedExecute::CreateIndex(spec)
+            | ValidatedExecute::CreateIndexIfNotExists(spec) => spec,
+            _ => {
+                return Err(Error::InvalidMultiliteOp(
+                    "CREATE index operation has invalid SQL provenance".into(),
+                ));
+            }
         };
         let mut dependencies = BTreeMap::new();
         for term in spec.terms {
@@ -444,11 +448,12 @@ impl IndexOperation {
         }
         match self.action {
             IndexAction::Create => {
-                let ValidatedExecute::CreateIndex(spec) =
-                    crate::sql::validate_execute(&self.sql)
-                        .map_err(|_| IndexCodecError::InvalidSql)?
-                else {
-                    return Err(IndexCodecError::InvalidSql);
+                let spec = match crate::sql::validate_execute(&self.sql)
+                    .map_err(|_| IndexCodecError::InvalidSql)?
+                {
+                    ValidatedExecute::CreateIndex(spec)
+                    | ValidatedExecute::CreateIndexIfNotExists(spec) => spec,
+                    _ => return Err(IndexCodecError::InvalidSql),
                 };
                 let expected_after = self
                     .before
@@ -478,10 +483,12 @@ impl IndexOperation {
                 }
             }
             IndexAction::Drop => {
-                let ValidatedExecute::DropIndex(spec) = crate::sql::validate_execute(&self.sql)
+                let spec = match crate::sql::validate_execute(&self.sql)
                     .map_err(|_| IndexCodecError::InvalidSql)?
-                else {
-                    return Err(IndexCodecError::InvalidSql);
+                {
+                    ValidatedExecute::DropIndex(spec)
+                    | ValidatedExecute::DropIndexIfExists(spec) => spec,
+                    _ => return Err(IndexCodecError::InvalidSql),
                 };
                 let expected_after = self
                     .before
