@@ -19,6 +19,7 @@ pub const WRITE_REVISION: &[u8] = b"write-revision";
 pub const TRANSACTIONS: &[u8] = b"transactions";
 pub const METADATA: &[u8] = b"metadata";
 pub const USER_VERSION: &[u8] = b"user-version";
+pub const VIEW_DEPENDENCIES: &[u8] = b"view-dependencies";
 
 /// Components before the value images in row and UNIQUE keys.
 pub const VALUE_KEY_PREFIX_COMPONENTS: usize = 5;

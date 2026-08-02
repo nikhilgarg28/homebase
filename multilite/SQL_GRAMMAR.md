@@ -116,6 +116,22 @@ observations. Other PRAGMAs are explicitly rejected: physical or
 connection-local settings are not silently replicated as logical database
 state.
 
+`CREATE VIEW name [(columns...)] AS SELECT ...` and `DROP VIEW name` are
+supported for views whose complete dependency graph resolves to synchronized
+base tables. View operations are metadata-only. CTEs, joins, compounds, and
+nested SELECT expressions are walked structurally; each base table's stable
+identity and the stable identity plus historical binding of every current
+column are authenticated guards. Table-owned and column-owned dependency
+markers make concurrent source-table or source-column destruction conflict in
+either admission order. Consequently row DML and ADD COLUMN commute with view
+DDL, while stale destructive DDL conflicts before replay can create a broken
+view. The current DROP COLUMN rebuild requires dependent views to be dropped
+first, even when the selected column is not referenced.
+The created view is prepared in its statement savepoint so SQLite's otherwise
+deferred unknown-column errors become atomic failures. Views over views,
+table-valued functions, TEMP/qualified views, and conditional view DDL remain
+outside this first slice pending a folded view-identity catalog.
+
 ## Completion Gate
 
 A new statement family or syntax extension is incomplete until all of these are

@@ -14,6 +14,7 @@ use super::schema::{
     CreateTable, MutationId, SqlName, TableId, schema_log_key, schema_object_name_scope_key,
     table_prefix,
 };
+use super::view;
 use crate::catalog::{self, TableState};
 use crate::commit::footprint::ConflictFootprint;
 use crate::repair;
@@ -63,6 +64,7 @@ impl DropTableOperation {
                 "DROP TABLE of a referenced parent table is not supported",
             ));
         }
+        view::ensure_table_not_referenced(connection, &source_table)?;
         let operation = Self {
             mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
             sql: sql.to_owned(),

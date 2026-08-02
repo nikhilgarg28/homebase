@@ -78,9 +78,11 @@ enum SqlShape {
     AddColumn,
     DropColumn,
     SetUserVersion,
+    CreateView,
+    DropView,
 }
 
-const SQL_SHAPES: [SqlShape; 14] = [
+const SQL_SHAPES: [SqlShape; 16] = [
     SqlShape::CreateTable,
     SqlShape::DropTable,
     SqlShape::Insert,
@@ -95,6 +97,8 @@ const SQL_SHAPES: [SqlShape; 14] = [
     SqlShape::AddColumn,
     SqlShape::DropColumn,
     SqlShape::SetUserVersion,
+    SqlShape::CreateView,
+    SqlShape::DropView,
 ];
 
 macro_rules! operation {
@@ -132,6 +136,75 @@ enum AdmissionOrder {
 }
 
 const PAIR_CASES: &[PairCase] = &[
+    PairCase {
+        name: "create_same_view_name",
+        relationship: "same shared SQLite schema-object name",
+        left: operation!(CreateView, "CREATE VIEW fresh_view AS SELECT id FROM notes"),
+        right: operation!(
+            CreateView,
+            "CREATE VIEW fresh_view AS SELECT body FROM notes"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "create_view_and_row_insert",
+        relationship: "schema dependency with a disjoint row mutation",
+        left: operation!(CreateView, "CREATE VIEW fresh_view AS SELECT id FROM notes"),
+        right: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (3, 'three', 'right', 'd3')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "create_view_and_secondary_index",
+        relationship: "stable-column view dependency and an optional access path",
+        left: operation!(
+            CreateView,
+            "CREATE VIEW fresh_view AS SELECT body FROM notes"
+        ),
+        right: operation!(
+            CreateIndex,
+            "CREATE INDEX notes_detail_view_peer ON notes (detail)"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "drop_view_and_row_insert",
+        relationship: "view name retirement and disjoint row mutation",
+        left: operation!(DropView, "DROP VIEW base_view"),
+        right: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (3, 'three', 'right', 'd3')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "create_view_and_drop_source_table",
+        relationship: "symmetric table-owned view dependency",
+        left: operation!(
+            CreateView,
+            "CREATE VIEW fresh_view AS SELECT id FROM labels"
+        ),
+        right: operation!(DropTable, "DROP TABLE labels"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "create_view_and_drop_referenced_column",
+        relationship: "view schema head and table-owned dependency marker",
+        left: operation!(
+            CreateView,
+            "CREATE VIEW fresh_view AS SELECT body FROM labels"
+        ),
+        right: operation!(DropColumn, "ALTER TABLE labels DROP COLUMN body"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
     PairCase {
         name: "user_version_conflict",
         relationship: "same replicated application metadata cell",
@@ -1030,6 +1103,11 @@ where
             )?;
             transaction.execute("CREATE INDEX notes_by_body ON notes (body)", ())?;
             transaction.execute(
+                "CREATE TABLE view_base (id INTEGER PRIMARY KEY, body TEXT)",
+                (),
+            )?;
+            transaction.execute("CREATE VIEW base_view AS SELECT id FROM view_base", ())?;
+            transaction.execute(
                 "CREATE TABLE parents (
                     id INTEGER PRIMARY KEY,
                     code TEXT NOT NULL UNIQUE,
@@ -1108,6 +1186,7 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseState {
     user_version: i32,
+    views: Vec<(String, String)>,
     tables: Vec<TableState>,
 }
 
@@ -1171,8 +1250,18 @@ fn observe(connection: &Connection) -> DatabaseState {
         .into_iter()
         .map(|name| observe_table(connection, name))
         .collect();
+    let views = connection
+        .prepare(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'view' ORDER BY lower(name), name",
+        )
+        .unwrap()
+        .query_map((), |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
     DatabaseState {
         user_version,
+        views,
         tables,
     }
 }

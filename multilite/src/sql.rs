@@ -47,6 +47,8 @@ pub enum ValidatedExecute {
     Delete(StatementOutput),
     Update(StatementOutput),
     SetUserVersion(i32),
+    CreateView(CreateViewSpec),
+    DropView(DropViewSpec),
 }
 
 /// Result shape of one validated statement.
@@ -76,6 +78,7 @@ impl ValidatedExecute {
             | Self::DropIndex(_)
             | Self::DropIndexIfExists(_)
             | Self::SetUserVersion(_) => StatementOutput::Changes,
+            Self::CreateView(_) | Self::DropView(_) => StatementOutput::Changes,
         }
     }
 }
@@ -135,6 +138,17 @@ pub enum CreateIndexTerm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropIndexSpec {
+    pub name: SqlName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateViewSpec {
+    pub name: SqlName,
+    pub dependencies: Vec<SqlName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropViewSpec {
     pub name: SqlName,
 }
 
@@ -495,6 +509,53 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ValidatedExecute::DropIndex(spec)
             })
         }
+        Stmt::CreateView {
+            temporary,
+            if_not_exists,
+            view_name,
+            select,
+            ..
+        } => {
+            if temporary || if_not_exists {
+                return Err(Error::UnsupportedSql(
+                    "temporary and IF NOT EXISTS views are not supported",
+                ));
+            }
+            if view_name.db_name.is_some() || view_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified CREATE VIEW names are not supported",
+                ));
+            }
+            let name = identifier(&view_name.name)?;
+            reject_reserved_schema_name(&name, "view")?;
+            if select_reads_reserved(&select) {
+                return Err(Error::UnsupportedSql(
+                    "views cannot read reserved Multilite tables",
+                ));
+            }
+            Ok(ValidatedExecute::CreateView(CreateViewSpec {
+                name,
+                dependencies: collect_view_dependencies(&select)?,
+            }))
+        }
+        Stmt::DropView {
+            if_exists,
+            view_name,
+        } => {
+            if if_exists {
+                return Err(Error::UnsupportedSql(
+                    "DROP VIEW IF EXISTS is not supported",
+                ));
+            }
+            if view_name.db_name.is_some() || view_name.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified DROP VIEW names are not supported",
+                ));
+            }
+            let name = identifier(&view_name.name)?;
+            reject_reserved_schema_name(&name, "view")?;
+            Ok(ValidatedExecute::DropView(DropViewSpec { name }))
+        }
         Stmt::Insert {
             with,
             or_conflict,
@@ -641,6 +702,294 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             "execute accepts only supported schema changes, INSERT, DELETE, and UPDATE",
         )),
     }
+}
+
+fn reject_reserved_schema_name(name: &SqlName, kind: &'static str) -> Result<()> {
+    if has_multilite_prefix(name.value()) || is_sqlite_internal_table(name.value()) {
+        Err(Error::UnsupportedSql(match kind {
+            "view" => "reserved SQLite and Multilite view names are not supported",
+            _ => "reserved SQLite and Multilite schema names are not supported",
+        }))
+    } else {
+        Ok(())
+    }
+}
+
+fn collect_view_dependencies(select: &Select) -> Result<Vec<SqlName>> {
+    use std::collections::BTreeMap;
+
+    let mut dependencies = BTreeMap::new();
+    let mut ctes = Vec::<Vec<u8>>::new();
+    collect_select_dependencies(select, &mut ctes, &mut dependencies)?;
+    if dependencies.is_empty() {
+        return Err(Error::UnsupportedSql(
+            "views must read at least one synchronized base table",
+        ));
+    }
+    Ok(dependencies.into_values().collect())
+}
+
+fn collect_select_dependencies(
+    select: &Select,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    let base = ctes.len();
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            ctes.push(identifier(&cte.tbl_name)?.canonical().to_vec());
+        }
+        for cte in &with.ctes {
+            collect_select_dependencies(&cte.select, ctes, dependencies)?;
+        }
+    }
+    collect_one_select_dependencies(&select.body.select, ctes, dependencies)?;
+    for compound in select.body.compounds.iter().flatten() {
+        collect_one_select_dependencies(&compound.select, ctes, dependencies)?;
+    }
+    for column in select.order_by.iter().flatten() {
+        collect_expression_dependencies(&column.expr, ctes, dependencies)?;
+    }
+    if let Some(limit) = &select.limit {
+        collect_expression_dependencies(&limit.expr, ctes, dependencies)?;
+        if let Some(offset) = &limit.offset {
+            collect_expression_dependencies(offset, ctes, dependencies)?;
+        }
+    }
+    ctes.truncate(base);
+    Ok(())
+}
+
+fn collect_one_select_dependencies(
+    select: &OneSelect,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    match select {
+        OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            window_clause,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr(expression, _) = column {
+                    collect_expression_dependencies(expression, ctes, dependencies)?;
+                }
+            }
+            if let Some(from) = from {
+                collect_from_dependencies(from, ctes, dependencies)?;
+            }
+            for expression in where_clause.iter().chain(having.iter()) {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+            for expression in group_by.iter().flatten() {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+            for definition in window_clause.iter().flatten() {
+                collect_window_dependencies(&definition.window, ctes, dependencies)?;
+            }
+        }
+        OneSelect::Values(rows) => {
+            for expression in rows.iter().flatten() {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_from_dependencies(
+    from: &FromClause,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    for table in from
+        .select
+        .iter()
+        .map(Box::as_ref)
+        .chain(from.joins.iter().flatten().map(|join| &join.table))
+    {
+        collect_table_dependencies(table, ctes, dependencies)?;
+    }
+    for join in from.joins.iter().flatten() {
+        if let Some(JoinConstraint::On(expression)) = &join.constraint {
+            collect_expression_dependencies(expression, ctes, dependencies)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_table_dependencies(
+    table: &SelectTable,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    match table {
+        SelectTable::Table(name, _, indexed) => {
+            if indexed.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "index hints in views are not supported",
+                ));
+            }
+            if name.db_name.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified view sources are not supported",
+                ));
+            }
+            let name = identifier(&name.name)?;
+            if !ctes.iter().any(|cte| cte == name.canonical()) {
+                reject_reserved_schema_name(&name, "table")?;
+                dependencies.insert(name.canonical().to_vec(), name);
+            }
+        }
+        SelectTable::Select(select, _) => collect_select_dependencies(select, ctes, dependencies)?,
+        SelectTable::Sub(from, _) => collect_from_dependencies(from, ctes, dependencies)?,
+        SelectTable::TableCall(..) => {
+            return Err(Error::UnsupportedSql(
+                "table-valued functions in views are not supported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_expression_dependencies(
+    expression: &Expr,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    match expression {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            for expression in [lhs.as_ref(), start.as_ref(), end.as_ref()] {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+        }
+        Expr::Binary(left, _, right) => {
+            collect_expression_dependencies(left, ctes, dependencies)?;
+            collect_expression_dependencies(right, ctes, dependencies)?;
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            for expression in base.iter().chain(else_expr.iter()) {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+            for (when, then) in when_then_pairs {
+                collect_expression_dependencies(when, ctes, dependencies)?;
+                collect_expression_dependencies(then, ctes, dependencies)?;
+            }
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => collect_expression_dependencies(expr, ctes, dependencies)?,
+        Expr::Exists(select) | Expr::Subquery(select) => {
+            collect_select_dependencies(select, ctes, dependencies)?
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            for argument in args.iter().flatten() {
+                collect_expression_dependencies(argument, ctes, dependencies)?;
+            }
+            if let Some(FunctionCallOrder::SortList(columns)) = order_by {
+                for column in columns {
+                    collect_expression_dependencies(&column.expr, ctes, dependencies)?;
+                }
+            }
+            if let Some(tail) = filter_over {
+                if let Some(filter) = &tail.filter_clause {
+                    collect_expression_dependencies(filter, ctes, dependencies)?;
+                }
+                if let Some(over) = &tail.over_clause {
+                    if let Over::Window(window) = &**over {
+                        collect_window_dependencies(window, ctes, dependencies)?;
+                    }
+                }
+            }
+        }
+        Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(tail) = filter_over {
+                if let Some(filter) = &tail.filter_clause {
+                    collect_expression_dependencies(filter, ctes, dependencies)?;
+                }
+            }
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            collect_expression_dependencies(lhs, ctes, dependencies)?;
+            for value in rhs.iter().flatten() {
+                collect_expression_dependencies(value, ctes, dependencies)?;
+            }
+        }
+        Expr::InSelect { lhs, rhs, .. } => {
+            collect_expression_dependencies(lhs, ctes, dependencies)?;
+            collect_select_dependencies(rhs, ctes, dependencies)?;
+        }
+        Expr::InTable { .. } => {
+            return Err(Error::UnsupportedSql(
+                "table-valued IN expressions in views are not supported",
+            ));
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            collect_expression_dependencies(lhs, ctes, dependencies)?;
+            collect_expression_dependencies(rhs, ctes, dependencies)?;
+            if let Some(escape) = escape {
+                collect_expression_dependencies(escape, ctes, dependencies)?;
+            }
+        }
+        Expr::Parenthesized(expressions) => {
+            for expression in expressions {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+        }
+        Expr::Raise(_, expression) => {
+            if let Some(expression) = expression {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+        }
+        Expr::DoublyQualified(..)
+        | Expr::Id(_)
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_) => {}
+    }
+    Ok(())
+}
+
+fn collect_window_dependencies(
+    window: &Window,
+    ctes: &mut Vec<Vec<u8>>,
+    dependencies: &mut std::collections::BTreeMap<Vec<u8>, SqlName>,
+) -> Result<()> {
+    for expression in window.partition_by.iter().flatten() {
+        collect_expression_dependencies(expression, ctes, dependencies)?;
+    }
+    for column in window.order_by.iter().flatten() {
+        collect_expression_dependencies(&column.expr, ctes, dependencies)?;
+    }
+    if let Some(frame) = &window.frame_clause {
+        for bound in std::iter::once(&frame.start).chain(frame.end.iter()) {
+            if let FrameBound::Following(expression) | FrameBound::Preceding(expression) = bound {
+                collect_expression_dependencies(expression, ctes, dependencies)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Classify one public prepared statement with a single AST parse.
@@ -2324,6 +2673,49 @@ mod tests {
                 validate_statement(sql),
                 Err(Error::UnsupportedSql(_))
             ));
+        }
+    }
+
+    #[test]
+    fn views_resolve_every_nested_base_table_and_fence_unsafe_sources() {
+        let ValidatedExecute::CreateView(spec) = validate_execute(
+            "CREATE VIEW report (id, body) AS
+             WITH selected AS (
+                 SELECT id, body FROM notes WHERE id IN (SELECT note_id FROM tags)
+             )
+             SELECT selected.id, selected.body
+             FROM selected
+             WHERE EXISTS (SELECT 1 FROM authors WHERE authors.id = selected.id)",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(spec.name.value(), "report");
+        assert_eq!(
+            spec.dependencies
+                .iter()
+                .map(SqlName::value)
+                .collect::<Vec<_>>(),
+            ["authors", "notes", "tags"]
+        );
+        assert!(matches!(
+            validate_execute("DROP VIEW report").unwrap(),
+            ValidatedExecute::DropView(DropViewSpec { name }) if name.value() == "report"
+        ));
+        for sql in [
+            "CREATE TEMP VIEW report AS SELECT * FROM notes",
+            "CREATE VIEW IF NOT EXISTS report AS SELECT * FROM notes",
+            "CREATE VIEW report AS SELECT 1",
+            "CREATE VIEW report AS SELECT * FROM main.notes",
+            "CREATE VIEW report AS SELECT * FROM __multilite__pending",
+            "CREATE VIEW report AS SELECT * FROM json_each('[1]')",
+            "DROP VIEW IF EXISTS report",
+            "DROP VIEW main.report",
+        ] {
+            assert!(
+                matches!(validate_execute(sql), Err(Error::UnsupportedSql(_))),
+                "unsupported view was accepted: {sql}"
+            );
         }
     }
 

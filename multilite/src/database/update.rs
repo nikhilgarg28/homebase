@@ -26,6 +26,7 @@ use crate::logical::schema::{
     CreateTable, SqlName, TableId, schema_object_name_scope_key, table_prefix,
 };
 use crate::logical::transaction::MultiliteTransaction;
+use crate::logical::view::ViewOperation;
 use crate::runtime::ExecutionMode;
 use crate::sql::{StatementOutput, ValidatedExecute, ValidatedRead, ValidatedStatement};
 use crate::{Error, Params, Result};
@@ -217,6 +218,8 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             ValidatedExecute::SetUserVersion(value) => {
                 self.execute_set_user_version(sql, params, value)
             }
+            ValidatedExecute::CreateView(spec) => self.execute_create_view(sql, params, spec),
+            ValidatedExecute::DropView(spec) => self.execute_drop_view(sql, params, spec),
             ValidatedExecute::Insert(StatementOutput::Changes)
             | ValidatedExecute::Delete(StatementOutput::Changes)
             | ValidatedExecute::Update(StatementOutput::Changes) => {
@@ -391,6 +394,46 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         if let Some(operation) = operation {
             self.record_operation(MultiliteOp::SetUserVersion(operation).compile()?);
         }
+        Ok(changed)
+    }
+
+    fn execute_create_view<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        spec: crate::sql::CreateViewSpec,
+    ) -> Result<usize> {
+        let operation = self
+            .hooks
+            .with_internal(|| ViewOperation::prepare_create(self.connection, sql, &spec))?;
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(sql, params)?;
+                self.hooks
+                    .with_internal(|| operation.validate_created(self.connection))?;
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        ensure_no_schema_rows(&events, "CREATE VIEW captured application rows")?;
+        self.record_operation(MultiliteOp::View(operation).compile()?);
+        Ok(changed)
+    }
+
+    fn execute_drop_view<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        spec: crate::sql::DropViewSpec,
+    ) -> Result<usize> {
+        let operation = self
+            .hooks
+            .with_internal(|| ViewOperation::prepare_drop(self.connection, &spec))?;
+        let (changed, events) = self
+            .hooks
+            .run_schema(|| Ok(self.connection.execute(sql, params)?), |_| Ok(()))?;
+        ensure_no_schema_rows(&events, "DROP VIEW captured application rows")?;
+        self.record_operation(MultiliteOp::View(operation).compile()?);
         Ok(changed)
     }
 

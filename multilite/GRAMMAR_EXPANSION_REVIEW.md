@@ -61,7 +61,35 @@ Status: complete.
 
 ## Views
 
-Status: pending.
+Status: complete for synchronized base-table views.
+
+- `CREATE VIEW` and `DROP VIEW` replicate metadata only. Their operation frame
+  carries canonical CREATE SQL plus stable IDs and historical names for every
+  base table and all of its current columns; no rows or repair sidecar are
+  involved.
+- CREATE writes table-owned and stable-column-owned dependency markers; DROP
+  removes the same markers. `DROP TABLE` retires/asserts the table prefix, while
+  `DROP COLUMN` retires/asserts the selected column-dependency prefix. CREATE
+  asserts every captured table and column name binding. This makes destructive
+  DDL conflicts symmetric in either admission order without a shared schema
+  head that would serialize unrelated column DDL.
+- The SELECT dependency walker covers CTEs, joins, compounds, scalar/EXISTS/IN
+  subqueries, function/window expressions, ordering, limits, and offsets.
+  Every dependency contributes mandatory table/column name-binding guards and
+  conservative all-column markers, so DML and ADD COLUMN commute while a stale
+  DROP COLUMN cannot leave an admitted view unmaterializable.
+- CREATE is validated by preparing `SELECT * FROM view LIMIT 0` inside the same
+  branch savepoint. SQLite's permissive creation of a view with unknown columns
+  therefore becomes an atomic typed failure.
+- Views over views, table-valued functions, TEMP/qualified views, and
+  `IF [NOT] EXISTS` remain fenced. A folded stable-ID view catalog is required
+  before view-of-view dependencies and foreign/pre-existing view provenance
+  can be distinguished cleanly; this is the principal follow-up risk from the
+  story.
+- The current DROP COLUMN materializer rebuilds its table. Any synchronized
+  view over that table must therefore be dropped first, even when it does not
+  mention the removed column. Stable per-column provenance can later relax
+  that conservative local rule together with a view-aware rebuild.
 
 ## ADD COLUMN REFERENCES
 

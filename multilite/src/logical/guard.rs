@@ -6,7 +6,9 @@ use homebase_core::tag::Mutation;
 use sha2::{Digest, Sha256};
 
 use super::codes;
-use super::schema::{ColumnId, ForeignKeyId, IndexId, MutationId, SchemaRevisionId, TableId};
+use super::schema::{
+    ColumnId, ForeignKeyId, IndexId, MutationId, SchemaRevisionId, SqlName, TableId,
+};
 use crate::commit::footprint::ConflictFootprint;
 use crate::{Error, Result as MultiliteResult};
 
@@ -31,6 +33,7 @@ pub enum TargetFamily {
     ForeignReference,
     TransactionLog,
     UserVersion,
+    ViewDependency,
 }
 
 /// Logical operation family whose conflict contract emitted a guard.
@@ -48,6 +51,8 @@ pub enum OperationFamily {
     DropColumn,
     TransactionRead,
     SetUserVersion,
+    CreateView,
+    DropView,
 }
 
 /// Mutation shape permitted against one logical target family.
@@ -80,6 +85,14 @@ macro_rules! mutation_contract {
 pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(TransactionEnvelope, Set, TransactionLog),
     mutation_contract!(SetUserVersion, Set, UserVersion),
+    mutation_contract!(CreateView, Set, SchemaLog),
+    mutation_contract!(CreateView, Set, SchemaObjectName),
+    mutation_contract!(CreateView, Set, ViewDependency),
+    mutation_contract!(CreateView, Set, ColumnDependency),
+    mutation_contract!(DropView, Set, SchemaLog),
+    mutation_contract!(DropView, Delete, SchemaObjectName),
+    mutation_contract!(DropView, Delete, ViewDependency),
+    mutation_contract!(DropView, Delete, ColumnDependency),
     mutation_contract!(CreateTable, Set, SchemaLog),
     mutation_contract!(CreateTable, Set, SchemaObjectName),
     mutation_contract!(CreateTable, Set, TableSchema),
@@ -139,6 +152,7 @@ pub enum RejectionKind {
     RevertIndex,
     RevertAlterTable,
     RestoreUserVersion,
+    RevertView,
 }
 
 /// One operation-to-repair mapping in the checked compiler contract.
@@ -169,6 +183,8 @@ pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
     rejection_contract!(AddColumn, RevertAlterTable),
     rejection_contract!(DropColumn, RevertAlterTable),
     rejection_contract!(SetUserVersion, RestoreUserVersion),
+    rejection_contract!(CreateView, RevertView),
+    rejection_contract!(DropView, RevertView),
 ];
 
 impl TargetFamily {
@@ -214,6 +230,9 @@ impl TargetFamily {
                     }
                     value if value == codes::WRITE_REVISION && parts.len() == 4 => {
                         Some(Self::WriteRevision)
+                    }
+                    value if value == codes::VIEW_DEPENDENCIES && matches!(parts.len(), 4 | 5) => {
+                        Some(Self::ViewDependency)
                     }
                     value if value == codes::ROWS && parts.len() >= 5 => Some(Self::Row),
                     value if value == codes::UNIQUE && parts.len() >= 5 => Some(Self::UniqueOwner),
@@ -268,6 +287,7 @@ pub enum GuardReason {
     TableExistence,
     SerializableRead,
     UserVersion,
+    ViewDependency,
 }
 
 /// One permitted guard shape in the checked compiler contract.
@@ -347,6 +367,17 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
         SchemaObjectName
     ),
     contract!(SetUserVersion, Write, UserVersion, UserVersion),
+    contract!(CreateView, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(CreateView, Invariant, ViewDependency, SchemaObjectName),
+    contract!(CreateView, Invariant, ViewDependency, ColumnName),
+    contract!(CreateView, Invariant, ViewDependency, ViewDependency),
+    contract!(CreateView, Invariant, ColumnDependency, ColumnDependency),
+    contract!(CreateView, Write, ColumnDependency, ColumnDependency),
+    contract!(DropView, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropView, Invariant, ViewDependency, ViewDependency),
+    contract!(DropView, Invariant, ColumnDependency, ColumnDependency),
+    contract!(DropView, Write, ColumnDependency, ColumnDependency),
+    contract!(DropColumn, Invariant, ViewDependency, ViewDependency),
     contract!(
         TransactionRead,
         SerializableRead,
@@ -378,7 +409,10 @@ pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(DropColumn, Invariant, ViewDependency, ViewDependency),
     contract!(SetUserVersion, Write, UserVersion, UserVersion),
+    contract!(CreateView, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropView, Invariant, SchemaObjectName, SchemaObjectName),
 ];
 
 /// One unpruned, reviewable conflict dependency emitted by the compiler.
@@ -611,18 +645,18 @@ fn mutation_guard_requirements(
     use GuardReason::{
         ColumnDependency, ColumnNameBinding, ForeignChildren, ForeignReference, RowIdentity,
         SchemaObjectName, SchemaRevision, TableExistence, UniqueOwnership,
-        UserVersion as UserVersionReason, WriteContract,
+        UserVersion as UserVersionReason, ViewDependency as ViewDependencyReason, WriteContract,
     };
     use MutationKind::{Delete, DeletePrefix, Set};
     use OperationFamily::{
-        AddColumn, CreateIndex, CreateTable, DropColumn, DropIndex, DropTable, RenameColumn,
-        RenameTable, RowChanges, SetUserVersion,
+        AddColumn, CreateIndex, CreateTable, CreateView, DropColumn, DropIndex, DropTable,
+        DropView, RenameColumn, RenameTable, RowChanges, SetUserVersion,
     };
     use TargetFamily::{
         ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
         ForeignReference as ForeignReferenceTarget, Row,
         SchemaObjectName as SchemaObjectNameTarget, TableRoot, UniqueOwner,
-        UserVersion as UserVersionTarget, WriteRevision,
+        UserVersion as UserVersionTarget, ViewDependency as ViewDependencyTarget, WriteRevision,
     };
 
     match (operation, kind, family) {
@@ -630,7 +664,15 @@ fn mutation_guard_requirements(
         | (DropTable, Delete, SchemaObjectNameTarget)
         | (RenameTable, Set | Delete, SchemaObjectNameTarget)
         | (CreateIndex, Set, SchemaObjectNameTarget)
-        | (DropIndex, Delete, SchemaObjectNameTarget) => &[(Invariant, SchemaObjectName)],
+        | (DropIndex, Delete, SchemaObjectNameTarget)
+        | (CreateView, Set, SchemaObjectNameTarget)
+        | (DropView, Delete, SchemaObjectNameTarget) => &[(Invariant, SchemaObjectName)],
+        (CreateView, Set, ViewDependencyTarget) | (DropView, Delete, ViewDependencyTarget) => {
+            &[(Invariant, ViewDependencyReason)]
+        }
+        (CreateView, Set, ColumnDependencyTarget) | (DropView, Delete, ColumnDependencyTarget) => {
+            &[(Invariant, ColumnDependency), (Write, ColumnDependency)]
+        }
         (RenameColumn, Set | Delete, ColumnName)
         | (AddColumn, Set, ColumnName)
         | (DropColumn, Delete, ColumnName) => &[(Invariant, ColumnNameBinding)],
@@ -780,6 +822,11 @@ pub enum LogicalTarget {
         column: ColumnId,
         owner: ColumnId,
     },
+    ColumnViewDependency {
+        table: TableId,
+        column: ColumnId,
+        canonical: Vec<u8>,
+    },
     TableRoot {
         table: TableId,
     },
@@ -824,6 +871,13 @@ pub enum LogicalTarget {
         transaction: [u8; 16],
     },
     UserVersion,
+    ViewDependencyPrefix {
+        table: TableId,
+    },
+    ViewDependency {
+        table: TableId,
+        canonical: Vec<u8>,
+    },
 }
 
 impl LogicalTarget {
@@ -836,7 +890,8 @@ impl LogicalTarget {
             Self::ColumnName { .. } => TargetFamily::ColumnName,
             Self::ColumnDependencyPrefix { .. }
             | Self::ColumnIndexDependency { .. }
-            | Self::ColumnCheckDependency { .. } => TargetFamily::ColumnDependency,
+            | Self::ColumnCheckDependency { .. }
+            | Self::ColumnViewDependency { .. } => TargetFamily::ColumnDependency,
             Self::TableRoot { .. } => TargetFamily::TableRoot,
             Self::ActivePrimaryIndex { .. } => TargetFamily::ActivePrimaryIndex,
             Self::ActiveSchemaRevision { .. } => TargetFamily::ActiveSchemaRevision,
@@ -849,6 +904,9 @@ impl LogicalTarget {
             }
             Self::TransactionLog { .. } => TargetFamily::TransactionLog,
             Self::UserVersion => TargetFamily::UserVersion,
+            Self::ViewDependencyPrefix { .. } | Self::ViewDependency { .. } => {
+                TargetFamily::ViewDependency
+            }
         }
     }
 
@@ -915,6 +973,19 @@ impl LogicalTarget {
                 column.as_bytes().to_vec(),
                 codes::COLUMNS.to_vec(),
                 owner.as_bytes().to_vec(),
+            ],
+            Self::ColumnViewDependency {
+                table,
+                column,
+                canonical,
+            } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::COLUMN_DEPENDENCIES.to_vec(),
+                column.as_bytes().to_vec(),
+                codes::VIEW_DEPENDENCIES.to_vec(),
+                name_component(canonical),
             ],
             Self::TableRoot { table } => vec![
                 codes::ROOT.to_vec(),
@@ -985,6 +1056,19 @@ impl LogicalTarget {
                 codes::METADATA.to_vec(),
                 codes::USER_VERSION.to_vec(),
             ],
+            Self::ViewDependencyPrefix { table } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::VIEW_DEPENDENCIES.to_vec(),
+            ],
+            Self::ViewDependency { table, canonical } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::VIEW_DEPENDENCIES.to_vec(),
+                name_component(canonical),
+            ],
         };
         let key = Key::from_bytes(components)?;
         debug_assert_eq!(TargetFamily::classify(&key), Some(self.family()));
@@ -1022,6 +1106,31 @@ fn foreign_reference_prefix(
     .into_iter()
     .chain(parent_images.iter().cloned())
     .collect()
+}
+
+pub fn view_dependency_prefix(table: TableId) -> Key {
+    LogicalTarget::ViewDependencyPrefix { table }
+        .render()
+        .expect("view-dependency prefix is bounded")
+}
+
+pub fn view_dependency_key(table: TableId, view: &SqlName) -> Key {
+    LogicalTarget::ViewDependency {
+        table,
+        canonical: view.canonical().to_vec(),
+    }
+    .render()
+    .expect("view-dependency key is bounded")
+}
+
+pub fn column_view_dependency_key(table: TableId, column: ColumnId, view: &SqlName) -> Key {
+    LogicalTarget::ColumnViewDependency {
+        table,
+        column,
+        canonical: view.canonical().to_vec(),
+    }
+    .render()
+    .expect("column view-dependency key is bounded")
 }
 
 pub(super) fn name_component(canonical: &[u8]) -> Vec<u8> {
@@ -1175,8 +1284,9 @@ mod tests {
             GuardReason::TableExistence,
             GuardReason::SerializableRead,
             GuardReason::UserVersion,
+            GuardReason::ViewDependency,
         ];
-        assert_eq!(reasons.len(), 14);
+        assert_eq!(reasons.len(), 15);
     }
 
     #[test]
@@ -1352,6 +1462,8 @@ mod tests {
             OperationFamily::AddColumn,
             OperationFamily::DropColumn,
             OperationFamily::SetUserVersion,
+            OperationFamily::CreateView,
+            OperationFamily::DropView,
         ]);
         assert_eq!(
             REJECTION_CONTRACTS

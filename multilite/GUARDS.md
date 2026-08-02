@@ -10,6 +10,14 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | --- | --- | --- |
 | `TransactionEnvelope` | `Set` | `TransactionLog` |
 | `SetUserVersion` | `Set` | `UserVersion` |
+| `CreateView` | `Set` | `SchemaLog` |
+| `CreateView` | `Set` | `SchemaObjectName` |
+| `CreateView` | `Set` | `ViewDependency` |
+| `CreateView` | `Set` | `ColumnDependency` |
+| `DropView` | `Set` | `SchemaLog` |
+| `DropView` | `Delete` | `SchemaObjectName` |
+| `DropView` | `Delete` | `ViewDependency` |
+| `DropView` | `Delete` | `ColumnDependency` |
 | `CreateTable` | `Set` | `SchemaLog` |
 | `CreateTable` | `Set` | `SchemaObjectName` |
 | `CreateTable` | `Set` | `TableSchema` |
@@ -108,6 +116,17 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `TableRoot` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `SchemaObjectName` |
 | `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |
+| `CreateView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `CreateView` | `Invariant` | `ViewDependency` | `SchemaObjectName` |
+| `CreateView` | `Invariant` | `ViewDependency` | `ColumnName` |
+| `CreateView` | `Invariant` | `ViewDependency` | `ViewDependency` |
+| `CreateView` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
+| `CreateView` | `Write` | `ColumnDependency` | `ColumnDependency` |
+| `DropView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `DropView` | `Invariant` | `ViewDependency` | `ViewDependency` |
+| `DropView` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
+| `DropView` | `Write` | `ColumnDependency` | `ColumnDependency` |
+| `DropColumn` | `Invariant` | `ViewDependency` | `ViewDependency` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `UserVersion` |
 
 ## Rejection Repair
@@ -124,6 +143,8 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `AddColumn` | `RevertAlterTable` |
 | `DropColumn` | `RevertAlterTable` |
 | `SetUserVersion` | `RestoreUserVersion` |
+| `CreateView` | `RevertView` |
+| `DropView` | `RevertView` |
 
 ## Required Guards
 
@@ -148,4 +169,7 @@ These family-level guards must occur at least once. In addition, the compiler re
 | `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `DropColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `DropColumn` | `Invariant` | `ViewDependency` | `ViewDependency` |
 | `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |
+| `CreateView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `DropView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |

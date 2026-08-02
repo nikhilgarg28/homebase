@@ -72,6 +72,111 @@ fn user_version_is_a_durable_write_and_schema_pragmas_are_explicit_reads() {
 }
 
 #[test]
+fn views_query_drop_repair_and_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("views.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())
+        .unwrap();
+    db.execute(
+        "CREATE VIEW upper_notes (id, body) AS
+         SELECT id, upper(body) FROM notes WHERE id >= 2",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT id, body FROM upper_notes", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(2, "TWO".into())]
+    );
+    drop(db);
+
+    let db = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        db.query("SELECT body FROM upper_notes", (), |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        ["TWO"]
+    );
+    assert!(matches!(
+        db.execute("DROP TABLE notes", ()),
+        Err(Error::UnsupportedSql(
+            "table is referenced by a synchronized view"
+        ))
+    ));
+    assert!(matches!(
+        db.execute("ALTER TABLE notes DROP COLUMN body", ()),
+        Err(Error::UnsupportedSql(
+            "table is referenced by a synchronized view"
+        ))
+    ));
+    db.execute("DROP VIEW upper_notes", ()).unwrap();
+    db.execute("DROP TABLE notes", ()).unwrap();
+    assert!(
+        db.query("SELECT * FROM upper_notes", (), |_| Ok(()))
+            .is_err()
+    );
+}
+
+#[test]
+fn views_track_multiple_nested_sources_and_release_ddl_fences_on_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = MultiliteConnection::open(directory.path().join("nested-views.sqlite")).unwrap();
+    database
+        .update(|transaction| {
+            transaction.execute("CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT)", ())?;
+            transaction.execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    team_id INTEGER,
+                    body TEXT
+                )",
+                (),
+            )?;
+            transaction.execute("INSERT INTO teams VALUES (1, 'core')", ())?;
+            transaction.execute("INSERT INTO notes VALUES (7, 1, 'ready')", ())?;
+            transaction.execute(
+                "CREATE VIEW team_notes AS
+                 WITH selected AS (SELECT team_id, body FROM notes WHERE id = 7)
+                 SELECT teams.name, selected.body
+                 FROM teams JOIN selected ON selected.team_id = teams.id",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        database
+            .query("SELECT name, body FROM team_notes", (), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [("core".into(), "ready".into())]
+    );
+    for sql in [
+        "DROP TABLE teams",
+        "ALTER TABLE teams DROP COLUMN name",
+        "DROP TABLE notes",
+    ] {
+        assert!(matches!(
+            database.execute(sql, ()),
+            Err(Error::UnsupportedSql(
+                "table is referenced by a synchronized view"
+            ))
+        ));
+    }
+    database.execute("DROP VIEW team_notes", ()).unwrap();
+    database
+        .execute("ALTER TABLE teams DROP COLUMN name", ())
+        .unwrap();
+    database.execute("DROP TABLE notes", ()).unwrap();
+}
+
+#[test]
 fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("drop-table.sqlite");
@@ -3152,8 +3257,6 @@ fn unsupported_verbs_transactions_and_multiple_statements_are_rejected() {
         .unwrap();
 
     for sql in [
-        "CREATE VIEW note_view AS SELECT * FROM notes",
-        "PRAGMA user_version = 9",
         "ATTACH DATABASE ':memory:' AS attached",
         "VACUUM",
         "ANALYZE",

@@ -10,13 +10,14 @@ use rusqlite::Connection;
 use rusqlite::config::DbConfig;
 use uuid::{Uuid, Variant, Version};
 
-use super::guard::{GuardPlan, GuardReason, OperationFamily};
+use super::guard::{GuardPlan, GuardReason, OperationFamily, view_dependency_prefix};
 use super::row::primary_index_prefix;
 use super::schema::{
     ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
     column_check_dependency_key, column_dependency_prefix, column_name_scope_key, schema_log_key,
     schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
+use super::view;
 use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
 use crate::repair;
@@ -205,6 +206,7 @@ impl AlterTableOperation {
         let before = catalog::by_name(connection, spec.table.value())?.ok_or(
             Error::UnsupportedSql("ALTER TABLE target has no synchronized schema identity"),
         )?;
+        view::ensure_table_not_referenced(connection, &spec.table)?;
         let column = catalog::column_id_by_name(connection, before.table_id(), &spec.column)?
             .ok_or(Error::UnsupportedSql(
                 "ALTER TABLE DROP COLUMN references an unknown column",
@@ -303,6 +305,10 @@ impl AlterTableOperation {
                         }
                     }
                     AlterTableDelta::DropColumn { .. } => {
+                        guards.invariant(
+                            view_dependency_prefix(self.table),
+                            GuardReason::ViewDependency,
+                        )?;
                         for dependency in before.column_check_dependencies(*column) {
                             let key = column_check_dependency_key(self.table, dependency, *column);
                             guards.invariant(key.clone(), GuardReason::ColumnDependency)?;
@@ -1596,10 +1602,13 @@ mod tests {
         };
         assert_explicit_range_assertions(
             &lowered.footprint,
-            &[column_dependency_prefix(after.table_id(), *column)],
+            &[
+                column_dependency_prefix(after.table_id(), *column),
+                view_dependency_prefix(after.table_id()),
+            ],
         );
         assert_eq!(lowered.mutations.len(), 4);
-        assert_eq!(lowered.footprint.constraints().len(), 2);
+        assert_eq!(lowered.footprint.constraints().len(), 3);
         assert_eq!(lowered.footprint.writes().len(), 1);
 
         apply_speculative_drop(&connection, &drop);

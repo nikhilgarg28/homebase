@@ -366,6 +366,7 @@ fn apply_rejection(connection: &Connection, effects: &[RejectionEffect]) -> Resu
             }
             RejectionEffect::RevertIndex { operation } => operation.rollback(connection)?,
             RejectionEffect::RestoreUserVersion { operation } => operation.rollback(connection)?,
+            RejectionEffect::RevertView { operation } => operation.rollback(connection)?,
         }
     }
     Ok(())

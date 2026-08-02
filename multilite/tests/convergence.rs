@@ -194,6 +194,117 @@ fn pragma_reads_join_only_serializable_conflict_footprints() {
 }
 
 #[test]
+fn views_conflict_by_shared_name_repair_and_converge_at_both_isolation_levels() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("view-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("view-second-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        first
+            .update(|transaction| {
+                transaction
+                    .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())?;
+                transaction.execute("INSERT INTO notes VALUES (1, 'one')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "CREATE VIEW report AS SELECT id, upper(body) AS body FROM notes",
+                (),
+            )
+            .unwrap();
+        second
+            .execute(
+                "CREATE VIEW report AS SELECT id, lower(body) AS body FROM notes",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("same-name views unexpectedly both admitted")
+        };
+        second.rollback(&rejection).unwrap();
+        assert!(
+            second
+                .query("SELECT * FROM report", (), |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        assert_eq!(
+            second
+                .query("SELECT body FROM report", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            ["ONE"]
+        );
+
+        first.execute("DROP VIEW report", ()).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .query("SELECT * FROM report", (), |_| Ok(()))
+                    .is_err()
+            );
+        }
+
+        first
+            .execute("CREATE VIEW report AS SELECT id, body FROM notes", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        first.execute("DROP VIEW report", ()).unwrap();
+        second.execute("DROP VIEW report", ()).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("concurrent DROP VIEW unexpectedly both admitted")
+        };
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT body FROM report", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            ["one"]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        assert!(
+            second
+                .query("SELECT * FROM report", (), |_| Ok(()))
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn public_sql_create_and_insert_converge_across_two_replicas() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
