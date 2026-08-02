@@ -965,6 +965,203 @@ fn delete_actions_capture_complete_multi_table_transitions() {
 }
 
 #[test]
+fn set_default_captures_composite_strict_and_without_rowid_children() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("set-default.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                parent_id INTEGER NOT NULL,
+                PRIMARY KEY (tenant, parent_id)
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE strict_children (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT NOT NULL DEFAULT 'fallback',
+                parent_id INTEGER NOT NULL DEFAULT 0,
+                body TEXT,
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON DELETE SET DEFAULT
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE composite_children (
+                group_name TEXT NOT NULL,
+                child_id INTEGER NOT NULL,
+                tenant TEXT DEFAULT 'fallback',
+                parent_id INTEGER DEFAULT 0,
+                body BLOB,
+                PRIMARY KEY (group_name, child_id),
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON DELETE SET DEFAULT
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO parents VALUES ('fallback', 0), ('north', 1), ('south', 2)",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO strict_children VALUES
+                (10, 'north', 1, 'change'),
+                (20, 'south', 2, 'keep')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO composite_children VALUES
+                ('g', 10, 'north', 1, x'01'),
+                ('g', 20, 'south', 2, x'02')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "DELETE FROM parents WHERE tenant = 'north' AND parent_id = 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, tenant, parent_id FROM strict_children ORDER BY id",
+            (),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        [(10, "fallback".into(), 0), (20, "south".into(), 2)]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT child_id, tenant, parent_id FROM composite_children ORDER BY child_id",
+            (),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        [(10, "fallback".into(), 0), (20, "south".into(), 2)]
+    );
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT tenant, parent_id FROM composite_children WHERE child_id = 10",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        [("fallback".into(), 0)]
+    );
+    drop(reopened);
+
+    let physical = Connection::open(&path).unwrap();
+    assert_eq!(
+        physical
+            .query_row(
+                "SELECT DISTINCT on_delete FROM pragma_foreign_key_list('strict_children')",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "SET DEFAULT"
+    );
+}
+
+#[test]
+fn set_default_and_restrict_failures_rollback_every_indirect_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("blocking-actions.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "CREATE TABLE cascaded (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON DELETE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE defaulted (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER NOT NULL DEFAULT 0
+                    REFERENCES parents(id) ON DELETE SET DEFAULT
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE restricted (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON DELETE RESTRICT
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1), (2), (3)", ())?;
+        transaction.execute("INSERT INTO cascaded VALUES (10, 1), (20, 2)", ())?;
+        transaction.execute("INSERT INTO defaulted VALUES (10, 1)", ())?;
+        transaction.execute("INSERT INTO restricted VALUES (30, 2)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Parent zero is absent, so SET DEFAULT makes the final FK check fail. The
+    // preceding cascade must be rolled back with the outer statement.
+    assert!(matches!(
+        db.execute("DELETE FROM parents WHERE id = 1", ()),
+        Err(Error::Sqlite(_))
+    ));
+    // RESTRICT is an immediate blocker and likewise leaves sibling cascades
+    // untouched.
+    assert!(matches!(
+        db.execute("DELETE FROM parents WHERE id = 2", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id FROM parents ORDER BY id", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        db.query("SELECT id, parent FROM cascaded ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap(),
+        [(10, 1), (20, 2)]
+    );
+    assert_eq!(
+        db.query("SELECT parent FROM defaulted", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+
+    // RESTRICT is not a blanket fence: an unreferenced parent is deletable.
+    assert_eq!(
+        db.execute("DELETE FROM parents WHERE id = 3", ()).unwrap(),
+        1
+    );
+}
+
+#[test]
 fn blocking_foreign_key_rolls_back_mixed_delete_actions_and_hook_events() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("mixed-actions.sqlite")).unwrap();

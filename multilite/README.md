@@ -23,10 +23,10 @@ Homebase metadata. Public SQL currently permits restricted persistent
 `STRICT` tables are supported. A rowid table must expose one exact `INTEGER
 PRIMARY KEY` alias; richer and composite primary keys use `WITHOUT ROWID`.
 Defaults, CHECK constraints, named constraints, ordered multi-column UNIQUE
-keys, and immediate `NO ACTION` foreign keys participate in the synchronized
-schema and guard model. Other verbs, caller-owned transactions, conflict
-clauses, attached databases, `AUTOINCREMENT`, deferred or cascading foreign
-keys, and unsupported expression/collation forms are rejected. The
+keys, and immediate foreign keys participate in the synchronized schema and
+guard model. Other verbs, caller-owned transactions, conflict clauses,
+attached databases, `AUTOINCREMENT`, deferred foreign keys, mutating `ON
+UPDATE` actions, and unsupported expression/collation forms are rejected. The
 `__multilite__` namespace is reserved. Exact boundaries live in the grammar
 spec and executable parser tests rather than this overview.
 The internal operation layer translates restricted table creation and captured
@@ -154,9 +154,11 @@ write compiled against the older catalog cannot slip through. A referenced
 explicit UNIQUE index cannot be dropped until relationship evolution can
 durably retarget or remove the relationship. SQLite continues to establish
 immediate local existence and `MATCH SIMPLE` NULL behavior against the branch
-snapshot. `ON DELETE CASCADE` and `SET NULL` use SQLite's complete nested
-transition; remote apply and rejection repair never rerun the referential
-action.
+snapshot. `ON DELETE CASCADE`, `SET NULL`, and `SET DEFAULT` use SQLite's
+complete nested transition; remote apply and rejection repair never rerun the
+referential action. `RESTRICT` retains SQLite's immediate statement semantics,
+while its parent-prefix guard fences a child created concurrently on another
+replica.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional `WITH` clause, SQLite predicate, and ordinary `INDEXED BY` or `NOT

@@ -1524,11 +1524,8 @@ fn validate_foreign_key(
                     RefAct::NoAction => ReferentialAction::NoAction,
                     RefAct::Cascade => ReferentialAction::Cascade,
                     RefAct::SetNull => ReferentialAction::SetNull,
-                    RefAct::SetDefault | RefAct::Restrict => {
-                        return Err(Error::UnsupportedSql(
-                            "ON DELETE SET DEFAULT and RESTRICT are not supported",
-                        ));
-                    }
+                    RefAct::SetDefault => ReferentialAction::SetDefault,
+                    RefAct::Restrict => ReferentialAction::Restrict,
                 });
             }
             RefArg::OnUpdate(RefAct::NoAction) if on_update.is_none() => {
@@ -2240,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_cascade_and_set_null_delete_actions() {
+    fn accepts_every_delete_action() {
         for (sql, expected) in [
             (
                 "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
@@ -2249,6 +2246,14 @@ mod tests {
             (
                 "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id) ON DELETE SET NULL ON UPDATE NO ACTION)",
                 ReferentialAction::SetNull,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER DEFAULT 0 REFERENCES parents(id) ON DELETE SET DEFAULT)",
+                ReferentialAction::SetDefault,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE RESTRICT)",
+                ReferentialAction::Restrict,
             ),
         ] {
             let ValidatedExecute::CreateTable(spec) = validate_execute(sql).unwrap() else {
@@ -2266,8 +2271,6 @@ mod tests {
     fn rejects_foreign_key_extensions_outside_the_supported_slice() {
         for sql in [
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE SET NULL)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE SET DEFAULT)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE RESTRICT)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE ON DELETE SET NULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) MATCH FULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",

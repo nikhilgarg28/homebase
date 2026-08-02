@@ -88,6 +88,8 @@ const TAG_FOREIGN_KEY_ON_UPDATE: u8 = 11;
 const FOREIGN_KEY_NO_ACTION: u8 = 0;
 const FOREIGN_KEY_CASCADE: u8 = 1;
 const FOREIGN_KEY_SET_NULL: u8 = 2;
+const FOREIGN_KEY_SET_DEFAULT: u8 = 3;
+const FOREIGN_KEY_RESTRICT: u8 = 4;
 const INDEX_DEFINITION_FRAME_VERSION: u8 = 1;
 const TAG_INDEX_ID: u8 = 1;
 const TAG_INDEX_KIND: u8 = 2;
@@ -399,6 +401,8 @@ pub enum ReferentialAction {
     NoAction,
     Cascade,
     SetNull,
+    SetDefault,
+    Restrict,
 }
 
 impl ReferentialAction {
@@ -407,6 +411,8 @@ impl ReferentialAction {
             Self::NoAction => FOREIGN_KEY_NO_ACTION,
             Self::Cascade => FOREIGN_KEY_CASCADE,
             Self::SetNull => FOREIGN_KEY_SET_NULL,
+            Self::SetDefault => FOREIGN_KEY_SET_DEFAULT,
+            Self::Restrict => FOREIGN_KEY_RESTRICT,
         }
     }
 
@@ -415,6 +421,8 @@ impl ReferentialAction {
             FOREIGN_KEY_NO_ACTION => Some(Self::NoAction),
             FOREIGN_KEY_CASCADE => Some(Self::Cascade),
             FOREIGN_KEY_SET_NULL => Some(Self::SetNull),
+            FOREIGN_KEY_SET_DEFAULT => Some(Self::SetDefault),
+            FOREIGN_KEY_RESTRICT => Some(Self::Restrict),
             _ => None,
         }
     }
@@ -424,6 +432,8 @@ impl ReferentialAction {
             Self::NoAction => "NO ACTION",
             Self::Cascade => "CASCADE",
             Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+            Self::Restrict => "RESTRICT",
         }
     }
 }
@@ -4564,6 +4574,20 @@ mod tests {
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
 
         let encoded_foreign_key = encode_foreign_key_definition(foreign_key);
+        for action in [
+            ReferentialAction::NoAction,
+            ReferentialAction::Cascade,
+            ReferentialAction::SetNull,
+            ReferentialAction::SetDefault,
+            ReferentialAction::Restrict,
+        ] {
+            let mut variant = foreign_key.clone();
+            variant.actions.on_delete = action;
+            assert_eq!(
+                decode_foreign_key_definition(&encode_foreign_key_definition(&variant)).unwrap(),
+                variant
+            );
+        }
         for malformed_tag in [TAG_FOREIGN_KEY_ON_DELETE, TAG_FOREIGN_KEY_ON_UPDATE] {
             let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
             let mut malformed_action = Writer::new();

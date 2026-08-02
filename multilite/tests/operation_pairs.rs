@@ -418,6 +418,22 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "set_default_parent_delete_and_child_insert",
+        relationship: "SET DEFAULT parent range and a concurrently inserted child marker",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO defaulted VALUES (301, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "restrict_parent_delete_and_child_insert",
+        relationship: "locally unreferenced RESTRICT parent and a concurrent child marker",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO restricted VALUES (401, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "cascade_parent_delete_and_child_retarget_into_parent",
         relationship: "deleted parent range and a child reference moved into it",
         left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
@@ -952,6 +968,23 @@ where
                 (),
             )?;
             transaction.execute(
+                "CREATE TABLE defaulted (
+                    id INTEGER PRIMARY KEY,
+                    parent_code TEXT NOT NULL DEFAULT 'p10'
+                        REFERENCES parents(code) ON DELETE SET DEFAULT,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE restricted (
+                    id INTEGER PRIMARY KEY,
+                    parent_code TEXT REFERENCES parents(code) ON DELETE RESTRICT,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )?;
+            transaction.execute(
                 "INSERT INTO notes VALUES
                     (1, 'one', 'body-one', 'd1'),
                     (2, 'two', 'body-two', 'd2')",
@@ -965,6 +998,7 @@ where
             )?;
             transaction.execute("INSERT INTO children VALUES (100, 'p10', 'base')", ())?;
             transaction.execute("INSERT INTO labels VALUES (200, 'p10', 'base')", ())?;
+            transaction.execute("INSERT INTO defaulted VALUES (300, 'p20', 'base')", ())?;
             Ok(())
         })
         .unwrap();
