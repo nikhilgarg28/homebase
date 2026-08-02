@@ -1162,6 +1162,248 @@ fn set_default_and_restrict_failures_rollback_every_indirect_effect() {
 }
 
 #[test]
+fn update_actions_capture_composite_multilevel_and_identity_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("update-actions.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                parent_id INTEGER NOT NULL,
+                body TEXT,
+                PRIMARY KEY (tenant, parent_id)
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE cascade_children (
+                tenant TEXT NOT NULL,
+                parent_id INTEGER NOT NULL,
+                child_id INTEGER NOT NULL,
+                body TEXT,
+                PRIMARY KEY (tenant, parent_id, child_id),
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON UPDATE CASCADE
+            ) WITHOUT ROWID, STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE grandchildren (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                parent_id INTEGER,
+                child_id INTEGER,
+                FOREIGN KEY (tenant, parent_id, child_id)
+                    REFERENCES cascade_children (tenant, parent_id, child_id)
+                    ON UPDATE CASCADE
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE null_children (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                parent_id INTEGER,
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON UPDATE SET NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE default_children (
+                id INTEGER PRIMARY KEY,
+                tenant TEXT NOT NULL DEFAULT 'fallback',
+                parent_id INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, parent_id)
+                    ON UPDATE SET DEFAULT
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO parents VALUES
+                ('fallback', 0, 'fallback'),
+                ('north', 1, 'move')",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO cascade_children VALUES ('north', 1, 10, 'child')",
+            (),
+        )?;
+        transaction.execute("INSERT INTO grandchildren VALUES (100, 'north', 1, 10)", ())?;
+        transaction.execute("INSERT INTO null_children VALUES (200, 'north', 1)", ())?;
+        transaction.execute("INSERT INTO default_children VALUES (300, 'north', 1)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "UPDATE parents
+             SET tenant = 'west', parent_id = 9
+             WHERE tenant = 'north' AND parent_id = 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, parent_id, child_id FROM cascade_children",
+            (),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        [("west".into(), 9, 10)]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, parent_id, child_id FROM grandchildren",
+            (),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?
+            )),
+        )
+        .unwrap(),
+        [("west".into(), 9, 10)]
+    );
+    assert_eq!(
+        db.query("SELECT tenant, parent_id FROM null_children", (), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+            ))
+        })
+        .unwrap(),
+        [(None, None)]
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, parent_id FROM default_children",
+            (),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        [("fallback".into(), 0)]
+    );
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query(
+                "SELECT tenant, parent_id FROM cascade_children",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        [("west".into(), 9)]
+    );
+    drop(reopened);
+
+    let physical = Connection::open(&path).unwrap();
+    for (table, expected) in [
+        ("cascade_children", "CASCADE"),
+        ("grandchildren", "CASCADE"),
+        ("null_children", "SET NULL"),
+        ("default_children", "SET DEFAULT"),
+    ] {
+        assert_eq!(
+            physical
+                .query_row(
+                    "SELECT DISTINCT on_update FROM pragma_foreign_key_list(?1)",
+                    [table],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn update_restrict_and_invalid_action_results_are_atomic() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("update-blockers.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "CREATE TABLE cascaded (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE defaulted (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER NOT NULL DEFAULT 0
+                    REFERENCES parents(id) ON UPDATE SET DEFAULT
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE restricted (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON UPDATE RESTRICT
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1), (2), (3)", ())?;
+        transaction.execute("INSERT INTO cascaded VALUES (10, 1), (20, 2)", ())?;
+        transaction.execute("INSERT INTO defaulted VALUES (10, 1)", ())?;
+        transaction.execute("INSERT INTO restricted VALUES (20, 2)", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    // SET DEFAULT targets missing parent zero. SQLite may have run earlier
+    // cascades, but the statement savepoint must erase every indirect event.
+    assert!(matches!(
+        db.execute("UPDATE parents SET id = 9 WHERE id = 1", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert!(matches!(
+        db.execute("UPDATE parents SET id = 9 WHERE id = 2", ()),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id FROM parents ORDER BY id", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        db.query("SELECT id, parent FROM cascaded ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap(),
+        [(10, 1), (20, 2)]
+    );
+    assert_eq!(
+        db.query("SELECT parent FROM defaulted", (), |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+
+    assert_eq!(
+        db.execute("UPDATE parents SET id = 9 WHERE id = 3", ())
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn blocking_foreign_key_rolls_back_mixed_delete_actions_and_hook_events() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("mixed-actions.sqlite")).unwrap();

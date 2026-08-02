@@ -16,10 +16,10 @@ images. `INSERT [OR ABORT|OR IGNORE|OR REPLACE]`, `REPLACE INTO`,
 SQLite's complete captured net row transition rather than replaying conflict
 selection on replicas. Replacement includes every implicitly deleted conflict
 victim. `ON DELETE CASCADE`, `SET NULL`, and `SET DEFAULT` capture their
-complete multi-table transition; `RESTRICT` preserves SQLite's immediate
-statement behavior. `OR FAIL`, `OR ROLLBACK`, public trigger creation, mutating
-`ON UPDATE` actions, `RETURNING`, and write `ORDER BY` / `LIMIT` remain outside
-the managed surface.
+complete multi-table transition; the same five actions are supported for `ON
+UPDATE`, and `RESTRICT` preserves SQLite's immediate statement behavior. `OR
+FAIL`, `OR ROLLBACK`, public trigger creation, `RETURNING`, and write `ORDER BY`
+/ `LIMIT` remain outside the managed surface.
 
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
 FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings

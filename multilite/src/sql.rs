@@ -1520,25 +1520,14 @@ fn validate_foreign_key(
     for argument in clause.args {
         match argument {
             RefArg::OnDelete(action) if on_delete.is_none() => {
-                on_delete = Some(match action {
-                    RefAct::NoAction => ReferentialAction::NoAction,
-                    RefAct::Cascade => ReferentialAction::Cascade,
-                    RefAct::SetNull => ReferentialAction::SetNull,
-                    RefAct::SetDefault => ReferentialAction::SetDefault,
-                    RefAct::Restrict => ReferentialAction::Restrict,
-                });
+                on_delete = Some(referential_action(action));
             }
-            RefArg::OnUpdate(RefAct::NoAction) if on_update.is_none() => {
-                on_update = Some(ReferentialAction::NoAction)
+            RefArg::OnUpdate(action) if on_update.is_none() => {
+                on_update = Some(referential_action(action));
             }
             RefArg::OnDelete(_) => {
                 return Err(Error::UnsupportedSql(
                     "foreign keys cannot contain more than one ON DELETE clause",
-                ));
-            }
-            RefArg::OnUpdate(_) if on_update.is_none() => {
-                return Err(Error::UnsupportedSql(
-                    "foreign-key ON UPDATE actions other than NO ACTION are not supported",
                 ));
             }
             RefArg::OnUpdate(_) => {
@@ -1575,6 +1564,16 @@ fn validate_foreign_key(
             on_update: on_update.unwrap_or_default(),
         },
     })
+}
+
+fn referential_action(action: RefAct) -> ReferentialAction {
+    match action {
+        RefAct::NoAction => ReferentialAction::NoAction,
+        RefAct::Cascade => ReferentialAction::Cascade,
+        RefAct::SetNull => ReferentialAction::SetNull,
+        RefAct::SetDefault => ReferentialAction::SetDefault,
+        RefAct::Restrict => ReferentialAction::Restrict,
+    }
 }
 
 fn simple_indexed_columns(
@@ -2268,10 +2267,41 @@ mod tests {
     }
 
     #[test]
+    fn accepts_every_update_action() {
+        for (sql, expected) in [
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE NO ACTION)",
+                ReferentialAction::NoAction,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE)",
+                ReferentialAction::Cascade,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE SET NULL)",
+                ReferentialAction::SetNull,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER DEFAULT 0 REFERENCES parents(id) ON UPDATE SET DEFAULT)",
+                ReferentialAction::SetDefault,
+            ),
+            (
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE RESTRICT)",
+                ReferentialAction::Restrict,
+            ),
+        ] {
+            let ValidatedExecute::CreateTable(spec) = validate_execute(sql).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(spec.foreign_keys[0].actions.on_update, expected);
+        }
+    }
+
+    #[test]
     fn rejects_foreign_key_extensions_outside_the_supported_slice() {
         for sql in [
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE SET NULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE ON DELETE SET NULL)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON UPDATE CASCADE ON UPDATE SET NULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) MATCH FULL)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id, tenant))",

@@ -4588,6 +4588,20 @@ mod tests {
                 variant
             );
         }
+        for action in [
+            ReferentialAction::NoAction,
+            ReferentialAction::Cascade,
+            ReferentialAction::SetNull,
+            ReferentialAction::SetDefault,
+            ReferentialAction::Restrict,
+        ] {
+            let mut variant = foreign_key.clone();
+            variant.actions.on_update = action;
+            assert_eq!(
+                decode_foreign_key_definition(&encode_foreign_key_definition(&variant)).unwrap(),
+                variant
+            );
+        }
         for malformed_tag in [TAG_FOREIGN_KEY_ON_DELETE, TAG_FOREIGN_KEY_ON_UPDATE] {
             let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
             let mut malformed_action = Writer::new();
@@ -4622,6 +4636,15 @@ mod tests {
         contradictory_action.refresh_schema_revision();
         assert_eq!(
             CreateTable::decode_operation(&contradictory_action.encode()),
+            Err(SchemaCodecError::SqlMismatch)
+        );
+        let mut contradictory_update = child.clone();
+        contradictory_update.schema.foreign_keys[0]
+            .actions
+            .on_update = ReferentialAction::Cascade;
+        contradictory_update.refresh_schema_revision();
+        assert_eq!(
+            CreateTable::decode_operation(&contradictory_update.encode()),
             Err(SchemaCodecError::SqlMismatch)
         );
 

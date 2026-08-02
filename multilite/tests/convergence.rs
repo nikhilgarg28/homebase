@@ -1558,6 +1558,157 @@ fn set_default_and_restrict_delete_races_repair_and_converge() {
 }
 
 #[test]
+fn mutating_update_actions_repair_races_and_converge() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        for (name, action, has_initial_child, final_parent) in [
+            ("cascade", "CASCADE", true, Some(2)),
+            ("set-null", "SET NULL", true, None),
+            ("set-default", "SET DEFAULT", true, Some(0)),
+            ("restrict", "RESTRICT", false, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let server = server();
+            let first_path = directory.path().join(format!("update-{name}-first.sqlite"));
+            let first_options = || {
+                OpenOptions::new()
+                    .isolation_level(isolation)
+                    .server(router(Arc::clone(&server)))
+            };
+            let first = MultiliteConnection::open_with(&first_path, first_options()).unwrap();
+            assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+            let second = MultiliteConnection::open_with(
+                directory
+                    .path()
+                    .join(format!("update-{name}-second.sqlite")),
+                OpenOptions::new()
+                    .isolation_level(isolation)
+                    .invitation(first.replica_invitation())
+                    .server(router(Arc::clone(&server))),
+            )
+            .unwrap();
+
+            first
+                .update(|transaction| {
+                    transaction.execute(
+                        "CREATE TABLE parents (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                        (),
+                    )?;
+                    transaction.execute(
+                        &format!(
+                            "CREATE TABLE children (
+                                id INTEGER PRIMARY KEY,
+                                parent INTEGER DEFAULT 0
+                                    REFERENCES parents(id) ON UPDATE {action},
+                                body TEXT NOT NULL
+                            ) STRICT"
+                        ),
+                        (),
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO parents VALUES (0, 'fallback'), (1, 'target')",
+                        (),
+                    )?;
+                    if has_initial_child {
+                        transaction
+                            .execute("INSERT INTO children VALUES (10, 1, 'existing')", ())?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            second.pull().unwrap();
+            second.rebase().unwrap();
+
+            first
+                .execute("UPDATE parents SET id = 2 WHERE id = 1", ())
+                .unwrap();
+            second
+                .execute("INSERT INTO children VALUES (11, 1, 'concurrent')", ())
+                .unwrap();
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+            let PushOutcome::Rejected(rejection) = first.push().unwrap() else {
+                panic!("ON UPDATE {action} did not conflict with a concurrent child")
+            };
+
+            drop(first);
+            let first = MultiliteConnection::open_with(&first_path, first_options()).unwrap();
+            first.rollback(&rejection).unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            first.pull().unwrap();
+            second.pull().unwrap();
+            first.rebase().unwrap();
+            second.rebase().unwrap();
+
+            let restored = if has_initial_child {
+                vec![(10, Some(1)), (11, Some(1))]
+            } else {
+                vec![(11, Some(1))]
+            };
+            for database in [&first, &second] {
+                assert_eq!(
+                    database
+                        .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    [0, 1]
+                );
+                assert_eq!(
+                    database
+                        .query("SELECT id, parent FROM children ORDER BY id", (), |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                        })
+                        .unwrap(),
+                    restored
+                );
+            }
+
+            if action == "RESTRICT" {
+                assert!(matches!(
+                    first.execute("UPDATE parents SET id = 2 WHERE id = 1", ()),
+                    Err(Error::Sqlite(_))
+                ));
+                first
+                    .execute("DELETE FROM children WHERE id = 11", ())
+                    .unwrap();
+            }
+            first
+                .execute("UPDATE parents SET id = 2 WHERE id = 1", ())
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            first.pull().unwrap();
+            second.pull().unwrap();
+            first.rebase().unwrap();
+            second.rebase().unwrap();
+
+            for database in [&first, &second] {
+                assert_eq!(
+                    database
+                        .query("SELECT id FROM parents ORDER BY id", (), |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    [0, 2]
+                );
+                let expected = if action == "RESTRICT" {
+                    Vec::new()
+                } else {
+                    vec![(10, final_parent), (11, final_parent)]
+                };
+                assert_eq!(
+                    database
+                        .query("SELECT id, parent FROM children ORDER BY id", (), |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                        })
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unique_parent_relationships_conflict_symmetrically_and_allow_sibling_inserts() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

@@ -475,6 +475,38 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "cascade_parent_key_move_and_child_insert",
+        relationship: "ON UPDATE CASCADE old-parent range and a concurrent child marker",
+        left: operation!(Update, "UPDATE parents SET code = 'p21' WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO children VALUES (103, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "set_null_parent_key_move_and_child_insert",
+        relationship: "ON UPDATE SET NULL old-parent range and a concurrent child marker",
+        left: operation!(Update, "UPDATE parents SET code = 'p21' WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO labels VALUES (203, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "set_default_parent_key_move_and_child_insert",
+        relationship: "ON UPDATE SET DEFAULT transition and a concurrent child marker",
+        left: operation!(Update, "UPDATE parents SET code = 'p21' WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO defaulted VALUES (303, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "restrict_parent_key_move_and_child_insert",
+        relationship: "locally unreferenced ON UPDATE RESTRICT parent and a concurrent child marker",
+        left: operation!(Update, "UPDATE parents SET code = 'p21' WHERE id = 20"),
+        right: operation!(Insert, "INSERT INTO restricted VALUES (403, 'p20', 'late')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "create_distinct_tables",
         relationship: "different schema-object names and table identities",
         left: operation!(CreateTable, "CREATE TABLE alpha (id INTEGER PRIMARY KEY)"),
@@ -954,7 +986,8 @@ where
             transaction.execute(
                 "CREATE TABLE children (
                     id INTEGER PRIMARY KEY,
-                    parent_code TEXT REFERENCES parents(code) ON DELETE CASCADE,
+                    parent_code TEXT REFERENCES parents(code)
+                        ON DELETE CASCADE ON UPDATE CASCADE,
                     body TEXT NOT NULL
                 )",
                 (),
@@ -962,7 +995,8 @@ where
             transaction.execute(
                 "CREATE TABLE labels (
                     id INTEGER PRIMARY KEY,
-                    parent_code TEXT REFERENCES parents(code) ON DELETE SET NULL,
+                    parent_code TEXT REFERENCES parents(code)
+                        ON DELETE SET NULL ON UPDATE SET NULL,
                     body TEXT NOT NULL
                 )",
                 (),
@@ -971,7 +1005,8 @@ where
                 "CREATE TABLE defaulted (
                     id INTEGER PRIMARY KEY,
                     parent_code TEXT NOT NULL DEFAULT 'p10'
-                        REFERENCES parents(code) ON DELETE SET DEFAULT,
+                        REFERENCES parents(code)
+                        ON DELETE SET DEFAULT ON UPDATE SET DEFAULT,
                     body TEXT NOT NULL
                 )",
                 (),
@@ -979,7 +1014,8 @@ where
             transaction.execute(
                 "CREATE TABLE restricted (
                     id INTEGER PRIMARY KEY,
-                    parent_code TEXT REFERENCES parents(code) ON DELETE RESTRICT,
+                    parent_code TEXT REFERENCES parents(code)
+                        ON DELETE RESTRICT ON UPDATE RESTRICT,
                     body TEXT NOT NULL
                 )",
                 (),
