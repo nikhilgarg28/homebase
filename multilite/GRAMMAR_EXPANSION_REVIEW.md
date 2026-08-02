@@ -119,4 +119,46 @@ Status: complete for one inline relationship on the added column.
 
 ## Dropping named constraints
 
-Status: pending.
+Status: complete for named table-level UNIQUE, FOREIGN KEY, and CHECK.
+
+- `ALTER TABLE table DROP CONSTRAINT name` is intentionally a Multilite SQL
+  extension: sqlite3-parser recognizes the spelling, while canonical physical
+  apply uses the existing stable-ID table rebuild rather than asking stock
+  SQLite to execute unsupported syntax.
+- The logical operation carries metadata only: mutation identity, source SQL,
+  stable table identity, constraint name, and complete before/after schema IR.
+  UNIQUE, FK, and CHECK definitions remain in the IR with `active = false`, so
+  historical row operations can still authenticate and replay their stricter
+  owner/reference bookkeeping. No repair sidecar is needed because no row
+  value is destroyed.
+- Named-constraint cells provide the shared SQLite-name fence. UNIQUE
+  constraints additionally delete and guard their active identity plus the
+  complete incoming relationship-marker prefix. FK retirement deletes and
+  guards its exact parent relationship marker. CHECK retirement needs only the
+  name binding because it has no external ownership namespace. None advances
+  the table write revision; stale DML therefore commutes when its historical
+  rules remain semantically safe.
+- Under the current coarse serializable read tracer, a stale child write
+  compiled before FK retirement rejects when the retirement admits first, but
+  the reverse order admits both: the write's old-schema table read is real in
+  that serialization order, while the metadata-only drop does not semantically
+  read row values. Snapshot isolation admits both orders.
+- A UNIQUE target with an active incoming FK is refused before branch mutation.
+  The FK must be retired first. Pair coverage verifies the converse race: a
+  concurrent FK addition and UNIQUE retirement conflict in either admission
+  order through the relationship marker, not through local SQLite replay.
+- Coverage includes codec round trips and malformed active flags, guard audit,
+  named UNIQUE/CHECK/FK behavior, quoted case-insensitive names, duplicate
+  names, parameter refusal, STRICT and composite-PK WITHOUT ROWID schemas,
+  managed-update rollback, reopen, rejection repair, both isolation levels,
+  both admission orders, and converged schema/row state.
+- Deliberate boundaries: PRIMARY KEY, NOT NULL, DEFAULT, and unnamed constraints
+  cannot be dropped; `ADD CONSTRAINT` and type changes remain unsupported.
+  CHECK constraints currently use their canonical name as retirement identity,
+  so all retired constraint names remain permanently reserved within the
+  table's retained IR. A future CheckId can relax that boundary. Retired definitions, active-state
+  tombstones, and UNIQUE-owner cells need the general frontier-aware schema GC
+  protocol. FK addition still rewrites the parent/child write revisions, so
+  independent relationship additions are conservatively serialized; relaxing
+  that requires a monotonic per-contract registry on both sides, not an ad hoc
+  exception in this operation.

@@ -5163,6 +5163,210 @@ fn managed_update_adds_multiple_columns_in_statement_order() {
 }
 
 #[test]
+fn drop_constraint_projects_named_unique_check_and_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("drop-constraint.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                tenant TEXT NOT NULL,
+                id INTEGER NOT NULL,
+                PRIMARY KEY (tenant, id)
+            ) WITHOUT ROWID, STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                row_id INTEGER PRIMARY KEY,
+                tenant TEXT,
+                parent_id INTEGER,
+                email TEXT,
+                score INTEGER,
+                CONSTRAINT uq_email UNIQUE (tenant, email),
+                CONSTRAINT ck_score CHECK (score >= 0),
+                CONSTRAINT fk_parent FOREIGN KEY (tenant, parent_id)
+                    REFERENCES parents (tenant, id)
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES ('acme', 1)", ())?;
+        transaction.execute(
+            "INSERT INTO children VALUES (1, 'acme', 1, 'one@example', 1)",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(
+        db.execute(
+            "INSERT INTO children VALUES (2, 'acme', 1, 'one@example', 2)",
+            (),
+        )
+        .is_err()
+    );
+    db.execute("ALTER TABLE children DROP CONSTRAINT uq_email", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO children VALUES (2, 'acme', 1, 'one@example', 2)",
+        (),
+    )
+    .unwrap();
+
+    assert!(
+        db.execute(
+            "INSERT INTO children VALUES (3, 'acme', 1, 'three@example', -1)",
+            (),
+        )
+        .is_err()
+    );
+    db.execute("ALTER TABLE children DROP CONSTRAINT ck_score", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO children VALUES (3, 'acme', 1, 'three@example', -1)",
+        (),
+    )
+    .unwrap();
+
+    assert!(
+        db.execute(
+            "INSERT INTO children VALUES (4, 'missing', 9, 'four@example', 4)",
+            (),
+        )
+        .is_err()
+    );
+    db.execute("ALTER TABLE children DROP CONSTRAINT fk_parent", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO children VALUES (4, 'missing', 9, 'four@example', 4)",
+        (),
+    )
+    .unwrap();
+    db.execute("DELETE FROM parents WHERE tenant = 'acme' AND id = 1", ())
+        .unwrap();
+    drop(db);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .query("SELECT count(*) FROM children", (), |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        [4]
+    );
+    reopened
+        .execute(
+            "INSERT INTO children VALUES (5, 'missing', 9, 'one@example', -2)",
+            (),
+        )
+        .unwrap();
+}
+
+#[test]
+fn drop_constraint_is_atomic_inside_managed_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let db =
+        MultiliteConnection::open(directory.path().join("drop-constraint-atomic.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            body TEXT,
+            CONSTRAINT uq_body UNIQUE (body)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'one')", ())
+        .unwrap();
+
+    let result: multilite::Result<()> = db.update(|transaction| {
+        transaction.execute("ALTER TABLE notes DROP CONSTRAINT uq_body", ())?;
+        transaction.execute("INSERT INTO notes VALUES (2, 'one')", ())?;
+        Err(Error::UnsupportedSql("injected rollback"))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        db.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert!(
+        db.execute("INSERT INTO notes VALUES (3, 'one')", ())
+            .is_err()
+    );
+}
+
+#[test]
+fn drop_constraint_handles_names_parameters_and_foreign_key_dependencies() {
+    let directory = tempfile::tempdir().unwrap();
+    let db =
+        MultiliteConnection::open(directory.path().join("drop-constraint-edges.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                code TEXT,
+                CONSTRAINT \"Odd Unique\" UNIQUE (code)
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                code TEXT,
+                CONSTRAINT fk_code FOREIGN KEY (code) REFERENCES parents (code)
+            )",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(matches!(
+        db.execute("ALTER TABLE parents DROP CONSTRAINT \"odd unique\"", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    db.execute("ALTER TABLE children DROP CONSTRAINT fk_code", ())
+        .unwrap();
+    assert!(
+        db.execute(
+            "ALTER TABLE parents DROP CONSTRAINT \"Odd Unique\"",
+            [1_i64],
+        )
+        .is_err(),
+        "custom DDL must reject unused bound parameters"
+    );
+    db.execute("ALTER TABLE parents DROP CONSTRAINT \"Odd Unique\"", ())
+        .unwrap();
+    let reused_name = db.execute(
+        "ALTER TABLE parents ADD COLUMN extra TEXT
+         CONSTRAINT \"odd unique\" CHECK (extra IS NULL)",
+        (),
+    );
+    assert!(
+        matches!(reused_name, Err(Error::UnsupportedSql(_))),
+        "retired constraint name was unexpectedly reusable: {reused_name:?}"
+    );
+
+    assert!(matches!(
+        db.execute("ALTER TABLE parents DROP CONSTRAINT missing", ()),
+        Err(Error::UnsupportedSql(_))
+    ));
+    assert!(matches!(
+        db.execute(
+            "CREATE TABLE duplicate_names (
+                id INTEGER CONSTRAINT same PRIMARY KEY,
+                value TEXT,
+                CONSTRAINT SAME CHECK (value <> '')
+            )",
+            (),
+        ),
+        Err(Error::InvalidMultiliteOp(_))
+    ));
+}
+
+#[test]
 fn public_sql_cannot_access_or_create_reserved_tables() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("reserved.sqlite")).unwrap();

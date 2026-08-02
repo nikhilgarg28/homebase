@@ -1185,7 +1185,9 @@ impl RowSet {
         let expected_indexes = index_rules(created);
         let known_indexes = known_index_rules(created);
         let expected_foreign_keys = foreign_key_rules(catalog, created)?;
+        let known_foreign_keys = known_foreign_key_rules(catalog, created)?;
         let expected_incoming_foreign_keys = incoming_foreign_key_rules(catalog, created)?;
+        let known_incoming_foreign_keys = known_incoming_foreign_key_rules(catalog, created)?;
         if self.rules.table != created.table_id()
             || self.rules.primary_index != created.primary_index_id()
             || self.rules.storage != created.storage()
@@ -1198,8 +1200,22 @@ impl RowSet {
                 .indexes
                 .iter()
                 .any(|actual| !known_indexes.contains(actual))
-            || self.rules.foreign_keys != expected_foreign_keys
-            || self.rules.incoming_foreign_keys != expected_incoming_foreign_keys
+            || expected_foreign_keys
+                .iter()
+                .any(|expected| !self.rules.foreign_keys.contains(expected))
+            || self
+                .rules
+                .foreign_keys
+                .iter()
+                .any(|actual| !known_foreign_keys.contains(actual))
+            || expected_incoming_foreign_keys
+                .iter()
+                .any(|expected| !self.rules.incoming_foreign_keys.contains(expected))
+            || self
+                .rules
+                .incoming_foreign_keys
+                .iter()
+                .any(|actual| !known_incoming_foreign_keys.contains(actual))
         {
             return Err(Error::InvalidMultiliteOp(
                 "row operation contradicts the local schema catalog".into(),
@@ -2707,6 +2723,7 @@ fn index_rules(created: &CreateTable) -> Vec<IndexRules> {
     created
         .unique_constraints()
         .iter()
+        .filter(|unique| unique.is_active())
         .map(|unique| IndexRules {
             index: unique.index_id(),
             parts: index_parts(created, unique.columns()),
@@ -2752,7 +2769,19 @@ fn foreign_key_rules(
     created
         .foreign_keys()
         .iter()
-        .map(|foreign_key| foreign_key_rule(catalog, created, foreign_key))
+        .filter(|foreign_key| foreign_key.is_active())
+        .map(|foreign_key| foreign_key_rule(catalog, created, foreign_key, false))
+        .collect()
+}
+
+fn known_foreign_key_rules(
+    catalog: &CatalogSnapshot,
+    created: &CreateTable,
+) -> Result<Vec<ForeignKeyRules>> {
+    created
+        .foreign_keys()
+        .iter()
+        .map(|foreign_key| foreign_key_rule(catalog, created, foreign_key, true))
         .collect()
 }
 
@@ -2760,17 +2789,21 @@ fn foreign_key_rule(
     catalog: &CatalogSnapshot,
     child: &CreateTable,
     foreign_key: &ForeignKeyDefinition,
+    include_retired: bool,
 ) -> Result<ForeignKeyRules> {
     let parent = catalog
         .by_id(foreign_key.referenced_table())
         .ok_or(Error::InvalidDatabase(
             "foreign key references an unknown parent table",
         ))?;
-    let parent_columns = parent
-        .foreign_key_target_columns(foreign_key.referenced_index())
-        .ok_or(Error::InvalidDatabase(
-            "foreign key target is no longer active in the parent schema",
-        ))?;
+    let parent_columns = (if include_retired {
+        parent.known_foreign_key_target_columns(foreign_key.referenced_index())
+    } else {
+        parent.foreign_key_target_columns(foreign_key.referenced_index())
+    })
+    .ok_or(Error::InvalidDatabase(
+        "foreign key target is no longer active in the parent schema",
+    ))?;
     if parent_columns
         .iter()
         .copied()
@@ -2822,12 +2855,44 @@ fn incoming_foreign_key_rules(
     for (child, foreign_key) in catalog.incoming_foreign_keys(parent.table_id()) {
         // Reuse full relationship validation so corrupt catalog links do not
         // silently weaken parent-side deletion guards.
-        let _ = foreign_key_rule(catalog, child, foreign_key)?;
+        let _ = foreign_key_rule(catalog, child, foreign_key, false)?;
         let target = foreign_key.referenced_index();
         let parent_key_parts = parent
             .foreign_key_target_columns(target)
             .ok_or(Error::InvalidDatabase(
                 "foreign key target is no longer active in the parent schema",
+            ))?
+            .into_iter()
+            .map(|column| KeyPartRules {
+                column: column.id(),
+                affinity: column.affinity(parent.mode()),
+                rowid_alias: target == parent.primary_index_id()
+                    && parent.is_rowid_alias(column.id()),
+            })
+            .collect();
+        incoming.push(IncomingForeignKeyRules {
+            id: foreign_key.id(),
+            child_table: child.table_id(),
+            child_primary_index: child.primary_index_id(),
+            parent_index: target,
+            parent_key_parts,
+        });
+    }
+    Ok(incoming)
+}
+
+fn known_incoming_foreign_key_rules(
+    catalog: &CatalogSnapshot,
+    parent: &CreateTable,
+) -> Result<Vec<IncomingForeignKeyRules>> {
+    let mut incoming = Vec::new();
+    for (child, foreign_key) in catalog.known_incoming_foreign_keys(parent.table_id()) {
+        let _ = foreign_key_rule(catalog, child, foreign_key, true)?;
+        let target = foreign_key.referenced_index();
+        let parent_key_parts = parent
+            .known_foreign_key_target_columns(target)
+            .ok_or(Error::InvalidDatabase(
+                "foreign key target is absent from the parent schema history",
             ))?
             .into_iter()
             .map(|column| KeyPartRules {

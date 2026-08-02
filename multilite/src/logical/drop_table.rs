@@ -11,8 +11,8 @@ use uuid::{Uuid, Variant, Version};
 
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::schema::{
-    CreateTable, MutationId, SqlName, TableId, schema_log_key, schema_object_name_scope_key,
-    table_prefix,
+    CreateTable, MutationId, SqlName, TableId, constraint_reference_key, schema_log_key,
+    schema_object_name_scope_key, table_prefix,
 };
 use super::view;
 use crate::catalog::{self, TableState};
@@ -119,7 +119,20 @@ impl DropTableOperation {
         mutations.push(Mutation::DeleteRange {
             range: Range::Prefix(table),
         });
-        for foreign_key in self.before.foreign_keys() {
+        for foreign_key in self
+            .before
+            .foreign_keys()
+            .iter()
+            .filter(|foreign_key| foreign_key.is_active())
+        {
+            let reference = constraint_reference_key(
+                foreign_key.referenced_table(),
+                foreign_key.referenced_index().as_bytes(),
+                foreign_key.id(),
+            );
+            guards.invariant(reference.clone(), GuardReason::ConstraintReference)?;
+            guards.write(reference.clone(), GuardReason::ConstraintReference)?;
+            mutations.push(Mutation::Delete { key: reference });
             let prefix = LogicalTarget::ForeignReferencePrefix {
                 parent: foreign_key.referenced_table(),
                 relationship: foreign_key.id(),
@@ -455,6 +468,62 @@ mod tests {
             !encoded
                 .windows(b"north".len())
                 .any(|bytes| bytes == b"north")
+        );
+    }
+
+    #[test]
+    fn dropping_a_child_table_retires_its_exact_constraint_reference_marker() {
+        let connection = Connection::open_in_memory().unwrap();
+        repair::register(&connection).unwrap();
+        repair::initialize(&connection).unwrap();
+        catalog::initialize(&connection).unwrap();
+
+        let parent_sql = "CREATE TABLE parents (id INTEGER PRIMARY KEY)";
+        connection.execute(parent_sql, ()).unwrap();
+        let crate::sql::ValidatedExecute::CreateTable(parent_spec) =
+            crate::sql::validate_execute(parent_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let parent = CreateTable::prepare(&connection, parent_sql, parent_spec).unwrap();
+        catalog::insert(&connection, &parent).unwrap();
+
+        let child_sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER,
+            CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+        )";
+        connection.execute(child_sql, ()).unwrap();
+        let crate::sql::ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
+        catalog::insert(&connection, &child).unwrap();
+
+        let drop_sql = "DROP TABLE children";
+        let crate::sql::ValidatedExecute::DropTable(drop_spec) =
+            crate::sql::validate_execute(drop_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let operation = DropTableOperation::prepare(&connection, drop_sql, &drop_spec).unwrap();
+        let lowered = operation.to_homebase().unwrap();
+        let foreign_key = &child.foreign_keys()[0];
+        let reference = constraint_reference_key(
+            parent.table_id(),
+            foreign_key.referenced_index().as_bytes(),
+            foreign_key.id(),
+        );
+
+        assert_explicit_range_assertions(&lowered.footprint, std::slice::from_ref(&reference));
+        assert!(lowered.footprint.writes().contains(&reference));
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::Delete { key } if key == &reference))
         );
     }
 

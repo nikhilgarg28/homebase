@@ -35,6 +35,7 @@ pub enum ValidatedExecute {
     RenameColumn(RenameColumnSpec),
     AddColumn(AddColumnSpec),
     DropColumn(DropColumnSpec),
+    DropConstraint(DropConstraintSpec),
     CreateTable(CreateTableSpec),
     CreateTableIfNotExists(CreateTableSpec),
     DropTable(DropTableSpec),
@@ -69,6 +70,7 @@ impl ValidatedExecute {
             | Self::RenameColumn(_)
             | Self::AddColumn(_)
             | Self::DropColumn(_)
+            | Self::DropConstraint(_)
             | Self::CreateTable(_)
             | Self::CreateTableIfNotExists(_)
             | Self::DropTable(_)
@@ -108,6 +110,12 @@ pub struct AddColumnSpec {
 pub struct DropColumnSpec {
     pub table: SqlName,
     pub column: SqlName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropConstraintSpec {
+    pub table: SqlName,
+    pub constraint: SqlName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,6 +371,24 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             Ok(ValidatedExecute::DropColumn(DropColumnSpec {
                 table,
                 column,
+            }))
+        }
+        Stmt::AlterTable(table, AlterTableBody::DropConstraint(constraint)) => {
+            if table.db_name.is_some() || table.alias.is_some() {
+                return Err(Error::UnsupportedSql(
+                    "qualified ALTER TABLE names are not supported",
+                ));
+            }
+            let table = identifier(&table.name)?;
+            let constraint = identifier(&constraint)?;
+            if has_multilite_prefix(table.value()) || is_sqlite_internal_table(table.value()) {
+                return Err(Error::UnsupportedSql(
+                    "reserved SQLite and Multilite table names are not supported",
+                ));
+            }
+            Ok(ValidatedExecute::DropConstraint(DropConstraintSpec {
+                table,
+                constraint,
             }))
         }
         Stmt::AlterTable(..) => Err(Error::UnsupportedSql(

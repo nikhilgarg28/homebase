@@ -137,6 +137,98 @@ fn concurrent_user_versions_reject_repair_and_converge_at_both_isolation_levels(
 }
 
 #[test]
+fn concurrent_constraint_drops_reject_repair_and_converge() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let second_path = directory
+            .path()
+            .join(format!("constraint-second-{isolation:?}.sqlite"));
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("constraint-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let invitation = first.replica_invitation();
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(invitation.clone())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT,
+                    CONSTRAINT uq_body UNIQUE (body)
+                )",
+                (),
+            )
+            .unwrap();
+        first
+            .execute("INSERT INTO notes VALUES (1, 'one')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("ALTER TABLE notes DROP CONSTRAINT uq_body", ())
+            .unwrap();
+        second
+            .update(|transaction| {
+                transaction.execute("ALTER TABLE notes DROP CONSTRAINT uq_body", ())?;
+                transaction.execute("INSERT INTO notes VALUES (2, 'one')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("concurrent DROP CONSTRAINT operations were both admitted")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(invitation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            [1],
+            "newer row inverses must run before the rejected constraint is restored"
+        );
+        assert!(
+            second
+                .execute("INSERT INTO notes VALUES (2, 'one')", ())
+                .is_err(),
+            "rejection repair must restore the UNIQUE constraint"
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        second
+            .execute("INSERT INTO notes VALUES (2, 'one')", ())
+            .unwrap();
+    }
+}
+
+#[test]
 fn pragma_reads_join_only_serializable_conflict_footprints() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

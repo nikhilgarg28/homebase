@@ -118,6 +118,23 @@ child rows project `NULL` through SQLite's native ADD COLUMN semantics. Self
 references, composite targets from a single added column, `MATCH`, and deferred
 constraints remain fenced.
 
+`ALTER TABLE table DROP CONSTRAINT name` is a Multilite extension for active,
+named table-level `UNIQUE`, `FOREIGN KEY`, and `CHECK` constraints. SQLite has
+no native spelling for this operation, so Multilite resolves the name to the
+constraint's stable schema identity, retires it in the immutable before/after
+schema IR, and rebuilds the physical table internally. The replicated frame is
+metadata-only and rejection repair restores the constraint from that same IR;
+no row values enter a sidecar or the wire format. Constraint-name cells,
+active UNIQUE identities, and exact FK-to-parent relationship markers make
+same-constraint changes and FK-target retirement conflict symmetrically. The
+table write revision does not advance, so historical row operations carrying
+the stricter retired UNIQUE/FK bookkeeping remain valid and can commute with
+the drop. A UNIQUE constraint or unique index still cannot be retired while an
+active FK targets it; drop the referencing FK first. PRIMARY KEY, NOT NULL,
+DEFAULT, unnamed constraints, `ADD CONSTRAINT`, and type changes remain
+outside this slice. Retired constraint names remain reserved within the table's
+retained schema history.
+
 `PRAGMA [main.]user_version` is supported for reads and signed 32-bit literal
 assignments. A changing assignment is one replicated metadata operation with
 write conflict detection under both isolation levels and local rejection

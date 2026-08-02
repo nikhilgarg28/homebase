@@ -25,11 +25,15 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateTable` | `Set` | `ActiveSchemaRevision` |
 | `CreateTable` | `Set` | `IndexDefinition` |
 | `CreateTable` | `Set` | `ColumnName` |
+| `CreateTable` | `Set` | `ConstraintName` |
+| `CreateTable` | `Set` | `ActiveConstraint` |
+| `CreateTable` | `Set` | `ConstraintReference` |
 | `CreateTable` | `Set` | `WriteRevision` |
 | `DropTable` | `Set` | `SchemaLog` |
 | `DropTable` | `Delete` | `SchemaObjectName` |
 | `DropTable` | `DeletePrefix` | `TableRoot` |
 | `DropTable` | `DeletePrefix` | `ForeignReference` |
+| `DropTable` | `Delete` | `ConstraintReference` |
 | `RowChanges` | `Set` | `Row` |
 | `RowChanges` | `Set` | `UniqueOwner` |
 | `RowChanges` | `Set` | `ForeignReference` |
@@ -43,6 +47,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateIndex` | `Set` | `ActiveSchemaRevision` |
 | `CreateIndex` | `Set` | `ColumnDependency` |
 | `CreateIndex` | `Set` | `IndexDefinition` |
+| `CreateIndex` | `Set` | `ActiveConstraint` |
 | `CreateIndex` | `Set` | `UniqueOwner` |
 | `CreateIndex` | `Set` | `WriteRevision` |
 | `DropIndex` | `Set` | `SchemaLog` |
@@ -50,6 +55,8 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `DropIndex` | `Set` | `ActiveSchemaRevision` |
 | `DropIndex` | `Delete` | `SchemaObjectName` |
 | `DropIndex` | `Delete` | `ColumnDependency` |
+| `DropIndex` | `Delete` | `ActiveConstraint` |
+| `DropIndex` | `DeletePrefix` | `ConstraintReference` |
 | `RenameTable` | `Set` | `SchemaLog` |
 | `RenameTable` | `Set` | `SchemaObjectName` |
 | `RenameTable` | `Delete` | `SchemaObjectName` |
@@ -58,14 +65,23 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameColumn` | `Delete` | `ColumnName` |
 | `AddColumn` | `Set` | `SchemaLog` |
 | `AddColumn` | `Set` | `ColumnName` |
+| `AddColumn` | `Set` | `ConstraintName` |
+| `AddColumn` | `Set` | `ConstraintReference` |
 | `AddColumn` | `Set` | `TableSchema` |
 | `AddColumn` | `Set` | `ColumnDependency` |
 | `AddColumn` | `Set` | `WriteRevision` |
 | `DropColumn` | `Set` | `SchemaLog` |
 | `DropColumn` | `Set` | `TableSchema` |
 | `DropColumn` | `Delete` | `ColumnName` |
+| `DropColumn` | `Delete` | `ConstraintName` |
 | `DropColumn` | `Delete` | `ColumnDependency` |
 | `DropColumn` | `DeletePrefix` | `ColumnDependency` |
+| `DropConstraint` | `Set` | `SchemaLog` |
+| `DropConstraint` | `Set` | `TableSchema` |
+| `DropConstraint` | `Delete` | `ConstraintName` |
+| `DropConstraint` | `Delete` | `ActiveConstraint` |
+| `DropConstraint` | `Delete` | `ConstraintReference` |
+| `DropConstraint` | `DeletePrefix` | `ConstraintReference` |
 
 ## Guards
 
@@ -73,12 +89,17 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | --- | --- | --- | --- |
 | `CreateTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `CreateTable` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `CreateTable` | `Invariant` | `ConstraintState` | `ActiveConstraint` |
+| `CreateTable` | `Invariant` | `ConstraintReference` | `ConstraintReference` |
+| `CreateTable` | `Write` | `ConstraintReference` | `ConstraintReference` |
 | `CreateTable` | `Write` | `WriteContract` | `WriteRevision` |
 | `DropTable` | `Invariant` | `TableExistence` | `TableRoot` |
 | `DropTable` | `Write` | `TableExistence` | `TableRoot` |
 | `DropTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `DropTable` | `Invariant` | `ForeignReference` | `ForeignReference` |
 | `DropTable` | `Write` | `ForeignReference` | `ForeignReference` |
+| `DropTable` | `Invariant` | `ConstraintReference` | `ConstraintReference` |
+| `DropTable` | `Write` | `ConstraintReference` | `ConstraintReference` |
 | `RowChanges` | `Invariant` | `RowIdentity` | `Row` |
 | `RowChanges` | `Write` | `RowIdentity` | `Row` |
 | `RowChanges` | `Invariant` | `UniqueOwnership` | `UniqueOwner` |
@@ -97,25 +118,43 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateIndex` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `CreateIndex` | `Write` | `WriteContract` | `WriteRevision` |
 | `CreateIndex` | `Invariant` | `ExistingRows` | `Row` |
+| `CreateIndex` | `Invariant` | `ConstraintState` | `ActiveConstraint` |
+| `CreateIndex` | `Write` | `ConstraintState` | `ActiveConstraint` |
 | `DropIndex` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `DropIndex` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `DropIndex` | `Write` | `SchemaRevision` | `ActiveSchemaRevision` |
 | `DropIndex` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `DropIndex` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `DropIndex` | `Invariant` | `WriteContract` | `WriteRevision` |
+| `DropIndex` | `Invariant` | `ConstraintState` | `ActiveConstraint` |
+| `DropIndex` | `Write` | `ConstraintState` | `ActiveConstraint` |
+| `DropIndex` | `Invariant` | `ConstraintReference` | `ConstraintReference` |
+| `DropIndex` | `Write` | `ConstraintReference` | `ConstraintReference` |
 | `RenameTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `AddColumn` | `Invariant` | `ConstraintNameBinding` | `ConstraintName` |
 | `AddColumn` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `AddColumn` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
+| `AddColumn` | `Invariant` | `ConstraintState` | `ActiveConstraint` |
+| `AddColumn` | `Invariant` | `ConstraintReference` | `ConstraintReference` |
+| `AddColumn` | `Write` | `ConstraintReference` | `ConstraintReference` |
 | `AddColumn` | `Invariant` | `ExistingRows` | `TableRows` |
 | `AddColumn` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `AddColumn` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `AddColumn` | `Write` | `WriteContract` | `WriteRevision` |
 | `AddColumn` | `Invariant` | `ExistingRows` | `Row` |
 | `DropColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `DropColumn` | `Invariant` | `ConstraintNameBinding` | `ConstraintName` |
+| `DropColumn` | `Write` | `ConstraintNameBinding` | `ConstraintName` |
 | `DropColumn` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `DropColumn` | `Write` | `ColumnDependency` | `ColumnDependency` |
+| `DropConstraint` | `Invariant` | `ConstraintNameBinding` | `ConstraintName` |
+| `DropConstraint` | `Write` | `ConstraintNameBinding` | `ConstraintName` |
+| `DropConstraint` | `Invariant` | `ConstraintState` | `ActiveConstraint` |
+| `DropConstraint` | `Write` | `ConstraintState` | `ActiveConstraint` |
+| `DropConstraint` | `Invariant` | `ConstraintReference` | `ConstraintReference` |
+| `DropConstraint` | `Write` | `ConstraintReference` | `ConstraintReference` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `TableRoot` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `SchemaObjectName` |
 | `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |
@@ -145,6 +184,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameColumn` | `RevertAlterTable` |
 | `AddColumn` | `RevertAlterTable` |
 | `DropColumn` | `RevertAlterTable` |
+| `DropConstraint` | `RevertAlterTable` |
 | `SetUserVersion` | `RestoreUserVersion` |
 | `CreateView` | `RevertView` |
 | `DropView` | `RevertView` |
@@ -173,6 +213,7 @@ These family-level guards must occur at least once. In addition, the compiler re
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `DropColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `DropColumn` | `Invariant` | `ViewDependency` | `ViewDependency` |
+| `DropConstraint` | `Invariant` | `ConstraintNameBinding` | `ConstraintName` |
 | `SetUserVersion` | `Write` | `UserVersion` | `UserVersion` |
 | `CreateView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `DropView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |

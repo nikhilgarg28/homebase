@@ -1894,7 +1894,7 @@ fn create_table_and_homebase_submission_commit_atomically_and_survive_reopen() {
     else {
         panic!("captured schema operation was not a commit")
     };
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     assert_eq!(range_asserts.len(), 2);
     assert_eq!(*submit_mode, SubmitMode::Unchecked);
     assert!(
@@ -2409,7 +2409,7 @@ fn pull_fetches_admissions_without_applying_them_and_survives_reopen() {
         }
     );
     assert_eq!(space.admits.len(), 1);
-    assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 9);
+    assert_eq!(space.admits[&AdmissionSeq(1)].entries.len(), 10);
     assert!(!table_exists(&replica, "notes"));
 
     assert_eq!(replica.pull().unwrap(), outcome);

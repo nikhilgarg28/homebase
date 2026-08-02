@@ -14,6 +14,7 @@ use super::{
 pub enum SchemaInvariantError {
     EmptyTable,
     DuplicateColumnName,
+    DuplicateConstraintName,
     InvalidNullability,
     InvalidColumnType,
     InvalidPrimaryKey,
@@ -38,6 +39,9 @@ impl fmt::Display for SchemaInvariantError {
         formatter.write_str(match self {
             Self::EmptyTable => "table schema has no columns",
             Self::DuplicateColumnName => "table schema reuses a column name",
+            Self::DuplicateConstraintName => {
+                "table schema reuses a current or retired constraint name"
+            }
             Self::InvalidNullability => "column nullability contradicts its named constraint",
             Self::InvalidColumnType => "column has an invalid type declaration",
             Self::InvalidPrimaryKey => "table schema has an invalid primary key",
@@ -87,6 +91,46 @@ pub(super) fn validate_table_schema(
         {
             return Err(SchemaInvariantError::InvalidColumnType);
         }
+    }
+
+    let mut constraint_names = BTreeSet::new();
+    let names = schema
+        .primary_key
+        .name
+        .iter()
+        .chain(
+            columns
+                .iter()
+                .filter_map(|column| column.not_null_name.as_ref()),
+        )
+        .chain(
+            columns
+                .iter()
+                .filter_map(|column| column.default.as_ref()?.name.as_ref()),
+        )
+        .chain(
+            schema
+                .unique_constraints
+                .iter()
+                .filter_map(|constraint| constraint.name.as_ref()),
+        )
+        .chain(
+            schema
+                .foreign_keys
+                .iter()
+                .filter_map(|constraint| constraint.name.as_ref()),
+        )
+        .chain(
+            schema
+                .checks
+                .iter()
+                .filter_map(|constraint| constraint.name.as_ref()),
+        );
+    if names
+        .into_iter()
+        .any(|name| !constraint_names.insert(name.canonical()))
+    {
+        return Err(SchemaInvariantError::DuplicateConstraintName);
     }
 
     let primary = &schema.primary_key.index;

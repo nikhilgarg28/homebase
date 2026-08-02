@@ -77,12 +77,13 @@ enum SqlShape {
     RenameColumn,
     AddColumn,
     DropColumn,
+    DropConstraint,
     SetUserVersion,
     CreateView,
     DropView,
 }
 
-const SQL_SHAPES: [SqlShape; 16] = [
+const SQL_SHAPES: [SqlShape; 17] = [
     SqlShape::CreateTable,
     SqlShape::DropTable,
     SqlShape::Insert,
@@ -96,6 +97,7 @@ const SQL_SHAPES: [SqlShape; 16] = [
     SqlShape::RenameColumn,
     SqlShape::AddColumn,
     SqlShape::DropColumn,
+    SqlShape::DropConstraint,
     SqlShape::SetUserVersion,
     SqlShape::CreateView,
     SqlShape::DropView,
@@ -771,6 +773,88 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::COMMUTE,
     },
     PairCase {
+        name: "drop_constraint_and_stale_insert",
+        relationship: "retiring a UNIQUE rule while accepting stricter historical bookkeeping",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT uq_constrained_value"
+        ),
+        right: operation!(
+            Insert,
+            "INSERT INTO constrained VALUES (3, 'three', 'positive')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "drop_distinct_constraints",
+        relationship: "different stable named constraints on one table",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT uq_constrained_value"
+        ),
+        right: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT ck_constrained_other"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "drop_same_constraint",
+        relationship: "same named constraint binding and active identity",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT uq_constrained_value"
+        ),
+        right: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT uq_constrained_value"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "drop_unique_constraint_and_add_foreign_key",
+        relationship: "same stable parent constraint state",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE available_parents DROP CONSTRAINT uq_available_parent_code"
+        ),
+        right: operation!(
+            AddColumn,
+            "ALTER TABLE fk_base ADD COLUMN constraint_code TEXT
+             REFERENCES available_parents(code)"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "drop_foreign_key_and_stale_child_insert",
+        relationship: "retired relationship accepts stricter historical bookkeeping under snapshot isolation",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE constraint_children DROP CONSTRAINT fk_constraint_parent"
+        ),
+        right: operation!(Insert, "INSERT INTO constraint_children VALUES (2, 'one')"),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::directional(Disposition::SecondRejects, Disposition::BothAdmit),
+    },
+    PairCase {
+        name: "drop_constraint_and_rename_dependency",
+        relationship: "stable constraint identity across a column-name change",
+        left: operation!(
+            DropConstraint,
+            "ALTER TABLE constrained DROP CONSTRAINT uq_constrained_value"
+        ),
+        right: operation!(
+            RenameColumn,
+            "ALTER TABLE constrained RENAME COLUMN value TO contents"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
         name: "add_column_and_create_unrelated_index",
         relationship: "new column and index over an existing stable column",
         left: operation!(
@@ -1136,6 +1220,41 @@ where
                 (),
             )?;
             transaction.execute(
+                "CREATE TABLE constrained (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT,
+                    other TEXT,
+                    CONSTRAINT uq_constrained_value UNIQUE (value),
+                    CONSTRAINT ck_constrained_other CHECK (other <> '')
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE constraint_parents (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT,
+                    CONSTRAINT uq_constraint_parent_code UNIQUE (code)
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE constraint_children (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT,
+                    CONSTRAINT fk_constraint_parent FOREIGN KEY (code)
+                        REFERENCES constraint_parents (code)
+                )",
+                (),
+            )?;
+            transaction.execute(
+                "CREATE TABLE available_parents (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT,
+                    CONSTRAINT uq_available_parent_code UNIQUE (code)
+                )",
+                (),
+            )?;
+            transaction.execute(
                 "CREATE TABLE parents (
                     id INTEGER PRIMARY KEY,
                     code TEXT NOT NULL UNIQUE,
@@ -1186,6 +1305,14 @@ where
                     (2, 'two', 'body-two', 'd2')",
                 (),
             )?;
+            transaction.execute(
+                "INSERT INTO constrained VALUES
+                    (1, 'one', 'positive'),
+                    (2, 'two', 'positive')",
+                (),
+            )?;
+            transaction.execute("INSERT INTO constraint_parents VALUES (1, 'one')", ())?;
+            transaction.execute("INSERT INTO available_parents VALUES (1, 'one')", ())?;
             transaction.execute("INSERT INTO fk_base VALUES (1, 'base')", ())?;
             transaction.execute(
                 "INSERT INTO parents VALUES

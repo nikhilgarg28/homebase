@@ -59,12 +59,14 @@ const TAG_CHECK_COLUMN: u8 = 1;
 const TAG_CHECK_NAME: u8 = 2;
 const TAG_CHECK_EXPRESSION: u8 = 3;
 const TAG_CHECK_DEPENDENCY: u8 = 4;
+const TAG_CHECK_ACTIVE: u8 = 5;
 const TYPE_DECLARATION_FRAME_VERSION: u8 = 1;
 const TAG_TYPE_NAME: u8 = 1;
 const TAG_TYPE_ARGUMENT: u8 = 2;
 const TAG_UNIQUE_INDEX_DEFINITION: u8 = 1;
 const TAG_UNIQUE_NAME: u8 = 2;
 const TAG_UNIQUE_CONFLICT: u8 = 3;
+const TAG_UNIQUE_ACTIVE: u8 = 4;
 const TAG_NAMED_INDEX_DEFINITION: u8 = 1;
 const TAG_INDEX_NAME: u8 = 2;
 const TAG_INDEX_ACTIVE: u8 = 6;
@@ -88,6 +90,7 @@ const TAG_FOREIGN_KEY_PARENT_COLUMN_NAME: u8 = 8;
 const TAG_FOREIGN_KEY_PARENT_INDEX_ID: u8 = 9;
 const TAG_FOREIGN_KEY_ON_DELETE: u8 = 10;
 const TAG_FOREIGN_KEY_ON_UPDATE: u8 = 11;
+const TAG_FOREIGN_KEY_ACTIVE: u8 = 12;
 const FOREIGN_KEY_NO_ACTION: u8 = 0;
 const FOREIGN_KEY_CASCADE: u8 = 1;
 const FOREIGN_KEY_SET_NULL: u8 = 2;
@@ -830,6 +833,7 @@ pub struct UniqueConstraint {
     name: Option<SqlName>,
     conflict: ConflictPolicy,
     index: IndexDefinition,
+    active: bool,
 }
 
 /// Semantic kind of one table-owned logical index.
@@ -899,6 +903,7 @@ pub struct ForeignKeyDefinition {
     referenced_columns: Vec<ColumnId>,
     referenced_column_names: Vec<SqlName>,
     actions: ReferentialActions,
+    active: bool,
 }
 
 /// One SQLite CHECK declaration owned by a table schema.
@@ -908,6 +913,15 @@ pub struct CheckConstraint {
     name: Option<SqlName>,
     expression: SqlExpression,
     dependencies: Vec<ColumnId>,
+    active: bool,
+}
+
+/// One active named table constraint which can be retired independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DroppableConstraint {
+    Unique(UniqueConstraint),
+    ForeignKey(ForeignKeyDefinition),
+    Check(CheckConstraint),
 }
 
 /// Complete schema known for one table revision.
@@ -1085,6 +1099,14 @@ impl TableSchema {
 }
 
 impl UniqueConstraint {
+    pub fn name(&self) -> Option<&SqlName> {
+        self.name.as_ref()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub fn index_id(&self) -> IndexId {
         self.index.id()
     }
@@ -1107,9 +1129,12 @@ impl ForeignKeyDefinition {
         self.id
     }
 
-    #[cfg(test)]
     pub fn name(&self) -> Option<&SqlName> {
         self.name.as_ref()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 
     pub fn columns(&self) -> &[ColumnId] {
@@ -1139,6 +1164,49 @@ impl ForeignKeyDefinition {
 
     pub(crate) fn referenced_column_names(&self) -> &[SqlName] {
         &self.referenced_column_names
+    }
+}
+
+impl CheckConstraint {
+    pub fn name(&self) -> Option<&SqlName> {
+        self.name.as_ref()
+    }
+}
+
+impl DroppableConstraint {
+    pub fn name(&self) -> &SqlName {
+        match self {
+            Self::Unique(constraint) => constraint
+                .name
+                .as_ref()
+                .expect("droppable UNIQUE constraints are named"),
+            Self::ForeignKey(constraint) => constraint
+                .name
+                .as_ref()
+                .expect("droppable foreign keys are named"),
+            Self::Check(constraint) => constraint
+                .name
+                .as_ref()
+                .expect("droppable CHECK constraints are named"),
+        }
+    }
+
+    pub fn unique_index(&self) -> Option<IndexId> {
+        match self {
+            Self::Unique(constraint) => Some(constraint.index_id()),
+            Self::ForeignKey(_) | Self::Check(_) => None,
+        }
+    }
+
+    pub fn foreign_reference(&self) -> Option<(TableId, IndexId, ForeignKeyId)> {
+        match self {
+            Self::ForeignKey(constraint) => Some((
+                constraint.referenced_table(),
+                constraint.referenced_index(),
+                constraint.id(),
+            )),
+            Self::Unique(_) | Self::Check(_) => None,
+        }
     }
 }
 
@@ -1406,6 +1474,7 @@ impl CreateTable {
         guards.invariant(name_scope.clone(), GuardReason::SchemaObjectName)?;
         guards.write(write_revision.clone(), GuardReason::WriteContract)?;
         let mut parent_write_revisions = BTreeSet::new();
+        let mut parent_constraint_references = BTreeSet::new();
         for foreign_key in &self.schema.foreign_keys {
             // The schema head guards the referenced logical index definition,
             // whether it is the primary or a UNIQUE index.
@@ -1413,6 +1482,19 @@ impl CreateTable {
                 active_schema_revision_key(foreign_key.referenced_table),
                 GuardReason::SchemaRevision,
             )?;
+            let constraint_state = active_constraint_key(
+                foreign_key.referenced_table,
+                foreign_key.referenced_index.as_bytes(),
+            );
+            guards.invariant(constraint_state.clone(), GuardReason::ConstraintState)?;
+            let reference = constraint_reference_key(
+                foreign_key.referenced_table,
+                foreign_key.referenced_index.as_bytes(),
+                foreign_key.id(),
+            );
+            guards.invariant(reference.clone(), GuardReason::ConstraintReference)?;
+            guards.write(reference.clone(), GuardReason::ConstraintReference)?;
+            parent_constraint_references.insert(reference);
             let revision = write_revision_key(foreign_key.referenced_table);
             guards.write(revision.clone(), GuardReason::WriteContract)?;
             parent_write_revisions.insert(revision);
@@ -1442,6 +1524,10 @@ impl CreateTable {
                 key: primary_index,
                 value: self.schema.primary_key.index.encode(),
             },
+            Mutation::Set {
+                key: active_constraint_key(self.table_id, self.primary_index_id().as_bytes()),
+                value: self.primary_index_id().as_bytes().to_vec(),
+            },
         ];
         mutations.extend(
             self.schema
@@ -1456,6 +1542,52 @@ impl CreateTable {
             key: column_name_scope_key(self.table_id, column.name()),
             value: column.id().as_bytes().to_vec(),
         }));
+        if let Some(name) = self.schema.primary_key.name() {
+            mutations.push(Mutation::Set {
+                key: constraint_name_scope_key(self.table_id, name),
+                value: self.primary_index_id().as_bytes().to_vec(),
+            });
+        }
+        for column in &self.schema.columns {
+            for name in column
+                .not_null_name()
+                .into_iter()
+                .chain(column.default().and_then(|default| default.name.as_ref()))
+            {
+                mutations.push(Mutation::Set {
+                    key: constraint_name_scope_key(self.table_id, name),
+                    value: column.id().as_bytes().to_vec(),
+                });
+            }
+        }
+        for unique in &self.schema.unique_constraints {
+            if let Some(name) = unique.name() {
+                mutations.push(Mutation::Set {
+                    key: constraint_name_scope_key(self.table_id, name),
+                    value: unique.index_id().as_bytes().to_vec(),
+                });
+            }
+            mutations.push(Mutation::Set {
+                key: active_constraint_key(self.table_id, unique.index_id().as_bytes()),
+                value: unique.index_id().as_bytes().to_vec(),
+            });
+        }
+        for foreign_key in &self.schema.foreign_keys {
+            if let Some(name) = foreign_key.name() {
+                mutations.push(Mutation::Set {
+                    key: constraint_name_scope_key(self.table_id, name),
+                    value: foreign_key.id().as_bytes().to_vec(),
+                });
+            }
+        }
+        for check in &self.schema.checks {
+            if let Some(name) = check.name() {
+                mutations.push(Mutation::Set {
+                    key: constraint_name_scope_key(self.table_id, name),
+                    value: self.mutation_id.as_bytes().to_vec(),
+                });
+            }
+        }
         mutations.push(Mutation::Set {
             key: write_revision.clone(),
             value: self.mutation_id.0.to_vec(),
@@ -1464,6 +1596,14 @@ impl CreateTable {
             key,
             value: self.mutation_id.0.to_vec(),
         }));
+        mutations.extend(
+            parent_constraint_references
+                .into_iter()
+                .map(|key| Mutation::Set {
+                    key,
+                    value: self.table_id.as_bytes().to_vec(),
+                }),
+        );
         let footprint = guards.footprint();
         Ok(SchemaHomebaseOp {
             mutations,
@@ -1828,6 +1968,188 @@ impl CreateTable {
         folded.refresh_and_validate_evolution()
     }
 
+    /// Resolve one currently active, named table constraint.
+    pub fn droppable_constraint_named(&self, name: &SqlName) -> Result<DroppableConstraint> {
+        if self
+            .schema
+            .primary_key
+            .name
+            .as_ref()
+            .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        {
+            return Err(Error::UnsupportedSql(
+                "dropping PRIMARY KEY constraints is not supported",
+            ));
+        }
+        if self.schema.columns.iter().any(|column| {
+            column
+                .not_null_name
+                .as_ref()
+                .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        }) {
+            return Err(Error::UnsupportedSql(
+                "dropping NOT NULL constraints is not supported",
+            ));
+        }
+        if self.schema.columns.iter().any(|column| {
+            column
+                .default
+                .as_ref()
+                .and_then(|default| default.name.as_ref())
+                .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        }) {
+            return Err(Error::UnsupportedSql(
+                "dropping DEFAULT constraints is not supported",
+            ));
+        }
+        if let Some(constraint) = self.schema.unique_constraints.iter().find(|constraint| {
+            constraint.active
+                && constraint
+                    .name
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        }) {
+            return Ok(DroppableConstraint::Unique(constraint.clone()));
+        }
+        if let Some(constraint) = self.schema.foreign_keys.iter().find(|constraint| {
+            constraint.active
+                && constraint
+                    .name
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        }) {
+            return Ok(DroppableConstraint::ForeignKey(constraint.clone()));
+        }
+        if let Some(constraint) = self.schema.checks.iter().find(|constraint| {
+            constraint.active
+                && constraint
+                    .name
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.canonical() == name.canonical())
+        }) {
+            return Ok(DroppableConstraint::Check(constraint.clone()));
+        }
+        Err(Error::UnsupportedSql(
+            "DROP CONSTRAINT references an unknown or unnamed constraint",
+        ))
+    }
+
+    fn constraint_name_is_reserved(&self, name: &SqlName) -> bool {
+        self.schema
+            .primary_key
+            .name
+            .iter()
+            .chain(
+                self.schema
+                    .columns
+                    .iter()
+                    .filter_map(|column| column.not_null_name.as_ref()),
+            )
+            .chain(
+                self.schema
+                    .columns
+                    .iter()
+                    .filter_map(|column| column.default.as_ref()?.name.as_ref()),
+            )
+            .chain(
+                self.schema
+                    .unique_constraints
+                    .iter()
+                    .filter_map(|constraint| constraint.name.as_ref()),
+            )
+            .chain(
+                self.schema
+                    .foreign_keys
+                    .iter()
+                    .filter_map(|constraint| constraint.name.as_ref()),
+            )
+            .chain(
+                self.schema
+                    .checks
+                    .iter()
+                    .filter_map(|constraint| constraint.name.as_ref()),
+            )
+            .any(|existing| existing.canonical() == name.canonical())
+    }
+
+    pub fn with_retired_constraint(&self, constraint: &DroppableConstraint) -> Result<Self> {
+        let mut evolved = self.clone();
+        retire_constraint(&mut evolved.schema, constraint)?;
+        evolved.refresh_and_validate_evolution()
+    }
+
+    /// Fold an independently admitted retirement into the current catalog IR.
+    pub fn fold_retired_constraint(&self, constraint: &DroppableConstraint) -> Result<Self> {
+        let mut folded = self.clone();
+        retire_constraint(&mut folded.schema, constraint)?;
+        folded.refresh_and_validate_evolution()
+    }
+
+    /// Reverse one speculative constraint retirement.
+    pub fn fold_restored_constraint(&self, constraint: &DroppableConstraint) -> Result<Self> {
+        let mut folded = self.clone();
+        match constraint {
+            DroppableConstraint::Unique(expected) => {
+                let current = folded
+                    .schema
+                    .unique_constraints
+                    .iter_mut()
+                    .find(|current| current.index_id() == expected.index_id())
+                    .ok_or(Error::InvalidDatabase(
+                        "constraint restoration references an unknown UNIQUE identity",
+                    ))?;
+                let mut retired = expected.clone();
+                retired.active = false;
+                if current != &retired {
+                    return Err(Error::InvalidDatabase(
+                        "constraint restoration contradicts the current UNIQUE definition",
+                    ));
+                }
+                current.active = true;
+            }
+            DroppableConstraint::ForeignKey(expected) => {
+                let current = folded
+                    .schema
+                    .foreign_keys
+                    .iter_mut()
+                    .find(|current| current.id() == expected.id())
+                    .ok_or(Error::InvalidDatabase(
+                        "constraint restoration references an unknown foreign-key identity",
+                    ))?;
+                let mut retired = expected.clone();
+                retired.active = false;
+                if current != &retired {
+                    return Err(Error::InvalidDatabase(
+                        "constraint restoration contradicts the current foreign-key definition",
+                    ));
+                }
+                current.active = true;
+            }
+            DroppableConstraint::Check(_expected) => {
+                let current = folded
+                    .schema
+                    .checks
+                    .iter_mut()
+                    .find(|current| {
+                        current
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| name.canonical() == constraint.name().canonical())
+                    })
+                    .ok_or(Error::InvalidDatabase(
+                        "constraint restoration references an unknown CHECK definition",
+                    ))?;
+                if current.active {
+                    return Err(Error::InvalidDatabase(
+                        "constraint restoration contradicts the current CHECK definition",
+                    ));
+                }
+                current.active = true;
+            }
+        }
+        folded.refresh_and_validate_evolution()
+    }
+
     pub fn with_added_column(
         &self,
         connection: &Connection,
@@ -1843,6 +2165,15 @@ impl CreateTable {
         let id = ColumnId::from_bytes(Uuid::new_v4().into_bytes());
         let mut evolved = self.with_added_column_identity(id, spec, checks)?;
         if let Some(foreign_key) = foreign_key {
+            if foreign_key
+                .name
+                .as_ref()
+                .is_some_and(|name| evolved.constraint_name_is_reserved(name))
+            {
+                return Err(Error::UnsupportedSql(
+                    "constraint name is already used or retained by this table",
+                ));
+            }
             let resolved = resolve_added_foreign_key(connection, &evolved, id, foreign_key)?;
             evolved.schema.foreign_keys.push(resolved);
             evolved = evolved.refresh_and_validate_evolution()?;
@@ -1856,6 +2187,25 @@ impl CreateTable {
         spec: &CreateColumn,
         checks: &[CreateCheckConstraint],
     ) -> Result<Self> {
+        let mut introduced = BTreeSet::new();
+        for name in spec
+            .not_null_name
+            .iter()
+            .chain(
+                spec.default
+                    .as_ref()
+                    .and_then(|default| default.name.as_ref()),
+            )
+            .chain(checks.iter().filter_map(|check| check.name.as_ref()))
+        {
+            if self.constraint_name_is_reserved(name)
+                || !introduced.insert(name.canonical().to_vec())
+            {
+                return Err(Error::UnsupportedSql(
+                    "constraint name is already used or retained by this table",
+                ));
+            }
+        }
         let mut evolved = self.clone();
         evolved.schema.columns.push(Column {
             id,
@@ -1877,6 +2227,7 @@ impl CreateTable {
                         &check.expression,
                         &evolved.schema.columns,
                     )?,
+                    active: true,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1895,6 +2246,16 @@ impl CreateTable {
         let mut evolved = self.with_added_column_identity(id, spec, checks)?;
         match (parsed, encoded) {
             (None, None) => return Ok(evolved),
+            (Some(parsed), Some(_encoded))
+                if parsed
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| evolved.constraint_name_is_reserved(name)) =>
+            {
+                return Err(Error::UnsupportedSql(
+                    "constraint name is already used or retained by this table",
+                ));
+            }
             (Some(parsed), Some(encoded))
                 if encoded.columns == [id]
                     && parsed.columns.len() == 1
@@ -1982,6 +2343,72 @@ impl CreateTable {
             .foreign_keys
             .iter()
             .filter(move |foreign_key| foreign_key.columns.contains(&column))
+    }
+
+    /// Named constraints introduced together with one added column.
+    pub fn added_column_constraint_bindings(&self, column: ColumnId) -> Vec<(SqlName, [u8; 16])> {
+        let mut bindings = Vec::new();
+        if let Some(definition) = self
+            .schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.id() == column)
+        {
+            if let Some(name) = definition.not_null_name() {
+                bindings.push((name.clone(), column.as_bytes()));
+            }
+            if let Some(name) = definition
+                .default()
+                .and_then(|default| default.name.as_ref())
+            {
+                bindings.push((name.clone(), column.as_bytes()));
+            }
+        }
+        bindings.extend(
+            self.schema
+                .checks
+                .iter()
+                .filter(|check| check.column == Some(column))
+                .filter_map(|check| check.name().map(|name| (name.clone(), column.as_bytes()))),
+        );
+        bindings.extend(
+            self.schema
+                .foreign_keys
+                .iter()
+                .filter(|foreign_key| foreign_key.columns().contains(&column))
+                .filter_map(|foreign_key| {
+                    foreign_key
+                        .name()
+                        .map(|name| (name.clone(), foreign_key.id().as_bytes()))
+                }),
+        );
+        bindings
+    }
+
+    pub fn removed_column_constraint_names(&self, column: ColumnId) -> Vec<SqlName> {
+        let mut names = Vec::new();
+        if let Some(definition) = self
+            .schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.id() == column)
+        {
+            names.extend(definition.not_null_name().cloned());
+            names.extend(
+                definition
+                    .default()
+                    .and_then(|default| default.name.as_ref())
+                    .cloned(),
+            );
+        }
+        names.extend(
+            self.schema
+                .checks
+                .iter()
+                .filter(|check| check.column == Some(column))
+                .filter_map(|check| check.name().cloned()),
+        );
+        names
     }
 
     pub fn with_removed_column(&self, column: ColumnId) -> Result<Self> {
@@ -2242,6 +2669,12 @@ impl CreateTable {
             || (definition.kind() == IndexKind::Unique
                 && self
                     .schema
+                    .unique_constraints
+                    .iter()
+                    .any(|unique| unique.index.id() == definition.id() && !unique.active))
+            || (definition.kind() == IndexKind::Unique
+                && self
+                    .schema
                     .indexes
                     .iter()
                     .any(|index| index.index().id() == definition.id() && !index.is_active()))
@@ -2250,6 +2683,18 @@ impl CreateTable {
         }
         let columns = definition.columns();
         columns
+            .iter()
+            .map(|id| self.schema.columns.iter().find(|column| column.id == *id))
+            .collect()
+    }
+
+    pub fn known_foreign_key_target_columns(&self, index: IndexId) -> Option<Vec<&Column>> {
+        let definition = self.index_definition(index)?;
+        if definition.kind() == IndexKind::Secondary {
+            return None;
+        }
+        definition
+            .columns()
             .iter()
             .map(|id| self.schema.columns.iter().find(|column| column.id == *id))
             .collect()
@@ -2280,7 +2725,7 @@ impl CreateTable {
             .schema
             .unique_constraints
             .iter()
-            .find(|unique| matches(unique.columns()))
+            .find(|unique| unique.active && matches(unique.columns()))
             .map(UniqueConstraint::index_id)
             .or_else(|| {
                 self.schema
@@ -2309,7 +2754,7 @@ impl CreateTable {
 
     /// Ensure every stable parent identity still names the declared primary key.
     pub fn validate_foreign_key_parents(&self, connection: &Connection) -> Result<()> {
-        for foreign_key in self.foreign_keys() {
+        for foreign_key in self.foreign_keys().iter().filter(|key| key.active) {
             let parent = catalog::by_id(connection, foreign_key.referenced_table)?.ok_or(
                 Error::InvalidDatabase("foreign key references an unknown parent table"),
             )?;
@@ -2317,6 +2762,62 @@ impl CreateTable {
         }
         Ok(())
     }
+}
+
+fn retire_constraint(schema: &mut TableSchema, constraint: &DroppableConstraint) -> Result<()> {
+    match constraint {
+        DroppableConstraint::Unique(expected) => {
+            let current = schema
+                .unique_constraints
+                .iter_mut()
+                .find(|current| current.index_id() == expected.index_id())
+                .ok_or(Error::InvalidDatabase(
+                    "constraint retirement references an unknown UNIQUE identity",
+                ))?;
+            if current != expected || !current.active {
+                return Err(Error::InvalidDatabase(
+                    "constraint retirement contradicts the current UNIQUE definition",
+                ));
+            }
+            current.active = false;
+        }
+        DroppableConstraint::ForeignKey(expected) => {
+            let current = schema
+                .foreign_keys
+                .iter_mut()
+                .find(|current| current.id() == expected.id())
+                .ok_or(Error::InvalidDatabase(
+                    "constraint retirement references an unknown foreign-key identity",
+                ))?;
+            if current != expected || !current.active {
+                return Err(Error::InvalidDatabase(
+                    "constraint retirement contradicts the current foreign-key definition",
+                ));
+            }
+            current.active = false;
+        }
+        DroppableConstraint::Check(_expected) => {
+            let current = schema
+                .checks
+                .iter_mut()
+                .find(|current| {
+                    current
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.canonical() == constraint.name().canonical())
+                })
+                .ok_or(Error::InvalidDatabase(
+                    "constraint retirement references an unknown CHECK definition",
+                ))?;
+            if !current.active {
+                return Err(Error::InvalidDatabase(
+                    "constraint retirement contradicts the current CHECK definition",
+                ));
+            }
+            current.active = false;
+        }
+    }
+    Ok(())
 }
 
 fn render_structural_create_table(table: &CreateTable, connection: &Connection) -> Result<String> {
@@ -2378,7 +2879,11 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
     push_conflict_policy(&mut declaration, table.schema.primary_key.conflict());
     declarations.push(declaration.trim_start().to_owned());
 
-    for unique in table.unique_constraints() {
+    for unique in table
+        .unique_constraints()
+        .iter()
+        .filter(|unique| unique.active)
+    {
         let columns = unique
             .columns()
             .iter()
@@ -2394,7 +2899,11 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         declarations.push(declaration.trim_start().to_owned());
     }
 
-    for foreign_key in table.foreign_keys() {
+    for foreign_key in table
+        .foreign_keys()
+        .iter()
+        .filter(|foreign_key| foreign_key.active)
+    {
         let child = foreign_key
             .columns()
             .iter()
@@ -2440,7 +2949,7 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         declarations.push(declaration.trim_start().to_owned());
     }
 
-    for check in table.schema.checks() {
+    for check in table.schema.checks().iter().filter(|check| check.active) {
         let mut declaration = String::new();
         push_constraint_name(&mut declaration, check.name.as_ref());
         declaration.push_str(" CHECK (");
@@ -2566,6 +3075,7 @@ fn resolve_added_foreign_key(
         referenced_columns: parent_columns.iter().map(|column| column.id()).collect(),
         referenced_column_names,
         actions: spec.actions,
+        active: true,
     };
     validate_foreign_key_link(child, &definition, &parent)?;
     Ok(definition)
@@ -2722,7 +3232,7 @@ fn foreign_reference_key_fits(parent_key_parts: usize, child_key_parts: usize) -
 pub(crate) fn validate_foreign_key_graph(tables: &[CreateTable]) -> Result<()> {
     let mut relationships = BTreeSet::new();
     for child in tables {
-        for foreign_key in child.foreign_keys() {
+        for foreign_key in child.foreign_keys().iter().filter(|key| key.active) {
             let parent = tables
                 .iter()
                 .find(|table| table.table_id() == foreign_key.referenced_table())
@@ -2814,6 +3324,7 @@ fn build_create_table(
                     kind: IndexKind::Unique,
                     columns: resolved,
                 },
+                active: true,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2853,6 +3364,7 @@ fn build_create_table(
                     .map(|column| column.name().clone())
                     .collect(),
                 actions: resolved.spec.actions,
+                active: true,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2909,6 +3421,7 @@ fn lower_checks(
                 name: check.name,
                 dependencies,
                 expression: check.expression,
+                active: true,
             })
         })
         .collect()
@@ -2982,6 +3495,41 @@ pub fn column_name_scope_key(table: TableId, name: &SqlName) -> Key {
     }
     .render()
     .expect("column-name scope components are bounded and non-empty")
+}
+
+pub fn constraint_name_scope_key(table: TableId, name: &SqlName) -> Key {
+    LogicalTarget::ConstraintName {
+        table,
+        canonical: name.canonical().to_vec(),
+    }
+    .render()
+    .expect("constraint-name scope components are bounded and non-empty")
+}
+
+pub fn active_constraint_key(table: TableId, identity: [u8; 16]) -> Key {
+    LogicalTarget::ActiveConstraint { table, identity }
+        .render()
+        .expect("active constraint key is bounded")
+}
+
+pub fn constraint_reference_prefix(table: TableId, identity: [u8; 16]) -> Key {
+    LogicalTarget::ConstraintReferencePrefix { table, identity }
+        .render()
+        .expect("constraint reference prefix is bounded")
+}
+
+pub fn constraint_reference_key(
+    table: TableId,
+    identity: [u8; 16],
+    relationship: ForeignKeyId,
+) -> Key {
+    LogicalTarget::ConstraintReference {
+        table,
+        identity,
+        relationship,
+    }
+    .render()
+    .expect("constraint reference key is bounded")
 }
 
 pub fn column_dependency_prefix(table: TableId, column: ColumnId) -> Key {
@@ -3204,6 +3752,9 @@ fn encode_check_constraint(check: &CheckConstraint) -> Vec<u8> {
             .field(TAG_CHECK_DEPENDENCY, &dependency.as_bytes())
             .expect("CHECK dependency field length must fit in u32");
     }
+    writer
+        .field(TAG_CHECK_ACTIVE, &[u8::from(check.active)])
+        .expect("CHECK active field length must fit in u32");
     writer.finish()
 }
 
@@ -3219,6 +3770,9 @@ fn encode_unique_constraint(unique: &UniqueConstraint) -> Vec<u8> {
     }
     writer
         .field(TAG_UNIQUE_CONFLICT, &[unique.conflict.to_u8()])
+        .expect("schema field length must fit in u32");
+    writer
+        .field(TAG_UNIQUE_ACTIVE, &[u8::from(unique.active)])
         .expect("schema field length must fit in u32");
     writer.finish()
 }
@@ -3369,6 +3923,9 @@ fn encode_foreign_key_definition(foreign_key: &ForeignKeyDefinition) -> Vec<u8> 
             .field(TAG_FOREIGN_KEY_PARENT_COLUMN_NAME, name.value().as_bytes())
             .expect("foreign-key field length must fit in u32");
     }
+    writer
+        .field(TAG_FOREIGN_KEY_ACTIVE, &[u8::from(foreign_key.active)])
+        .expect("foreign-key active field length must fit in u32");
     writer.finish()
 }
 
@@ -3616,6 +4173,7 @@ fn decode_foreign_key_definition(
     let mut on_update = None;
     let mut referenced_columns = Vec::new();
     let mut referenced_column_names = Vec::new();
+    let mut active = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_FOREIGN_KEY_ID => set_once(&mut id, ForeignKeyId(uuid_bytes(value)?))?,
@@ -3652,6 +4210,7 @@ fn decode_foreign_key_definition(
                 referenced_columns.push(ColumnId(uuid_bytes(value)?))
             }
             TAG_FOREIGN_KEY_PARENT_COLUMN_NAME => referenced_column_names.push(decode_name(value)?),
+            TAG_FOREIGN_KEY_ACTIVE => set_once(&mut active, decode_boolean(value)?)?,
             _ => {}
         }
     }
@@ -3683,6 +4242,7 @@ fn decode_foreign_key_definition(
             on_update: on_update
                 .ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ON_UPDATE))?,
         },
+        active: active.ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ACTIVE))?,
     })
 }
 
@@ -3701,15 +4261,7 @@ fn decode_named_index(frame: &[u8]) -> std::result::Result<NamedIndex, SchemaCod
             TAG_NAMED_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_INDEX_NAME => set_once(&mut name, decode_name(value)?)?,
             TAG_INDEX_ACTIVE => {
-                let [value] = value else {
-                    return Err(SchemaCodecError::InvalidLength);
-                };
-                let value = match value {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(SchemaCodecError::InvalidSchema),
-                };
-                set_once(&mut active, value)?;
+                set_once(&mut active, decode_boolean(value)?)?;
             }
             TAG_INDEX_TERM => terms.push(decode_index_term(value)?),
             TAG_INDEX_PREDICATE => {
@@ -3896,6 +4448,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
     let mut name = None;
     let mut expression = None;
     let mut dependencies = Vec::new();
+    let mut active = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_CHECK_COLUMN => set_once(&mut column, ColumnId::from_bytes(uuid_bytes(value)?))?,
@@ -3912,6 +4465,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
             TAG_CHECK_DEPENDENCY => {
                 dependencies.push(ColumnId::from_bytes(uuid_bytes(value)?));
             }
+            TAG_CHECK_ACTIVE => set_once(&mut active, decode_boolean(value)?)?,
             _ => {}
         }
     }
@@ -3920,6 +4474,7 @@ fn decode_check_constraint(frame: &[u8]) -> std::result::Result<CheckConstraint,
         name,
         expression: expression.ok_or(SchemaCodecError::MissingField(TAG_CHECK_EXPRESSION))?,
         dependencies,
+        active: active.ok_or(SchemaCodecError::MissingField(TAG_CHECK_ACTIVE))?,
     })
 }
 
@@ -3996,11 +4551,13 @@ fn decode_unique_constraint(
     let mut index = None;
     let mut name = None;
     let mut conflict = None;
+    let mut active = None;
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
         match tag {
             TAG_UNIQUE_INDEX_DEFINITION => set_once(&mut index, decode_logical_index(value)?)?,
             TAG_UNIQUE_NAME => set_once(&mut name, decode_name(value)?)?,
             TAG_UNIQUE_CONFLICT => set_once(&mut conflict, decode_conflict_policy(value)?)?,
+            TAG_UNIQUE_ACTIVE => set_once(&mut active, decode_boolean(value)?)?,
             _ => {}
         }
     }
@@ -4012,7 +4569,17 @@ fn decode_unique_constraint(
         name,
         conflict: conflict.ok_or(SchemaCodecError::MissingField(TAG_UNIQUE_CONFLICT))?,
         index,
+        active: active.ok_or(SchemaCodecError::MissingField(TAG_UNIQUE_ACTIVE))?,
     })
+}
+
+fn decode_boolean(value: &[u8]) -> std::result::Result<bool, SchemaCodecError> {
+    match value {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        [_] => Err(SchemaCodecError::InvalidSchema),
+        _ => Err(SchemaCodecError::InvalidLength),
+    }
 }
 
 fn decode_conflict_policy(value: &[u8]) -> std::result::Result<ConflictPolicy, SchemaCodecError> {
@@ -4174,6 +4741,7 @@ fn validate_initial_provenance_sql(
         if parsed.name != encoded.name
             || parsed.columns.as_slice() != columns.as_slice()
             || parsed.conflict != encoded.conflict
+            || !encoded.active
         {
             return Err(SchemaCodecError::SqlMismatch);
         }
@@ -4189,6 +4757,7 @@ fn validate_initial_provenance_sql(
         if parsed.name != encoded.name
             || parsed.columns.as_slice() != columns.as_slice()
             || parsed.actions != encoded.actions
+            || !encoded.active
             || parsed.referenced_table.canonical() != encoded.referenced_table_name.canonical()
             || parsed.referenced_columns.as_ref().is_some_and(|columns| {
                 columns.len() != encoded.referenced_column_names.len()
@@ -4212,6 +4781,7 @@ fn validate_initial_provenance_sql(
         if parsed.column.as_ref() != column.as_ref()
             || parsed.name != encoded.name
             || parsed.expression != encoded.expression
+            || !encoded.active
         {
             return Err(SchemaCodecError::SqlMismatch);
         }
@@ -4590,7 +5160,7 @@ mod tests {
     fn table_creation_lowers_to_log_and_revision_cells_and_raises_back() {
         let created = deterministic_create("Notes");
         let lowered = created.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 9);
+        assert_eq!(lowered.mutations.len(), 10);
         assert_eq!(lowered.footprint.constraints().len(), 1);
         assert_eq!(lowered.footprint.writes().len(), 1);
         assert_explicit_range_assertions(
@@ -4634,14 +5204,40 @@ mod tests {
         let decoded = CreateTable::decode(&created.encode()).unwrap();
         assert_eq!(decoded, created);
         let lowered = created.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 11);
+        assert_eq!(lowered.mutations.len(), 14);
         assert_eq!(
-            lowered.mutations[6].key(),
+            lowered.mutations[7].key(),
             &index_definition_key(created.table_id, unique.index.id)
         );
         assert_eq!(
             CreateTable::from_homebase(&admit(lowered.mutations)).unwrap(),
             created
+        );
+    }
+
+    #[test]
+    fn retired_constraint_state_roundtrips_but_is_invalid_for_initial_create() {
+        let created = deterministic_unique_create();
+        let mut retired = created.schema.unique_constraints[0].clone();
+        retired.active = false;
+        assert_eq!(
+            decode_unique_constraint(&encode_unique_constraint(&retired)).unwrap(),
+            retired
+        );
+
+        let mut invalid_create = created;
+        invalid_create.schema.unique_constraints[0].active = false;
+        invalid_create.refresh_schema_revision();
+        assert!(matches!(
+            CreateTable::decode_operation(&invalid_create.encode()),
+            Err(SchemaCodecError::InvalidSchema | SchemaCodecError::SqlMismatch)
+        ));
+
+        assert_eq!(decode_boolean(&[]), Err(SchemaCodecError::InvalidLength));
+        assert_eq!(decode_boolean(&[2]), Err(SchemaCodecError::InvalidSchema));
+        assert_eq!(
+            decode_boolean(&[0, 1]),
+            Err(SchemaCodecError::InvalidLength)
         );
     }
 
@@ -5037,12 +5633,26 @@ mod tests {
         );
 
         let lowered = child.to_homebase().unwrap();
+        let reference = constraint_reference_key(
+            parent.table_id(),
+            foreign_key.referenced_index().as_bytes(),
+            foreign_key.id(),
+        );
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
                 schema_object_name_scope_key(&child.name),
                 active_schema_revision_key(parent.table_id()),
+                reference.clone(),
             ],
+        );
+        assert!(lowered.footprint.writes().contains(&reference));
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::Set { key, value }
+                if key == &reference && value == &child.table_id().as_bytes()))
         );
         assert!(
             lowered
@@ -5114,13 +5724,20 @@ mod tests {
         child.validate_foreign_key_parents(&connection).unwrap();
 
         let lowered = child.to_homebase().unwrap();
+        let reference = constraint_reference_key(
+            parent.table_id(),
+            foreign_key.referenced_index().as_bytes(),
+            foreign_key.id(),
+        );
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
                 schema_object_name_scope_key(&child.name),
                 active_schema_revision_key(parent.table_id()),
+                reference.clone(),
             ],
         );
+        assert!(lowered.footprint.writes().contains(&reference));
         assert!(
             lowered
                 .footprint
@@ -5294,8 +5911,8 @@ mod tests {
 
         assert_eq!(CreateTable::decode(&created.encode()).unwrap(), created);
         let lowered = created.to_homebase().unwrap();
-        assert_eq!(lowered.mutations.len(), 15);
-        for (mutation, unique) in lowered.mutations[6..10]
+        assert_eq!(lowered.mutations.len(), 23);
+        for (mutation, unique) in lowered.mutations[7..11]
             .iter()
             .zip(&created.schema.unique_constraints)
         {

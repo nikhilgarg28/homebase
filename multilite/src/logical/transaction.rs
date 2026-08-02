@@ -553,7 +553,7 @@ mod tests {
                 RejectionEffect::RemoveCreatedTable { .. }
             ]
         ));
-        assert_eq!(lowered.mutations.len(), 10);
+        assert_eq!(lowered.mutations.len(), 11);
         assert_eq!(lowered.footprint.writes().len(), 2);
         assert_eq!(lowered.footprint.constraints().len(), 4);
         assert!(lowered.footprint.reads().is_empty());

@@ -22,6 +22,9 @@ pub enum TargetFamily {
     SchemaObjectName,
     TableSchema,
     ColumnName,
+    ConstraintName,
+    ActiveConstraint,
+    ConstraintReference,
     ColumnDependency,
     TableRoot,
     ActivePrimaryIndex,
@@ -50,6 +53,7 @@ pub enum OperationFamily {
     RenameColumn,
     AddColumn,
     DropColumn,
+    DropConstraint,
     TransactionRead,
     SetUserVersion,
     CreateView,
@@ -101,11 +105,15 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(CreateTable, Set, ActiveSchemaRevision),
     mutation_contract!(CreateTable, Set, IndexDefinition),
     mutation_contract!(CreateTable, Set, ColumnName),
+    mutation_contract!(CreateTable, Set, ConstraintName),
+    mutation_contract!(CreateTable, Set, ActiveConstraint),
+    mutation_contract!(CreateTable, Set, ConstraintReference),
     mutation_contract!(CreateTable, Set, WriteRevision),
     mutation_contract!(DropTable, Set, SchemaLog),
     mutation_contract!(DropTable, Delete, SchemaObjectName),
     mutation_contract!(DropTable, DeletePrefix, TableRoot),
     mutation_contract!(DropTable, DeletePrefix, ForeignReference),
+    mutation_contract!(DropTable, Delete, ConstraintReference),
     mutation_contract!(RowChanges, Set, Row),
     mutation_contract!(RowChanges, Set, UniqueOwner),
     mutation_contract!(RowChanges, Set, ForeignReference),
@@ -119,6 +127,7 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(CreateIndex, Set, ActiveSchemaRevision),
     mutation_contract!(CreateIndex, Set, ColumnDependency),
     mutation_contract!(CreateIndex, Set, IndexDefinition),
+    mutation_contract!(CreateIndex, Set, ActiveConstraint),
     mutation_contract!(CreateIndex, Set, UniqueOwner),
     mutation_contract!(CreateIndex, Set, WriteRevision),
     mutation_contract!(DropIndex, Set, SchemaLog),
@@ -126,6 +135,8 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(DropIndex, Set, ActiveSchemaRevision),
     mutation_contract!(DropIndex, Delete, SchemaObjectName),
     mutation_contract!(DropIndex, Delete, ColumnDependency),
+    mutation_contract!(DropIndex, Delete, ActiveConstraint),
+    mutation_contract!(DropIndex, DeletePrefix, ConstraintReference),
     mutation_contract!(RenameTable, Set, SchemaLog),
     mutation_contract!(RenameTable, Set, SchemaObjectName),
     mutation_contract!(RenameTable, Delete, SchemaObjectName),
@@ -134,14 +145,23 @@ pub const MUTATION_CONTRACTS: &[MutationContract] = &[
     mutation_contract!(RenameColumn, Delete, ColumnName),
     mutation_contract!(AddColumn, Set, SchemaLog),
     mutation_contract!(AddColumn, Set, ColumnName),
+    mutation_contract!(AddColumn, Set, ConstraintName),
+    mutation_contract!(AddColumn, Set, ConstraintReference),
     mutation_contract!(AddColumn, Set, TableSchema),
     mutation_contract!(AddColumn, Set, ColumnDependency),
     mutation_contract!(AddColumn, Set, WriteRevision),
     mutation_contract!(DropColumn, Set, SchemaLog),
     mutation_contract!(DropColumn, Set, TableSchema),
     mutation_contract!(DropColumn, Delete, ColumnName),
+    mutation_contract!(DropColumn, Delete, ConstraintName),
     mutation_contract!(DropColumn, Delete, ColumnDependency),
     mutation_contract!(DropColumn, DeletePrefix, ColumnDependency),
+    mutation_contract!(DropConstraint, Set, SchemaLog),
+    mutation_contract!(DropConstraint, Set, TableSchema),
+    mutation_contract!(DropConstraint, Delete, ConstraintName),
+    mutation_contract!(DropConstraint, Delete, ActiveConstraint),
+    mutation_contract!(DropConstraint, Delete, ConstraintReference),
+    mutation_contract!(DropConstraint, DeletePrefix, ConstraintReference),
 ];
 
 /// Local materialized-state repair selected when authority rejects an op.
@@ -183,6 +203,7 @@ pub const REJECTION_CONTRACTS: &[RejectionContract] = &[
     rejection_contract!(RenameColumn, RevertAlterTable),
     rejection_contract!(AddColumn, RevertAlterTable),
     rejection_contract!(DropColumn, RevertAlterTable),
+    rejection_contract!(DropConstraint, RevertAlterTable),
     rejection_contract!(SetUserVersion, RestoreUserVersion),
     rejection_contract!(CreateView, RevertView),
     rejection_contract!(DropView, RevertView),
@@ -216,6 +237,22 @@ impl TargetFamily {
                             && parts.len() == 6 =>
                     {
                         Some(Self::ColumnName)
+                    }
+                    value
+                        if value == codes::NAMES
+                            && component(4) == Some(codes::CONSTRAINTS)
+                            && parts.len() == 6 =>
+                    {
+                        Some(Self::ConstraintName)
+                    }
+                    value if value == codes::ACTIVE_CONSTRAINTS && parts.len() == 5 => {
+                        Some(Self::ActiveConstraint)
+                    }
+                    value
+                        if value == codes::CONSTRAINT_REFERENCES
+                            && matches!(parts.len(), 5 | 6) =>
+                    {
+                        Some(Self::ConstraintReference)
                     }
                     value if value == codes::COLUMN_DEPENDENCIES && parts.len() >= 5 => {
                         Some(Self::ColumnDependency)
@@ -277,6 +314,9 @@ pub enum GuardClass {
 pub enum GuardReason {
     SchemaObjectName,
     ColumnNameBinding,
+    ConstraintNameBinding,
+    ConstraintState,
+    ConstraintReference,
     SchemaRevision,
     WriteContract,
     PrimaryIndex,
@@ -316,12 +356,27 @@ macro_rules! contract {
 pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(CreateTable, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(CreateTable, Invariant, ConstraintState, ActiveConstraint),
+    contract!(
+        CreateTable,
+        Invariant,
+        ConstraintReference,
+        ConstraintReference
+    ),
+    contract!(CreateTable, Write, ConstraintReference, ConstraintReference),
     contract!(CreateTable, Write, WriteContract, WriteRevision),
     contract!(DropTable, Invariant, TableExistence, TableRoot),
     contract!(DropTable, Write, TableExistence, TableRoot),
     contract!(DropTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(DropTable, Invariant, ForeignReference, ForeignReference),
     contract!(DropTable, Write, ForeignReference, ForeignReference),
+    contract!(
+        DropTable,
+        Invariant,
+        ConstraintReference,
+        ConstraintReference
+    ),
+    contract!(DropTable, Write, ConstraintReference, ConstraintReference),
     contract!(RowChanges, Invariant, RowIdentity, Row),
     contract!(RowChanges, Write, RowIdentity, Row),
     contract!(RowChanges, Invariant, UniqueOwnership, UniqueOwner),
@@ -340,25 +395,68 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateIndex, Write, ColumnDependency, ColumnDependency),
     contract!(CreateIndex, Write, WriteContract, WriteRevision),
     contract!(CreateIndex, Invariant, ExistingRows, Row),
+    contract!(CreateIndex, Invariant, ConstraintState, ActiveConstraint),
+    contract!(CreateIndex, Write, ConstraintState, ActiveConstraint),
     contract!(DropIndex, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(DropIndex, Invariant, SchemaRevision, ActiveSchemaRevision),
     contract!(DropIndex, Write, SchemaRevision, ActiveSchemaRevision),
     contract!(DropIndex, Invariant, ColumnDependency, ColumnDependency),
     contract!(DropIndex, Write, ColumnDependency, ColumnDependency),
     contract!(DropIndex, Invariant, WriteContract, WriteRevision),
+    contract!(DropIndex, Invariant, ConstraintState, ActiveConstraint),
+    contract!(DropIndex, Write, ConstraintState, ActiveConstraint),
+    contract!(
+        DropIndex,
+        Invariant,
+        ConstraintReference,
+        ConstraintReference
+    ),
+    contract!(DropIndex, Write, ConstraintReference, ConstraintReference),
     contract!(RenameTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Invariant, ConstraintNameBinding, ConstraintName),
     contract!(AddColumn, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(AddColumn, Invariant, SchemaRevision, ActiveSchemaRevision),
+    contract!(AddColumn, Invariant, ConstraintState, ActiveConstraint),
+    contract!(
+        AddColumn,
+        Invariant,
+        ConstraintReference,
+        ConstraintReference
+    ),
+    contract!(AddColumn, Write, ConstraintReference, ConstraintReference),
     contract!(AddColumn, Invariant, ExistingRows, TableRows),
     contract!(AddColumn, Invariant, ColumnDependency, ColumnDependency),
     contract!(AddColumn, Write, ColumnDependency, ColumnDependency),
     contract!(AddColumn, Write, WriteContract, WriteRevision),
     contract!(AddColumn, Invariant, ExistingRows, Row),
     contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(DropColumn, Invariant, ConstraintNameBinding, ConstraintName),
+    contract!(DropColumn, Write, ConstraintNameBinding, ConstraintName),
     contract!(DropColumn, Invariant, ColumnDependency, ColumnDependency),
     contract!(DropColumn, Write, ColumnDependency, ColumnDependency),
+    contract!(
+        DropConstraint,
+        Invariant,
+        ConstraintNameBinding,
+        ConstraintName
+    ),
+    contract!(DropConstraint, Write, ConstraintNameBinding, ConstraintName),
+    contract!(DropConstraint, Invariant, ConstraintState, ActiveConstraint),
+    contract!(DropConstraint, Write, ConstraintState, ActiveConstraint),
+    contract!(
+        DropConstraint,
+        Invariant,
+        ConstraintReference,
+        ConstraintReference
+    ),
+    contract!(
+        DropConstraint,
+        Write,
+        ConstraintReference,
+        ConstraintReference
+    ),
     contract!(
         TransactionRead,
         SerializableRead,
@@ -415,6 +513,12 @@ pub const REQUIRED_GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(DropColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(DropColumn, Invariant, ViewDependency, ViewDependency),
+    contract!(
+        DropConstraint,
+        Invariant,
+        ConstraintNameBinding,
+        ConstraintName
+    ),
     contract!(SetUserVersion, Write, UserVersion, UserVersion),
     contract!(CreateView, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(DropView, Invariant, SchemaObjectName, SchemaObjectName),
@@ -648,17 +752,19 @@ fn mutation_guard_requirements(
 ) -> &'static [(GuardClass, GuardReason)] {
     use GuardClass::{Invariant, Write};
     use GuardReason::{
-        ColumnDependency, ColumnNameBinding, ForeignChildren, ForeignReference, RowIdentity,
-        SchemaObjectName, SchemaRevision, TableExistence, UniqueOwnership,
-        UserVersion as UserVersionReason, ViewDependency as ViewDependencyReason, WriteContract,
+        ColumnDependency, ColumnNameBinding, ConstraintNameBinding, ConstraintReference,
+        ConstraintState, ForeignChildren, ForeignReference, RowIdentity, SchemaObjectName,
+        SchemaRevision, TableExistence, UniqueOwnership, UserVersion as UserVersionReason,
+        ViewDependency as ViewDependencyReason, WriteContract,
     };
     use MutationKind::{Delete, DeletePrefix, Set};
     use OperationFamily::{
-        AddColumn, CreateIndex, CreateTable, CreateView, DropColumn, DropIndex, DropTable,
-        DropView, RenameColumn, RenameTable, RowChanges, SetUserVersion,
+        AddColumn, CreateIndex, CreateTable, CreateView, DropColumn, DropConstraint, DropIndex,
+        DropTable, DropView, RenameColumn, RenameTable, RowChanges, SetUserVersion,
     };
     use TargetFamily::{
-        ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget, ColumnName,
+        ActiveConstraint, ActiveSchemaRevision, ColumnDependency as ColumnDependencyTarget,
+        ColumnName, ConstraintName, ConstraintReference as ConstraintReferenceTarget,
         ForeignReference as ForeignReferenceTarget, Row,
         SchemaObjectName as SchemaObjectNameTarget, TableRoot, UniqueOwner,
         UserVersion as UserVersionTarget, ViewDependency as ViewDependencyTarget, WriteRevision,
@@ -681,6 +787,27 @@ fn mutation_guard_requirements(
         (RenameColumn, Set | Delete, ColumnName)
         | (AddColumn, Set, ColumnName)
         | (DropColumn, Delete, ColumnName) => &[(Invariant, ColumnNameBinding)],
+        (AddColumn, Set, ConstraintName) => &[(Invariant, ConstraintNameBinding)],
+        (DropColumn, Delete, ConstraintName) => &[
+            (Invariant, ConstraintNameBinding),
+            (Write, ConstraintNameBinding),
+        ],
+        (DropConstraint, Delete, ConstraintName) => &[
+            (Invariant, ConstraintNameBinding),
+            (Write, ConstraintNameBinding),
+        ],
+        (DropConstraint, Delete, ActiveConstraint) => {
+            &[(Invariant, ConstraintState), (Write, ConstraintState)]
+        }
+        (CreateIndex, Set, ActiveConstraint) | (DropIndex, Delete, ActiveConstraint) => {
+            &[(Invariant, ConstraintState), (Write, ConstraintState)]
+        }
+        (CreateTable | AddColumn, Set, ConstraintReferenceTarget)
+        | (DropTable | DropConstraint, Delete, ConstraintReferenceTarget)
+        | (DropIndex | DropConstraint, DeletePrefix, ConstraintReferenceTarget) => &[
+            (Invariant, ConstraintReference),
+            (Write, ConstraintReference),
+        ],
         (CreateIndex | DropIndex, Set, ActiveSchemaRevision) => {
             &[(Invariant, SchemaRevision), (Write, SchemaRevision)]
         }
@@ -813,6 +940,23 @@ pub enum LogicalTarget {
         table: TableId,
         canonical: Vec<u8>,
     },
+    ConstraintName {
+        table: TableId,
+        canonical: Vec<u8>,
+    },
+    ActiveConstraint {
+        table: TableId,
+        identity: [u8; 16],
+    },
+    ConstraintReferencePrefix {
+        table: TableId,
+        identity: [u8; 16],
+    },
+    ConstraintReference {
+        table: TableId,
+        identity: [u8; 16],
+        relationship: ForeignKeyId,
+    },
     ColumnDependencyPrefix {
         table: TableId,
         column: ColumnId,
@@ -896,6 +1040,11 @@ impl LogicalTarget {
             Self::SchemaObjectName { .. } => TargetFamily::SchemaObjectName,
             Self::TableSchema { .. } => TargetFamily::TableSchema,
             Self::ColumnName { .. } => TargetFamily::ColumnName,
+            Self::ConstraintName { .. } => TargetFamily::ConstraintName,
+            Self::ActiveConstraint { .. } => TargetFamily::ActiveConstraint,
+            Self::ConstraintReferencePrefix { .. } | Self::ConstraintReference { .. } => {
+                TargetFamily::ConstraintReference
+            }
             Self::ColumnDependencyPrefix { .. }
             | Self::ColumnIndexDependency { .. }
             | Self::ColumnCheckDependency { .. }
@@ -949,6 +1098,40 @@ impl LogicalTarget {
                 codes::NAMES.to_vec(),
                 codes::COLUMNS.to_vec(),
                 name_component(canonical),
+            ],
+            Self::ConstraintName { table, canonical } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::NAMES.to_vec(),
+                codes::CONSTRAINTS.to_vec(),
+                name_component(canonical),
+            ],
+            Self::ActiveConstraint { table, identity } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::ACTIVE_CONSTRAINTS.to_vec(),
+                identity.to_vec(),
+            ],
+            Self::ConstraintReferencePrefix { table, identity } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::CONSTRAINT_REFERENCES.to_vec(),
+                identity.to_vec(),
+            ],
+            Self::ConstraintReference {
+                table,
+                identity,
+                relationship,
+            } => vec![
+                codes::ROOT.to_vec(),
+                codes::TABLES.to_vec(),
+                table.as_bytes().to_vec(),
+                codes::CONSTRAINT_REFERENCES.to_vec(),
+                identity.to_vec(),
+                relationship.as_bytes().to_vec(),
             ],
             Self::ColumnDependencyPrefix { table, column } => vec![
                 codes::ROOT.to_vec(),
@@ -1476,6 +1659,7 @@ mod tests {
             OperationFamily::RenameColumn,
             OperationFamily::AddColumn,
             OperationFamily::DropColumn,
+            OperationFamily::DropConstraint,
             OperationFamily::SetUserVersion,
             OperationFamily::CreateView,
             OperationFamily::DropView,

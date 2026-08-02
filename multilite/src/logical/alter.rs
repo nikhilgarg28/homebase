@@ -13,20 +13,23 @@ use uuid::{Uuid, Variant, Version};
 use super::guard::{GuardPlan, GuardReason, OperationFamily, view_dependency_prefix};
 use super::row::{primary_index_prefix, table_row_prefix};
 use super::schema::{
-    ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId,
+    ColumnId, CreateTable, MutationId, SchemaRevisionId, SqlName, TableId, active_constraint_key,
     active_schema_revision_key, column_check_dependency_key, column_dependency_prefix,
-    column_name_scope_key, schema_log_key, schema_object_name_scope_key, table_schema_key,
+    column_name_scope_key, constraint_name_scope_key, constraint_reference_key,
+    constraint_reference_prefix, schema_log_key, schema_object_name_scope_key, table_schema_key,
     write_revision_key,
 };
 use super::view;
 use crate::catalog;
 use crate::commit::footprint::ConflictFootprint;
 use crate::repair;
-use crate::sql::{AddColumnSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute};
+use crate::sql::{
+    AddColumnSpec, DropConstraintSpec, RenameColumnSpec, RenameTableSpec, ValidatedExecute,
+};
 use crate::sqlite::quote_identifier;
 use crate::{Error, Result};
 
-const ALTER_TABLE_VERSION: u8 = 5;
+const ALTER_TABLE_VERSION: u8 = 6;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_TABLE: u8 = 3;
@@ -43,6 +46,7 @@ const RENAME_TABLE: u8 = 1;
 const RENAME_COLUMN: u8 = 2;
 const ADD_COLUMN: u8 = 3;
 const DROP_COLUMN: u8 = 4;
+const DROP_CONSTRAINT: u8 = 5;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AlterTableDelta {
     RenameTable {
@@ -63,6 +67,11 @@ enum AlterTableDelta {
     },
     DropColumn {
         column: ColumnId,
+        name: SqlName,
+        before: CreateTable,
+        after: CreateTable,
+    },
+    DropConstraint {
         name: SqlName,
         before: CreateTable,
         after: CreateTable,
@@ -243,6 +252,41 @@ impl AlterTableOperation {
         Ok(operation)
     }
 
+    pub fn prepare_drop_constraint(
+        connection: &Connection,
+        sql: &str,
+        spec: &DropConstraintSpec,
+    ) -> Result<Self> {
+        let before = catalog::by_name(connection, spec.table.value())?.ok_or(
+            Error::UnsupportedSql("ALTER TABLE target has no synchronized schema identity"),
+        )?;
+        let constraint = before.droppable_constraint_named(&spec.constraint)?;
+        if let Some(index) = constraint.unique_index()
+            && catalog::incoming_foreign_keys(connection, before.table_id())?
+                .iter()
+                .any(|(_, foreign_key)| foreign_key.referenced_index() == index)
+        {
+            return Err(Error::UnsupportedSql(
+                "DROP CONSTRAINT cannot retire a UNIQUE constraint referenced by a foreign key",
+            ));
+        }
+        let after = before.with_retired_constraint(&constraint)?;
+        let operation = Self {
+            mutation_id: MutationId::from_bytes(Uuid::new_v4().into_bytes()),
+            sql: sql.to_owned(),
+            table: before.table_id(),
+            schema_revision: before.schema_revision_id(),
+            source_table: spec.table.clone(),
+            delta: AlterTableDelta::DropConstraint {
+                name: spec.constraint.clone(),
+                before,
+                after,
+            },
+        };
+        operation.validate().map_err(invalid_operation)?;
+        Ok(operation)
+    }
+
     /// Move the name registry without evolving table-owned schema state.
     pub fn to_homebase(&self) -> Result<AlterTableHomebaseOp> {
         self.validate().map_err(invalid_operation)?;
@@ -320,6 +364,26 @@ impl AlterTableOperation {
                                 active_schema_revision_key(foreign_key.referenced_table()),
                                 GuardReason::SchemaRevision,
                             )?;
+                            let constraint_state = active_constraint_key(
+                                foreign_key.referenced_table(),
+                                foreign_key.referenced_index().as_bytes(),
+                            );
+                            guards.invariant(
+                                constraint_state.clone(),
+                                GuardReason::ConstraintState,
+                            )?;
+                            let reference = constraint_reference_key(
+                                foreign_key.referenced_table(),
+                                foreign_key.referenced_index().as_bytes(),
+                                foreign_key.id(),
+                            );
+                            guards
+                                .invariant(reference.clone(), GuardReason::ConstraintReference)?;
+                            guards.write(reference.clone(), GuardReason::ConstraintReference)?;
+                            mutations.push(Mutation::Set {
+                                key: reference,
+                                value: self.table.as_bytes().to_vec(),
+                            });
                             guards.invariant(
                                 table_row_prefix(foreign_key.referenced_table()),
                                 GuardReason::ExistingRows,
@@ -331,6 +395,14 @@ impl AlterTableOperation {
                             mutations.push(Mutation::Set {
                                 key: parent_write_revision,
                                 value: self.mutation_id.as_bytes().to_vec(),
+                            });
+                        }
+                        for (name, identity) in after.added_column_constraint_bindings(*column) {
+                            let key = constraint_name_scope_key(self.table, &name);
+                            guards.invariant(key.clone(), GuardReason::ConstraintNameBinding)?;
+                            mutations.push(Mutation::Set {
+                                key,
+                                value: identity.to_vec(),
                             });
                         }
                     }
@@ -351,6 +423,12 @@ impl AlterTableOperation {
                         mutations.push(Mutation::DeleteRange {
                             range: Range::Prefix(dependents),
                         });
+                        for name in before.removed_column_constraint_names(*column) {
+                            let key = constraint_name_scope_key(self.table, &name);
+                            guards.invariant(key.clone(), GuardReason::ConstraintNameBinding)?;
+                            guards.write(key.clone(), GuardReason::ConstraintNameBinding)?;
+                            mutations.push(Mutation::Delete { key });
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -362,6 +440,53 @@ impl AlterTableOperation {
                         key: write_revision,
                         value: self.mutation_id.as_bytes().to_vec(),
                     });
+                }
+                let footprint = guards.footprint();
+                Ok(AlterTableHomebaseOp {
+                    mutations,
+                    footprint,
+                    guards,
+                })
+            }
+            AlterTableDelta::DropConstraint {
+                name,
+                before,
+                after,
+            } => {
+                let constraint = before.droppable_constraint_named(name)?;
+                let name_key = constraint_name_scope_key(self.table, name);
+                let mut guards = GuardPlan::for_operation(OperationFamily::DropConstraint);
+                guards.invariant(name_key.clone(), GuardReason::ConstraintNameBinding)?;
+                guards.write(name_key.clone(), GuardReason::ConstraintNameBinding)?;
+                let mut mutations = vec![
+                    Mutation::Set {
+                        key: schema_log_key(self.mutation_id),
+                        value: self.encode(),
+                    },
+                    Mutation::Delete { key: name_key },
+                    Mutation::Set {
+                        key: table_schema_key(self.table, after.schema_revision_id()),
+                        value: after.encode(),
+                    },
+                ];
+                if let Some(index) = constraint.unique_index() {
+                    let active = active_constraint_key(self.table, index.as_bytes());
+                    guards.invariant(active.clone(), GuardReason::ConstraintState)?;
+                    guards.write(active.clone(), GuardReason::ConstraintState)?;
+                    mutations.push(Mutation::Delete { key: active });
+                    let references = constraint_reference_prefix(self.table, index.as_bytes());
+                    guards.invariant(references.clone(), GuardReason::ConstraintReference)?;
+                    guards.write(references.clone(), GuardReason::ConstraintReference)?;
+                    mutations.push(Mutation::DeleteRange {
+                        range: Range::Prefix(references),
+                    });
+                }
+                if let Some((parent, index, relationship)) = constraint.foreign_reference() {
+                    let reference =
+                        constraint_reference_key(parent, index.as_bytes(), relationship);
+                    guards.invariant(reference.clone(), GuardReason::ConstraintReference)?;
+                    guards.write(reference.clone(), GuardReason::ConstraintReference)?;
+                    mutations.push(Mutation::Delete { key: reference });
                 }
                 let footprint = guards.footprint();
                 Ok(AlterTableHomebaseOp {
@@ -394,7 +519,10 @@ impl AlterTableOperation {
     /// Apply an authenticated binding change to canonical SQLite.
     pub fn apply(&self, connection: &Connection) -> Result<()> {
         self.validate().map_err(invalid_operation)?;
-        if matches!(self.delta, AlterTableDelta::DropColumn { .. }) {
+        if matches!(
+            self.delta,
+            AlterTableDelta::DropColumn { .. } | AlterTableDelta::DropConstraint { .. }
+        ) {
             return self.record_catalog(connection);
         }
         self.validate_catalog_before(connection)?;
@@ -405,6 +533,9 @@ impl AlterTableOperation {
             AlterTableDelta::AddColumn { .. } => crate::sql::render_alter_table(&self.sql, &table)?,
             AlterTableDelta::DropColumn { .. } => {
                 unreachable!("DROP COLUMN materializes through table rebuild")
+            }
+            AlterTableDelta::DropConstraint { .. } => {
+                unreachable!("DROP CONSTRAINT materializes through table rebuild")
             }
             AlterTableDelta::RenameTable { old_name, new_name } => {
                 rename_sql(&table, RenameTarget::Table, old_name, new_name)
@@ -418,7 +549,14 @@ impl AlterTableOperation {
     }
 
     pub fn materializes_internally(&self) -> bool {
-        matches!(self.delta, AlterTableDelta::DropColumn { .. })
+        matches!(
+            self.delta,
+            AlterTableDelta::DropColumn { .. } | AlterTableDelta::DropConstraint { .. }
+        )
+    }
+
+    pub fn requires_native_sql_prepare(&self) -> bool {
+        !matches!(self.delta, AlterTableDelta::DropConstraint { .. })
     }
 
     /// Local sidecar identity required while this destructive operation is pending.
@@ -531,6 +669,16 @@ impl AlterTableOperation {
                 catalog::replace(connection, &folded)?;
                 rebuild_table_if_needed(connection, &folded, false)
             }
+            AlterTableDelta::DropConstraint { name, before, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "DROP CONSTRAINT table is missing from the schema catalog",
+                    ))?;
+                let constraint = before.droppable_constraint_named(name)?;
+                let folded = current.fold_retired_constraint(&constraint)?;
+                catalog::replace(connection, &folded)?;
+                rebuild_table_if_needed(connection, &folded, true)
+            }
         }
     }
 
@@ -624,6 +772,16 @@ impl AlterTableOperation {
                 rebuild_table_if_needed(connection, &folded, true)?;
                 repair::retire(connection, self.mutation_id.as_bytes())
             }
+            AlterTableDelta::DropConstraint { name, before, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending DROP CONSTRAINT table is missing from the schema catalog",
+                    ))?;
+                let constraint = before.droppable_constraint_named(name)?;
+                let folded = current.fold_restored_constraint(&constraint)?;
+                catalog::replace(connection, &folded)?;
+                rebuild_table_if_needed(connection, &folded, true)
+            }
         }
     }
 
@@ -704,6 +862,20 @@ impl AlterTableOperation {
                     .field(TAG_PREDECESSOR, &predecessor.as_bytes())
                     .expect("ALTER TABLE field fits in u32");
                 put_name(&mut writer, TAG_NEW_NAME, name);
+                writer
+                    .field(TAG_BEFORE, &before.encode())
+                    .expect("ALTER TABLE field fits in u32");
+                writer
+                    .field(TAG_AFTER, &after.encode())
+                    .expect("ALTER TABLE field fits in u32");
+            }
+            AlterTableDelta::DropConstraint {
+                name,
+                before,
+                after,
+            } => {
+                put_action(&mut writer, DROP_CONSTRAINT);
+                put_name(&mut writer, TAG_OLD_NAME, name);
                 writer
                     .field(TAG_BEFORE, &before.encode())
                     .expect("ALTER TABLE field fits in u32");
@@ -812,6 +984,11 @@ impl AlterTableOperation {
                 before: take_required(&mut before, TAG_BEFORE)?,
                 after: take_required(&mut after, TAG_AFTER)?,
             },
+            DROP_CONSTRAINT => AlterTableDelta::DropConstraint {
+                name: take_required(&mut old_name, TAG_OLD_NAME)?,
+                before: take_required(&mut before, TAG_BEFORE)?,
+                after: take_required(&mut after, TAG_AFTER)?,
+            },
             _ => return Err(AlterTableCodecError::InvalidAction),
         };
         if column.is_some()
@@ -904,6 +1081,22 @@ impl AlterTableOperation {
                 && before.schema_revision_id() != after.schema_revision_id()
                 && before
                     .with_removed_column(*column)
+                    .is_ok_and(|expected| expected == *after) => {}
+            (
+                AlterTableDelta::DropConstraint {
+                    name,
+                    before,
+                    after,
+                },
+                ValidatedExecute::DropConstraint(spec),
+            ) if spec.table == self.source_table
+                && spec.constraint == *name
+                && before.table_id() == self.table
+                && before.schema_revision_id() == self.schema_revision
+                && before.schema_revision_id() != after.schema_revision_id()
+                && before
+                    .droppable_constraint_named(name)
+                    .and_then(|constraint| before.with_retired_constraint(&constraint))
                     .is_ok_and(|expected| expected == *after) => {}
             _ => return Err(AlterTableCodecError::InvalidRename),
         }
@@ -1001,6 +1194,27 @@ impl AlterTableOperation {
                     ));
                 }
             }
+            AlterTableDelta::DropConstraint { name, before, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "DROP CONSTRAINT table is missing from the schema catalog",
+                    ))?;
+                let expected = before.droppable_constraint_named(name)?;
+                if current.droppable_constraint_named(name)? != expected {
+                    return Err(Error::InvalidDatabase(
+                        "DROP CONSTRAINT no longer matches the schema catalog",
+                    ));
+                }
+                if let Some(index) = expected.unique_index()
+                    && catalog::incoming_foreign_keys(connection, self.table)?
+                        .iter()
+                        .any(|(_, foreign_key)| foreign_key.referenced_index() == index)
+                {
+                    return Err(Error::InvalidDatabase(
+                        "DROP CONSTRAINT UNIQUE target became referenced",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1070,6 +1284,19 @@ impl AlterTableOperation {
                         "pending DROP COLUMN no longer matches SQLite state",
                     ));
                 }
+            }
+            AlterTableDelta::DropConstraint { name, before, .. } => {
+                let current =
+                    catalog::by_id(connection, self.table)?.ok_or(Error::InvalidDatabase(
+                        "pending DROP CONSTRAINT table is missing from the schema catalog",
+                    ))?;
+                if current.droppable_constraint_named(name).is_ok() {
+                    return Err(Error::InvalidDatabase(
+                        "pending DROP CONSTRAINT no longer matches SQLite state",
+                    ));
+                }
+                let constraint = before.droppable_constraint_named(name)?;
+                current.fold_restored_constraint(&constraint)?;
             }
         }
         Ok(())
@@ -1443,6 +1670,15 @@ mod tests {
         AlterTableOperation::prepare_drop_column(connection, sql, &spec).unwrap()
     }
 
+    fn prepare_constraint_drop(connection: &Connection, name: &str) -> AlterTableOperation {
+        let sql = format!("ALTER TABLE notes DROP CONSTRAINT {name}");
+        let ValidatedExecute::DropConstraint(spec) = crate::sql::validate_execute(&sql).unwrap()
+        else {
+            unreachable!()
+        };
+        AlterTableOperation::prepare_drop_constraint(connection, &sql, &spec).unwrap()
+    }
+
     fn apply_speculative_drop(connection: &Connection, operation: &AlterTableOperation) {
         operation.capture_local_repair(connection).unwrap();
         operation.apply(connection).unwrap();
@@ -1528,6 +1764,176 @@ mod tests {
             AlterTableOperation::decode(&crossed),
             Err(AlterTableCodecError::InvalidAction)
         );
+    }
+
+    #[test]
+    fn named_unique_constraint_retires_with_exact_guards_and_rolls_back() {
+        let (connection, created) = connection_with(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                email TEXT,
+                score INTEGER,
+                CONSTRAINT uq_email UNIQUE (email),
+                CONSTRAINT ck_score CHECK (score >= 0)
+            )",
+        );
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'a', 1)", ())
+            .unwrap();
+        let operation = prepare_constraint_drop(&connection, "uq_email");
+        assert_eq!(
+            AlterTableOperation::decode(&operation.encode()).unwrap(),
+            operation
+        );
+
+        let lowered = operation.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 5);
+        let unique = created
+            .unique_constraints()
+            .iter()
+            .find(|unique| unique.name().is_some_and(|name| name.value() == "uq_email"))
+            .unwrap();
+        assert_explicit_range_assertions(
+            &lowered.footprint,
+            &[
+                constraint_name_scope_key(created.table_id(), &SqlName::new("uq_email".into())),
+                active_constraint_key(created.table_id(), unique.index_id().as_bytes()),
+                constraint_reference_prefix(created.table_id(), unique.index_id().as_bytes()),
+            ],
+        );
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .filter_map(Mutation::point_key)
+                .all(|key| key != &write_revision_key(created.table_id()))
+        );
+
+        operation.apply(&connection).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (2, 'a', 2)", ())
+            .unwrap();
+        connection
+            .execute("DELETE FROM notes WHERE id = 2", ())
+            .unwrap();
+        operation.rollback(&connection).unwrap();
+        assert!(
+            connection
+                .execute("INSERT INTO notes VALUES (3, 'a', 3)", ())
+                .is_err()
+        );
+        catalog::validate(&connection).unwrap();
+    }
+
+    #[test]
+    fn named_check_constraint_retires_without_unique_state() {
+        let (connection, _) = connection_with(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                score INTEGER,
+                CONSTRAINT ck_score CHECK (score >= 0)
+            )",
+        );
+        let operation = prepare_constraint_drop(&connection, "ck_score");
+        assert_eq!(operation.to_homebase().unwrap().mutations.len(), 3);
+
+        operation.apply(&connection).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (1, -1)", ())
+            .unwrap();
+        connection.execute("DELETE FROM notes", ()).unwrap();
+        operation.rollback(&connection).unwrap();
+        assert!(
+            connection
+                .execute("INSERT INTO notes VALUES (2, -1)", ())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn named_foreign_key_retires_its_exact_parent_reference_and_rolls_back() {
+        let (connection, parent) = connection_with(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                code TEXT,
+                CONSTRAINT uq_parent_code UNIQUE (code)
+            )",
+        );
+        let child_sql = "CREATE TABLE children (
+            id INTEGER PRIMARY KEY,
+            code TEXT,
+            CONSTRAINT fk_parent_code FOREIGN KEY (code) REFERENCES parents(code)
+        )";
+        let ValidatedExecute::CreateTable(child_spec) =
+            crate::sql::validate_execute(child_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let child = CreateTable::prepare(&connection, child_sql, child_spec).unwrap();
+        connection.execute(child_sql, ()).unwrap();
+        catalog::insert(&connection, &child).unwrap();
+        connection
+            .execute("INSERT INTO parents VALUES (1, 'one')", ())
+            .unwrap();
+
+        let sql = "ALTER TABLE children DROP CONSTRAINT fk_parent_code";
+        let ValidatedExecute::DropConstraint(spec) = crate::sql::validate_execute(sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let operation =
+            AlterTableOperation::prepare_drop_constraint(&connection, sql, &spec).unwrap();
+        let foreign_key = &child.foreign_keys()[0];
+        let reference = constraint_reference_key(
+            parent.table_id(),
+            foreign_key.referenced_index().as_bytes(),
+            foreign_key.id(),
+        );
+        let lowered = operation.to_homebase().unwrap();
+        assert_eq!(lowered.mutations.len(), 4);
+        assert_explicit_range_assertions(&lowered.footprint, std::slice::from_ref(&reference));
+        assert!(lowered.footprint.writes().contains(&reference));
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::Delete { key } if key == &reference))
+        );
+
+        operation.apply(&connection).unwrap();
+        connection
+            .execute("INSERT INTO children VALUES (1, 'missing')", ())
+            .unwrap();
+        connection.execute("DELETE FROM children", ()).unwrap();
+        operation.rollback(&connection).unwrap();
+        assert!(
+            connection
+                .execute("INSERT INTO children VALUES (2, 'missing')", ())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn primary_not_null_default_and_unknown_constraints_are_typed_boundaries() {
+        let (connection, _) = connection_with(
+            "CREATE TABLE notes (
+                id INTEGER CONSTRAINT pk_notes PRIMARY KEY,
+                body TEXT CONSTRAINT nn_body NOT NULL
+                          CONSTRAINT df_body DEFAULT 'empty'
+            )",
+        );
+        for name in ["pk_notes", "nn_body", "df_body", "missing"] {
+            let sql = format!("ALTER TABLE notes DROP CONSTRAINT {name}");
+            let ValidatedExecute::DropConstraint(spec) =
+                crate::sql::validate_execute(&sql).unwrap()
+            else {
+                unreachable!()
+            };
+            assert!(matches!(
+                AlterTableOperation::prepare_drop_constraint(&connection, &sql, &spec),
+                Err(Error::UnsupportedSql(_))
+            ));
+        }
     }
 
     #[test]
@@ -1716,6 +2122,12 @@ mod tests {
             operation
         );
         let lowered = operation.to_homebase().unwrap();
+        let foreign_key = &after.foreign_keys()[0];
+        let reference = constraint_reference_key(
+            parent.table_id(),
+            foreign_key.referenced_index().as_bytes(),
+            foreign_key.id(),
+        );
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
@@ -1723,8 +2135,10 @@ mod tests {
                 table_row_prefix(parent.table_id()),
                 active_schema_revision_key(parent.table_id()),
                 schema_object_name_scope_key(parent.table_name_identity()),
+                reference.clone(),
             ],
         );
+        assert!(lowered.footprint.writes().contains(&reference));
         assert!(
             lowered
                 .footprint

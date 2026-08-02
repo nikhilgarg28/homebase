@@ -448,7 +448,7 @@ mod tests {
             MultiliteOp::create_table("CREATE TABLE notes (id INTEGER PRIMARY KEY)", table());
         let (mutations, footprint) = operation.to_homebase().unwrap().into_parts();
 
-        assert_eq!(mutations.len(), 8);
+        assert_eq!(mutations.len(), 9);
         assert_eq!(footprint.constraints().len(), 1);
         assert!(footprint.constraints().contains(mutations[1].key()));
         assert_eq!(footprint.writes().len(), 1);

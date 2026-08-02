@@ -162,6 +162,24 @@ impl CatalogSnapshot {
                 child
                     .foreign_keys()
                     .iter()
+                    .filter(move |foreign_key| {
+                        foreign_key.is_active() && foreign_key.referenced_table() == parent
+                    })
+                    .map(move |foreign_key| (child, foreign_key))
+            })
+            .collect()
+    }
+
+    pub fn known_incoming_foreign_keys(
+        &self,
+        parent: TableId,
+    ) -> Vec<(&CreateTable, &ForeignKeyDefinition)> {
+        self.tables
+            .values()
+            .flat_map(|child| {
+                child
+                    .foreign_keys()
+                    .iter()
                     .filter(move |foreign_key| foreign_key.referenced_table() == parent)
                     .map(move |foreign_key| (child, foreign_key))
             })
@@ -876,7 +894,9 @@ pub fn incoming_foreign_keys(
             child
                 .foreign_keys()
                 .iter()
-                .filter(|foreign_key| foreign_key.referenced_table() == parent)
+                .filter(|foreign_key| {
+                    foreign_key.is_active() && foreign_key.referenced_table() == parent
+                })
                 .cloned()
                 .map(|foreign_key| (child.clone(), foreign_key)),
         );

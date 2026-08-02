@@ -13,8 +13,9 @@ use uuid::{Uuid, Variant, Version};
 use super::guard::{GuardPlan, GuardReason, LogicalTarget, OperationFamily};
 use super::row::{IndexBackfillEntry, backfill_unique_index, primary_index_prefix};
 use super::schema::{
-    CreateTable, IndexId, MutationId, NamedIndex, active_schema_revision_key,
-    column_index_dependency_key, column_name_scope_key, index_definition_key, schema_log_key,
+    CreateTable, IndexId, MutationId, NamedIndex, active_constraint_key,
+    active_schema_revision_key, column_index_dependency_key, column_name_scope_key,
+    constraint_reference_prefix, index_definition_key, schema_log_key,
     schema_object_name_scope_key, table_schema_key, write_revision_key,
 };
 use crate::catalog;
@@ -186,6 +187,31 @@ impl IndexOperation {
                 key: index_definition_key(self.after.table_id(), self.index.index_id()),
                 value: self.index.encode(),
             });
+        }
+
+        if self.index.is_unique() {
+            let active =
+                active_constraint_key(self.after.table_id(), self.index.index_id().as_bytes());
+            guards.invariant(active.clone(), GuardReason::ConstraintState)?;
+            guards.write(active.clone(), GuardReason::ConstraintState)?;
+            mutations.push(match self.action {
+                IndexAction::Create => Mutation::Set {
+                    key: active,
+                    value: self.index.index_id().as_bytes().to_vec(),
+                },
+                IndexAction::Drop => Mutation::Delete { key: active },
+            });
+            if self.action == IndexAction::Drop {
+                let references = constraint_reference_prefix(
+                    self.after.table_id(),
+                    self.index.index_id().as_bytes(),
+                );
+                guards.invariant(references.clone(), GuardReason::ConstraintReference)?;
+                guards.write(references.clone(), GuardReason::ConstraintReference)?;
+                mutations.push(Mutation::DeleteRange {
+                    range: homebase_core::range::Range::Prefix(references),
+                });
+            }
         }
 
         if self.action == IndexAction::Create && self.index.is_unique() {
@@ -799,7 +825,7 @@ mod tests {
                 .writes()
                 .contains(&write_revision_key(before.table_id()))
         );
-        assert_eq!(lowered.footprint.constraints().len(), 7);
+        assert_eq!(lowered.footprint.constraints().len(), 8);
 
         operation.record_catalog(&connection).unwrap();
         assert_eq!(
@@ -1202,9 +1228,13 @@ mod tests {
                     drop.after.columns()[2].id(),
                     drop.index.index_id(),
                 ),
+                constraint_reference_prefix(
+                    drop.after.table_id(),
+                    drop.index.index_id().as_bytes(),
+                ),
             ],
         );
-        assert_eq!(lowered.footprint.writes().len(), 3);
+        assert_eq!(lowered.footprint.writes().len(), 5);
         assert!(
             lowered
                 .footprint
@@ -1215,7 +1245,8 @@ mod tests {
             !lowered
                 .mutations
                 .iter()
-                .any(|mutation| mutation.key() == &write_revision_key(drop.after.table_id()))
+                .filter_map(Mutation::point_key)
+                .any(|key| key == &write_revision_key(drop.after.table_id()))
         );
 
         drop.rollback(&connection).unwrap();

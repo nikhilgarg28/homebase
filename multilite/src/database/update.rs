@@ -151,6 +151,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 })?;
                 self.execute_alter(sql, params, operation)
             }
+            ValidatedExecute::DropConstraint(spec) => {
+                let operation = self.hooks.with_internal(|| {
+                    AlterTableOperation::prepare_drop_constraint(self.connection, sql, &spec)
+                })?;
+                self.execute_alter(sql, params, operation)
+            }
             ValidatedExecute::CreateTable(table) => self.execute_create_table(sql, params, table),
             ValidatedExecute::CreateTableIfNotExists(table) => {
                 let is_noop = self
@@ -632,7 +638,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         let (changed, events) = self.hooks.run_schema(
             || {
                 if operation.materializes_internally() {
-                    let mut statement = self.connection.prepare(sql)?;
+                    let validation_sql = if operation.requires_native_sql_prepare() {
+                        sql
+                    } else {
+                        "SELECT 1"
+                    };
+                    let mut statement = self.connection.prepare(validation_sql)?;
                     params.__bind_in(&mut statement)?;
                     drop(statement);
                     self.hooks
