@@ -15,6 +15,11 @@ The standard bundled amalgamation is also generated with SQLite's
 SQLite for `UPDATE` and `DELETE` statements using `ORDER BY`, `LIMIT`, or
 `OFFSET`. The SQLCipher amalgamation is unchanged.
 
+The bundled build script checks the amalgamation for that parser marker before
+enabling the compile option. An upstream refresh using the ordinary parser now
+fails at build time instead of producing a library that advertises a feature
+its parser cannot accept.
+
 The callback is consulted only when an ordinary table insert would otherwise
 run SQLite's `OP_NewRowid`. SQLite still validates that each returned positive
 rowid is unused. Explicit rowids, `WITHOUT ROWID`, virtual, `AUTOINCREMENT`, and

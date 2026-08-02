@@ -814,6 +814,126 @@ fn limited_write_selection_is_snapshot_captured_and_serializable_at_table_scope(
 }
 
 #[test]
+fn limited_write_selection_tracks_cross_table_dependencies_for_serializable() {
+    let directory = tempfile::tempdir().unwrap();
+    for (selection, statement) in [
+        (
+            "order",
+            "UPDATE tasks SET state = 'selected'
+             ORDER BY (SELECT rank FROM controls WHERE id = 1), score DESC, id
+             LIMIT 1",
+        ),
+        (
+            "limit",
+            "UPDATE tasks SET state = 'selected'
+             ORDER BY score DESC, id
+             LIMIT (SELECT take FROM controls WHERE id = 1)",
+        ),
+    ] {
+        for (isolation_name, isolation, expect_rejection) in [
+            ("snapshot", IsolationLevel::Snapshot, false),
+            ("serializable", IsolationLevel::Serializable, true),
+        ] {
+            let label = format!("{selection}-{isolation_name}");
+            let authority = server();
+            let first = MultiliteConnection::open_with(
+                directory.path().join(format!("{label}-first.sqlite")),
+                OpenOptions::new().server(router(Arc::clone(&authority))),
+            )
+            .unwrap();
+            assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+            let second = MultiliteConnection::open_with(
+                directory.path().join(format!("{label}-second.sqlite")),
+                OpenOptions::new()
+                    .invitation(first.replica_invitation())
+                    .server(router(Arc::clone(&authority))),
+            )
+            .unwrap();
+
+            first
+                .update(|transaction| {
+                    transaction.execute(
+                        "CREATE TABLE tasks (
+                            id INTEGER PRIMARY KEY,
+                            score INTEGER NOT NULL,
+                            state TEXT NOT NULL
+                        )",
+                        (),
+                    )?;
+                    transaction.execute(
+                        "CREATE TABLE controls (
+                            id INTEGER PRIMARY KEY,
+                            rank INTEGER NOT NULL,
+                            take INTEGER NOT NULL
+                        )",
+                        (),
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO tasks VALUES
+                            (1, 10, 'open'), (2, 20, 'open'),
+                            (3, 30, 'open'), (4, 40, 'open')",
+                        (),
+                    )?;
+                    transaction.execute("INSERT INTO controls VALUES (1, 0, 1)", ())?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            second.pull().unwrap();
+            second.rebase().unwrap();
+
+            first
+                .update_with(UpdateOptions::new(isolation), |transaction| {
+                    assert_eq!(transaction.execute(statement, ())?, 1);
+                    Ok(())
+                })
+                .unwrap();
+            second
+                .execute(
+                    "UPDATE controls SET rank = rank + 1, take = 2 WHERE id = 1",
+                    (),
+                )
+                .unwrap();
+
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+            if expect_rejection {
+                let rejection = rejected(first.push().unwrap());
+                assert_range_assertion_failed(&rejection);
+                first.rollback(&rejection).unwrap();
+                assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            } else {
+                assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            }
+            converge(&first, &second);
+
+            let expected = if expect_rejection { vec![] } else { vec![4] };
+            for database in [&first, &second] {
+                assert_eq!(
+                    database
+                        .query(
+                            "SELECT id FROM tasks WHERE state = 'selected' ORDER BY id",
+                            (),
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    expected,
+                    "{label}"
+                );
+                assert_eq!(
+                    database
+                        .query("SELECT rank, take FROM controls WHERE id = 1", (), |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .unwrap(),
+                    [(1, 2)],
+                    "{label}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_returning_projection_is_conservatively_serializable_at_table_scope() {
     let directory = tempfile::tempdir().unwrap();
     for (label, isolation, expect_rejection) in [

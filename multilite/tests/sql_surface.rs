@@ -1,5 +1,30 @@
+use std::path::Path;
+
 use multilite::{Error, MultiliteConnection};
+use rusqlite::types::Value;
 use rusqlite::{Connection, params};
+
+fn local_write_state(path: &Path) -> (i64, String, Option<String>) {
+    let raw = Connection::open(path).unwrap();
+    (
+        raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        raw.query_row(
+            "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
+            (),
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        raw.query_row(
+            "SELECT max(hex(device_seq)) FROM __multilite__pending",
+            (),
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+    )
+}
 
 #[test]
 fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
@@ -2344,41 +2369,13 @@ fn limited_writes_use_native_order_limit_and_offset_selection() {
         [1, 2, 3, 4]
     );
 
-    let before_noop = {
-        let raw = Connection::open(&path).unwrap();
-        (
-            raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            raw.query_row(
-                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
-                (),
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        )
-    };
+    let before_noop = local_write_state(&path);
     assert_eq!(
         db.execute("UPDATE notes SET body = 'never' ORDER BY id LIMIT 0", (),)
             .unwrap(),
         0
     );
-    let after_noop = {
-        let raw = Connection::open(&path).unwrap();
-        (
-            raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            raw.query_row(
-                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
-                (),
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        )
-    };
+    let after_noop = local_write_state(&path);
     assert_eq!(after_noop, before_noop);
 
     assert_eq!(
@@ -2405,6 +2402,100 @@ fn limited_writes_use_native_order_limit_and_offset_selection() {
         )
         .unwrap(),
         0
+    );
+}
+
+#[test]
+fn invalid_limited_write_bounds_roll_back_without_advancing_local_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("invalid-limited-bounds.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            body TEXT NOT NULL
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'one'), (2, 'two')", ())
+        .unwrap();
+
+    let expected_rows = [(1, String::from("one")), (2, String::from("two"))];
+    let state = local_write_state(&path);
+    for sql in [
+        "UPDATE notes SET body = 'bad' ORDER BY id LIMIT NULL",
+        "DELETE FROM notes ORDER BY id LIMIT 'not-an-integer'",
+        "UPDATE notes SET body = 'bad' ORDER BY id LIMIT 1.5",
+        "DELETE FROM notes ORDER BY id LIMIT 9223372036854775808",
+        "UPDATE notes SET body = 'bad' ORDER BY id LIMIT 1 OFFSET NULL",
+        "DELETE FROM notes ORDER BY id LIMIT 1 OFFSET 'not-an-integer'",
+    ] {
+        assert!(
+            matches!(db.execute(sql, ()), Err(Error::Sqlite(_))),
+            "{sql}"
+        );
+        assert_eq!(
+            db.query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+            expected_rows,
+            "{sql}"
+        );
+        assert_eq!(local_write_state(&path), state, "{sql}");
+    }
+
+    for value in [
+        Value::Null,
+        Value::Text("not-an-integer".into()),
+        Value::Real(1.5),
+    ] {
+        assert!(matches!(
+            db.execute(
+                "UPDATE notes SET body = 'bad' ORDER BY id LIMIT ?1",
+                params![value],
+            ),
+            Err(Error::Sqlite(_))
+        ));
+        assert_eq!(local_write_state(&path), state);
+    }
+    for value in [
+        Value::Null,
+        Value::Text("not-an-integer".into()),
+        Value::Real(1.5),
+    ] {
+        assert!(matches!(
+            db.execute(
+                "DELETE FROM notes ORDER BY id LIMIT 1 OFFSET ?1",
+                params![value],
+            ),
+            Err(Error::Sqlite(_))
+        ));
+        assert_eq!(local_write_state(&path), state);
+    }
+    assert_eq!(
+        db.query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        expected_rows
+    );
+
+    assert_eq!(
+        db.execute(
+            "UPDATE notes SET body = 'first' ORDER BY id LIMIT 1 OFFSET -99",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "first".into()), (2, "two".into())]
     );
 }
 

@@ -27,9 +27,12 @@ SQLite. SQLite chooses the affected rows once against the writable branch
 snapshot. Multilite replicates the resulting `RowChanges`, not the selection
 query, so remote apply and rejection repair never rerun a top-N decision.
 Selection expressions are ordinary reads: snapshot isolation retains mandatory
-row and constraint guards, while serializable isolation currently adds the
-conservative target-table read prefix. `RETURNING` may be combined with these
-clauses, but its output order is not promised by SQLite.
+row and constraint guards, while serializable isolation adds conservative
+table-root prefixes for every synchronized table SQLite reads, including tables
+consulted by scalar subqueries in `ORDER BY`, `LIMIT`, or `OFFSET`. Invalid
+runtime bounds roll back before a logical operation, commit sequence, or pending
+record is created. `RETURNING` may be combined with these clauses, but its
+output order is not promised by SQLite.
 
 `INSERT`, `UPDATE`, and `DELETE` accept SQLite `RETURNING` result columns.
 Statement validation classifies access (`read` or `write`) independently from

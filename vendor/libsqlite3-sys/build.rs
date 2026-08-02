@@ -147,6 +147,15 @@ mod build_bundled {
         // parser. Multilite relies on native selection for UPDATE/DELETE
         // ORDER BY and LIMIT rather than reimplementing it above SQLite.
         if !cfg!(feature = "bundled-sqlcipher") {
+            const UDL_PARSER_MARKER: &[u8] = b"#define SQLITE_UDL_CAPABLE_PARSER 1";
+            let amalgamation = std::fs::read(format!("{lib_name}/sqlite3.c"))
+                .expect("could not read the bundled SQLite amalgamation");
+            assert!(
+                amalgamation
+                    .windows(UDL_PARSER_MARKER.len())
+                    .any(|window| window == UDL_PARSER_MARKER),
+                "the bundled SQLite amalgamation lacks SQLITE_UDL_CAPABLE_PARSER; regenerate it with SQLITE_ENABLE_UPDATE_DELETE_LIMIT before compiling that option"
+            );
             cfg.flag("-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT");
         }
 

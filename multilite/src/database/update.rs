@@ -1234,8 +1234,8 @@ mod tests {
                     id INTEGER PRIMARY KEY,
                     parent INTEGER REFERENCES parents(id) ON DELETE CASCADE
                  );
-                 INSERT INTO parents VALUES (1);
-                 INSERT INTO children VALUES (10, 1), (11, 1)",
+                 INSERT INTO parents VALUES (1), (2);
+                 INSERT INTO children VALUES (10, 1), (11, 1), (20, 2)",
             )
             .unwrap();
         let hooks = BranchHooks::install_with_budget(
@@ -1248,7 +1248,7 @@ mod tests {
         assert!(matches!(
             hooks.run(
                 || {
-                    connection.execute("DELETE FROM parents WHERE id = 1", ())?;
+                    connection.execute("DELETE FROM parents ORDER BY id LIMIT 1", ())?;
                     Ok(())
                 },
                 |_| Ok(()),
@@ -1263,14 +1263,14 @@ mod tests {
                 .query_row("SELECT count(*) FROM parents", (), |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             connection
                 .query_row("SELECT count(*) FROM children", (), |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 

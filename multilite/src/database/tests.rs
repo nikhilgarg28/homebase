@@ -912,7 +912,7 @@ fn remote_returning_rows_are_not_returned_after_authority_rejects_the_write() {
 }
 
 #[test]
-fn remote_delete_rejection_restores_the_complete_row_before_returning() {
+fn remote_limited_delete_rejection_restores_the_complete_row_before_returning() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let first = Database::open_with(
@@ -932,7 +932,12 @@ fn remote_delete_rejection_restores_the_complete_row_before_returning() {
                 )",
                 (),
             )?;
-            update.execute("INSERT INTO notes VALUES (1, 'original', x'0102')", ())?;
+            update.execute(
+                "INSERT INTO notes VALUES
+                    (1, 'original', x'0102'),
+                    (3, 'untouched', x'0304')",
+                (),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -949,7 +954,10 @@ fn remote_delete_rejection_restores_the_complete_row_before_returning() {
     let second_runtime = second.runtime().unwrap();
     let error = second
         .update(&second_runtime, |update| {
-            assert_eq!(update.execute("DELETE FROM notes WHERE id = 1", ())?, 1);
+            assert_eq!(
+                update.execute("DELETE FROM notes ORDER BY id LIMIT 1", ())?,
+                1
+            );
             assert_eq!(
                 update.execute("INSERT INTO notes VALUES (1, 'replacement', x'99')", ())?,
                 1
@@ -958,9 +966,12 @@ fn remote_delete_rejection_restores_the_complete_row_before_returning() {
                 update.execute("INSERT INTO notes VALUES (2, 'temporary', NULL)", ())?,
                 1
             );
-            assert_eq!(update.execute("DELETE FROM notes WHERE id = 2", ())?, 1);
             assert_eq!(
-                first.execute(&first_runtime, "DELETE FROM notes WHERE id = 1", ())?,
+                update.execute("DELETE FROM notes WHERE id = 2 ORDER BY id LIMIT 1", ())?,
+                1
+            );
+            assert_eq!(
+                first.execute(&first_runtime, "DELETE FROM notes ORDER BY id LIMIT 1", (),)?,
                 1
             );
             assert_eq!(first.push()?, PushOutcome::Drained);
@@ -976,21 +987,28 @@ fn remote_delete_rejection_restores_the_complete_row_before_returning() {
     second.with_connection(|connection| {
         assert_eq!(
             connection
-                .query_row("SELECT id, body, payload FROM notes", (), |row| {
+                .prepare("SELECT id, body, payload FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                     ))
-                },)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
-            (1, "original".into(), vec![1, 2])
+            [
+                (1, "original".into(), vec![1, 2]),
+                (3, "untouched".into(), vec![3, 4]),
+            ]
         );
     });
 }
 
 #[test]
-fn remote_update_rejection_restores_the_before_image_before_returning() {
+fn remote_limited_update_rejection_restores_the_before_image_before_returning() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
     let first = Database::open_with(
@@ -1010,7 +1028,12 @@ fn remote_update_rejection_restores_the_before_image_before_returning() {
                 )",
                 (),
             )?;
-            update.execute("INSERT INTO notes VALUES (1, 'original', x'0102')", ())?;
+            update.execute(
+                "INSERT INTO notes VALUES
+                    (1, 'original', x'0102'),
+                    (2, 'untouched', x'0304')",
+                (),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1029,7 +1052,8 @@ fn remote_update_rejection_restores_the_before_image_before_returning() {
         .update(&second_runtime, |update| {
             assert_eq!(
                 update.execute(
-                    "UPDATE notes SET body = 'loser', payload = x'99' WHERE id = 1",
+                    "UPDATE notes SET body = 'loser', payload = x'99'
+                     ORDER BY id LIMIT 1",
                     (),
                 )?,
                 1
@@ -1037,7 +1061,7 @@ fn remote_update_rejection_restores_the_before_image_before_returning() {
             assert_eq!(
                 first.execute(
                     &first_runtime,
-                    "UPDATE notes SET body = 'winner' WHERE id = 1",
+                    "UPDATE notes SET body = 'winner' ORDER BY id LIMIT 1",
                     (),
                 )?,
                 1
@@ -1055,15 +1079,22 @@ fn remote_update_rejection_restores_the_before_image_before_returning() {
     second.with_connection(|connection| {
         assert_eq!(
             connection
-                .query_row("SELECT id, body, payload FROM notes", (), |row| {
+                .prepare("SELECT id, body, payload FROM notes ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                     ))
                 })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
-            (1, "original".into(), vec![1, 2])
+            [
+                (1, "original".into(), vec![1, 2]),
+                (2, "untouched".into(), vec![3, 4]),
+            ]
         );
     });
 }
