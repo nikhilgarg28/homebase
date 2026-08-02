@@ -13,6 +13,16 @@
 - Resolve lease-barrier scope and align code, tests, and documentation. The server currently records the space-global admission high water at grant time, while older design text describes a prefix-local barrier. Decide whether barriers are intentionally global or should become prefix-local, document the resulting semantics, and remove the contradictory contract everywhere.
 - Evaluate a whole-space cumulative checksum as a sync/snapshot integrity layer. Unlike the per-device checksum used for push recovery, clients can validate a cross-device checksum only when they receive every intervening canonical batch or a compact proof; design it with changelog retention, snapshot manifests, and the existing per-prefix Merkle-hash idea rather than folding it into device admission.
 multilite
+- Conditional table/index DDL follows transaction-snapshot semantics rather
+  than desired-state reconciliation. Successful no-ops emit no standalone
+  operation; their shared schema-name observation joins a larger serializable
+  transaction's read footprint. Add ergonomic retry separately: standalone
+  statements need owned replayable parameters, while managed `FnOnce` updates
+  must either return a typed retryable conflict or gain an explicit retry-safe
+  `FnMut` API. Authority rejection requires rollback plus pull/rebase before
+  re-executing the complete dependent transaction; never reinterpret a losing
+  random table identity as the winning one.
+
 - Keep synchronized uniqueness intentionally narrower than SQLite's complete
   index grammar. Plain column tuples, with column order preserved, are the
   durable product boundary

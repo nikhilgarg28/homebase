@@ -105,6 +105,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `DropColumn` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `DropColumn` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `TransactionRead` | `SerializableRead` | `SerializableRead` | `TableRoot` |
+| `TransactionRead` | `SerializableRead` | `SerializableRead` | `SchemaObjectName` |
 
 ## Rejection Repair
 

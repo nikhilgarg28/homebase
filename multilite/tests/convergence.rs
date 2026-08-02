@@ -233,6 +233,98 @@ fn idempotent_ddl_lowers_missing_objects_and_repeats_as_convergent_noops() {
 }
 
 #[test]
+fn concurrent_conditional_table_drops_repair_and_retry_as_a_noop() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = server();
+        let second_path = directory
+            .path()
+            .join(format!("conditional-drop-second-{isolation:?}.sqlite"));
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("conditional-drop-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE disposable (
+                        tenant TEXT,
+                        id INTEGER,
+                        body TEXT NOT NULL UNIQUE,
+                        PRIMARY KEY (tenant, id)
+                    ) WITHOUT ROWID",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE INDEX disposable_body ON disposable(lower(body))",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO disposable VALUES ('north', 1, 'one')", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("DROP TABLE IF EXISTS disposable", ())
+            .unwrap();
+        second
+            .execute("DROP TABLE IF EXISTS DISPOSABLE", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("concurrent conditional table drops both admitted")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        second.rollback(&rejection).unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        second
+            .execute("DROP TABLE IF EXISTS disposable", ())
+            .unwrap();
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .query("SELECT * FROM disposable", (), |_| Ok(()))
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn ignored_conflicts_compile_only_the_rows_sqlite_changed_and_converge() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

@@ -64,12 +64,14 @@ schema revision, index definitions, active primary index, and one mutable
 `write-revision` cell whose value is the UUID of the latest DDL operation that
 changed valid row lowering. The inverse translation verifies the complete
 envelope and checks that stored SQL projects to the same structured operation.
-`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and
-`DROP INDEX IF EXISTS` preserve SQLite's idempotent behavior. A missing object
-lowers to the ordinary logical operation; a same-kind existing object (or a
-missing dropped index) is a true no-op that mints no UUID, pending record, or
-local commit. SQLite's shared table/index namespace still rejects cross-kind
-CREATE collisions.
+`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `DROP INDEX IF
+EXISTS`, and `DROP TABLE IF EXISTS` preserve SQLite's idempotent behavior. A
+missing create target or present drop target lowers to the ordinary logical
+operation. A disposition already satisfied in the branch snapshot is a true
+no-op that mints no UUID, pending record, or local commit; inside a larger
+serializable update, its schema-name observation joins the transaction's read
+footprint. SQLite's shared schema namespace still determines cross-kind
+behavior.
 
 SQLite's preupdate hook captures final inserted, deleted, and updated values
 after affinity and conflict handling have run. One SQL statement becomes one

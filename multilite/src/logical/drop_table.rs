@@ -321,12 +321,14 @@ impl DropTableOperation {
     }
 
     fn validate(&self) -> std::result::Result<(), DropTableCodecError> {
-        let crate::sql::ValidatedExecute::DropTable(spec) =
-            crate::sql::validate_execute(&self.sql).map_err(|_| DropTableCodecError::InvalidSql)?
-        else {
-            return Err(DropTableCodecError::InvalidSql);
+        let spec = match crate::sql::validate_execute(&self.sql)
+            .map_err(|_| DropTableCodecError::InvalidSql)?
+        {
+            crate::sql::ValidatedExecute::DropTable(spec)
+            | crate::sql::ValidatedExecute::DropTableIfExists(spec) => spec,
+            _ => return Err(DropTableCodecError::InvalidSql),
         };
-        if spec.name != self.source_table {
+        if spec.name.canonical() != self.source_table.canonical() {
             return Err(DropTableCodecError::SqlMismatch);
         }
         self.before
@@ -501,11 +503,18 @@ mod tests {
             Err(DropTableCodecError::Truncated)
         );
 
-        let mut contradictory = operation;
+        let mut contradictory = operation.clone();
         contradictory.sql = "DROP TABLE another_table".into();
         assert_eq!(
             DropTableOperation::decode(&contradictory.encode()),
             Err(DropTableCodecError::SqlMismatch)
+        );
+
+        let mut conditional = operation;
+        conditional.sql = "DROP TABLE IF EXISTS inventory".into();
+        assert_eq!(
+            DropTableOperation::decode(&conditional.encode()).unwrap(),
+            conditional
         );
     }
 }

@@ -22,7 +22,9 @@ use crate::logical::guard::{GuardPlan, GuardReason, OperationFamily};
 use crate::logical::index::IndexOperation;
 use crate::logical::operation::{CompiledOperation, MultiliteOp};
 use crate::logical::row::{CaptureBudget, CapturedChange, RowChanges};
-use crate::logical::schema::{CreateTable, TableId, table_prefix};
+use crate::logical::schema::{
+    CreateTable, SqlName, TableId, schema_object_name_scope_key, table_prefix,
+};
 use crate::logical::transaction::MultiliteTransaction;
 use crate::runtime::ExecutionMode;
 use crate::sql::ValidatedExecute;
@@ -127,33 +129,31 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     .hooks
                     .with_internal(|| self.create_table_is_noop(&table.name))?;
                 if is_noop {
-                    self.execute_schema_noop(sql, params, "CREATE TABLE captured application rows")
+                    self.execute_conditional_schema_noop(
+                        sql,
+                        params,
+                        &table.name,
+                        "CREATE TABLE captured application rows",
+                    )
                 } else {
                     self.execute_create_table(sql, params, table)
                 }
             }
-            ValidatedExecute::DropTable(spec) => {
-                let operation = self
+            ValidatedExecute::DropTable(spec) => self.execute_drop_table(sql, params, spec),
+            ValidatedExecute::DropTableIfExists(spec) => {
+                let is_noop = self
                     .hooks
-                    .with_internal(|| DropTableOperation::prepare(self.connection, sql, &spec))?;
-                let compiled = MultiliteOp::DropTable(operation.clone()).compile()?;
-                let (changed, events) = self.hooks.run_schema(
-                    || {
-                        let changed = self.connection.execute(sql, params)?;
-                        self.hooks.with_internal(|| {
-                            catalog::remove_by_id(self.connection, operation.table_id())
-                        })?;
-                        Ok(changed)
-                    },
-                    |_| Ok(()),
-                )?;
-                if !events.is_empty() {
-                    return Err(Error::CaptureInvariant(
+                    .with_internal(|| self.drop_table_is_noop(&spec.name))?;
+                if is_noop {
+                    self.execute_conditional_schema_noop(
+                        sql,
+                        params,
+                        &spec.name,
                         "DROP TABLE captured application rows",
-                    ));
+                    )
+                } else {
+                    self.execute_drop_table(sql, params, spec)
                 }
-                self.record_operation(compiled);
-                Ok(changed)
             }
             ValidatedExecute::CreateIndex(spec) => self.execute_create_index(sql, params, spec),
             ValidatedExecute::CreateIndexIfNotExists(spec) => {
@@ -161,7 +161,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     .hooks
                     .with_internal(|| self.create_index_is_noop(&spec.name))?;
                 if is_noop {
-                    self.execute_schema_noop(sql, params, "CREATE INDEX captured application rows")
+                    self.execute_conditional_schema_noop(
+                        sql,
+                        params,
+                        &spec.name,
+                        "CREATE INDEX captured application rows",
+                    )
                 } else {
                     self.execute_create_index(sql, params, spec)
                 }
@@ -172,7 +177,12 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     .hooks
                     .with_internal(|| self.drop_index_is_noop(&spec.name))?;
                 if is_noop {
-                    self.execute_schema_noop(sql, params, "DROP INDEX captured application rows")
+                    self.execute_conditional_schema_noop(
+                        sql,
+                        params,
+                        &spec.name,
+                        "DROP INDEX captured application rows",
+                    )
                 } else {
                     self.execute_drop_index(sql, params, spec)
                 }
@@ -211,6 +221,31 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         )?;
         ensure_no_schema_rows(&events, "CREATE TABLE captured application rows")?;
         self.record_operation(operation);
+        Ok(changed)
+    }
+
+    fn execute_drop_table<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        spec: crate::sql::DropTableSpec,
+    ) -> Result<usize> {
+        let operation = self
+            .hooks
+            .with_internal(|| DropTableOperation::prepare(self.connection, sql, &spec))?;
+        let compiled = MultiliteOp::DropTable(operation.clone()).compile()?;
+        let (changed, events) = self.hooks.run_schema(
+            || {
+                let changed = self.connection.execute(sql, params)?;
+                self.hooks.with_internal(|| {
+                    catalog::remove_by_id(self.connection, operation.table_id())
+                })?;
+                Ok(changed)
+            },
+            |_| Ok(()),
+        )?;
+        ensure_no_schema_rows(&events, "DROP TABLE captured application rows")?;
+        self.record_operation(compiled);
         Ok(changed)
     }
 
@@ -278,54 +313,82 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         Ok(changed)
     }
 
+    fn execute_conditional_schema_noop<Q: Params>(
+        &mut self,
+        sql: &str,
+        params: Q,
+        name: &SqlName,
+        capture_error: &'static str,
+    ) -> Result<usize> {
+        let changed = self.execute_schema_noop(sql, params, capture_error)?;
+        let mut reads = GuardPlan::for_operation(OperationFamily::TransactionRead);
+        reads.serializable_read(
+            schema_object_name_scope_key(name),
+            GuardReason::SerializableRead,
+        )?;
+        self.footprint.extend(reads.footprint());
+        Ok(changed)
+    }
+
     fn create_table_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
-        let physical = schema_object_kind(self.connection, name.value())?;
-        let catalog = catalog::by_name(self.connection, name.value())?;
-        match (physical.as_deref(), catalog) {
-            (Some("table"), Some(table)) => {
+        match schema_object_state(
+            self.connection,
+            name,
+            "table",
+            catalog::by_name(self.connection, name.value())?,
+            "CREATE TABLE IF NOT EXISTS found an untracked SQLite table",
+            "schema catalog table is missing from SQLite",
+        )? {
+            SchemaObjectState::Present(table) => {
                 crate::physical::verify_table(self.connection, table.table_id())?;
                 Ok(true)
             }
-            (Some("table"), None) => Err(Error::InvalidDatabase(
-                "CREATE TABLE IF NOT EXISTS found an untracked SQLite table",
-            )),
-            (_, Some(_)) => Err(Error::InvalidDatabase(
-                "schema catalog table is missing from SQLite",
-            )),
-            _ => Ok(false),
+            SchemaObjectState::Missing | SchemaObjectState::DifferentKind => Ok(false),
         }
     }
 
     fn create_index_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
-        let physical = schema_object_kind(self.connection, name.value())?;
-        let catalog = catalog::index_by_name(self.connection, name)?;
-        match (physical.as_deref(), catalog) {
-            (Some("index"), Some((table, _))) => {
+        match schema_object_state(
+            self.connection,
+            name,
+            "index",
+            catalog::index_by_name(self.connection, name)?,
+            "CREATE INDEX IF NOT EXISTS found an untracked SQLite index",
+            "schema catalog index is missing from SQLite",
+        )? {
+            SchemaObjectState::Present((table, _)) => {
                 crate::physical::verify_table(self.connection, table.table_id())?;
                 Ok(true)
             }
-            (Some("index"), None) => Err(Error::InvalidDatabase(
-                "CREATE INDEX IF NOT EXISTS found an untracked SQLite index",
-            )),
-            (_, Some(_)) => Err(Error::InvalidDatabase(
-                "schema catalog index is missing from SQLite",
-            )),
-            _ => Ok(false),
+            SchemaObjectState::Missing | SchemaObjectState::DifferentKind => Ok(false),
         }
     }
 
     fn drop_index_is_noop(&self, name: &crate::logical::schema::SqlName) -> Result<bool> {
-        let physical = schema_object_kind(self.connection, name.value())?;
-        let catalog = catalog::index_by_name(self.connection, name)?;
-        match (physical.as_deref(), catalog) {
-            (Some("index"), Some(_)) => Ok(false),
-            (Some("index"), None) => Err(Error::InvalidDatabase(
-                "DROP INDEX IF EXISTS found an untracked SQLite index",
-            )),
-            (_, Some(_)) => Err(Error::InvalidDatabase(
-                "schema catalog index is missing from SQLite",
-            )),
-            _ => Ok(true),
+        match schema_object_state(
+            self.connection,
+            name,
+            "index",
+            catalog::index_by_name(self.connection, name)?,
+            "DROP INDEX IF EXISTS found an untracked SQLite index",
+            "schema catalog index is missing from SQLite",
+        )? {
+            SchemaObjectState::Present(_) => Ok(false),
+            SchemaObjectState::Missing | SchemaObjectState::DifferentKind => Ok(true),
+        }
+    }
+
+    fn drop_table_is_noop(&self, name: &SqlName) -> Result<bool> {
+        match schema_object_state(
+            self.connection,
+            name,
+            "table",
+            catalog::by_name(self.connection, name.value())?,
+            "DROP TABLE IF EXISTS found an untracked SQLite table",
+            "schema catalog table is missing from SQLite",
+        )? {
+            SchemaObjectState::Present(_) => Ok(false),
+            SchemaObjectState::Missing | SchemaObjectState::DifferentKind => Ok(true),
         }
     }
 
@@ -418,6 +481,32 @@ fn schema_object_kind(connection: &Connection, name: &str) -> Result<Option<Stri
             |row| row.get(0),
         )
         .optional()?)
+}
+
+enum SchemaObjectState<T> {
+    Missing,
+    Present(T),
+    DifferentKind,
+}
+
+fn schema_object_state<T>(
+    connection: &Connection,
+    name: &SqlName,
+    expected_kind: &'static str,
+    catalog: Option<T>,
+    untracked_error: &'static str,
+    missing_error: &'static str,
+) -> Result<SchemaObjectState<T>> {
+    let physical = schema_object_kind(connection, name.value())?;
+    match (physical.as_deref(), catalog) {
+        (Some(kind), Some(catalog)) if kind == expected_kind => {
+            Ok(SchemaObjectState::Present(catalog))
+        }
+        (Some(kind), None) if kind == expected_kind => Err(Error::InvalidDatabase(untracked_error)),
+        (_, Some(_)) => Err(Error::InvalidDatabase(missing_error)),
+        (Some(_), None) => Ok(SchemaObjectState::DifferentKind),
+        (None, None) => Ok(SchemaObjectState::Missing),
+    }
 }
 
 fn compile_row_changes(

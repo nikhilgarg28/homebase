@@ -38,6 +38,7 @@ pub enum ValidatedExecute {
     CreateTable(CreateTableSpec),
     CreateTableIfNotExists(CreateTableSpec),
     DropTable(DropTableSpec),
+    DropTableIfExists(DropTableSpec),
     CreateIndex(CreateIndexSpec),
     CreateIndexIfNotExists(CreateIndexSpec),
     DropIndex(DropIndexSpec),
@@ -383,11 +384,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             if_exists,
             tbl_name,
         } => {
-            if if_exists {
-                return Err(Error::UnsupportedSql(
-                    "DROP TABLE IF EXISTS is not supported",
-                ));
-            }
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified DROP TABLE names are not supported",
@@ -399,7 +395,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                     "reserved SQLite and Multilite table names are not supported",
                 ));
             }
-            Ok(ValidatedExecute::DropTable(DropTableSpec { name }))
+            let spec = DropTableSpec { name };
+            Ok(if if_exists {
+                ValidatedExecute::DropTableIfExists(spec)
+            } else {
+                ValidatedExecute::DropTable(spec)
+            })
         }
         Stmt::DropIndex {
             if_exists,
@@ -2660,6 +2661,11 @@ mod tests {
             validate_execute("DROP INDEX IF EXISTS notes_body"),
             Ok(ValidatedExecute::DropIndexIfExists(spec))
                 if spec.name == SqlName::new("notes_body".into())
+        ));
+        assert!(matches!(
+            validate_execute("DROP TABLE IF EXISTS notes"),
+            Ok(ValidatedExecute::DropTableIfExists(spec))
+                if spec.name == SqlName::new("notes".into())
         ));
     }
 

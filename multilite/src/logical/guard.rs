@@ -327,6 +327,12 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
         SerializableRead,
         TableRoot
     ),
+    contract!(
+        TransactionRead,
+        SerializableRead,
+        SerializableRead,
+        SchemaObjectName
+    ),
 ];
 
 /// Guards that every operation in a family must emit at least once.

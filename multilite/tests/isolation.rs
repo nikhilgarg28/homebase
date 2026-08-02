@@ -103,6 +103,94 @@ fn serializable_read_conflict_repairs_after_reopen_and_converges() {
 }
 
 #[test]
+fn conditional_schema_noops_track_serializable_name_reads() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        for drop_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let authority = server();
+            let first = MultiliteConnection::open_with(
+                directory.path().join(format!(
+                    "conditional-first-{isolation:?}-{drop_first}.sqlite"
+                )),
+                OpenOptions::new().server(router(Arc::clone(&authority))),
+            )
+            .unwrap();
+            assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+            let second = MultiliteConnection::open_with(
+                directory.path().join(format!(
+                    "conditional-second-{isolation:?}-{drop_first}.sqlite"
+                )),
+                OpenOptions::new()
+                    .invitation(first.replica_invitation())
+                    .server(router(Arc::clone(&authority))),
+            )
+            .unwrap();
+
+            first
+                .update(|transaction| {
+                    transaction.execute(
+                        "CREATE TABLE observed (id INTEGER PRIMARY KEY, body TEXT)",
+                        (),
+                    )?;
+                    transaction
+                        .execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT)", ())?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+            second.pull().unwrap();
+            second.rebase().unwrap();
+
+            first
+                .update_with(UpdateOptions::new(isolation), |transaction| {
+                    transaction.execute(
+                        "CREATE TABLE IF NOT EXISTS observed (
+                            id INTEGER PRIMARY KEY,
+                            ignored BLOB
+                        )",
+                        (),
+                    )?;
+                    transaction.execute("INSERT INTO audit VALUES (1, 'saw-observed')", ())?;
+                    Ok(())
+                })
+                .unwrap();
+            second.execute("DROP TABLE observed", ()).unwrap();
+
+            let expect_observer_rejection = drop_first && isolation == IsolationLevel::Serializable;
+            if drop_first {
+                assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+                if expect_observer_rejection {
+                    let rejection = rejected(first.push().unwrap());
+                    assert_range_assertion_failed(&rejection);
+                    first.rollback(&rejection).unwrap();
+                    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+                } else {
+                    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+                }
+            } else {
+                assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+                assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+            }
+
+            converge(&first, &second);
+            for database in [&first, &second] {
+                assert!(
+                    database
+                        .query("SELECT * FROM observed", (), |_| Ok(()))
+                        .is_err()
+                );
+                assert_eq!(
+                    database
+                        .query("SELECT count(*) FROM audit", (), |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    [i64::from(!expect_observer_rejection)]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn primary_key_collisions_are_mandatory_at_both_isolation_levels() {
     let directory = tempfile::tempdir().unwrap();
     for (label, isolation) in [

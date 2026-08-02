@@ -239,6 +239,43 @@ fn idempotent_ddl_noops_create_no_pending_operations_and_survive_reopen() {
             .unwrap(),
         ["batched", "batched_body"]
     );
+
+    let before_conditional_drop = local_state();
+    reopened
+        .execute("DROP TABLE IF EXISTS table_that_never_existed", ())
+        .unwrap();
+    reopened
+        .execute("DROP TABLE IF EXISTS batched_body", ())
+        .unwrap();
+    assert_eq!(local_state(), before_conditional_drop);
+
+    reopened
+        .execute("DROP TABLE IF EXISTS BATCHED", ())
+        .unwrap();
+    let after_conditional_drop = local_state();
+    assert_eq!(after_conditional_drop.0, before_conditional_drop.0 + 1);
+    reopened
+        .execute("DROP TABLE IF EXISTS batched", ())
+        .unwrap();
+    assert_eq!(local_state(), after_conditional_drop);
+    drop(reopened);
+
+    let reopened = MultiliteConnection::open(&path).unwrap();
+    assert!(
+        reopened
+            .query("SELECT * FROM batched", (), |_| Ok(()))
+            .is_err()
+    );
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM __multilite__repair WHERE kind = 2",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
 }
 
 #[test]

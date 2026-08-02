@@ -448,6 +448,14 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "conditional_drop_table_and_stale_insert",
+        relationship: "conditional table-root destruction and a stale row write",
+        left: operation!(DropTable, "DROP TABLE IF EXISTS notes"),
+        right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "drop_table_and_disjoint_parent_insert",
         relationship: "different table-owned roots",
         left: operation!(DropTable, "DROP TABLE notes"),
