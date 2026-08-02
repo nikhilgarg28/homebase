@@ -452,6 +452,152 @@ fn upsert_do_update_rejection_reopens_repairs_exact_net_effects_and_converges() 
 }
 
 #[test]
+fn replacement_rejection_reopens_restores_every_victim_and_converges() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory.path().join("replace-first.sqlite");
+        let second_path = directory.path().join("replace-second.sqlite");
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let invitation = first.replica_invitation();
+        let second_options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server)))
+        };
+        let second =
+            MultiliteConnection::open_with(&second_path, second_options().invitation(invitation))
+                .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE profiles (
+                        id INTEGER PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE,
+                        handle TEXT NOT NULL UNIQUE,
+                        body TEXT NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO profiles VALUES
+                        (1, 'one@example.com', 'one', 'first'),
+                        (2, 'two@example.com', 'two', 'second'),
+                        (5, 'five@example.com', 'five', 'untouched')",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute("UPDATE profiles SET body = 'winner' WHERE id = 1", ())
+            .unwrap();
+        second
+            .execute(
+                "REPLACE INTO profiles VALUES
+                    (3, 'one@example.com', 'two', 'speculative')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("conflicting replacement was admitted under {isolation:?}")
+        };
+
+        drop(second);
+        let second = MultiliteConnection::open_with(&second_path, second_options()).unwrap();
+        let profile_rows = |database: &MultiliteConnection<_>| {
+            database
+                .query(
+                    "SELECT id, email, handle, body FROM profiles ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            profile_rows(&second),
+            [
+                (
+                    3,
+                    "one@example.com".into(),
+                    "two".into(),
+                    "speculative".into(),
+                ),
+                (
+                    5,
+                    "five@example.com".into(),
+                    "five".into(),
+                    "untouched".into(),
+                ),
+            ]
+        );
+
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            profile_rows(&second),
+            [
+                (1, "one@example.com".into(), "one".into(), "first".into(),),
+                (2, "two@example.com".into(), "two".into(), "second".into(),),
+                (
+                    5,
+                    "five@example.com".into(),
+                    "five".into(),
+                    "untouched".into(),
+                ),
+            ]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        let expected = [
+            (
+                1,
+                String::from("one@example.com"),
+                String::from("one"),
+                String::from("winner"),
+            ),
+            (
+                2,
+                String::from("two@example.com"),
+                String::from("two"),
+                String::from("second"),
+            ),
+            (
+                5,
+                String::from("five@example.com"),
+                String::from("five"),
+                String::from("untouched"),
+            ),
+        ];
+        assert_eq!(profile_rows(&first), expected);
+        assert_eq!(profile_rows(&second), expected);
+    }
+}
+
+#[test]
 fn conflict_mode_rejection_repair_survives_reopen_and_restores_only_net_changes() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

@@ -57,6 +57,7 @@ struct Coverage {
     reopened_before_repair: bool,
     insert_or_ignore: bool,
     update_or_ignore: bool,
+    replacement: bool,
     upsert_do_nothing: bool,
     upsert_do_update: bool,
 }
@@ -73,6 +74,7 @@ impl Coverage {
         self.reopened_before_repair |= other.reopened_before_repair;
         self.insert_or_ignore |= other.insert_or_ignore;
         self.update_or_ignore |= other.update_or_ignore;
+        self.replacement |= other.replacement;
         self.upsert_do_nothing |= other.upsert_do_nothing;
         self.upsert_do_update |= other.upsert_do_update;
     }
@@ -98,6 +100,7 @@ fn seeded_two_replica_workloads_preserve_logical_and_sqlite_integrity() {
     assert!(coverage.reopened_before_repair);
     assert!(coverage.insert_or_ignore);
     assert!(coverage.update_or_ignore);
+    assert!(coverage.replacement);
     assert!(coverage.upsert_do_nothing);
     assert!(coverage.upsert_do_update);
 }
@@ -244,6 +247,7 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 true
             }
             3 => {
+                coverage.replacement = true;
                 first
                     .execute(
                         &first_runtime,
@@ -254,8 +258,9 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 second
                     .execute(
                         &second_runtime,
-                        "DELETE FROM children WHERE id = ?1",
-                        [child],
+                        "INSERT OR REPLACE INTO children
+                         VALUES (?1, ?2, 'replacement')",
+                        rusqlite::params![child, code_a],
                     )
                     .unwrap();
                 true

@@ -717,6 +717,183 @@ mod tests {
     }
 
     #[test]
+    fn replacement_hook_stream_reports_every_implicit_victim() {
+        for insert in ["INSERT OR REPLACE", "REPLACE"] {
+            let connection = Connection::open_in_memory().unwrap();
+            crate::catalog::initialize(&connection).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE,
+                        handle TEXT NOT NULL UNIQUE,
+                        body TEXT NOT NULL
+                    );
+                    INSERT INTO accounts VALUES
+                        (1, 'one@example.com', 'one', 'first'),
+                        (2, 'two@example.com', 'two', 'second')",
+                )
+                .unwrap();
+            let hooks = BranchHooks::install(&connection, false).unwrap();
+
+            let (_, events) = hooks
+                .run(
+                    || {
+                        Ok(connection.execute(
+                            &format!(
+                                "{insert} INTO accounts VALUES
+                                 (3, 'one@example.com', 'two', 'replacement')"
+                            ),
+                            (),
+                        )?)
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+
+            let mut deleted = events
+                .iter()
+                .filter_map(|event| match event {
+                    CapturedChange::Delete(row) => match row.values[0] {
+                        StoredValue::Integer(id) => Some(id),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            deleted.sort_unstable();
+            assert_eq!(deleted, [1, 2]);
+            assert_eq!(
+                events.last(),
+                Some(&CapturedChange::Insert(CapturedRow {
+                    table: "accounts".into(),
+                    rowid: 3,
+                    values: vec![
+                        StoredValue::Integer(3),
+                        StoredValue::Text(b"one@example.com".to_vec()),
+                        StoredValue::Text(b"two".to_vec()),
+                        StoredValue::Text(b"replacement".to_vec()),
+                    ],
+                }))
+            );
+            assert_eq!(events.len(), 3);
+        }
+    }
+
+    #[test]
+    fn update_or_replace_hook_stream_reports_deleted_victim_and_survivor_update() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    body TEXT NOT NULL
+                );
+                INSERT INTO accounts VALUES
+                    (1, 'one@example.com', 'first'),
+                    (2, 'two@example.com', 'second')",
+            )
+            .unwrap();
+        let hooks = BranchHooks::install(&connection, false).unwrap();
+
+        let (_, events) = hooks
+            .run(
+                || {
+                    Ok(connection.execute(
+                        "UPDATE OR REPLACE accounts
+                         SET email = 'two@example.com', body = 'replaced'
+                         WHERE id = 1",
+                        (),
+                    )?)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CapturedChange::Delete(row)
+                    if row.values[0] == StoredValue::Integer(2)
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CapturedChange::Update { before, after }
+                    if before.values[0] == StoredValue::Integer(1)
+                        && after.values[0] == StoredValue::Integer(1)
+                        && after.values[1]
+                            == StoredValue::Text(b"two@example.com".to_vec())
+            )
+        }));
+    }
+
+    #[test]
+    fn replacement_victims_count_toward_the_atomic_capture_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    handle TEXT NOT NULL UNIQUE
+                );
+                INSERT INTO accounts VALUES
+                    (1, 'one@example.com', 'one'),
+                    (2, 'two@example.com', 'two')",
+            )
+            .unwrap();
+        let hooks = BranchHooks::install_with_budget(
+            &connection,
+            false,
+            CaptureBudget::with_limits(2, usize::MAX),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            hooks.run(
+                || {
+                    connection.execute(
+                        "REPLACE INTO accounts VALUES
+                            (3, 'one@example.com', 'two')",
+                        (),
+                    )?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            ),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-change count",
+                limit: 2,
+            })
+        ));
+        assert_eq!(
+            connection
+                .prepare("SELECT id, email, handle FROM accounts ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [
+                (1, "one@example.com".into(), "one".into()),
+                (2, "two@example.com".into(), "two".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn capture_limit_rolls_back_the_complete_sqlite_statement() {
         let connection = Connection::open_in_memory().unwrap();
         crate::catalog::initialize(&connection).unwrap();

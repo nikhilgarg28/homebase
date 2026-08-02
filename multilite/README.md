@@ -66,10 +66,14 @@ SQLite's preupdate hook captures final inserted, deleted, and updated values
 after affinity and conflict handling have run. One SQL statement becomes one
 `RowChanges` operation: its ordered hook events are folded into deterministic
 net before/after images for one synchronized table, while immutable table,
-index, and relationship rules are stored once. `OR ABORT`, `OR IGNORE`, and
-UPSERT chains containing `DO NOTHING` and/or `DO UPDATE` therefore lower only
-the rows SQLite actually changed. A replica applies the captured net row
-transition; it does not rerun the procedural conflict-selection program.
+index, and relationship rules are stored once. `OR ABORT`, `OR IGNORE`,
+`INSERT OR REPLACE`, `REPLACE INTO`, `UPDATE OR REPLACE`, and UPSERT chains
+containing `DO NOTHING` and/or `DO UPDATE` therefore lower only the rows SQLite
+actually changed. Replacement captures every implicitly deleted UNIQUE/primary
+key victim together with the final row. A replica applies the complete captured
+net transition; it does not rerun the procedural conflict-selection program or
+its intermediate foreign-key checks. Canonical and inverse replay suppress user
+triggers, validate the final foreign-key state, and commit atomically.
 Snapshot isolation validates the resulting row, UNIQUE, and foreign-key guards,
 while serializable isolation additionally retains the conflict handler's table
 reads. Row frames identify their schema revision and carry

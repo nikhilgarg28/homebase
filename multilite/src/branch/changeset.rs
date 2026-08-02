@@ -8,7 +8,6 @@ use fallible_iterator::FallibleIterator as _;
 use fallible_streaming_iterator::FallibleStreamingIterator as _;
 use homebase_core::reader::Reader;
 use homebase_core::writer::Writer;
-use rusqlite::config::DbConfig;
 use rusqlite::hooks::Action;
 use rusqlite::session::{ChangesetIter, Session};
 use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
@@ -17,7 +16,7 @@ use sqlite3_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 use sqlite3_parser::lexer::sql::Parser;
 
 use super::WritableBranch;
-use crate::connection::with_savepoint;
+use crate::connection::{with_materialization_context, with_savepoint};
 use crate::sqlite::quote_identifier;
 use crate::value::StoredValue;
 
@@ -503,47 +502,24 @@ fn apply_changes(
             return Ok(());
         }
 
-        let triggers = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
-        let foreign_keys = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
-        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
-        if let Err(error) = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false) {
-            let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers);
-            return Err(error.into());
-        }
-
-        let replay_result = (|| {
-            let replay = prepare_replay(connection, changes)?;
-            for change in &replay {
-                if let Some(key) = &change.old_key {
-                    delete_old_row(connection, &change.table, key)?;
+        with_materialization_context(
+            connection,
+            || {
+                let replay = prepare_replay(connection, changes)?;
+                for change in &replay {
+                    if let Some(key) = &change.old_key {
+                        delete_old_row(connection, &change.table, key)?;
+                    }
                 }
-            }
-            for change in &replay {
-                if let Some(row) = &change.final_row {
-                    insert_final_row(connection, &change.table, row)?;
+                for change in &replay {
+                    if let Some(row) = &change.final_row {
+                        insert_final_row(connection, &change.table, row)?;
+                    }
                 }
-            }
-            let foreign_key_violation = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
-                (),
-                |row| row.get::<_, bool>(0),
-            )?;
-            if foreign_key_violation {
-                return Err(ChangesetError::ForeignKeyViolation);
-            }
-            Ok(())
-        })();
-
-        let restore_triggers = connection
-            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers)
-            .map(|_| ());
-        let restore_foreign_keys = connection
-            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys)
-            .map(|_| ());
-        replay_result?;
-        restore_triggers?;
-        restore_foreign_keys?;
-        Ok(())
+                Ok(())
+            },
+            || ChangesetError::ForeignKeyViolation,
+        )
     })
 }
 
@@ -938,6 +914,8 @@ struct ChangeSummary {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use rusqlite::config::DbConfig;
 
     use super::*;
     use crate::branch::snapshot::PinnedSnapshot;

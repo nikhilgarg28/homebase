@@ -1,6 +1,7 @@
 use crate::Result;
 use parking_lot::ReentrantMutex;
 use rusqlite::Connection;
+use rusqlite::config::DbConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +81,84 @@ where
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback.into()),
         },
+    }
+}
+
+/// Apply captured final state without re-running user triggers or intermediate
+/// foreign-key checks, then validate the complete resulting database.
+pub(crate) fn with_materialization_context<T, E>(
+    connection: &Connection,
+    operation: impl FnOnce() -> std::result::Result<T, E>,
+    foreign_key_error: impl FnOnce() -> E,
+) -> std::result::Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    let config = MaterializationConfig::suppress(connection)?;
+    let value = operation()?;
+    let foreign_key_violation = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+        (),
+        |row| row.get::<_, bool>(0),
+    )?;
+    if foreign_key_violation {
+        return Err(foreign_key_error());
+    }
+    config.restore()?;
+    Ok(value)
+}
+
+struct MaterializationConfig<'connection> {
+    connection: &'connection Connection,
+    triggers: bool,
+    foreign_keys: bool,
+    active: bool,
+}
+
+impl<'connection> MaterializationConfig<'connection> {
+    fn suppress(connection: &'connection Connection) -> rusqlite::Result<Self> {
+        let triggers = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
+        let foreign_keys = connection.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+        if let Err(error) = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false) {
+            let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers);
+            return Err(error);
+        }
+        Ok(Self {
+            connection,
+            triggers,
+            foreign_keys,
+            active: true,
+        })
+    }
+
+    fn restore(mut self) -> rusqlite::Result<()> {
+        let triggers = self
+            .connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, self.triggers)
+            .map(|_| ());
+        let foreign_keys = self
+            .connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, self.foreign_keys)
+            .map(|_| ());
+        if triggers.is_ok() && foreign_keys.is_ok() {
+            self.active = false;
+        }
+        triggers?;
+        foreign_keys
+    }
+}
+
+impl Drop for MaterializationConfig<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .connection
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, self.triggers);
+            let _ = self
+                .connection
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, self.foreign_keys);
+        }
     }
 }
 
@@ -167,6 +246,36 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn materialization_context_restores_connection_flags_after_a_panic() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)
+            .unwrap();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = with_materialization_context::<(), Error>(
+                &connection,
+                || panic!("injected panic"),
+                || Error::CommitConflict("foreign key".into()),
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
         );
     }
 }

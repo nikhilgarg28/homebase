@@ -596,7 +596,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn canonical_apply_detects_a_row_after_image_divergence() {
+    fn canonical_apply_suppresses_unrepresented_trigger_side_effects() {
         let created = create_operation();
         let MultiliteOp::CreateTable(table) = &created else {
             unreachable!()
@@ -630,12 +630,13 @@ mod tests {
         )])
         .unwrap();
 
-        assert!(matches!(
-            transaction.apply(&connection),
-            Err(Error::InvalidDatabase(
-                "canonical row changes diverged from captured after-images"
-            ))
-        ));
+        transaction.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT id FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
     }
 
     #[test]

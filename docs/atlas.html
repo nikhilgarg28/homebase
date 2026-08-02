@@ -352,7 +352,7 @@ components: [
   behavior:[
     "Measures the managed SQL surface against stock SQLite behavior on the accepted grammar.",
     "Reports unsupported Multilite grammar separately from behavioral failures and summarizes coverage by parsed SQLite statement shape.",
-    "The typed operation-pair registry runs 38 DML, UPSERT, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (152 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
+    "The typed operation-pair registry runs 44 DML, UPSERT, replacement, UNIQUE, FK, namespace, DDL, and stale-schema relationships under Snapshot and Serializable isolation in both admission orders (176 executions). It repairs expected losers, converges both replicas, checks SQLite/FK integrity, and compares normalized schema+row state; pairs declared commutative must be order-independent."],
   invariants:[
     "Unsupported syntax is coverage debt; wrong results, unexpected errors, and SQLite-reference failures remain hard failures.",
     "The pair registry covers every current logical operation family and includes commutative, conflicting, isolation-dependent, and directional relationships."],
@@ -367,7 +367,7 @@ components: [
     "All names \u2014 write targets and read positions \u2014 are dequoted via SqlName::from_sqlite_token before reserved-name checks (closed Aug 1, commit 26bee3d).",
     "Every expression position is walked for reserved reads, including DML CTEs, UPDATE FROM sources, DELETE WHERE, and UPDATE SET/WHERE.",
     "Captured DML admits WITH-prefixed UPDATE/DELETE, UPDATE FROM, tuple assignments, and safe INDEXED BY / NOT INDEXED hints without adding durable operation variants.",
-    "INSERT/UPDATE OR ABORT and OR IGNORE plus UPSERT DO NOTHING/DO UPDATE compile from SQLite's observed net effects; replacement and partial-statement modes remain fenced.",
+    "INSERT/UPDATE OR ABORT, OR IGNORE, and OR REPLACE, REPLACE INTO, plus UPSERT DO NOTHING/DO UPDATE compile from SQLite's observed net effects; partial-statement FAIL/ROLLBACK modes remain fenced.",
     "CREATE TABLE resolves to a validated spec (columns, PK, uniques, FKs, checks) before anything executes.",
     "It is a classifier and UX layer \u2014 the runtime authorizer is the actual security boundary."],
   invariants:["Accepting a statement never implies every SQLite spelling of it is supported; every extension must clear SQL_GRAMMAR.md's completion gate."],
@@ -382,13 +382,13 @@ components: [
         // future parser shape violates that contract, reject conservatively.
         .unwrap_or(true)
 }`},
-    {title:"UPDATE gate: admit atomic/no-op modes and fence partial/replacement modes", file:"sql.rs", code:
+    {title:"UPDATE gate: admit atomic/no-op/replacement modes and fence partial modes", file:"sql.rs", code:
 `if !matches!(
     or_conflict,
-    None | Some(ResolveType::Abort | ResolveType::Ignore)
+    None | Some(ResolveType::Abort | ResolveType::Ignore | ResolveType::Replace)
 ) {
     return Err(Error::UnsupportedSql(
-        "UPDATE supports only ABORT and IGNORE conflict resolution",
+        "UPDATE supports only ABORT, IGNORE, and REPLACE conflict resolution",
     ));
 }
 validate_index_hint(indexed.as_ref())?;
@@ -1150,7 +1150,8 @@ grammar: [
   { name:"WITH \u2026 INSERT (CTE prefix)", status:"supported", note:"CTE selects are reserved-read checked like the body." },
   { name:"DEFAULT VALUES", status:"supported", note:"" },
   { name:"INSERT OR ABORT / OR IGNORE", status:"supported", note:"SQLite executes the statement on the branch; RowChanges compiles only the rows actually changed. Mixed ignored+inserted statements have two-replica convergence coverage under both isolation levels." },
-  { name:"INSERT OR REPLACE / OR FAIL / OR ROLLBACK, REPLACE INTO", status:"fenced", note:"Replacement and partial-statement conflict modes need an explicit OCC and rejection-repair contract before admission." },
+  { name:"INSERT OR REPLACE / REPLACE INTO", status:"supported", note:"Every implicit primary-key/UNIQUE victim and final inserted row lower into one RowChanges net transition. Coverage includes overlapping victims, transient multi-row replacements, exact inverse repair after reopen, both isolation levels, policy paths, STRICT/composite/FK tables, operation pairs, trigger suppression, and capture limits." },
+  { name:"INSERT OR FAIL / OR ROLLBACK", status:"fenced", note:"Partial-statement conflict modes need a distinct transaction and rejection-repair contract before admission." },
   { name:"UPSERT ON CONFLICT \u2026 DO NOTHING", status:"supported", note:"Single or chained DO NOTHING clauses, including conflict targets, compile from SQLite's observed net row effects." },
   { name:"UPSERT \u2026 DO UPDATE", status:"supported", note:"SQLite chooses the conflict clause and emits ordered preupdate events; RowChanges folds them to one net transition. Coverage includes metadata-silent no-ops, repeated targets, PK/FK moves, STRICT and composite WITHOUT ROWID tables, affinity and overlapping UNIQUE behavior, outer conflict algorithms, hostile triggers, schema-evolution pairs, both isolation levels, Remote/LocalFirst policies, seeded integrity, and rejection/reopen repair." },
   { name:"RETURNING", status:"fenced", note:"\u201cINSERT RETURNING is not supported.\u201d" },
@@ -1163,7 +1164,8 @@ grammar: [
   { name:"tuple assignment SET (a,b) = (\u2026)", status:"supported", note:"SQLite evaluates the tuple on the private branch; the preupdate hook captures the final before/after image, so no parallel expression evaluator is needed." },
   { name:"UPDATE \u2026 FROM", status:"supported", note:"FROM sources participate in reserved-read checks and serializable table-root tracing; final rows lower through the shared RowChanges statement delta." },
   { name:"UPDATE OR ABORT / OR IGNORE", status:"supported", note:"Final before/after images are normalized operation-wide; ignored rows produce no durable operation." },
-  { name:"UPDATE OR FAIL / OR REPLACE / OR ROLLBACK", status:"fenced", note:"Partial-statement and replacement semantics need an explicit OCC and rejection-repair contract." },
+  { name:"UPDATE OR REPLACE", status:"supported", note:"SQLite's victim deletes and surviving row update are captured as one operation-wide net transition; canonical and inverse replay suppress triggers, apply final state atomically, and validate final FK integrity." },
+  { name:"UPDATE OR FAIL / OR ROLLBACK", status:"fenced", note:"Partial-statement semantics need a distinct transaction and rejection-repair contract." },
   { name:"WITH \u2026 DELETE / WITH \u2026 UPDATE (CTE prefixes)", status:"supported", note:"Every CTE SELECT is traversed for reserved sources; execution and capture use the same RowChanges operation as unprefixed DML." },
   { name:"ORDER BY / LIMIT forms", status:"fenced", note:"\u201cDELETE ORDER BY and LIMIT\u201d / \u201cUPDATE ORDER BY and LIMIT\u201d are rejected." },
   { name:"INDEXED BY / NOT INDEXED", status:"supported", note:"Planner hints do not enter the durable operation. Reserved SQLite/Multilite index names are rejected; ordinary named indexes and NOT INDEXED are accepted." },
@@ -1225,8 +1227,8 @@ roadmap: [
   detail:"Before dense admission history becomes the only bootstrap path: a trust object binding one materialized space state to an admission seq and device/space lineage, so a new replica verifies a checkpoint and replays only the dense suffix. A Homebase primitive, not a Multilite snapshot." },
 { id:"r20", title:"FK evolution: retirement, retargeting, coercion", themes:["protocol"], layers:["multilite"], horizon:"later",
   detail:"Define retirement/GC for dropped relationships before widening the grammar; then durable retargeting/removal, affinity/collation coercion, self-references and cycles, deferred constraints, mutating actions, add/drop relationship evolution." },
-{ id:"r21", title:"Finish statement-delta grammar (replacement, triggers)", themes:["protocol","correctness"], layers:["multilite"], horizon:"later",
-  detail:"RowChanges now normalizes mixed/repeated preupdate events, derives operation-wide guards, and produces one exact inverse. OR ABORT, OR IGNORE, and UPSERT DO NOTHING/DO UPDATE are admitted. Remaining work: explicit OCC contracts and completion-gate evidence for REPLACE, FAIL/ROLLBACK, triggers, and mutating FK actions." },
+{ id:"r21", title:"Finish statement-delta grammar (partial modes, triggers)", themes:["protocol","correctness"], layers:["multilite"], horizon:"later",
+  detail:"RowChanges now normalizes mixed/repeated preupdate events, derives operation-wide guards, and produces one exact inverse. OR ABORT, OR IGNORE, OR REPLACE, REPLACE INTO, and UPSERT DO NOTHING/DO UPDATE are admitted. Remaining work: explicit contracts and completion-gate evidence for FAIL/ROLLBACK, triggers, and mutating FK actions." },
 { id:"r22", title:"Serverless-born clients acquiring authority later", themes:["protocol"], layers:["client"], horizon:"research",
   detail:"How does an oplog accumulated without leases acquire authority and ship? Device-scoped-prefix/ledger pattern may make it safe." },
 { id:"r23", title:"Adopt an existing SQLite file", themes:["protocol","ecosystem"], layers:["multilite"], horizon:"next",
@@ -1322,7 +1324,7 @@ launch: {
     { id:"l1", status:"done", title:"Statement-delta compiler (RowChanges)",
       detail:"One normalizer folds mixed/repeated preupdate events into deterministic net before/after images for the statement's synchronized table, checks SQLite before-image continuity, derives operation-wide mutations and guards, and supplies one RestoreRowChanges inverse. Malformed codecs, deterministic normalization, apply/inverse, guard contracts, pair behavior, and rejection/reopen are covered." },
     { id:"l2", status:"wip", title:"Admit conflict modes through the completion gate",
-      detail:"OR ABORT, OR IGNORE, and UPSERT DO NOTHING/DO UPDATE are landed with mixed-outcome convergence coverage. REPLACE, FAIL/ROLLBACK, triggers, and mutating FK actions remain fenced until each has its own OCC spec, pair-registry entries, and rejection-repair tests." },
+      detail:"OR ABORT, OR IGNORE, OR REPLACE, REPLACE INTO, and UPSERT DO NOTHING/DO UPDATE are landed with mixed-outcome convergence, pair-registry, policy, and rejection/reopen coverage. FAIL/ROLLBACK, triggers, and mutating FK actions remain fenced until each has its own OCC spec and completion-gate evidence." },
     { id:"l3", status:"partial", title:"Spillable, bounded-memory atomic capture",
       detail:"Mandatory for launch. Row DML currently fails atomically at 100,000 captured events or 64 MiB, with operation/transaction codec rechecks. Replace that practical ceiling with bounded-memory spill storage, operation-wide normalization across chunks, chunked pending and authority representation, one atomic admission/rejection decision, exact inverse repair, crash cleanup, and a configurable abuse cap. Apply the same typed limits to DROP COLUMN repair and UNIQUE backfill." },
     { id:"l4", status:"todo", title:"Crash-safe suffix archive before rejection rollback",
@@ -1358,7 +1360,7 @@ launch: {
     { id:"l14", status:"todo", title:"Crash-injected recovery seeds",
       detail:"N seeds with kill points around WAL/journal/cursor/meta transitions, all recovering to validated state. Publish N." },
     { id:"l15", status:"wip", title:"Randomized two-replica convergence corpus",
-      detail:"Generalize the hand-curated pair registry (38 relationships, 152 executions \u2014 landed) into seeded random DML/DDL programs with random interleavings and rejection patterns, same oracle: converged rows+schema, clean integrity/FK checks, authority reverse-reference agreement. '10,000 random schedules, zero divergence' is a sentence people quote." },
+      detail:"Generalize the hand-curated pair registry (44 relationships, 176 executions \u2014 landed) into seeded random DML/DDL programs with random interleavings and rejection patterns, same oracle: converged rows+schema, clean integrity/FK checks, authority reverse-reference agreement. '10,000 random schedules, zero divergence' is a sentence people quote." },
     { id:"l16", status:"todo", title:"Network-fault DST over the real transport",
       detail:"Run the shipping transport client under the sim's delay/duplication/loss/partition schedule \u2014 tests the code that ships, not the trait. Blocked on l8." },
     { id:"l17", status:"wip", title:"Differential fuzz + SLT coverage numbers",

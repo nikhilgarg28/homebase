@@ -67,6 +67,7 @@ enum SqlShape {
     CreateTable,
     Insert,
     Upsert,
+    Replace,
     Delete,
     Update,
     CreateIndex,
@@ -77,10 +78,11 @@ enum SqlShape {
     DropColumn,
 }
 
-const SQL_SHAPES: [SqlShape; 11] = [
+const SQL_SHAPES: [SqlShape; 12] = [
     SqlShape::CreateTable,
     SqlShape::Insert,
     SqlShape::Upsert,
+    SqlShape::Replace,
     SqlShape::Delete,
     SqlShape::Update,
     SqlShape::CreateIndex,
@@ -287,6 +289,45 @@ const PAIR_CASES: &[PairCase] = &[
                 body = excluded.body"
         ),
         right: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "replace_disjoint_unique_victims",
+        relationship: "replacement statements retiring different row and UNIQUE owners",
+        left: operation!(
+            Replace,
+            "REPLACE INTO notes VALUES (3, 'one', 'left', 'd3')"
+        ),
+        right: operation!(
+            Replace,
+            "INSERT OR REPLACE INTO notes VALUES (4, 'two', 'right', 'd4')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "replace_same_unique_victim",
+        relationship: "replacement statements retiring one shared row and UNIQUE owner",
+        left: operation!(
+            Replace,
+            "REPLACE INTO notes VALUES (3, 'one', 'left', 'd3')"
+        ),
+        right: operation!(
+            Replace,
+            "INSERT OR REPLACE INTO notes VALUES (4, 'one', 'right', 'd4')"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "update_or_replace_and_victim_update",
+        relationship: "replacement victim concurrently changed by another transaction",
+        left: operation!(
+            Replace,
+            "UPDATE OR REPLACE notes SET slug = 'two', body = 'left' WHERE id = 1"
+        ),
+        right: operation!(Update, "UPDATE notes SET body = 'right' WHERE id = 2"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -518,6 +559,20 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::directional(Disposition::SecondRejects, Disposition::BothAdmit),
     },
     PairCase {
+        name: "secondary_index_and_stale_replace",
+        relationship: "access-path DDL and replacement of an existing row",
+        left: operation!(
+            CreateIndex,
+            "CREATE INDEX notes_detail_replace_lookup ON notes (detail)"
+        ),
+        right: operation!(
+            Replace,
+            "REPLACE INTO notes VALUES (3, 'one', 'replacement', 'd3')"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
         name: "unique_index_and_stale_insert",
         relationship: "write-contract DDL and a row compiled against its predecessor",
         left: operation!(
@@ -539,6 +594,20 @@ const PAIR_CASES: &[PairCase] = &[
             Upsert,
             "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
              ON CONFLICT(id) DO UPDATE SET body = excluded.body"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "unique_index_and_stale_replace",
+        relationship: "write-contract DDL and replacement compiled against its predecessor",
+        left: operation!(
+            CreateIndex,
+            "CREATE UNIQUE INDEX notes_detail_replace_unique ON notes (detail)"
+        ),
+        right: operation!(
+            Replace,
+            "REPLACE INTO notes VALUES (3, 'one', 'replacement', 'd3')"
         ),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
@@ -567,6 +636,17 @@ const PAIR_CASES: &[PairCase] = &[
             Upsert,
             "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
              ON CONFLICT(id) DO UPDATE SET body = notes.body || '-upsert'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "table_rename_and_stale_replace",
+        relationship: "stable table identity across a stale replacement name binding",
+        left: operation!(RenameTable, "ALTER TABLE notes RENAME TO archived_notes"),
+        right: operation!(
+            Replace,
+            "REPLACE INTO notes VALUES (3, 'one', 'replacement', 'd3')"
         ),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::COMMUTE,

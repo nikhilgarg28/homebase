@@ -398,10 +398,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
         } => {
             if !matches!(
                 or_conflict,
-                None | Some(ResolveType::Abort | ResolveType::Ignore)
+                None | Some(ResolveType::Abort | ResolveType::Ignore | ResolveType::Replace)
             ) {
                 return Err(Error::UnsupportedSql(
-                    "INSERT supports only ABORT and IGNORE conflict resolution",
+                    "INSERT supports only ABORT, IGNORE, and REPLACE conflict resolution",
                 ));
             }
             let upsert = match &body {
@@ -489,10 +489,10 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
         } => {
             if !matches!(
                 or_conflict,
-                None | Some(ResolveType::Abort | ResolveType::Ignore)
+                None | Some(ResolveType::Abort | ResolveType::Ignore | ResolveType::Replace)
             ) {
                 return Err(Error::UnsupportedSql(
-                    "UPDATE supports only ABORT and IGNORE conflict resolution",
+                    "UPDATE supports only ABORT, IGNORE, and REPLACE conflict resolution",
                 ));
             }
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
@@ -1872,6 +1872,9 @@ mod tests {
         for sql in [
             "INSERT OR ABORT INTO notes VALUES (1)",
             "INSERT OR IGNORE INTO notes VALUES (1)",
+            "INSERT OR REPLACE INTO notes VALUES (1)",
+            "REPLACE INTO notes VALUES (1)",
+            "WITH value(id) AS (SELECT 1) INSERT OR REPLACE INTO notes SELECT id FROM value",
             "INSERT INTO notes VALUES (1) ON CONFLICT DO NOTHING",
             "INSERT INTO notes VALUES (1) ON CONFLICT(id) DO NOTHING",
             "INSERT INTO notes VALUES (1, 'next')
@@ -1879,22 +1882,23 @@ mod tests {
             "INSERT INTO notes VALUES (1, 'next')
              ON CONFLICT(id) DO NOTHING
              ON CONFLICT DO UPDATE SET body = excluded.body WHERE notes.body <> excluded.body",
+            "INSERT OR REPLACE INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body",
             "UPDATE OR ABORT notes SET body = 'next'",
             "UPDATE OR IGNORE notes SET body = 'next'",
+            "UPDATE OR REPLACE notes SET body = 'next'",
         ] {
             validate_execute(sql).unwrap_or_else(|error| panic!("rejected {sql}: {error}"));
         }
     }
 
     #[test]
-    fn rejects_partial_or_mixed_conflict_forms() {
+    fn rejects_partial_statement_conflict_forms() {
         for sql in [
-            "REPLACE INTO notes VALUES (1)",
-            "INSERT OR REPLACE INTO notes VALUES (1)",
             "WITH value(id) AS (SELECT 1) INSERT OR FAIL INTO notes SELECT id FROM value",
             "INSERT OR ROLLBACK INTO notes VALUES (1)",
             "UPDATE OR FAIL notes SET body = 'next'",
-            "UPDATE OR REPLACE notes SET body = 'next'",
+            "UPDATE OR ROLLBACK notes SET body = 'next'",
         ] {
             assert_unsupported(sql);
         }
@@ -1909,6 +1913,8 @@ mod tests {
             "INSERT INTO sqlite_schema VALUES ('table', 'x', 'x', 1, '')",
             "WITH hidden AS (SELECT value FROM __multilite__meta)
              INSERT INTO notes SELECT value FROM hidden",
+            "WITH hidden AS (SELECT value FROM __multilite__meta)
+             INSERT OR REPLACE INTO notes SELECT value FROM hidden",
             "INSERT INTO notes SELECT (SELECT value FROM __multilite__meta)",
             "INSERT INTO notes VALUES (1, 'next')
              ON CONFLICT(id) DO UPDATE
@@ -1923,6 +1929,9 @@ mod tests {
             "INSERT INTO notes VALUES (1, 'next')
              ON CONFLICT(id) WHERE EXISTS (SELECT 1 FROM __multilite__pending)
              DO UPDATE SET body = excluded.body",
+            "UPDATE OR REPLACE notes SET body = (
+                SELECT value FROM __multilite__meta LIMIT 1
+             )",
         ] {
             assert_unsupported(sql);
         }
@@ -2516,7 +2525,6 @@ mod tests {
     #[test]
     fn rejects_update_extensions_without_owned_semantics() {
         for sql in [
-            "UPDATE OR REPLACE notes SET body = 'x'",
             "UPDATE main.notes SET body = 'x'",
             "UPDATE notes AS old SET body = 'x'",
             "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",

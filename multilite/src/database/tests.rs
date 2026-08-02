@@ -693,6 +693,87 @@ fn local_first_upsert_pushes_in_the_background_and_converges() {
 }
 
 #[test]
+fn local_first_replacement_pushes_complete_net_effects_and_converges() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let database = Database::open_with(
+        directory.path().join("local-first-replace.sqlite"),
+        OpenOptions::new()
+            .sync_policy(SyncPolicy::LocalFirst {
+                write_delay: Duration::ZERO,
+                read_staleness: Duration::from_secs(60),
+            })
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(database.database_id().space_id()));
+    let runtime = database.runtime().unwrap();
+    database
+        .update(&runtime, |update| {
+            update.execute(
+                "CREATE TABLE profiles (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    handle TEXT NOT NULL UNIQUE
+                )",
+                (),
+            )?;
+            update.execute(
+                "INSERT INTO profiles VALUES
+                    (1, 'one@example.com', 'one'),
+                    (2, 'two@example.com', 'two')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    wait_until(|| pending_ops(&database).is_empty());
+
+    let replica = Database::open_with(
+        directory.path().join("local-first-replace-replica.sqlite"),
+        OpenOptions::new()
+            .invitation(database.replica_invitation())
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let replica_runtime = replica.runtime().unwrap();
+    replica.pull().unwrap();
+    replica.rebase(&replica_runtime).unwrap();
+
+    assert_eq!(
+        database
+            .execute(
+                &runtime,
+                "INSERT OR REPLACE INTO profiles VALUES
+                    (3, 'one@example.com', 'two')",
+                (),
+            )
+            .unwrap(),
+        1
+    );
+    wait_until(|| pending_ops(&database).is_empty());
+    replica.pull().unwrap();
+    replica.rebase(&replica_runtime).unwrap();
+
+    for candidate in [&database, &replica] {
+        candidate.with_connection(|connection| {
+            assert_eq!(
+                connection
+                    .query_row("SELECT id, email, handle FROM profiles", (), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },)
+                    .unwrap(),
+                (3, "one@example.com".into(), "two".into())
+            );
+        });
+    }
+}
+
+#[test]
 fn remote_write_returns_only_after_admission_and_pending_cleanup() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
@@ -1029,6 +1110,103 @@ fn remote_upsert_waits_for_admission_and_repairs_rejection_before_returning() {
             );
         });
     }
+}
+
+#[test]
+fn remote_update_or_replace_repairs_all_victims_before_returning_rejection() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let winner = Database::open_with(
+        directory.path().join("remote-replace-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(winner.database_id().space_id()));
+    let winner_runtime = winner.runtime().unwrap();
+    winner
+        .update(&winner_runtime, |update| {
+            update.execute(
+                "CREATE TABLE profiles (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    handle TEXT NOT NULL UNIQUE,
+                    body TEXT NOT NULL
+                )",
+                (),
+            )?;
+            update.execute(
+                "INSERT INTO profiles VALUES
+                    (1, 'one@example.com', 'one', 'first'),
+                    (2, 'two@example.com', 'two', 'second'),
+                    (3, 'three@example.com', 'three', 'third')",
+                (),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+
+    let remote = Database::open_with(
+        directory.path().join("remote-replace.sqlite"),
+        OpenOptions::new()
+            .invitation(winner.replica_invitation())
+            .sync_policy(SyncPolicy::Remote)
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let remote_runtime = remote.runtime().unwrap();
+    let error = remote
+        .update(&remote_runtime, |update| {
+            update.execute(
+                "UPDATE OR REPLACE profiles
+                 SET email = 'two@example.com', handle = 'three', body = 'loser'
+                 WHERE id = 1",
+                (),
+            )?;
+            winner.execute(
+                &winner_runtime,
+                "UPDATE profiles SET body = 'winner' WHERE id = 1",
+                (),
+            )?;
+            assert_eq!(winner.push()?, PushOutcome::Drained);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::AuthorityRejected(KernelError::RangeAssertFailed { .. })
+    ));
+    assert!(pending_ops(&remote).is_empty());
+    remote.with_connection(|connection| {
+        let rows = connection
+            .prepare("SELECT id, email, handle, body FROM profiles ORDER BY id")
+            .unwrap()
+            .query_map((), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (1, "one@example.com".into(), "one".into(), "first".into(),),
+                (2, "two@example.com".into(), "two".into(), "second".into(),),
+                (
+                    3,
+                    "three@example.com".into(),
+                    "three".into(),
+                    "third".into(),
+                ),
+            ]
+        );
+    });
 }
 
 #[test]

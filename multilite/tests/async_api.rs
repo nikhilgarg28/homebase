@@ -156,7 +156,7 @@ fn public_async_authority_pipeline_converges_replicas() {
                 transaction.execute(
                     "CREATE TABLE notes (
                         id INTEGER PRIMARY KEY,
-                        body TEXT NOT NULL
+                        body TEXT NOT NULL UNIQUE
                     )",
                     (),
                 )?;
@@ -171,8 +171,8 @@ fn public_async_authority_pipeline_converges_replicas() {
 
         second
             .execute_async(
-                "INSERT INTO notes VALUES (?1, ?2)",
-                (Value::Integer(2), Value::Text("second".into())),
+                "REPLACE INTO notes VALUES (?1, ?2)",
+                (Value::Integer(2), Value::Text("first".into())),
             )
             .await
             .unwrap();
@@ -180,7 +180,7 @@ fn public_async_authority_pipeline_converges_replicas() {
         first.pull_async().await.unwrap();
         first.rebase_async().await.unwrap();
 
-        let expected = vec![(1, String::from("first")), (2, String::from("second"))];
+        let expected = vec![(2, String::from("first"))];
         for database in [&first, &second] {
             assert_eq!(
                 database

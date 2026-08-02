@@ -1789,11 +1789,11 @@ impl RowChanges {
     }
 
     pub fn apply(&self, connection: &Connection) -> Result<()> {
-        self.table.apply(connection, false)
+        apply_final_row_state(connection, || self.table.apply(connection, false))
     }
 
     pub fn restore_materialized(&self, connection: &Connection) -> Result<()> {
-        self.table.apply(connection, true)
+        apply_final_row_state(connection, || self.table.apply(connection, true))
     }
 
     #[cfg(debug_assertions)]
@@ -1835,6 +1835,17 @@ impl RowChanges {
     fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
         self.table.validate_structure()
     }
+}
+
+fn apply_final_row_state(
+    connection: &Connection,
+    operation: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::connection::with_savepoint(connection, "__multilite__row_changes_apply", || {
+        crate::connection::with_materialization_context(connection, operation, || {
+            Error::CommitConflict("FOREIGN KEY constraint failed".into())
+        })
+    })
 }
 
 impl TableChangesBuilder {
@@ -3343,6 +3354,7 @@ mod tests {
         AdmissionSeq, AdmissionTag, CipherEpoch, DeviceChecksum, DeviceEntry, DeviceId, DeviceSeq,
         DeviceTag, Ver,
     };
+    use rusqlite::config::DbConfig;
 
     use super::*;
     use crate::commit::footprint::assert_explicit_range_assertions;
@@ -3854,6 +3866,220 @@ mod tests {
                 .query_row("SELECT body FROM notes", (), |row| row.get::<_, String>(0))
                 .unwrap(),
             "before"
+        );
+    }
+
+    #[test]
+    fn statement_delta_replaces_multiple_unique_victims_and_restores_them_exactly() {
+        let created = overlapping_unique_definition();
+        let connection = connection(&created);
+        connection
+            .execute(
+                "INSERT INTO profiles VALUES
+                    (1, 'acme', 'shared@example.com', 'alpha'),
+                    (2, 'other', 'other@example.com', 'beta')",
+                (),
+            )
+            .unwrap();
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Delete(profile(1, "acme", "shared@example.com", "alpha")),
+                CapturedChange::Delete(profile(2, "other", "other@example.com", "beta")),
+                CapturedChange::Insert(profile(3, "acme", "shared@example.com", "beta")),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(changes.table.rows.len(), 3);
+        assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
+        let lowered = changes.to_homebase().unwrap();
+        let mut asserted = lowered
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::Set { key, .. } => Some(key.clone()),
+                Mutation::Delete { .. } | Mutation::DeleteRange { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        asserted.extend([
+            active_primary_index_key(created.table_id()),
+            write_revision_key(created.table_id()),
+        ]);
+        assert_explicit_range_assertions(&lowered.footprint, &asserted);
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .all(|mutation| lowered.footprint.writes().contains(mutation.key()))
+        );
+        crate::logical::guard::validate_compiled_output(
+            OperationFamily::RowChanges,
+            &lowered.mutations,
+            &lowered.guards,
+        )
+        .unwrap();
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::Delete { .. }))
+        );
+        assert!(
+            lowered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::Set { .. }))
+        );
+
+        connection
+            .execute_batch(
+                "CREATE TABLE replay_audit (event TEXT NOT NULL);
+                 CREATE TRIGGER audit_profile_insert AFTER INSERT ON profiles BEGIN
+                     INSERT INTO replay_audit VALUES ('insert');
+                 END;
+                 CREATE TRIGGER audit_profile_delete AFTER DELETE ON profiles BEGIN
+                     INSERT INTO replay_audit VALUES ('delete');
+                 END",
+            )
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)
+            .unwrap();
+        changes.apply(&connection).unwrap();
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM replay_audit", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .prepare("SELECT id, tenant, email, username FROM profiles ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [(3, "acme".into(), "shared@example.com".into(), "beta".into(),)]
+        );
+
+        changes.restore_materialized(&connection).unwrap();
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM replay_audit", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .prepare("SELECT id, tenant, email, username FROM profiles ORDER BY id")
+                .unwrap()
+                .query_map((), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            [
+                (
+                    1,
+                    "acme".into(),
+                    "shared@example.com".into(),
+                    "alpha".into(),
+                ),
+                (2, "other".into(), "other@example.com".into(), "beta".into(),),
+            ]
+        );
+    }
+
+    #[test]
+    fn statement_delta_replay_rejects_an_invalid_final_foreign_key_state_atomically() {
+        let (connection, _parent, _child) = foreign_key_tables();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)
+            .unwrap();
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![CapturedChange::Insert(CapturedRow {
+                table: "children".into(),
+                rowid: 10,
+                values: vec![
+                    StoredValue::Integer(10),
+                    StoredValue::Integer(999),
+                    StoredValue::Text(b"orphan".to_vec()),
+                ],
+            })],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            changes.apply(&connection),
+            Err(Error::CommitConflict(_))
+        ));
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM children", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
         );
     }
 

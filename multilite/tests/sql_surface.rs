@@ -1441,7 +1441,6 @@ fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
         .unwrap();
 
     for sql in [
-        "UPDATE OR REPLACE notes SET body = 'x'",
         "UPDATE OR FAIL notes SET body = 'x'",
         "UPDATE OR ROLLBACK notes SET body = 'x'",
         "UPDATE main.notes SET body = 'x'",
@@ -1729,6 +1728,11 @@ fn trigger_generated_update_effects_abort_the_whole_statement() {
              AFTER UPDATE ON notes
              BEGIN
                  UPDATE audit SET body = new.body WHERE id = new.id;
+             END;
+             CREATE TRIGGER insert_audit
+             AFTER INSERT ON notes
+             BEGIN
+                 UPDATE audit SET body = new.body WHERE id = new.id;
              END",
         )
         .unwrap();
@@ -1736,6 +1740,9 @@ fn trigger_generated_update_effects_abort_the_whole_statement() {
 
     for sql in [
         "UPDATE notes SET body = 'changed' WHERE id = 1",
+        "UPDATE OR REPLACE notes SET body = 'changed' WHERE id = 1",
+        "REPLACE INTO notes VALUES (1, 'changed')",
+        "INSERT OR REPLACE INTO notes VALUES (1, 'changed')",
         "INSERT INTO notes VALUES (1, 'changed')
          ON CONFLICT(id) DO UPDATE SET body = excluded.body",
     ] {
@@ -1757,7 +1764,7 @@ fn trigger_generated_update_effects_abort_the_whole_statement() {
 }
 
 #[test]
-fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
+fn atomic_row_conflict_modes_follow_sqlite_and_partial_modes_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("conflicts.sqlite")).unwrap();
     db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
@@ -1766,8 +1773,6 @@ fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
         .unwrap();
 
     for sql in [
-        "REPLACE INTO notes VALUES (1, 'replaced')",
-        "INSERT OR REPLACE INTO notes VALUES (1, 'replaced')",
         "INSERT OR FAIL INTO notes VALUES (1, 'failed')",
         "INSERT OR ROLLBACK INTO notes VALUES (1, 'rolled-back')",
     ] {
@@ -1813,6 +1818,327 @@ fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
             .unwrap(),
         [(1, "original".into()), (2, "second".into())]
     );
+}
+
+#[test]
+fn replacement_conflict_modes_use_complete_net_row_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("replace.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE profiles (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL UNIQUE,
+            body TEXT NOT NULL CHECK (length(body) > 0),
+            UNIQUE (tenant, username)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO profiles VALUES
+            (1, 'acme', 'a@example.com', 'alpha', 'first'),
+            (2, 'other', 'b@example.com', 'beta', 'second'),
+            (5, 'keep', 'keep@example.com', 'keep', 'keep')",
+        (),
+    )
+    .unwrap();
+    let rows = || {
+        db.query(
+            "SELECT id, tenant, email, username, body FROM profiles ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        db.execute(
+            "REPLACE INTO profiles VALUES
+                (3, 'acme', 'a@example.com', 'beta', 'replacement')",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        rows(),
+        [
+            (
+                3,
+                "acme".into(),
+                "a@example.com".into(),
+                "beta".into(),
+                "replacement".into(),
+            ),
+            (
+                5,
+                "keep".into(),
+                "keep@example.com".into(),
+                "keep".into(),
+                "keep".into(),
+            ),
+        ]
+    );
+
+    db.execute(
+        "INSERT OR REPLACE INTO profiles VALUES
+            (3, 'acme', 'c@example.com', 'gamma', 'same-pk')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "WITH incoming(id, tenant, email, username, body) AS (
+            VALUES (6, 'keep', 'keep@example.com', 'six', 'from-cte')
+         )
+         INSERT OR REPLACE INTO profiles
+         SELECT id, tenant, email, username, body FROM incoming",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE OR REPLACE profiles
+         SET email = 'keep@example.com', username = 'merged', body = 'updated'
+         WHERE id = 3",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        rows(),
+        [(
+            3,
+            "acme".into(),
+            "keep@example.com".into(),
+            "merged".into(),
+            "updated".into(),
+        )]
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT OR REPLACE INTO profiles VALUES
+                (7, 'transient', 'transient@example.com', 'transient', 'first'),
+                (8, 'transient', 'transient@example.com', 'final', 'second')",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        rows().into_iter().map(|row| row.0).collect::<Vec<_>>(),
+        [3, 8]
+    );
+
+    db.execute(
+        "INSERT OR REPLACE INTO profiles VALUES
+            (9, 'unused', 'keep@example.com', 'unused', 'upserted')
+         ON CONFLICT(email) DO UPDATE SET body = excluded.body",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT id, body FROM profiles WHERE id = 3", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(3, "upserted".into())]
+    );
+
+    let before_failure = rows();
+    for sql in [
+        "INSERT OR REPLACE INTO profiles VALUES
+            (10, 'broken', 'keep@example.com', 'broken', '')",
+        "INSERT OR REPLACE INTO profiles VALUES
+            (11, 'unused', 'keep@example.com', 'final', 'must-abort')
+         ON CONFLICT(email) DO UPDATE SET username = excluded.username",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::Sqlite(_))));
+        assert_eq!(rows(), before_failure);
+    }
+}
+
+#[test]
+fn replacement_covers_composite_strict_and_foreign_key_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("replace-shapes.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE memberships (
+                tenant TEXT NOT NULL,
+                member INTEGER NOT NULL,
+                handle TEXT NOT NULL UNIQUE,
+                body TEXT NOT NULL,
+                PRIMARY KEY (tenant, member)
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO memberships VALUES
+                ('a', 1, 'first', 'first'),
+                ('b', 2, 'second', 'second')",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE strict_values (
+                id INTEGER PRIMARY KEY,
+                token TEXT NOT NULL UNIQUE,
+                amount INTEGER NOT NULL
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute("INSERT INTO strict_values VALUES (1, 'token', 1)", ())?;
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent_code TEXT NOT NULL REFERENCES parents(code),
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1, 'p1'), (2, 'p2')", ())?;
+        transaction.execute("INSERT INTO children VALUES (10, 'p1', 'child')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.execute(
+        "REPLACE INTO memberships VALUES ('c', 3, 'first', 'replacement')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE OR REPLACE memberships
+         SET handle = 'second', body = 'merged'
+         WHERE tenant = 'c' AND member = 3",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query(
+            "SELECT tenant, member, handle, body FROM memberships",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [("c".into(), 3, "second".into(), "merged".into())]
+    );
+
+    db.execute(
+        "INSERT OR REPLACE INTO strict_values VALUES (2, 'token', 2)",
+        (),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute(
+            "INSERT OR REPLACE INTO strict_values VALUES (3, 'token', X'00')",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id, token, amount FROM strict_values", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(2, "token".into(), 2)]
+    );
+
+    db.execute("REPLACE INTO parents VALUES (3, 'p1')", ())
+        .unwrap();
+    db.execute(
+        "INSERT OR REPLACE INTO children VALUES (10, 'p2', 'retargeted')",
+        (),
+    )
+    .unwrap();
+    db.execute("UPDATE OR REPLACE parents SET code = 'p2' WHERE id = 3", ())
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT id, code FROM parents", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(3, "p2".into())]
+    );
+    assert_eq!(
+        db.query("SELECT id, parent_code, body FROM children", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap(),
+        [(10, "p2".into(), "retargeted".into())]
+    );
+    for sql in [
+        "REPLACE INTO parents VALUES (3, 'p3')",
+        "REPLACE INTO children VALUES (10, 'missing', 'invalid')",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::Sqlite(_))));
+    }
+    assert_eq!(
+        db.query("SELECT code FROM parents", (), |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        ["p2"]
+    );
+    assert_eq!(
+        db.query("SELECT parent_code FROM children", (), |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        ["p2"]
+    );
+}
+
+#[test]
+fn replacement_of_an_adopted_table_rolls_back_without_a_schema_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adopted-replace.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT UNIQUE);
+             INSERT INTO notes VALUES (1, 'original')",
+        )
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    for sql in [
+        "REPLACE INTO notes VALUES (1, 'replaced')",
+        "INSERT OR REPLACE INTO notes VALUES (2, 'original')",
+        "UPDATE OR REPLACE notes SET body = 'replaced' WHERE id = 1",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
+        assert_eq!(read_note(&db), "original");
+    }
 }
 
 #[test]
