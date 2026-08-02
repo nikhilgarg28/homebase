@@ -137,6 +137,57 @@ fn concurrent_user_versions_reject_repair_and_converge_at_both_isolation_levels(
 }
 
 #[test]
+fn prepared_user_version_reads_join_serializable_footprints() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = server();
+    let first = MultiliteConnection::open_with(
+        directory.path().join("prepared-pragma-first.sqlite"),
+        OpenOptions::new()
+            .isolation_level(IsolationLevel::Serializable)
+            .server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+    assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+    let second = MultiliteConnection::open_with(
+        directory.path().join("prepared-pragma-second.sqlite"),
+        OpenOptions::new()
+            .isolation_level(IsolationLevel::Serializable)
+            .invitation(first.replica_invitation())
+            .server(router(Arc::clone(&authority))),
+    )
+    .unwrap();
+
+    first
+        .execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+    second.pull().unwrap();
+    second.rebase().unwrap();
+
+    first
+        .update(|transaction| {
+            let mut statement = transaction.prepare("PRAGMA user_version")?;
+            assert_eq!(
+                statement.query_map((), |row| row.get::<_, i32>(0))?,
+                [0]
+            );
+            transaction.execute("INSERT INTO notes VALUES (1, 'one')", ())?;
+            Ok(())
+        })
+        .unwrap();
+    second.execute("PRAGMA user_version = 7", ()).unwrap();
+    // Admit the write first so the concurrent prepared read's serializable
+    // footprint is the one that must reject.
+    assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+    let PushOutcome::Rejected(_) = first.push().unwrap() else {
+        panic!("prepared PRAGMA user_version read did not join the serializable footprint")
+    };
+}
+
+#[test]
 fn concurrent_constraint_drops_reject_repair_and_converge() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();
@@ -7131,6 +7182,47 @@ fn schema_conflict_policies_repair_stale_replacements_and_converge() {
                 [(2, "same@example".into(), "fallback".into())]
             );
         }
+
+        // ADD COLUMN NOT NULL ON CONFLICT must physically enforce on replicas.
+        first
+            .execute(
+                "ALTER TABLE accounts ADD COLUMN nickname TEXT
+                 NOT NULL ON CONFLICT REPLACE DEFAULT 'anon'",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        second
+            .execute(
+                "INSERT INTO accounts VALUES (3, 'other@example', 'body', NULL)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .query(
+                    "SELECT id, nickname FROM accounts WHERE id = 3",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [(3, "anon".into())]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        first.rebase().unwrap();
+        assert_eq!(
+            first
+                .query(
+                    "SELECT id, nickname FROM accounts WHERE id = 3",
+                    (),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            [(3, "anon".into())]
+        );
     }
 }
 

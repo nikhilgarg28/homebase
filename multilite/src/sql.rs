@@ -1006,12 +1006,16 @@ fn collect_expression_dependencies(
                 collect_expression_dependencies(expression, ctes, dependencies)?;
             }
         }
+        Expr::Variable(_) => {
+            return Err(Error::UnsupportedSql(
+                "parameters in views are not supported",
+            ));
+        }
         Expr::DoublyQualified(..)
         | Expr::Id(_)
         | Expr::Literal(_)
         | Expr::Name(_)
-        | Expr::Qualified(..)
-        | Expr::Variable(_) => {}
+        | Expr::Qualified(..) => {}
     }
     Ok(())
 }
@@ -1157,22 +1161,32 @@ fn pragma_value(body: PragmaBody) -> Expr {
 }
 
 fn parse_pragma_object(body: PragmaBody) -> Result<SqlName> {
-    match pragma_value(body) {
-        Expr::Id(id) => identifier(&Name(id.0)),
-        Expr::Name(name) => identifier(&name),
-        Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value),
+    let name = match pragma_value(body) {
+        Expr::Id(id) => identifier(&Name(id.0))?,
+        Expr::Name(name) => identifier(&name)?,
+        Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value)?,
         Expr::Parenthesized(mut values) if values.len() == 1 => match values.pop().unwrap() {
-            Expr::Id(id) => identifier(&Name(id.0)),
-            Expr::Name(name) => identifier(&name),
-            Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value),
-            _ => Err(Error::UnsupportedSql(
-                "PRAGMA object names must be literals",
-            )),
+            Expr::Id(id) => identifier(&Name(id.0))?,
+            Expr::Name(name) => identifier(&name)?,
+            Expr::Literal(Literal::String(value)) => SqlName::from_sqlite_token(&value)?,
+            _ => {
+                return Err(Error::UnsupportedSql(
+                    "PRAGMA object names must be literals",
+                ));
+            }
         },
-        _ => Err(Error::UnsupportedSql(
-            "PRAGMA object names must be literals",
-        )),
+        _ => {
+            return Err(Error::UnsupportedSql(
+                "PRAGMA object names must be literals",
+            ));
+        }
+    };
+    if has_multilite_prefix(name.value()) || is_sqlite_internal_table(name.value()) {
+        return Err(Error::UnsupportedSql(
+            "reserved SQLite and Multilite table names are not supported",
+        ));
     }
+    Ok(name)
 }
 
 fn parse_pragma_i32(body: PragmaBody) -> Result<i32> {
@@ -2735,11 +2749,17 @@ mod tests {
             });
             validate_read_statement(sql).unwrap();
         }
-        for sql in ["PRAGMA table_info", "PRAGMA index_info(1 + 2)"] {
-            assert!(matches!(
-                validate_statement(sql),
-                Err(Error::UnsupportedSql(_))
-            ));
+        for sql in [
+            "PRAGMA table_info",
+            "PRAGMA index_info(1 + 2)",
+            "PRAGMA table_info(__multilite__pending)",
+            "PRAGMA table_xinfo('__multilite__meta')",
+            "PRAGMA foreign_key_list(sqlite_master)",
+        ] {
+            assert!(
+                matches!(validate_statement(sql), Err(Error::UnsupportedSql(_))),
+                "unsupported PRAGMA was accepted: {sql}"
+            );
         }
     }
 
@@ -2773,6 +2793,7 @@ mod tests {
             "CREATE TEMP VIEW report AS SELECT * FROM notes",
             "CREATE VIEW IF NOT EXISTS report AS SELECT * FROM notes",
             "CREATE VIEW report AS SELECT 1",
+            "CREATE VIEW report AS SELECT * FROM notes WHERE id = ?",
             "CREATE VIEW report AS SELECT * FROM main.notes",
             "CREATE VIEW report AS SELECT * FROM __multilite__pending",
             "CREATE VIEW report AS SELECT * FROM json_each('[1]')",

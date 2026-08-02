@@ -319,6 +319,7 @@ impl AlterTableOperation {
                 guards.invariant(name_key.clone(), GuardReason::ColumnNameBinding)?;
                 let binding = match &self.delta {
                     AlterTableDelta::AddColumn { .. } => {
+                        guards.write(name_key.clone(), GuardReason::ColumnNameBinding)?;
                         for dependency in after.added_column_dependencies(*column) {
                             guards.invariant(
                                 column_name_scope_key(self.table, &dependency),
@@ -364,6 +365,27 @@ impl AlterTableOperation {
                                 active_schema_revision_key(foreign_key.referenced_table()),
                                 GuardReason::SchemaRevision,
                             )?;
+                            for (parent_column, parent_column_name) in foreign_key
+                                .referenced_columns()
+                                .iter()
+                                .zip(foreign_key.referenced_column_names())
+                            {
+                                // Touch the live parent column name binding so a
+                                // concurrent parent rename conflicts in either
+                                // admission order (invariant-only would miss the
+                                // AddColumn-first case, because mutations alone
+                                // become committed write regions).
+                                let key = column_name_scope_key(
+                                    foreign_key.referenced_table(),
+                                    parent_column_name,
+                                );
+                                guards.invariant(key.clone(), GuardReason::ColumnNameBinding)?;
+                                guards.write(key.clone(), GuardReason::ColumnNameBinding)?;
+                                mutations.push(Mutation::Set {
+                                    key,
+                                    value: parent_column.as_bytes().to_vec(),
+                                });
+                            }
                             let constraint_state = active_constraint_key(
                                 foreign_key.referenced_table(),
                                 foreign_key.referenced_index().as_bytes(),
@@ -2018,11 +2040,13 @@ mod tests {
         );
         assert_eq!(lowered.mutations.len(), 6);
         assert_eq!(lowered.footprint.constraints().len(), 5);
-        assert_eq!(lowered.footprint.writes().len(), 3);
+        // Column name binding, two column-check dependency markers, write revision.
+        assert_eq!(lowered.footprint.writes().len(), 4);
 
         let compatible = simple_add_operation(&compatible).to_homebase().unwrap();
         assert_eq!(compatible.mutations.len(), 3);
-        assert!(compatible.footprint.writes().is_empty());
+        // Compatible ADD COLUMN still touches its new column name binding.
+        assert_eq!(compatible.footprint.writes().len(), 1);
         assert!(
             compatible.mutations.iter().all(
                 |mutation| mutation.key() != &write_revision_key(compatible_created.table_id())
@@ -2128,6 +2152,11 @@ mod tests {
             foreign_key.referenced_index().as_bytes(),
             foreign_key.id(),
         );
+        let parent_column_names = foreign_key
+            .referenced_column_names()
+            .iter()
+            .map(|name| column_name_scope_key(parent.table_id(), name))
+            .collect::<Vec<_>>();
         assert_explicit_range_assertions(
             &lowered.footprint,
             &[
@@ -2138,6 +2167,10 @@ mod tests {
                 reference.clone(),
             ],
         );
+        for key in &parent_column_names {
+            assert!(lowered.footprint.constraints().contains(key));
+            assert!(lowered.footprint.writes().contains(key));
+        }
         assert!(lowered.footprint.writes().contains(&reference));
         assert!(
             lowered

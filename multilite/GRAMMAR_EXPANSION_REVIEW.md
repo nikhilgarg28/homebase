@@ -52,8 +52,11 @@ Status: complete.
   `foreign_key_list`. Everything else fails at the SQL gate instead of later
   surfacing as raw `SQLITE_AUTH`.
 - Serializable managed updates record the exact user-version cell or the
-  schema-object name plus owning table root inspected by a PRAGMA. Snapshot
-  isolation retains only mandatory write guards.
+  schema-object name plus owning table root inspected by a PRAGMA, including
+  through `prepare()` as well as `query()`. Snapshot isolation retains only
+  mandatory write guards. Same-value `PRAGMA user_version = N` assignments are
+  true logical no-ops with no fence: they neither write nor read the cell.
+  Assignments accept signed decimal literals only (not hex).
 - Physical, connection-local, or environment-sensitive PRAGMAs such as
   `journal_mode`, `data_version`, `schema_version`, and `page_count` remain
   fenced. Supporting operational configuration belongs on open options rather
@@ -69,10 +72,14 @@ Status: complete for synchronized base-table views.
   involved.
 - CREATE writes table-owned and stable-column-owned dependency markers; DROP
   removes the same markers. `DROP TABLE` retires/asserts the table prefix, while
-  `DROP COLUMN` retires/asserts the selected column-dependency prefix. CREATE
-  asserts every captured table and column name binding. This makes destructive
-  DDL conflicts symmetric in either admission order without a shared schema
-  head that would serialize unrelated column DDL.
+  `DROP COLUMN` retires/asserts the selected column-dependency prefix and the
+  table-wide view-dependency prefix (so any synchronized view on the table
+  blocks the drop, matching the local rebuild rule). CREATE and DROP both assert
+  every captured table and column name binding so a source rename that admits
+  first conflicts with DROP VIEW; rejection repair can then re-execute historical
+  CREATE SQL against unchanged names. Drop-then-rename still admits (the view is
+  already gone) without a shared schema head that would serialize unrelated
+  column DDL.
 - The SELECT dependency walker covers CTEs, joins, compounds, scalar/EXISTS/IN
   subqueries, function/window expressions, ordering, limits, and offsets.
   Every dependency contributes mandatory table/column name-binding guards and
@@ -101,10 +108,13 @@ Status: complete for one inline relationship on the added column.
   current parent binding before materializing it.
 - The operation advances both child and parent write revisions. Mandatory
   guards cover the child primary-index generation, the parent's complete row
-  namespace, parent active schema revision, and parent schema-name binding.
-  Thus stale child writes and stale parent writes reject symmetrically under
-  Snapshot and Serializable isolation; no historical row operation is replayed
-  against a relationship envelope it did not encode.
+  namespace, parent active schema revision, parent schema-name binding, and each
+  referenced parent column name binding. Parent column name cells are also
+  touched (same-value Set + Write) so a concurrent parent column rename
+  conflicts in either admission order; invariant-only asserts would miss the
+  AddColumn-first case. Stale child/parent writes likewise reject under Snapshot
+  and Serializable isolation; no historical row operation is replayed against a
+  relationship envelope it did not encode.
 - Rejection removes both the column and the relationship from physical SQLite,
   name bindings, and the folded catalog. Admission on another device folds the
   stable relationship and preserves it across reopen and later table rebuilds.
@@ -156,7 +166,9 @@ Status: complete for named table-level UNIQUE, FOREIGN KEY, and CHECK.
   cannot be dropped; `ADD CONSTRAINT` and type changes remain unsupported.
   CHECK constraints currently use their canonical name as retirement identity,
   so all retired constraint names remain permanently reserved within the
-  table's retained IR. A future CheckId can relax that boundary. Retired definitions, active-state
+  table's retained IR. DROP COLUMN therefore refuses columns that still own a
+  retired CHECK (active column-owned CHECKs continue to drop with the column).
+  A future CheckId can relax that boundary. Retired definitions, active-state
   tombstones, and UNIQUE-owner cells need the general frontier-aware schema GC
   protocol. FK addition still rewrites the parent/child write revisions, so
   independent relationship additions are conservatively serialized; relaxing

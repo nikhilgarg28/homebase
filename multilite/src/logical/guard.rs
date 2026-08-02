@@ -415,6 +415,7 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(RenameTable, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(RenameColumn, Invariant, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ColumnNameBinding, ColumnName),
+    contract!(AddColumn, Write, ColumnNameBinding, ColumnName),
     contract!(AddColumn, Invariant, ConstraintNameBinding, ConstraintName),
     contract!(AddColumn, Invariant, SchemaObjectName, SchemaObjectName),
     contract!(AddColumn, Invariant, SchemaRevision, ActiveSchemaRevision),
@@ -477,6 +478,8 @@ pub const GUARD_CONTRACTS: &[GuardContract] = &[
     contract!(CreateView, Invariant, ColumnDependency, ColumnDependency),
     contract!(CreateView, Write, ColumnDependency, ColumnDependency),
     contract!(DropView, Invariant, SchemaObjectName, SchemaObjectName),
+    contract!(DropView, Invariant, ViewDependency, SchemaObjectName),
+    contract!(DropView, Invariant, ViewDependency, ColumnName),
     contract!(DropView, Invariant, ViewDependency, ViewDependency),
     contract!(DropView, Invariant, ColumnDependency, ColumnDependency),
     contract!(DropView, Write, ColumnDependency, ColumnDependency),
@@ -784,9 +787,10 @@ fn mutation_guard_requirements(
         (CreateView, Set, ColumnDependencyTarget) | (DropView, Delete, ColumnDependencyTarget) => {
             &[(Invariant, ColumnDependency), (Write, ColumnDependency)]
         }
-        (RenameColumn, Set | Delete, ColumnName)
-        | (AddColumn, Set, ColumnName)
-        | (DropColumn, Delete, ColumnName) => &[(Invariant, ColumnNameBinding)],
+        (RenameColumn, Set | Delete, ColumnName) | (DropColumn, Delete, ColumnName) => {
+            &[(Invariant, ColumnNameBinding)]
+        }
+        (AddColumn, Set, ColumnName) => &[(Invariant, ColumnNameBinding), (Write, ColumnNameBinding)],
         (AddColumn, Set, ConstraintName) => &[(Invariant, ConstraintNameBinding)],
         (DropColumn, Delete, ConstraintName) => &[
             (Invariant, ConstraintNameBinding),

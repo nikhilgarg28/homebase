@@ -28,7 +28,7 @@ use crate::{Error, Result};
 
 pub use self::compiler::SchemaInvariantError;
 
-const SCHEMA_FRAME_VERSION: u8 = 7;
+const SCHEMA_FRAME_VERSION: u8 = 8;
 const TAG_MUTATION_ID: u8 = 1;
 const TAG_SQL: u8 = 2;
 const TAG_CREATE_TABLE: u8 = 10;
@@ -2073,9 +2073,7 @@ impl CreateTable {
     }
 
     pub fn with_retired_constraint(&self, constraint: &DroppableConstraint) -> Result<Self> {
-        let mut evolved = self.clone();
-        retire_constraint(&mut evolved.schema, constraint)?;
-        evolved.refresh_and_validate_evolution()
+        self.fold_retired_constraint(constraint)
     }
 
     /// Fold an independently admitted retirement into the current catalog IR.
@@ -2125,21 +2123,22 @@ impl CreateTable {
                 }
                 current.active = true;
             }
-            DroppableConstraint::Check(_expected) => {
+            DroppableConstraint::Check(expected) => {
                 let current = folded
                     .schema
                     .checks
                     .iter_mut()
                     .find(|current| {
-                        current
-                            .name
-                            .as_ref()
-                            .is_some_and(|name| name.canonical() == constraint.name().canonical())
+                        current.name.as_ref().is_some_and(|name| {
+                            name.canonical() == constraint.name().canonical()
+                        })
                     })
                     .ok_or(Error::InvalidDatabase(
                         "constraint restoration references an unknown CHECK definition",
                     ))?;
-                if current.active {
+                let mut retired = expected.clone();
+                retired.active = false;
+                if current != &retired {
                     return Err(Error::InvalidDatabase(
                         "constraint restoration contradicts the current CHECK definition",
                     ));
@@ -2428,11 +2427,12 @@ impl CreateTable {
                 .foreign_keys
                 .iter()
                 .any(|foreign_key| foreign_key.columns().contains(&column))
-            || self
-                .schema
-                .checks
-                .iter()
-                .any(|check| check.column != Some(column) && check.dependencies.contains(&column))
+            || self.schema.checks.iter().any(|check| {
+                // Active column-owned CHECKs drop with the column. Retired ones
+                // must stay so constraint names remain permanently reserved.
+                (!check.active && check.column == Some(column))
+                    || (check.column != Some(column) && check.dependencies.contains(&column))
+            })
         {
             return Err(Error::UnsupportedSql(
                 "DROP COLUMN does not support key, index, CHECK, or foreign-key dependencies",
@@ -2796,20 +2796,23 @@ fn retire_constraint(schema: &mut TableSchema, constraint: &DroppableConstraint)
             }
             current.active = false;
         }
-        DroppableConstraint::Check(_expected) => {
+        DroppableConstraint::Check(expected) => {
             let current = schema
                 .checks
                 .iter_mut()
                 .find(|current| {
-                    current
-                        .name
-                        .as_ref()
-                        .is_some_and(|name| name.canonical() == constraint.name().canonical())
+                    current.name.as_ref().is_some_and(|name| {
+                        name.canonical() == constraint.name().canonical()
+                    })
                 })
                 .ok_or(Error::InvalidDatabase(
                     "constraint retirement references an unknown CHECK definition",
                 ))?;
-            if !current.active {
+            if current.column != expected.column
+                || current.expression != expected.expression
+                || current.dependencies != expected.dependencies
+                || !current.active
+            {
                 return Err(Error::InvalidDatabase(
                     "constraint retirement contradicts the current CHECK definition",
                 ));
@@ -3045,9 +3048,12 @@ fn resolve_added_foreign_key(
         .ok_or(Error::UnsupportedSql(
             "foreign keys must reference a complete primary or UNIQUE key in order",
         ))?;
-    if parent_columns.len() != 1
-        || column.affinity(child.mode()) != parent_columns[0].affinity(parent.mode())
-    {
+    if parent_columns.len() != 1 {
+        return Err(Error::UnsupportedSql(
+            "ADD COLUMN foreign keys must reference a single-column primary or UNIQUE key",
+        ));
+    }
+    if column.affinity(child.mode()) != parent_columns[0].affinity(parent.mode()) {
         return Err(Error::UnsupportedSql(
             "foreign-key child and parent columns must have matching affinities",
         ));
@@ -3180,6 +3186,11 @@ fn validate_foreign_key_link(
     foreign_key: &ForeignKeyDefinition,
     parent: &CreateTable,
 ) -> Result<()> {
+    if foreign_key.referenced_table() == child.table_id() {
+        return Err(Error::InvalidDatabase(
+            "self-referential foreign keys are not supported",
+        ));
+    }
     let parent_columns = parent
         .foreign_key_target_columns(foreign_key.referenced_index)
         .ok_or(Error::InvalidDatabase(

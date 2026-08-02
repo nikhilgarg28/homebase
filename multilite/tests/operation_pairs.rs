@@ -208,6 +208,56 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "create_view_and_add_column",
+        relationship: "view dependency markers commute with unrelated column addition",
+        left: operation!(
+            CreateView,
+            "CREATE VIEW fresh_view AS SELECT id FROM labels"
+        ),
+        right: operation!(
+            AddColumn,
+            "ALTER TABLE labels ADD COLUMN extra TEXT DEFAULT 'x'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "drop_view_and_source_table_rename",
+        relationship: "DROP VIEW asserts source table name bindings for rejection repair",
+        left: operation!(DropView, "DROP VIEW base_view"),
+        right: operation!(
+            RenameTable,
+            "ALTER TABLE view_base RENAME TO view_base_renamed"
+        ),
+        // Drop-then-rename both admit (view is gone). Rename-then-drop rejects so
+        // rejection repair can recreate the view against the pre-rename names.
+        snapshot: ExpectedPair::directional(
+            Disposition::BothAdmit,
+            Disposition::SecondRejects,
+        ),
+        serializable: ExpectedPair::directional(
+            Disposition::BothAdmit,
+            Disposition::SecondRejects,
+        ),
+    },
+    PairCase {
+        name: "drop_view_and_source_column_rename",
+        relationship: "DROP VIEW asserts source column name bindings for rejection repair",
+        left: operation!(DropView, "DROP VIEW base_view"),
+        right: operation!(
+            RenameColumn,
+            "ALTER TABLE view_base RENAME COLUMN id TO note_id"
+        ),
+        snapshot: ExpectedPair::directional(
+            Disposition::BothAdmit,
+            Disposition::SecondRejects,
+        ),
+        serializable: ExpectedPair::directional(
+            Disposition::BothAdmit,
+            Disposition::SecondRejects,
+        ),
+    },
+    PairCase {
         name: "user_version_conflict",
         relationship: "same replicated application metadata cell",
         left: operation!(SetUserVersion, "PRAGMA user_version = 11"),
@@ -762,6 +812,21 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "add_foreign_key_and_parent_column_rename",
+        relationship: "parent column name binding required by ADD COLUMN REFERENCES",
+        left: operation!(
+            AddColumn,
+            "ALTER TABLE fk_base ADD COLUMN parent_id INTEGER
+             REFERENCES parents(id) ON DELETE CASCADE"
+        ),
+        right: operation!(
+            RenameColumn,
+            "ALTER TABLE parents RENAME COLUMN id TO parent_key"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "add_and_drop_disjoint_columns",
         relationship: "new column and unrelated existing column",
         left: operation!(
@@ -1046,7 +1111,14 @@ const PAIR_CASES: &[PairCase] = &[
 
 #[test]
 fn registered_operation_pairs_obey_admission_and_convergence_contracts() {
+    let filter = std::env::var("PAIR_FILTER").ok();
     for &case in PAIR_CASES {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !case.name.contains(filter))
+        {
+            continue;
+        }
         for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
             let left_then_right = run_case(case, isolation, AdmissionOrder::LeftThenRight);
             let right_then_left = run_case(case, isolation, AdmissionOrder::RightThenLeft);

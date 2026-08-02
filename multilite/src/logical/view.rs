@@ -145,12 +145,14 @@ impl ViewOperation {
                 },
                 ViewAction::Drop => Mutation::Delete { key: marker },
             });
-            if self.action == ViewAction::Create {
-                guards.invariant(
-                    schema_object_name_scope_key(&dependency.name),
-                    GuardReason::ViewDependency,
-                )?;
-            }
+            // CREATE and DROP both assert source name bindings so a rename that
+            // admits first conflicts with DROP/CREATE VIEW; rejection repair can
+            // then re-execute historical CREATE SQL against unchanged names.
+            // Drop-then-rename still admits (the view is already gone).
+            guards.invariant(
+                schema_object_name_scope_key(&dependency.name),
+                GuardReason::ViewDependency,
+            )?;
             for column in &dependency.columns {
                 let marker =
                     column_view_dependency_key(dependency.table, column.column, &self.name);
@@ -163,12 +165,10 @@ impl ViewOperation {
                     },
                     ViewAction::Drop => Mutation::Delete { key: marker },
                 });
-                if self.action == ViewAction::Create {
-                    guards.invariant(
-                        column_name_scope_key(dependency.table, &column.name),
-                        GuardReason::ViewDependency,
-                    )?;
-                }
+                guards.invariant(
+                    column_name_scope_key(dependency.table, &column.name),
+                    GuardReason::ViewDependency,
+                )?;
             }
         }
         mutations.push(match self.action {
@@ -399,11 +399,13 @@ pub(crate) fn ensure_table_not_referenced(connection: &Connection, table: &SqlNa
         let sql = row?;
         let ValidatedExecute::CreateView(view) =
             crate::sql::validate_execute(&sql).map_err(|_| {
-                Error::InvalidDatabase("stored view SQL is outside the supported grammar")
+                Error::UnsupportedSql(
+                    "schema contains a view outside the supported grammar; drop unsupported views before destructive DDL",
+                )
             })?
         else {
-            return Err(Error::InvalidDatabase(
-                "stored view SQL does not describe a view",
+            return Err(Error::UnsupportedSql(
+                "schema contains a view outside the supported grammar; drop unsupported views before destructive DDL",
             ));
         };
         if view

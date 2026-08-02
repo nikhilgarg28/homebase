@@ -57,6 +57,10 @@ fn user_version_is_a_durable_write_and_schema_pragmas_are_explicit_reads() {
         db.query("PRAGMA journal_mode", (), |_| Ok(())),
         Err(Error::UnsupportedSql(_))
     ));
+    assert!(matches!(
+        db.query("PRAGMA table_info(__multilite__pending)", (), |_| Ok(())),
+        Err(Error::UnsupportedSql(_))
+    ));
     let pending = local_write_state(&path).0;
     db.execute("PRAGMA user_version = -17", ()).unwrap();
     assert_eq!(local_write_state(&path).0, pending);
@@ -5364,6 +5368,42 @@ fn drop_constraint_handles_names_parameters_and_foreign_key_dependencies() {
         ),
         Err(Error::InvalidMultiliteOp(_))
     ));
+}
+
+#[test]
+fn drop_column_refuses_retired_column_attached_check_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("retired-check-drop.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE scores (
+            id INTEGER PRIMARY KEY,
+            score INTEGER CONSTRAINT ck_score CHECK (score >= 0),
+            body TEXT
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE scores DROP CONSTRAINT ck_score", ())
+        .unwrap();
+    assert!(
+        matches!(
+            db.execute("ALTER TABLE scores DROP COLUMN score", ()),
+            Err(Error::UnsupportedSql(_))
+        ),
+        "DROP COLUMN deleted a retired column-attached CHECK name"
+    );
+    assert!(
+        matches!(
+            db.execute(
+                "ALTER TABLE scores ADD COLUMN extra INTEGER
+                 CONSTRAINT ck_score CHECK (extra >= 0)",
+                (),
+            ),
+            Err(Error::UnsupportedSql(_))
+        ),
+        "retired CHECK name became reusable without dropping its column"
+    );
+    db.execute("ALTER TABLE scores DROP COLUMN body", ()).unwrap();
 }
 
 #[test]

@@ -135,10 +135,11 @@ DEFAULT, unnamed constraints, `ADD CONSTRAINT`, and type changes remain
 outside this slice. Retired constraint names remain reserved within the table's
 retained schema history.
 
-`PRAGMA [main.]user_version` is supported for reads and signed 32-bit literal
-assignments. A changing assignment is one replicated metadata operation with
-write conflict detection under both isolation levels and local rejection
-repair; assigning the current value is a logical no-op. Public read-only
+`PRAGMA [main.]user_version` is supported for reads and signed 32-bit decimal
+literal assignments (hex and string forms are rejected). A changing assignment
+is one replicated metadata operation with write conflict detection under both
+isolation levels and local rejection repair; assigning the current value is a
+logical no-op with no fence. Public read-only
 schema introspection also supports `table_info`, `table_xinfo`, `index_list`,
 `index_info`, `index_xinfo`, and `foreign_key_list` with literal object names.
 Serializable updates retain name and owning-table dependencies for those

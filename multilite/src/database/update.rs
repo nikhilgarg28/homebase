@@ -1,5 +1,6 @@
 //! Managed local update execution.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -40,7 +41,9 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
     connection: &'a Connection,
     hooks: BranchHooks<'a>,
     operations: Vec<CompiledOperation>,
-    footprint: ConflictFootprint,
+    // RefCell so prepare() can record PRAGMA read footprints without taking
+    // &mut self (prepared statements must outlive later execute/query calls).
+    footprint: RefCell<ConflictFootprint>,
     _server: PhantomData<fn() -> H>,
 }
 
@@ -63,7 +66,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 capture_budget,
             )?,
             operations: Vec::new(),
-            footprint: ConflictFootprint::new(),
+            footprint: RefCell::new(ConflictFootprint::new()),
             _server: PhantomData,
         })
     }
@@ -115,8 +118,17 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     }
 
     /// Prepare one read-only statement bound to this managed update.
+    ///
+    /// PRAGMA reads are recorded into the serializable footprint here, matching
+    /// [`Self::query`]. SELECT footprints continue to come from the authorizer.
     pub fn prepare(&self, sql: &str) -> Result<TransactionStatement<'a>> {
-        TransactionStatement::new(self.connection, sql)
+        match crate::sql::validate_statement(sql)? {
+            ValidatedStatement::Read(read) => {
+                self.record_explicit_read(&read)?;
+                TransactionStatement::new_prevalidated(self.connection, sql)
+            }
+            ValidatedStatement::Write(_) => Err(Error::StatementModeMismatch),
+        }
     }
 
     /// Execute one statement validated before the transaction began.
@@ -443,7 +455,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         Ok(changed)
     }
 
-    fn record_explicit_read(&mut self, read: &ValidatedRead) -> Result<()> {
+    fn record_explicit_read(&self, read: &ValidatedRead) -> Result<()> {
         let mut guards = GuardPlan::for_operation(OperationFamily::TransactionRead);
         match read {
             ValidatedRead::Select => return Ok(()),
@@ -482,7 +494,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                 }
             }
         }
-        self.footprint.extend(guards.footprint());
+        self.footprint.borrow_mut().extend(guards.footprint());
         Ok(())
     }
 
@@ -499,7 +511,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             schema_object_name_scope_key(name),
             GuardReason::SerializableRead,
         )?;
-        self.footprint.extend(reads.footprint());
+        self.footprint.borrow_mut().extend(reads.footprint());
         Ok(changed)
     }
 
@@ -669,18 +681,19 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
 
     fn record_operation(&mut self, operation: CompiledOperation) {
         self.footprint
+            .borrow_mut()
             .extend(operation.homebase().guards().footprint());
         self.operations.push(operation);
     }
 
-    fn into_branch_parts(mut self) -> Result<(Vec<CompiledOperation>, ConflictFootprint)> {
+    fn into_branch_parts(self) -> Result<(Vec<CompiledOperation>, ConflictFootprint)> {
         let reads = self.hooks.read_prefixes()?;
         let mut read_guards = GuardPlan::for_operation(OperationFamily::TransactionRead);
         for read in reads {
             read_guards.serializable_read(read, GuardReason::SerializableRead)?;
         }
-        self.footprint.extend(read_guards.footprint());
-        Ok((self.operations, self.footprint))
+        self.footprint.borrow_mut().extend(read_guards.footprint());
+        Ok((self.operations, self.footprint.into_inner()))
     }
 }
 

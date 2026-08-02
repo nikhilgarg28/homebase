@@ -133,6 +133,7 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `RenameTable` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `RenameColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ColumnNameBinding` | `ColumnName` |
+| `AddColumn` | `Write` | `ColumnNameBinding` | `ColumnName` |
 | `AddColumn` | `Invariant` | `ConstraintNameBinding` | `ConstraintName` |
 | `AddColumn` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
 | `AddColumn` | `Invariant` | `SchemaRevision` | `ActiveSchemaRevision` |
@@ -165,6 +166,8 @@ Guard classes have distinct semantics: `Invariant` is mandatory at every isolati
 | `CreateView` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `CreateView` | `Write` | `ColumnDependency` | `ColumnDependency` |
 | `DropView` | `Invariant` | `SchemaObjectName` | `SchemaObjectName` |
+| `DropView` | `Invariant` | `ViewDependency` | `SchemaObjectName` |
+| `DropView` | `Invariant` | `ViewDependency` | `ColumnName` |
 | `DropView` | `Invariant` | `ViewDependency` | `ViewDependency` |
 | `DropView` | `Invariant` | `ColumnDependency` | `ColumnDependency` |
 | `DropView` | `Write` | `ColumnDependency` | `ColumnDependency` |
