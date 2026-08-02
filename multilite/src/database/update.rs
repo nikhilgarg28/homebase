@@ -45,10 +45,22 @@ pub struct UpdateTransaction<'a, H: ServerHandle> {
 
 impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     fn branch(connection: &'a Connection, isolation: IsolationLevel) -> Result<Self> {
+        Self::branch_with_capture_budget(connection, isolation, CaptureBudget::default())
+    }
+
+    fn branch_with_capture_budget(
+        connection: &'a Connection,
+        isolation: IsolationLevel,
+        capture_budget: CaptureBudget,
+    ) -> Result<Self> {
         Ok(Self {
             isolation,
             connection,
-            hooks: BranchHooks::install(connection, isolation == IsolationLevel::Serializable)?,
+            hooks: BranchHooks::install_with_budget(
+                connection,
+                isolation == IsolationLevel::Serializable,
+                capture_budget,
+            )?,
             operations: Vec::new(),
             footprint: ConflictFootprint::new(),
             _server: PhantomData,
@@ -78,7 +90,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
     {
         let validated = crate::sql::validate_statement(sql)?;
         if validated.output() != StatementOutput::Rows {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         }
         match validated {
             ValidatedStatement::Read => {
@@ -208,7 +220,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             }
             ValidatedExecute::Insert(StatementOutput::Rows)
             | ValidatedExecute::Delete(StatementOutput::Rows)
-            | ValidatedExecute::Update(StatementOutput::Rows) => Err(Error::PreparedWrite),
+            | ValidatedExecute::Update(StatementOutput::Rows) => Err(Error::StatementModeMismatch),
         }
     }
 
@@ -230,7 +242,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
             | ValidatedExecute::Update(StatementOutput::Rows) => {
                 self.query_captured(sql, params, map, compile_row_changes)
             }
-            _ => Err(Error::PreparedWrite),
+            _ => Err(Error::StatementModeMismatch),
         }
     }
 
@@ -453,16 +465,23 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
+        let hook_state = Arc::clone(&self.hooks.state);
+        let mut map = map;
         self.run_captured(
-            |connection| {
+            move |connection| {
                 let mut statement = connection.prepare(sql)?;
                 if statement.readonly() || statement.column_count() == 0 {
-                    return Err(Error::PreparedWrite);
+                    return Err(Error::StatementModeMismatch);
                 }
-                statement
-                    .query_map(params, map)?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(Into::into)
+                let mut rows = statement.query(params)?;
+                let mut mapped = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if let Some(error) = lock(&hook_state).error.clone() {
+                        return Err(error);
+                    }
+                    mapped.push(map(row)?);
+                }
+                Ok(mapped)
             },
             compile,
         )
@@ -611,6 +630,7 @@ struct BranchHooks<'connection> {
 }
 
 impl<'connection> BranchHooks<'connection> {
+    #[cfg(test)]
     fn install(connection: &'connection Connection, trace_reads: bool) -> Result<Self> {
         Self::install_with_budget(connection, trace_reads, CaptureBudget::default())
     }
@@ -1340,6 +1360,60 @@ mod tests {
                 .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn returning_capture_limit_stops_mapping_and_leaves_hooks_reusable() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        let mut update =
+            UpdateTransaction::<crate::database::OfflineServer>::branch_with_capture_budget(
+                &connection,
+                IsolationLevel::Snapshot,
+                CaptureBudget::with_limits(2, usize::MAX),
+            )
+            .unwrap();
+        let mut mapped = 0;
+
+        assert!(matches!(
+            update.query_captured(
+                "INSERT INTO notes VALUES
+                    (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')
+                 RETURNING id",
+                (),
+                |row| {
+                    mapped += 1;
+                    row.get::<_, i64>(0)
+                },
+                |_, _| Ok(None),
+            ),
+            Err(Error::CaptureLimitExceeded {
+                resource: "row-change count",
+                limit: 2,
+            })
+        ));
+        assert_eq!(mapped, 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            update
+                .query_captured(
+                    "INSERT INTO notes VALUES (5, 'five') RETURNING id",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                    |_, _| Ok(None),
+                )
+                .unwrap(),
+            [5]
         );
     }
 

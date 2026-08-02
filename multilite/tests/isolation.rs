@@ -712,6 +712,71 @@ fn update_from_sources_are_reads_only_under_serializable_isolation() {
 }
 
 #[test]
+fn direct_returning_projection_is_conservatively_serializable_at_table_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation, expect_rejection) in [
+        ("snapshot", IsolationLevel::Snapshot, false),
+        ("serializable", IsolationLevel::Serializable, true),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-projection-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-projection-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        synchronize_schema(&first, &second);
+
+        for (database, id, day) in [(&first, 1_i64, "mon"), (&second, 2_i64, "tue")] {
+            database
+                .update_with(UpdateOptions::new(isolation), |transaction| {
+                    assert_eq!(
+                        transaction.query(
+                            "INSERT INTO bookings VALUES (?1, ?2) RETURNING id",
+                            (id, day),
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        [id]
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        if expect_rejection {
+            let rejection = rejected(second.push().unwrap());
+            assert_range_assertion_failed(&rejection);
+            second.rollback(&rejection).unwrap();
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        } else {
+            assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        }
+        converge(&first, &second);
+
+        let expected = if expect_rejection {
+            vec![(1, String::from("mon"))]
+        } else {
+            vec![(1, String::from("mon")), (2, String::from("tue"))]
+        };
+        for database in [&first, &second] {
+            assert_eq!(bookings(database), expected, "{label}");
+        }
+    }
+}
+
+#[test]
 fn returning_subqueries_are_reads_only_under_serializable_isolation() {
     let directory = tempfile::tempdir().unwrap();
     for (label, isolation, expect_rejection) in [

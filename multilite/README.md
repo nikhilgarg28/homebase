@@ -250,6 +250,13 @@ rejects statements that produce rows instead of silently discarding them.
 Reusable `prepare` supports the same distinction while retaining SQLite-shaped
 parameters and conversion.
 
+Serializable read tracking currently follows SQLite's authorizer at table
+granularity. Because SQLite reports columns projected directly by `RETURNING`
+as reads, a returning write can conservatively assert the target table root;
+this may reject otherwise-disjoint serializable writes. Snapshot isolation is
+unaffected, and actual subqueries inside `RETURNING` remain required read
+dependencies.
+
 Every connection lifecycle and data operation also has a runtime-neutral async
 form: `open_async`, `open_with_async`, `execute_async`, `query_async`,
 `prepare_async`, `view_async`, `update_async`, `push_async`, `pull_async`,

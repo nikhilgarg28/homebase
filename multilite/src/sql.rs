@@ -698,7 +698,7 @@ pub fn validate_read_statement(sql: &str) -> Result<()> {
         ) => Err(Error::UnsupportedSql(
             "transaction control is owned by the managed closure",
         )),
-        _ => Err(Error::PreparedWrite),
+        _ => Err(Error::StatementModeMismatch),
     }
 }
 
@@ -2094,7 +2094,10 @@ mod tests {
                 "prepared read gate accepted: {sql}"
             );
             assert!(
-                matches!(validate_read_statement(sql), Err(Error::PreparedWrite)),
+                matches!(
+                    validate_read_statement(sql),
+                    Err(Error::StatementModeMismatch)
+                ),
                 "read-only gate accepted: {sql}"
             );
         }

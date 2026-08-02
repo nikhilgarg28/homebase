@@ -480,7 +480,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     {
         let validated = sql::validate_statement(sql)?;
         if validated.output() != sql::StatementOutput::Rows {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         }
         match validated {
             sql::ValidatedStatement::Read => {
@@ -712,7 +712,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
     /// Execute a prepared rowless mutating statement.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         let sql::ValidatedStatement::Write(validated) = &self.validated else {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         };
         if validated.output() == sql::StatementOutput::Rows {
             return Err(rusqlite::Error::ExecuteReturnedResults.into());
@@ -727,7 +727,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         P: Params + Send + 'static,
     {
         let sql::ValidatedStatement::Write(validated) = &self.validated else {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         };
         if validated.output() == sql::StatementOutput::Rows {
             return Err(rusqlite::Error::ExecuteReturnedResults.into());
@@ -744,7 +744,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
         if self.validated.output() != sql::StatementOutput::Rows {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         }
         match &self.validated {
             sql::ValidatedStatement::Read => self.database.view(&self.runtime, |view| {
@@ -769,7 +769,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
     {
         let sql = self.sql.clone();
         if self.validated.output() != sql::StatementOutput::Rows {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         }
         match &self.validated {
             sql::ValidatedStatement::Read => {

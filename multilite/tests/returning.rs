@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use homebase_core::space::SpaceId;
@@ -21,6 +22,46 @@ fn row_count(database: &MultiliteConnection, table: &str) -> i64 {
             row.get::<_, i64>(0)
         })
         .unwrap()[0]
+}
+
+fn first_i64(row: &rusqlite::Row<'_>) -> rusqlite::Result<i64> {
+    row.get(0)
+}
+
+fn first_string(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LocalWriteState {
+    pending: i64,
+    commit_seq: String,
+    last_device_seq: Option<String>,
+}
+
+fn local_write_state(path: &std::path::Path) -> LocalWriteState {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    LocalWriteState {
+        pending: connection
+            .query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        commit_seq: connection
+            .query_row(
+                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
+                (),
+                |row| row.get(0),
+            )
+            .unwrap(),
+        last_device_seq: connection
+            .query_row(
+                "SELECT max(hex(device_seq)) FROM __multilite__pending",
+                (),
+                |row| row.get(0),
+            )
+            .unwrap(),
+    }
 }
 
 #[test]
@@ -118,7 +159,7 @@ fn query_and_execute_enforce_rows_vs_changes_without_mutating() {
 
     assert!(matches!(
         database.query("INSERT INTO notes VALUES (2, 'query')", (), |_| Ok(())),
-        Err(Error::PreparedWrite)
+        Err(Error::StatementModeMismatch)
     ));
 
     assert!(matches!(
@@ -129,7 +170,7 @@ fn query_and_execute_enforce_rows_vs_changes_without_mutating() {
                 |row| row.get::<_, i64>(0),
             )
         }),
-        Err(Error::PreparedWrite)
+        Err(Error::StatementModeMismatch)
     ));
 
     let mut returning = database
@@ -144,7 +185,7 @@ fn query_and_execute_enforce_rows_vs_changes_without_mutating() {
         .unwrap();
     assert!(matches!(
         rowless.query_map((), |_| Ok(())),
-        Err(Error::PreparedWrite)
+        Err(Error::StatementModeMismatch)
     ));
     assert_eq!(row_count(&database, "notes"), 0);
 }
@@ -226,6 +267,217 @@ fn returning_mapper_failure_rolls_back_the_complete_statement() {
     assert!(matches!(result, Err(Error::Sqlite(_))));
     assert_eq!(mapped, 2);
     assert_eq!(row_count(&database, "notes"), 0);
+}
+
+#[test]
+fn caught_mapper_failure_rolls_back_only_its_statement_inside_an_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("returning-caught-error.sqlite")).unwrap();
+    database
+        .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+
+    database
+        .update(|update| {
+            update.execute("INSERT INTO notes VALUES (1, 'before')", ())?;
+            let mut mapped = 0;
+            let failed = update.query(
+                "INSERT INTO notes VALUES (2, 'rolled back'), (3, 'also rolled back')
+                 RETURNING id",
+                (),
+                |row| {
+                    mapped += 1;
+                    if mapped == 2 {
+                        Err(rusqlite::Error::InvalidQuery)
+                    } else {
+                        row.get::<_, i64>(0)
+                    }
+                },
+            );
+            assert!(matches!(failed, Err(Error::Sqlite(_))));
+            assert_eq!(mapped, 2);
+            update.execute("INSERT INTO notes VALUES (4, 'after')", ())?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        database
+            .query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [(1, "before".into()), (4, "after".into())]
+    );
+}
+
+#[test]
+fn mapper_panic_discards_the_complete_managed_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("returning-map-panic.sqlite")).unwrap();
+    database
+        .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = database.update(|update| -> multilite::Result<()> {
+            update.execute("INSERT INTO notes VALUES (1, 'before')", ())?;
+            update.query(
+                "INSERT INTO notes VALUES (2, 'panic') RETURNING id",
+                (),
+                |_| -> rusqlite::Result<i64> { panic!("injected RETURNING mapper panic") },
+            )?;
+            Ok(())
+        });
+    }));
+    assert!(panic.is_err());
+    assert_eq!(row_count(&database, "notes"), 0);
+
+    database
+        .query(
+            "INSERT INTO notes VALUES (3, 'usable') RETURNING id",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(row_count(&database, "notes"), 1);
+}
+
+#[test]
+fn zero_effect_returning_dml_does_not_advance_local_write_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("returning-noop-state.sqlite");
+    let database = MultiliteConnection::open(&path).unwrap();
+    database
+        .execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT UNIQUE)",
+            (),
+        )
+        .unwrap();
+    database
+        .execute("INSERT INTO notes VALUES (1, 'one')", ())
+        .unwrap();
+    let before = local_write_state(&path);
+
+    assert!(
+        database
+            .query(
+                "UPDATE notes SET body = upper(body) WHERE id = 99 RETURNING id",
+                (),
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        database
+            .query(
+                "DELETE FROM notes WHERE id = 99 RETURNING id",
+                (),
+                first_i64
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        database
+            .query(
+                "INSERT INTO notes VALUES (2, 'one')
+                 ON CONFLICT(body) DO NOTHING RETURNING id",
+                (),
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(local_write_state(&path), before);
+    assert_eq!(row_count(&database, "notes"), 1);
+}
+
+#[test]
+fn prepared_returning_statement_can_be_reused_after_mapper_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("returning-reuse.sqlite")).unwrap();
+    database
+        .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    let mut statement = database
+        .prepare("INSERT INTO notes VALUES (?1, ?2) RETURNING id")
+        .unwrap();
+
+    assert_eq!(
+        statement
+            .query_map((1, "one"), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [1]
+    );
+    assert!(matches!(
+        statement.query_map((2, "two"), |_| Err::<i64, _>(rusqlite::Error::InvalidQuery)),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        statement
+            .query_map((3, "three"), |row| row.get::<_, i64>(0))
+            .unwrap(),
+        [3]
+    );
+    assert_eq!(
+        database
+            .query("SELECT id FROM notes ORDER BY id", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        [1, 3]
+    );
+}
+
+#[test]
+fn returning_uses_schema_changes_made_earlier_in_the_same_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        MultiliteConnection::open(directory.path().join("returning-schema.sqlite")).unwrap();
+
+    let observed = database
+        .update(|update| {
+            update.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                (),
+            )?;
+            let inserted = update.query(
+                "INSERT INTO notes VALUES (1, 'one') RETURNING id, body",
+                (),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            update.execute(
+                "ALTER TABLE notes ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                (),
+            )?;
+            let updated = update.query(
+                "UPDATE notes SET revision = revision + 1 RETURNING body, revision",
+                (),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            Ok((inserted, updated))
+        })
+        .unwrap();
+
+    assert_eq!(observed, (vec![(1, "one".into())], vec![("one".into(), 2)]));
+    assert_eq!(
+        database
+            .query("SELECT id, body, revision FROM notes", (), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap(),
+        [(1, "one".into(), 2)]
+    );
 }
 
 #[test]
@@ -396,10 +648,7 @@ fn async_direct_and_prepared_returning_queries_use_the_write_path() {
         assert!(!update.readonly());
         assert_eq!(
             update
-                .query_async((Value::Text("ONE".into()), Value::Integer(1)), |row| row
-                    .get::<_, String>(
-                    0
-                ),)
+                .query_async((Value::Text("ONE".into()), Value::Integer(1)), first_string,)
                 .await
                 .unwrap(),
             ["ONE"]

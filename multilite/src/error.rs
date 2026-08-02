@@ -19,8 +19,8 @@ pub enum Error {
         /// The error encountered while rolling its savepoint back.
         rollback: Box<Error>,
     },
-    /// A prepared statement was used through the wrong execution mode.
-    PreparedWrite,
+    /// A statement was used through an API expecting another access or output mode.
+    StatementModeMismatch,
     /// The statement uses SQL outside Multilite's current public surface.
     UnsupportedSql(&'static str),
     /// The selected open-time policy cannot operate without authority.
@@ -90,8 +90,8 @@ impl fmt::Display for Error {
                 f,
                 "statement failed ({statement}) and its rollback also failed ({rollback})"
             ),
-            Self::PreparedWrite => {
-                f.write_str("prepared statement execution mode does not match its SQL")
+            Self::StatementModeMismatch => {
+                f.write_str("statement API mode does not match its SQL access or output")
             }
             Self::UnsupportedSql(message) => write!(f, "unsupported SQL: {message}"),
             Self::AuthorityRequired(policy) => {
@@ -157,7 +157,7 @@ impl std::error::Error for Error {
         match self {
             Self::Sqlite(error) => Some(error.as_ref()),
             Self::StatementRollback { statement, .. } => Some(statement.as_ref()),
-            Self::PreparedWrite
+            Self::StatementModeMismatch
             | Self::UnsupportedSql(_)
             | Self::AuthorityRequired(_)
             | Self::AuthorityRejected(_)

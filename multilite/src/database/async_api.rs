@@ -216,7 +216,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
     {
         let validated = sql::validate_statement(&sql)?;
         if validated.output() != sql::StatementOutput::Rows {
-            return Err(Error::PreparedWrite);
+            return Err(Error::StatementModeMismatch);
         }
         match validated {
             sql::ValidatedStatement::Read => {

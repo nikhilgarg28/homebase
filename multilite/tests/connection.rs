@@ -418,7 +418,7 @@ fn managed_transactions_own_transaction_control_and_keep_views_read_only() {
         .unwrap();
     assert!(matches!(
         db.view(|tx| tx.prepare("INSERT INTO notes VALUES (1)").map(|_| ())),
-        Err(Error::PreparedWrite)
+        Err(Error::StatementModeMismatch)
     ));
     assert_eq!(
         db.query("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))

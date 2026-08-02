@@ -34,6 +34,14 @@ therefore not transactional. Under `Remote` policy, the outer `query` or
 `ViewTransaction` remains read-only, while `UpdateTransaction::query` can mix
 reads and returning writes in one managed transaction.
 
+Serializable tracing remains deliberately conservative. SQLite's authorizer
+reports target columns projected directly by `RETURNING` as reads, so the
+current table-root tracer may make a serializable returning write conflict
+with another write to the same table even when their row keys are disjoint.
+Snapshot isolation is unaffected. Reads performed by subqueries inside a
+`RETURNING` expression are genuine dependencies and are always retained;
+future predicate tracing may distinguish those from output-only projections.
+
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
 FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings
 produce the same statement-delta operation as simpler DML.
@@ -41,7 +49,9 @@ produce the same statement-delta operation as simpler DML.
 Each statement may capture at most 100,000 direct row events and 64 MiB of row
 images. The normalized row operation and enclosing transaction frame enforce
 the same 64 MiB durable boundary on encode and decode. Crossing a limit rolls
-back the complete SQLite statement with a typed error.
+back the complete SQLite statement with a typed error. For `RETURNING`, capture
+poisoning is checked before invoking the row mapper, so application mapping
+stops as soon as SQLite reports the bounded failure.
 
 `DROP COLUMN` and `DROP TABLE` replicate metadata only. Their originating
 replica streams dropped values or complete row images into a local repair
