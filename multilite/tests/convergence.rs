@@ -4487,6 +4487,278 @@ fn rejected_drop_table_restores_composite_rows_indexes_across_restart_and_conver
 }
 
 #[test]
+fn rejected_drop_table_restores_complete_schema_behavior_after_restart() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let second_path = directory
+            .path()
+            .join(format!("drop-table-schema-second-{isolation:?}.sqlite"));
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("drop-table-schema-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .server(router(Arc::clone(&server)))
+                .isolation_level(isolation),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server)))
+                .isolation_level(isolation),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE parents (
+                        tenant TEXT,
+                        id INTEGER,
+                        PRIMARY KEY (tenant, id)
+                    ) WITHOUT ROWID, STRICT",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE inventory (
+                        tenant TEXT,
+                        sku INTEGER,
+                        parent_tenant TEXT NOT NULL,
+                        parent_id INTEGER NOT NULL,
+                        code TEXT CONSTRAINT code_nn NOT NULL DEFAULT 'fallback',
+                        quantity INTEGER NOT NULL DEFAULT 1
+                            CONSTRAINT quantity_positive CHECK (quantity > 0),
+                        note TEXT,
+                        CONSTRAINT inventory_pk PRIMARY KEY (tenant, sku),
+                        CONSTRAINT inventory_code UNIQUE (tenant, code),
+                        CONSTRAINT inventory_parent FOREIGN KEY (parent_tenant, parent_id)
+                            REFERENCES parents (tenant, id)
+                    ) WITHOUT ROWID, STRICT",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE UNIQUE INDEX inventory_note_unique ON inventory(note)",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE INDEX inventory_code_lookup
+                     ON inventory(lower(code) DESC) WHERE quantity > 0",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO parents VALUES ('north', 1), ('south', 2)", ())?;
+                transaction.execute(
+                    "INSERT INTO inventory VALUES
+                        ('north', 1, 'north', 1, 'alpha', 2, 'north-note'),
+                        ('south', 2, 'south', 2, 'beta', 3, 'south-note')",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "INSERT INTO inventory VALUES
+                    ('remote', 9, 'north', 1, 'remote', 4, 'remote-note')",
+                (),
+            )
+            .unwrap();
+        second.execute("DROP TABLE inventory", ()).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("stale DROP TABLE was not rejected")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .server(router(Arc::clone(&server)))
+                .isolation_level(isolation),
+        )
+        .unwrap();
+        second.rollback(&rejection).unwrap();
+
+        assert_eq!(
+            index_names(&second),
+            ["inventory_code_lookup", "inventory_note_unique"]
+        );
+        assert!(
+            second
+                .execute(
+                    "INSERT INTO inventory VALUES
+                        ('north', 7, 'north', 1, 'alpha', 2, 'another-note')",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(
+            second
+                .execute(
+                    "INSERT INTO inventory VALUES
+                        ('other', 7, 'north', 1, 'gamma', 2, 'north-note')",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(
+            second
+                .execute(
+                    "INSERT INTO inventory VALUES
+                        ('other', 8, 'north', 1, 'gamma', 0, 'zero-quantity')",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(
+            second
+                .execute(
+                    "INSERT INTO inventory VALUES
+                        ('other', 9, 'missing', 99, 'gamma', 2, 'missing-parent')",
+                    (),
+                )
+                .is_err()
+        );
+        assert!(
+            second
+                .execute("DELETE FROM parents WHERE tenant = 'north' AND id = 1", ())
+                .is_err()
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        second
+            .execute(
+                "INSERT INTO inventory
+                    (tenant, sku, parent_tenant, parent_id, note)
+                 VALUES ('local', 3, 'south', 2, 'local-note')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .query(
+                    "SELECT code, quantity FROM inventory
+                     WHERE tenant = 'local' AND sku = 3",
+                    (),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            [("fallback".into(), 1)]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT count(*) FROM inventory", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                [4]
+            );
+            assert_eq!(
+                index_names(database),
+                ["inventory_code_lookup", "inventory_note_unique"]
+            );
+        }
+    }
+}
+
+#[test]
+fn admitted_child_drop_allows_later_parent_deletes_to_converge() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("drop-child-first-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .server(router(Arc::clone(&server)))
+                .isolation_level(isolation),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("drop-child-second-{isolation:?}.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server)))
+                .isolation_level(isolation),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE parents (
+                        tenant TEXT,
+                        id INTEGER,
+                        PRIMARY KEY (tenant, id)
+                    ) WITHOUT ROWID",
+                    (),
+                )?;
+                transaction.execute(
+                    "CREATE TABLE children (
+                        id INTEGER PRIMARY KEY,
+                        tenant TEXT,
+                        parent_id INTEGER,
+                        FOREIGN KEY (tenant, parent_id)
+                            REFERENCES parents (tenant, id) ON DELETE CASCADE
+                    )",
+                    (),
+                )?;
+                transaction.execute("INSERT INTO parents VALUES ('north', 1)", ())?;
+                transaction.execute("INSERT INTO children VALUES (7, 'north', 1)", ())?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first.execute("DROP TABLE children", ()).unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        first
+            .execute("DELETE FROM parents WHERE tenant = 'north' AND id = 1", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+
+        second.pull().unwrap();
+        second.rebase().unwrap();
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .query("SELECT * FROM children", (), |_| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(
+                database
+                    .query("SELECT count(*) FROM parents", (), |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                [0]
+            );
+        }
+    }
+}
+
+#[test]
 fn composite_update_and_delete_repairs_survive_restart_and_converge() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();
