@@ -18,8 +18,18 @@ selection on replicas. Replacement includes every implicitly deleted conflict
 victim. `ON DELETE CASCADE`, `SET NULL`, and `SET DEFAULT` capture their
 complete multi-table transition; the same five actions are supported for `ON
 UPDATE`, and `RESTRICT` preserves SQLite's immediate statement behavior. `OR
-FAIL`, `OR ROLLBACK`, public trigger creation, and write `ORDER BY` / `LIMIT`
-remain outside the managed surface.
+FAIL`, `OR ROLLBACK`, and public trigger creation remain outside the managed
+surface.
+
+`UPDATE` and `DELETE` accept SQLite's native `ORDER BY`, `LIMIT`, and `OFFSET`
+forms, including `LIMIT offset, count`; `ORDER BY` requires `LIMIT`, matching
+SQLite. SQLite chooses the affected rows once against the writable branch
+snapshot. Multilite replicates the resulting `RowChanges`, not the selection
+query, so remote apply and rejection repair never rerun a top-N decision.
+Selection expressions are ordinary reads: snapshot isolation retains mandatory
+row and constraint guards, while serializable isolation currently adds the
+conservative target-table read prefix. `RETURNING` may be combined with these
+clauses, but its output order is not promised by SQLite.
 
 `INSERT`, `UPDATE`, and `DELETE` accept SQLite `RETURNING` result columns.
 Statement validation classifies access (`read` or `write`) independently from
@@ -43,8 +53,9 @@ Snapshot isolation is unaffected. Reads performed by subqueries inside a
 future predicate tracing may distinguish those from output-only projections.
 
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
-FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings
-produce the same statement-delta operation as simpler DML.
+FROM`, tuple assignments, `INDEXED BY` / `NOT INDEXED`, and native limited-write
+selection. These spellings produce the same statement-delta operation as
+simpler DML.
 
 Each statement may capture at most 100,000 direct row events and 64 MiB of row
 images. The normalized row operation and enclosing transaction frame enforce

@@ -712,6 +712,108 @@ fn update_from_sources_are_reads_only_under_serializable_isolation() {
 }
 
 #[test]
+fn limited_write_selection_is_snapshot_captured_and_serializable_at_table_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation, expect_rejection) in [
+        ("snapshot", IsolationLevel::Snapshot, false),
+        ("serializable", IsolationLevel::Serializable, true),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-limited-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-limited-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first
+            .execute(
+                "CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY,
+                    score INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                )",
+                (),
+            )
+            .unwrap();
+        first
+            .execute(
+                "INSERT INTO tasks VALUES
+                    (1, 10, 'open'), (2, 20, 'open'),
+                    (3, 30, 'open'), (4, 40, 'open')",
+                (),
+            )
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .update_with(UpdateOptions::new(isolation), |transaction| {
+                assert_eq!(
+                    transaction.execute(
+                        "UPDATE tasks SET state = 'selected'
+                         ORDER BY score DESC, id LIMIT 1",
+                        (),
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        second
+            .execute("INSERT INTO tasks VALUES (5, 999, 'concurrent')", ())
+            .unwrap();
+
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        if expect_rejection {
+            let rejection = rejected(first.push().unwrap());
+            assert_range_assertion_failed(&rejection);
+            first.rollback(&rejection).unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        } else {
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        }
+        converge(&first, &second);
+
+        let expected = if expect_rejection { vec![] } else { vec![4] };
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT id FROM tasks WHERE state = 'selected' ORDER BY id",
+                        (),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                expected,
+                "{label}"
+            );
+            assert_eq!(
+                database
+                    .query("SELECT score FROM tasks WHERE id = 5", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                [999],
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn direct_returning_projection_is_conservatively_serializable_at_table_scope() {
     let directory = tempfile::tempdir().unwrap();
     for (label, isolation, expect_rejection) in [

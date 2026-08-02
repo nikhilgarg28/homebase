@@ -75,6 +75,20 @@ fn defaults_and_checks_fixture_matches_sqlite() {
 }
 
 #[test]
+fn limited_writes_fixture_matches_sqlite() {
+    let report = run_file(
+        "tests/slt/limited-writes.slt",
+        &RunOptions {
+            engine: multilite_conformance::Engine::Both,
+            max_records: None,
+        },
+    );
+
+    assert_eq!(report.record_count(), 14);
+    assert_eq!(report.failed_count(), 0);
+}
+
+#[test]
 fn both_mode_classifies_unsupported_grammar_as_coverage_not_divergence() {
     let report = run_file(
         "tests/slt/unsupported.slt",
@@ -92,7 +106,7 @@ fn both_mode_classifies_unsupported_grammar_as_coverage_not_divergence() {
     }
     .statement_shapes();
     assert_eq!(shapes["create_table"].passed, 1);
-    assert_eq!(shapes["drop_table"].unsupported, 1);
+    assert_eq!(shapes["create_view"].unsupported, 1);
 }
 
 #[test]
@@ -106,6 +120,11 @@ fn corpus_walker_discovers_sqllogictest_files() {
         files
             .iter()
             .any(|file| file.ends_with("defaults-and-checks.slt"))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.ends_with("limited-writes.slt"))
     );
     assert!(files.iter().any(|file| file.ends_with("unsupported.slt")));
 

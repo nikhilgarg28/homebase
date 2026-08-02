@@ -1,5 +1,5 @@
 use multilite::{Error, MultiliteConnection};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 #[test]
 fn drop_table_streams_composite_rows_to_local_repair_and_survives_reopen() {
@@ -2284,6 +2284,274 @@ fn captured_dml_supports_ctes_update_from_tuples_and_index_hints() {
 }
 
 #[test]
+fn limited_writes_use_native_order_limit_and_offset_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("limited-writes.sqlite");
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                score INTEGER NOT NULL,
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("CREATE INDEX notes_score ON notes(score)", ())?;
+        transaction.execute(
+            "INSERT INTO notes VALUES
+                (1, 10, 'one'), (2, 50, 'two'), (3, 40, 'three'),
+                (4, 40, 'four'), (5, 20, 'five'), (6, 30, 'six')",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "UPDATE notes INDEXED BY notes_score SET body = 'picked'
+             ORDER BY score DESC, id ASC LIMIT ?1 OFFSET ?2",
+            params![2, 1],
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id FROM notes WHERE body = 'picked' ORDER BY id",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        [3, 4]
+    );
+
+    assert_eq!(
+        db.execute(
+            "DELETE FROM notes NOT INDEXED WHERE body <> 'picked'
+             ORDER BY score ASC, id DESC LIMIT ?1, ?2",
+            params![1, 2],
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query("SELECT id FROM notes ORDER BY id", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [1, 2, 3, 4]
+    );
+
+    let before_noop = {
+        let raw = Connection::open(&path).unwrap();
+        (
+            raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            raw.query_row(
+                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        db.execute("UPDATE notes SET body = 'never' ORDER BY id LIMIT 0", (),)
+            .unwrap(),
+        0
+    );
+    let after_noop = {
+        let raw = Connection::open(&path).unwrap();
+        (
+            raw.query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            raw.query_row(
+                "SELECT hex(commit_seq) FROM __multilite__commit_state WHERE singleton = 1",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(after_noop, before_noop);
+
+    assert_eq!(
+        db.execute(
+            "UPDATE notes SET body = 'tail' ORDER BY id LIMIT -1 OFFSET 2",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id FROM notes WHERE body = 'tail' ORDER BY id",
+            (),
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        [3, 4]
+    );
+    assert_eq!(
+        db.execute(
+            "DELETE FROM notes WHERE id < 0 ORDER BY id LIMIT 9223372036854775807",
+            (),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn limited_writes_cover_strict_composite_keys_cascades_and_replace_victims() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("limited-shapes.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE inventory (
+                tenant TEXT,
+                sku INTEGER,
+                priority INTEGER NOT NULL,
+                body ANY,
+                PRIMARY KEY (tenant, sku)
+            ) WITHOUT ROWID, STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO inventory VALUES
+                ('a', 1, 20, X'01'), ('a', 2, 40, 2.5),
+                ('b', 1, 40, NULL), ('b', 2, 10, 'tail')",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                priority INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL,
+                FOREIGN KEY (parent_id) REFERENCES parents(id)
+                    ON DELETE CASCADE ON UPDATE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1, 10), (2, 20), (3, 30)", ())?;
+        transaction.execute(
+            "INSERT INTO children VALUES (11, 1), (21, 2), (22, 2), (31, 3)",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE slugs (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                priority INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "INSERT INTO slugs VALUES (1, 'one', 10), (2, 'two', 20)",
+            (),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "UPDATE inventory SET body = 'selected'
+             ORDER BY priority DESC, tenant, sku LIMIT 2",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, sku FROM inventory WHERE body = 'selected'
+             ORDER BY tenant, sku",
+            (),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        [("a".into(), 2), ("b".into(), 1)]
+    );
+    assert_eq!(
+        db.execute(
+            "DELETE FROM inventory ORDER BY priority, tenant, sku LIMIT 1 OFFSET 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT tenant, sku FROM inventory ORDER BY tenant, sku",
+            (),
+            |row| { Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)) }
+        )
+        .unwrap(),
+        [("a".into(), 2), ("b".into(), 1), ("b".into(), 2)]
+    );
+
+    assert_eq!(
+        db.execute("DELETE FROM parents ORDER BY priority DESC, id LIMIT 1", (),)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT id FROM children ORDER BY id", (), |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        [11, 21, 22]
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE parents SET id = id + 100 ORDER BY priority DESC, id LIMIT 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, parent_id FROM children ORDER BY id",
+            (),
+            |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)) }
+        )
+        .unwrap(),
+        [(11, 1), (21, 102), (22, 102)]
+    );
+
+    assert_eq!(
+        db.execute(
+            "UPDATE OR REPLACE slugs SET slug = 'one'
+             ORDER BY priority DESC, id LIMIT 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query("SELECT id, slug FROM slugs", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(2, "one".into())]
+    );
+}
+
+#[test]
 fn update_moves_declared_primary_keys_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("update-identity.sqlite")).unwrap();
@@ -2721,7 +2989,7 @@ fn update_extensions_and_reserved_targets_are_rejected_without_mutation() {
         "UPDATE main.notes SET body = 'x'",
         "UPDATE notes AS old SET body = 'x'",
         "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
-        "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
+        "UPDATE notes SET body = 'x' ORDER BY id",
         "UPDATE __multilite__pending SET record = x''",
         "UPDATE sqlite_schema SET sql = NULL",
     ] {
@@ -2746,7 +3014,7 @@ fn delete_extensions_and_reserved_targets_are_rejected_without_mutation() {
         "DELETE FROM main.notes",
         "DELETE FROM notes AS old",
         "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
-        "DELETE FROM notes ORDER BY id LIMIT 1",
+        "DELETE FROM notes ORDER BY id",
         "DELETE FROM __multilite__pending",
         "DELETE FROM sqlite_sequence",
     ] {

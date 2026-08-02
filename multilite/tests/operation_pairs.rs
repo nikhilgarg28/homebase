@@ -350,6 +350,28 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "limited_updates_select_disjoint_rows",
+        relationship: "different top-N rows with one selection-read table",
+        left: operation!(Update, "UPDATE notes SET body = 'left' ORDER BY id LIMIT 1"),
+        right: operation!(
+            Update,
+            "UPDATE notes SET body = 'right' ORDER BY id LIMIT 1 OFFSET 1"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "limited_update_and_delete_select_same_row",
+        relationship: "same top-N row identity across SQL shapes",
+        left: operation!(
+            Update,
+            "UPDATE notes SET body = 'left' ORDER BY id DESC LIMIT 1"
+        ),
+        right: operation!(Delete, "DELETE FROM notes ORDER BY id DESC LIMIT 1"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "update_or_ignore_disjoint_rows",
         relationship: "conflict-mode writes to different rows with one predicate-read table",
         left: operation!(

@@ -1,0 +1,71 @@
+statement ok
+CREATE TABLE notes (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, body TEXT NOT NULL)
+
+statement ok
+CREATE INDEX notes_score ON notes(score)
+
+statement ok
+INSERT INTO notes VALUES (1, 10, 'one'), (2, 40, 'two'), (3, 30, 'three'), (4, 20, 'four')
+
+statement ok
+UPDATE notes INDEXED BY notes_score SET body = upper(body) ORDER BY score DESC, id LIMIT 2 OFFSET 1
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+1
+one
+2
+two
+3
+THREE
+4
+FOUR
+
+statement ok
+DELETE FROM notes NOT INDEXED ORDER BY score, id LIMIT 1, 2
+
+query IT
+SELECT id, body FROM notes ORDER BY id
+----
+1
+one
+2
+two
+
+statement ok
+CREATE TABLE inventory (tenant TEXT, sku INTEGER, priority INTEGER NOT NULL, body ANY, PRIMARY KEY (tenant, sku)) WITHOUT ROWID, STRICT
+
+statement ok
+INSERT INTO inventory VALUES ('a', 1, 20, X'01'), ('a', 2, 40, 2.5), ('b', 1, 40, NULL), ('b', 2, 10, 'tail')
+
+statement ok
+UPDATE inventory SET body = 'selected' ORDER BY priority DESC, tenant, sku LIMIT 2
+
+query TIT
+SELECT tenant, sku, body FROM inventory WHERE tenant = 'a' ORDER BY sku
+----
+a
+1
+01
+a
+2
+selected
+
+query TIT
+SELECT tenant, sku, body FROM inventory WHERE tenant = 'b' ORDER BY sku
+----
+b
+1
+selected
+b
+2
+tail
+
+statement ok
+DELETE FROM inventory ORDER BY priority, tenant, sku LIMIT 0
+
+query I
+SELECT count(*) FROM inventory
+----
+4

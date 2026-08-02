@@ -6351,6 +6351,118 @@ fn rejected_text_primary_key_move_restores_then_applies_the_winner() {
     }
 }
 
+#[test]
+fn rejected_limited_delete_reopens_repairs_exact_row_then_converges() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory
+            .path()
+            .join(format!("limited-first-{isolation:?}.sqlite"));
+        let second_path = directory
+            .path()
+            .join(format!("limited-second-{isolation:?}.sqlite"));
+        let options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server)))
+        };
+        let first = MultiliteConnection::open_with(&first_path, options()).unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            &second_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE notes (
+                        id INTEGER PRIMARY KEY,
+                        score INTEGER NOT NULL,
+                        body TEXT NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO notes VALUES
+                        (1, 10, 'one'), (2, 20, 'two'),
+                        (3, 30, 'three'), (4, 40, 'four')",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        assert_eq!(
+            first
+                .execute(
+                    "UPDATE notes SET body = 'winner'
+                     ORDER BY score DESC, id LIMIT 2",
+                    (),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            second
+                .execute("DELETE FROM notes ORDER BY score DESC, id LIMIT 1", (),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("overlapping limited write was not rejected")
+        };
+        drop(second);
+
+        let second = MultiliteConnection::open_with(&second_path, options()).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id FROM notes ORDER BY id", (), |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            [1, 2, 3]
+        );
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            second
+                .query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            [
+                (1, "one".into()),
+                (2, "two".into()),
+                (3, "three".into()),
+                (4, "four".into()),
+            ]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+        let expected = vec![
+            (1, "one".into()),
+            (2, "two".into()),
+            (3, "winner".into()),
+            (4, "winner".into()),
+        ];
+        assert_eq!(rows(&first), expected);
+        assert_eq!(rows(&second), expected);
+    }
+}
+
 fn document<H>(database: &MultiliteConnection<H>) -> (String, String)
 where
     H: ServerHandle + Send + Sync + 'static,

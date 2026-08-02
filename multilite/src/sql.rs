@@ -4,9 +4,9 @@ use fallible_iterator::FallibleIterator as _;
 use sqlite3_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, ForeignKeyClause, FrameBound,
     FromClause, FunctionCallOrder, FunctionTail, Indexed, IndexedColumn, InsertBody,
-    JoinConstraint, Literal, Name, OneSelect, Over, RefAct, RefArg, ResolveType, ResultColumn,
-    Select, SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type, TypeSize,
-    UnaryOperator, Upsert, UpsertDo, Window, With,
+    JoinConstraint, Limit, Literal, Name, OneSelect, Over, RefAct, RefArg, ResolveType,
+    ResultColumn, Select, SelectTable, SortedColumn, Stmt, TabFlags, TableConstraint, Type,
+    TypeSize, UnaryOperator, Upsert, UpsertDo, Window, With,
 };
 use sqlite3_parser::lexer::sql::Parser;
 
@@ -551,15 +551,12 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_index_hint(indexed.as_ref())?;
+            validate_write_selection(order_by.as_deref(), limit.as_ref())?;
             let output = write_output(returning.as_deref());
-            if order_by.is_some() || limit.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "DELETE ORDER BY and LIMIT are not supported",
-                ));
-            }
             if with_reads_reserved(with.as_ref())
                 || where_clause.as_ref().is_some_and(expression_reads_reserved)
                 || returning_reads_reserved(returning.as_deref())
+                || write_selection_reads_reserved(order_by.as_deref(), limit.as_ref())
             {
                 return Err(Error::UnsupportedSql(
                     "DELETE cannot read reserved Multilite tables",
@@ -599,17 +596,14 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_index_hint(indexed.as_ref())?;
+            validate_write_selection(order_by.as_deref(), limit.as_ref())?;
             let output = write_output(returning.as_deref());
-            if order_by.is_some() || limit.is_some() {
-                return Err(Error::UnsupportedSql(
-                    "UPDATE ORDER BY and LIMIT are not supported",
-                ));
-            }
             if with_reads_reserved(with.as_ref())
                 || sets.iter().any(|set| expression_reads_reserved(&set.expr))
                 || from.as_ref().is_some_and(from_reads_reserved)
                 || where_clause.as_ref().is_some_and(expression_reads_reserved)
                 || returning_reads_reserved(returning.as_deref())
+                || write_selection_reads_reserved(order_by.as_deref(), limit.as_ref())
             {
                 return Err(Error::UnsupportedSql(
                     "UPDATE cannot read reserved Multilite tables",
@@ -735,6 +729,32 @@ fn returning_reads_reserved(returning: Option<&[ResultColumn]>) -> bool {
         .into_iter()
         .flatten()
         .any(result_column_reads_reserved)
+}
+
+fn write_selection_reads_reserved(
+    order_by: Option<&[SortedColumn]>,
+    limit: Option<&Limit>,
+) -> bool {
+    order_by
+        .into_iter()
+        .flatten()
+        .any(sorted_column_reads_reserved)
+        || limit.is_some_and(|limit| {
+            expression_reads_reserved(&limit.expr)
+                || limit.offset.as_ref().is_some_and(expression_reads_reserved)
+        })
+}
+
+fn validate_write_selection(
+    order_by: Option<&[SortedColumn]>,
+    limit: Option<&Limit>,
+) -> Result<()> {
+    if order_by.is_some() && limit.is_none() {
+        return Err(Error::UnsupportedSql(
+            "write ORDER BY requires a LIMIT clause",
+        ));
+    }
+    Ok(())
 }
 
 fn result_column_reads_reserved(column: &ResultColumn) -> bool {
@@ -2698,11 +2718,17 @@ mod tests {
             "WITH old AS (SELECT 1 AS id) DELETE FROM notes WHERE id IN old",
             "DELETE FROM notes INDEXED BY notes_id WHERE id = 1",
             "DELETE FROM notes NOT INDEXED WHERE id = 1",
+            "DELETE FROM notes ORDER BY id DESC LIMIT 1",
+            "DELETE FROM notes LIMIT ?1 OFFSET ?2",
+            "DELETE FROM notes LIMIT ?1, ?2",
             "WITH replacement AS (SELECT 1 AS id, 'x' AS body)
              UPDATE notes SET (body, payload) = (replacement.body, x'00')
              FROM replacement WHERE replacement.id = notes.id",
             "UPDATE notes INDEXED BY notes_id SET body = 'x'",
             "UPDATE notes NOT INDEXED SET body = 'x'",
+            "UPDATE notes SET body = 'x' ORDER BY id DESC LIMIT 1",
+            "UPDATE notes SET body = 'x' LIMIT ?1 OFFSET ?2",
+            "UPDATE notes SET body = 'x' LIMIT ?1, ?2",
         ] {
             validate_execute(sql).unwrap();
         }
@@ -2714,6 +2740,8 @@ mod tests {
             "INSERT INTO notes VALUES (1) RETURNING id",
             "UPDATE notes SET body = 'x' RETURNING id, body",
             "DELETE FROM notes RETURNING *",
+            "UPDATE notes SET body = 'x' RETURNING id ORDER BY id LIMIT 2",
+            "DELETE FROM notes RETURNING id ORDER BY id LIMIT 2",
         ] {
             let validated = validate_statement(sql).unwrap();
             assert_eq!(validated.access(), StatementAccess::Write);
@@ -2755,7 +2783,7 @@ mod tests {
             "DELETE FROM notes AS old",
             "DELETE FROM notes INDEXED BY __multilite__internal",
             "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
-            "DELETE FROM notes ORDER BY id LIMIT 1",
+            "DELETE FROM notes ORDER BY id",
             "DELETE FROM __multilite__pending",
         ] {
             assert_unsupported(sql);
@@ -2769,8 +2797,28 @@ mod tests {
             "UPDATE notes AS old SET body = 'x'",
             "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",
             "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
-            "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
+            "UPDATE notes SET body = 'x' ORDER BY id",
             "UPDATE __multilite__pending SET record = x''",
+        ] {
+            assert_unsupported(sql);
+        }
+    }
+
+    #[test]
+    fn limited_write_selection_cannot_read_reserved_tables() {
+        for sql in [
+            "DELETE FROM notes
+             ORDER BY (SELECT value FROM __multilite__meta LIMIT 1) LIMIT 1",
+            "DELETE FROM notes
+             LIMIT (SELECT count(*) FROM __multilite__pending)",
+            "DELETE FROM notes LIMIT 1
+             OFFSET (SELECT count(*) FROM __multilite__commit_state)",
+            "UPDATE notes SET body = 'x'
+             ORDER BY (SELECT record FROM __multilite__catalog LIMIT 1) LIMIT 1",
+            "UPDATE notes SET body = 'x'
+             LIMIT (SELECT count(*) FROM __multilite__history)",
+            "UPDATE notes SET body = 'x' LIMIT 1
+             OFFSET (SELECT count(*) FROM __multilite__commit_state)",
         ] {
             assert_unsupported(sql);
         }

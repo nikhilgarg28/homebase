@@ -163,25 +163,29 @@ created concurrently on another replica.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional `WITH` clause, SQLite predicate, ordinary `INDEXED BY` or `NOT
-INDEXED` hint, and `RETURNING`; `ORDER BY` and `LIMIT` remain rejected. SQLite
-evaluates the predicate and the preupdate hook captures every complete old row
-image. `RowChanges` lowers those rows to exact Homebase point deletes with the
-same primary-index and write-revision guards as inserts. Remote apply verifies
-the complete current row before deleting it, and rejection restores values
-plus the hidden SQLite rowid when one exists. Zero-row deletes create no
-logical transaction.
+INDEXED` hint, `ORDER BY`, `LIMIT` / `OFFSET`, and `RETURNING`. `ORDER BY`
+requires `LIMIT`, matching SQLite. SQLite evaluates the predicate and limited
+selection once on the writable branch, and the preupdate hook captures every
+complete old row image. `RowChanges` lowers those rows to exact Homebase point
+deletes with the same primary-index and write-revision guards as inserts.
+Remote apply verifies the complete current row before deleting it, and
+rejection restores values plus the hidden SQLite rowid when one exists.
+Zero-row deletes create no logical transaction.
 
 `UPDATE` uses the same target boundary as `DELETE`, while allowing `WITH`,
 `UPDATE ... FROM`, tuple assignments, ordinary SQLite expressions and
-subqueries, and ordinary index hints. SQLite supplies complete before/after row
-images, so these forms use the same lowering rather than a parallel expression
-evaluator. Stable-key updates lower to a point Set; primary-key moves lower to
+subqueries, ordinary index hints, and native `ORDER BY` / `LIMIT` / `OFFSET`.
+SQLite supplies complete before/after row images, so these forms use the same
+lowering rather than a parallel expression evaluator. Replicas apply captured
+images rather than rerunning selection; a concurrent row that would have
+changed the top-N result does not retroactively change a snapshot-isolated
+operation. Stable-key updates lower to a point Set; primary-key moves lower to
 a Delete of the old key followed by a Set of the new key, with both keys in the
 conflict footprint. Across a multi-row operation every retired source is
 deleted before any destination is set, so one row may move into another row's
-former key. Rejection restores the old image. Integer primary-key moves
-follow SQLite's rowid alias, while non-integer primary-key moves preserve their
-hidden rowid; direct hidden-rowid changes remain unsupported.
+former key. Rejection restores the old image. Integer primary-key moves follow
+SQLite's rowid alias, while non-integer primary-key moves preserve their hidden
+rowid; direct hidden-rowid changes remain unsupported.
 
 `Connection::open` is the single file-lifecycle verb;
 `MultiliteConnection` remains an alias for compatibility. Open initializes or

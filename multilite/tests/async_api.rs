@@ -93,7 +93,8 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
         assert_eq!(
             database
                 .execute_async(
-                    "UPDATE notes SET body = upper(body) WHERE id = ?1",
+                    "UPDATE notes SET body = upper(body) WHERE id >= ?1
+                     ORDER BY id LIMIT 1",
                     [Value::Integer(1)],
                 )
                 .await
@@ -102,7 +103,10 @@ fn public_async_api_runs_local_work_off_the_caller_thread() {
         );
         assert_eq!(
             database
-                .execute_async("DELETE FROM notes WHERE id = ?1", [Value::Integer(2)])
+                .execute_async(
+                    "DELETE FROM notes WHERE id >= ?1 ORDER BY id LIMIT 1",
+                    [Value::Integer(2)],
+                )
                 .await
                 .unwrap(),
             1

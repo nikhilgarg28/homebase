@@ -144,6 +144,77 @@ fn direct_and_prepared_queries_execute_every_returning_dml_verb() {
 }
 
 #[test]
+fn limited_writes_return_only_rows_selected_by_native_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("limited-returning.sqlite");
+    let database = MultiliteConnection::open(&path).unwrap();
+    database
+        .execute(
+            "CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                score INTEGER NOT NULL,
+                body TEXT NOT NULL
+            )",
+            (),
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO notes VALUES
+                (1, 10, 'one'), (2, 40, 'two'),
+                (3, 30, 'three'), (4, 20, 'four')",
+            (),
+        )
+        .unwrap();
+
+    let mut update = database
+        .prepare(
+            "UPDATE notes SET body = upper(body)
+             RETURNING id, body ORDER BY score DESC, id LIMIT ?1 OFFSET ?2",
+        )
+        .unwrap();
+    let mut updated = update
+        .query_map((2, 1), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    updated.sort_by_key(|(id, _)| *id);
+    assert_eq!(updated, [(3, "THREE".into()), (4, "FOUR".into())]);
+
+    let mut deleted = database
+        .query(
+            "DELETE FROM notes RETURNING id ORDER BY score, id LIMIT 2",
+            (),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    deleted.sort_unstable();
+    assert_eq!(deleted, [1, 4]);
+    assert_eq!(
+        database
+            .query("SELECT id, body FROM notes ORDER BY id", (), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap(),
+        [(2, "two".into()), (3, "THREE".into())]
+    );
+
+    let before = local_write_state(&path);
+    assert!(
+        database
+            .query(
+                "UPDATE notes SET body = 'never'
+                 RETURNING id ORDER BY id LIMIT 0",
+                (),
+                first_i64,
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(local_write_state(&path), before);
+}
+
+#[test]
 fn query_and_execute_enforce_rows_vs_changes_without_mutating() {
     let directory = tempfile::tempdir().unwrap();
     let database =
