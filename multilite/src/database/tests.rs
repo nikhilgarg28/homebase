@@ -850,6 +850,68 @@ fn remote_rejection_undoes_sqlite_before_returning_the_error() {
 }
 
 #[test]
+fn remote_returning_rows_are_not_returned_after_authority_rejects_the_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = server();
+    let winner = Database::open_with(
+        directory.path().join("returning-winner.sqlite"),
+        OpenOptions::new().server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    assert!(server.create_space(winner.database_id().space_id()));
+    let winner_runtime = winner.runtime().unwrap();
+    winner
+        .execute(
+            &winner_runtime,
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(winner.push().unwrap(), PushOutcome::Drained);
+
+    let remote = Database::open_with(
+        directory.path().join("returning-remote.sqlite"),
+        OpenOptions::new()
+            .invitation(winner.replica_invitation())
+            .sync_policy(SyncPolicy::Remote)
+            .server(router(Arc::clone(&server))),
+    )
+    .unwrap();
+    let remote_runtime = remote.runtime().unwrap();
+    let error = remote
+        .update(&remote_runtime, |update| {
+            let returned = update.query(
+                "INSERT INTO notes VALUES (1, 'loser') RETURNING id, body",
+                (),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            assert_eq!(returned, [(1, String::from("loser"))]);
+            winner.execute(
+                &winner_runtime,
+                "INSERT INTO notes VALUES (1, 'winner')",
+                (),
+            )?;
+            assert_eq!(winner.push()?, PushOutcome::Drained);
+            Ok(returned)
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::AuthorityRejected(KernelError::RangeAssertFailed { .. })
+    ));
+    remote.with_connection(|connection| {
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    });
+    assert!(pending_ops(&remote).is_empty());
+}
+
+#[test]
 fn remote_delete_rejection_restores_the_complete_row_before_returning() {
     let directory = tempfile::tempdir().unwrap();
     let server = server();

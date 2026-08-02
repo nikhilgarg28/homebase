@@ -27,7 +27,7 @@ use crate::logical::schema::{
 };
 use crate::logical::transaction::MultiliteTransaction;
 use crate::runtime::ExecutionMode;
-use crate::sql::ValidatedExecute;
+use crate::sql::{StatementOutput, ValidatedExecute, ValidatedStatement};
 use crate::{Error, Params, Result};
 
 /// One managed update accumulating a single durable transaction.
@@ -67,18 +67,32 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         self.execute_validated(sql, params, validated)
     }
 
-    /// Execute a read-only statement against this update's current snapshot.
-    pub fn query<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
+    /// Execute one row-producing statement against this update's current state.
+    ///
+    /// Both reads and DML with `RETURNING` are accepted. A returning write is
+    /// captured into the same managed transaction as calls to [`Self::execute`].
+    pub fn query<T, P, F>(&mut self, sql: &str, params: P, map: F) -> Result<Vec<T>>
     where
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        let mut statement = self.prepare(sql)?;
-        statement.query_map(params, map)
+        let validated = crate::sql::validate_statement(sql)?;
+        if validated.output() != StatementOutput::Rows {
+            return Err(Error::PreparedWrite);
+        }
+        match validated {
+            ValidatedStatement::Read => {
+                let mut statement = TransactionStatement::new_prevalidated(self.connection, sql)?;
+                statement.query_map(params, map)
+            }
+            ValidatedStatement::Write(validated) => {
+                self.query_validated(sql, params, map, *validated)
+            }
+        }
     }
 
     /// Alias matching rusqlite's mapped-query vocabulary.
-    pub fn query_map<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
+    pub fn query_map<T, P, F>(&mut self, sql: &str, params: P, map: F) -> Result<Vec<T>>
     where
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
@@ -187,9 +201,36 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     self.execute_drop_index(sql, params, spec)
                 }
             }
-            ValidatedExecute::Insert | ValidatedExecute::Delete | ValidatedExecute::Update => {
+            ValidatedExecute::Insert(StatementOutput::Changes)
+            | ValidatedExecute::Delete(StatementOutput::Changes)
+            | ValidatedExecute::Update(StatementOutput::Changes) => {
                 self.execute_captured(sql, params, compile_row_changes)
             }
+            ValidatedExecute::Insert(StatementOutput::Rows)
+            | ValidatedExecute::Delete(StatementOutput::Rows)
+            | ValidatedExecute::Update(StatementOutput::Rows) => Err(Error::PreparedWrite),
+        }
+    }
+
+    /// Execute one prevalidated write that produces mapped result rows.
+    pub(super) fn query_validated<T, P, F>(
+        &mut self,
+        sql: &str,
+        params: P,
+        map: F,
+        validated: ValidatedExecute,
+    ) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        match validated {
+            ValidatedExecute::Insert(StatementOutput::Rows)
+            | ValidatedExecute::Delete(StatementOutput::Rows)
+            | ValidatedExecute::Update(StatementOutput::Rows) => {
+                self.query_captured(sql, params, map, compile_row_changes)
+            }
+            _ => Err(Error::PreparedWrite),
         }
     }
 
@@ -398,9 +439,43 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         params: Q,
         compile: impl FnOnce(&CatalogSnapshot, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
     ) -> Result<usize> {
+        self.run_captured(|connection| Ok(connection.execute(sql, params)?), compile)
+    }
+
+    fn query_captured<T, P, F>(
+        &mut self,
+        sql: &str,
+        params: P,
+        map: F,
+        compile: impl FnOnce(&CatalogSnapshot, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
+    ) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.run_captured(
+            |connection| {
+                let mut statement = connection.prepare(sql)?;
+                if statement.readonly() || statement.column_count() == 0 {
+                    return Err(Error::PreparedWrite);
+                }
+                statement
+                    .query_map(params, map)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            },
+            compile,
+        )
+    }
+
+    fn run_captured<T>(
+        &mut self,
+        run: impl FnOnce(&Connection) -> Result<T>,
+        compile: impl FnOnce(&CatalogSnapshot, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
+    ) -> Result<T> {
         let mut captured_operation = None;
-        let (changed, _) = self.hooks.run(
-            || Ok(self.connection.execute(sql, params)?),
+        let (value, _) = self.hooks.run(
+            || run(self.connection),
             |events| {
                 captured_operation = self
                     .hooks
@@ -411,7 +486,7 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         if let Some(operation) = captured_operation {
             self.record_operation(operation);
         }
-        Ok(changed)
+        Ok(value)
     }
 
     fn execute_alter<Q: Params>(

@@ -18,8 +18,21 @@ selection on replicas. Replacement includes every implicitly deleted conflict
 victim. `ON DELETE CASCADE`, `SET NULL`, and `SET DEFAULT` capture their
 complete multi-table transition; the same five actions are supported for `ON
 UPDATE`, and `RESTRICT` preserves SQLite's immediate statement behavior. `OR
-FAIL`, `OR ROLLBACK`, public trigger creation, `RETURNING`, and write `ORDER BY`
-/ `LIMIT` remain outside the managed surface.
+FAIL`, `OR ROLLBACK`, public trigger creation, and write `ORDER BY` / `LIMIT`
+remain outside the managed surface.
+
+`INSERT`, `UPDATE`, and `DELETE` accept SQLite `RETURNING` result columns.
+Statement validation classifies access (`read` or `write`) independently from
+output (`rows` or change count): `query` and prepared `query_map` route a
+returning DML statement through a writable capture branch, while `execute`
+returns SQLite's `ExecuteReturnedResults` error. Returned rows are transient
+API output and never enter the logical operation, pending frame, or replicated
+wire format. A mapper or statement error rolls back the complete statement.
+Mapping necessarily runs on the speculative branch; mapper side effects are
+therefore not transactional. Under `Remote` policy, the outer `query` or
+`update` call returns mapped values only after authority accepts the write.
+`ViewTransaction` remains read-only, while `UpdateTransaction::query` can mix
+reads and returning writes in one managed transaction.
 
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
 FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings

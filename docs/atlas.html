@@ -335,6 +335,7 @@ components: [
   summary:"The public SQLite-shaped connection. Runtime-neutral futures over open, prepare, execute, query/view, update, push, pull, rebase, rollback.",
   behavior:[
     "Owned SQLite work runs on a bounded process-wide blocking pool; only owned mapped rows cross the boundary.",
+    "SQL classification routes SELECT queries to pinned readers and DML RETURNING queries to writable capture branches; execute refuses row-producing statements.",
     "Nested blocking::run calls execute inline via a thread-local worker flag, so the pool cannot self-deadlock.",
     "Managed update closures stay synchronous while they borrow the thread-bound branch connection."],
   invariants:["No public path executes application SQL without the Public-mode authorizer installed."],
@@ -362,11 +363,11 @@ components: [
 /* ---- multilite: SQL surface & capture ---- */
 { id:"sqlgate", layer:"multilite", band:"SQL surface & capture", name:"SQL gate",
   files:["multilite/src/sql.rs","multilite/SQL_GRAMMAR.md"],
-  summary:"Parser-based (sqlite3_parser AST) classification of every incoming statement: read vs execute vs rejected, with tight shape allowlists per statement family.",
+  summary:"Parser-based (sqlite3_parser AST) classification of every incoming statement along independent access (read/write) and output (rows/changes) axes, with tight shape allowlists per family.",
   behavior:[
     "Single-statement enforcement; default-reject catch-all for unknown statement kinds.",
     "All names \u2014 write targets and read positions \u2014 are dequoted via SqlName::from_sqlite_token before reserved-name checks (closed Aug 1, commit 26bee3d).",
-    "Every expression position is walked for reserved reads, including DML CTEs, UPDATE FROM sources, DELETE WHERE, and UPDATE SET/WHERE.",
+    "Every expression position is walked for reserved reads, including DML CTEs, UPDATE FROM sources, DELETE WHERE, UPDATE SET/WHERE, and RETURNING expressions.",
     "Captured DML admits WITH-prefixed UPDATE/DELETE, UPDATE FROM, tuple assignments, and safe INDEXED BY / NOT INDEXED hints without adding durable operation variants.",
     "INSERT/UPDATE OR ABORT, OR IGNORE, and OR REPLACE, REPLACE INTO, plus UPSERT DO NOTHING/DO UPDATE compile from SQLite's observed net effects; partial-statement FAIL/ROLLBACK modes remain fenced.",
     "CREATE TABLE resolves to a validated spec (columns, PK, uniques, FKs, checks) before anything executes.",
@@ -397,12 +398,13 @@ if with_reads_reserved(with.as_ref())
     || sets.iter().any(|set| expression_reads_reserved(&set.expr))
     || from.as_ref().is_some_and(from_reads_reserved)
     || where_clause.as_ref().is_some_and(expression_reads_reserved)
+    || returning_reads_reserved(returning.as_deref())
 {
     return Err(Error::UnsupportedSql(
         "UPDATE cannot read reserved Multilite tables",
     ));
 }
-Ok(ValidatedExecute::Update)`},
+Ok(ValidatedExecute::Update(write_output(returning.as_deref())))`},
     {title:"Transaction control is never user SQL", file:"sql.rs", code:
 `Cmd::Stmt(
     Stmt::Begin(..) | Stmt::Commit(..) | Stmt::Rollback { .. }
@@ -418,6 +420,7 @@ Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(Error::UnsupportedSql(
   summary:"Runs a user update closure on a private writable branch, then turns everything it did into one compiled proposal.",
   behavior:[
     "Loads one catalog snapshot per transaction; hooks resolve names through it (refreshed only after DDL).",
+    "UpdateTransaction::query maps both SELECT and DML RETURNING; returned rows stay transient while captured row effects join the proposal.",
     "Serializable isolation records one stable table UUID per table read (coarse, deliberate) via the authorizer.",
     "into_branch_parts assembles compiled operations + merged guard plan into footprint and proposal."],
   invariants:["A branch update either becomes exactly one CommitProposal or leaves no durable trace."], health:[] },
@@ -999,8 +1002,8 @@ edges: [
   { from:"python", to:"api", label:"binds", spine:false },
   { from:"conformance", to:"api", label:"exercises", spine:false },
   { from:"api", to:"sqlgate", label:"every statement", spine:true },
-  { from:"api", to:"update", label:"update()", spine:true },
-  { from:"api", to:"view", label:"query()/view()", spine:false },
+  { from:"api", to:"update", label:"update()/write query()", spine:true },
+  { from:"api", to:"view", label:"read query()/view()", spine:false },
   { from:"sqlgate", to:"update", label:"validated plans", spine:false },
   { from:"update", to:"branchvfs", label:"opens branch", spine:true },
   { from:"branchvfs", to:"snapshot", label:"overlays", spine:true },
@@ -1091,7 +1094,7 @@ flows: [
     { comp:"backend", text:"Repair applies atomically; the entire suffix after the failure is forfeited (suffix-forfeit contract)." }] },
 { id:"read", name:"Snapshot read", blurb:"queries never block writers",
   steps:[
-    { comp:"api", text:"view()/query() requests a read." },
+    { comp:"api", text:"view(), or query() classified as read, requests a snapshot." },
     { comp:"policy", text:"Freshness check: LocalOnly serves immediately; LocalFirst serves within the staleness bound; Remote refreshes first." },
     { comp:"committer", text:"capture_view pins a canonical reader at the exact queue position." },
     { comp:"snapshot", text:"The reader pool reuses a generation-pinned SQLite reader \u2014 no file copy, no writer contention." },
@@ -1166,7 +1169,7 @@ grammar: [
   { name:"INSERT OR FAIL / OR ROLLBACK", status:"fenced", note:"Partial-statement conflict modes need a distinct transaction and rejection-repair contract before admission." },
   { name:"UPSERT ON CONFLICT \u2026 DO NOTHING", status:"supported", note:"Single or chained DO NOTHING clauses, including conflict targets, compile from SQLite's observed net row effects." },
   { name:"UPSERT \u2026 DO UPDATE", status:"supported", note:"SQLite chooses the conflict clause and emits ordered preupdate events; RowChanges folds them to one net transition. Coverage includes metadata-silent no-ops, repeated targets, PK/FK moves, STRICT and composite WITHOUT ROWID tables, affinity and overlapping UNIQUE behavior, outer conflict algorithms, hostile triggers, schema-evolution pairs, both isolation levels, Remote/LocalFirst policies, seeded integrity, and rejection/reopen repair." },
-  { name:"RETURNING", status:"fenced", note:"\u201cINSERT RETURNING is not supported.\u201d" },
+  { name:"RETURNING", status:"supported", note:"query/query_map and prepared queries route INSERT RETURNING through a writable capture branch. Returned rows are transient; execute returns SQLite's ExecuteReturnedResults error." },
   { name:"qualified / aliased targets (db.t, t AS a)", status:"fenced", note:"\u201cqualified and aliased INSERT targets are not supported.\u201d" } ] },
 { family:"UPDATE / DELETE", items:[
   { name:"UPDATE t SET col = expr \u2026 WHERE \u2026 (subqueries allowed)", status:"supported", note:"Full before/after row capture; subqueries run against the branch snapshot; SET, FROM, CTE, and WHERE expressions are reserved-read checked." },
@@ -1181,7 +1184,7 @@ grammar: [
   { name:"WITH \u2026 DELETE / WITH \u2026 UPDATE (CTE prefixes)", status:"supported", note:"Every CTE SELECT is traversed for reserved sources; execution and capture use the same RowChanges operation as unprefixed DML." },
   { name:"ORDER BY / LIMIT forms", status:"fenced", note:"\u201cDELETE ORDER BY and LIMIT\u201d / \u201cUPDATE ORDER BY and LIMIT\u201d are rejected." },
   { name:"INDEXED BY / NOT INDEXED", status:"supported", note:"Planner hints do not enter the durable operation. Reserved SQLite/Multilite index names are rejected; ordinary named indexes and NOT INDEXED are accepted." },
-  { name:"RETURNING", status:"fenced", note:"Rejected on both statements." },
+  { name:"RETURNING", status:"supported", note:"UPDATE and DELETE RETURNING use the same captured net transition and pending/rejection lifecycle as rowless DML. Mapper failure rolls back the statement. Mapping runs speculatively, but under Remote policy the outer query/update call returns values only after admission." },
   { name:"qualified / aliased targets", status:"fenced", note:"\u201cqualified and aliased DELETE/UPDATE targets are not supported.\u201d" } ] },
 { family:"SELECT / reads", items:[
   { name:"full SELECT grammar: joins, subqueries, CTEs, compounds, window functions", status:"supported", note:"Reads are full SQLite against pinned snapshot readers; the gate walks every subquery, CTE, compound, ORDER BY, and expression position for reserved names (now dequoted); the authorizer enforces at runtime." },
@@ -1393,8 +1396,8 @@ launch: {
 
   { name:"E. Grammar \u2014 close the gap or fence it in writing", blurb:"Get the accepted surface to \u2018everything a typical app schema needs\u2019; whatever stays out is a documented decision with a typed error, never a surprise.",
     items:[
-    { id:"l26", status:"todo", title:"RETURNING on INSERT / UPDATE / DELETE",
-      detail:"The biggest remaining ORM-compatibility gap (SQLite \u2265 3.35 idiom for fetching generated ids). Read-out only: the logical operation, codecs, and wire format are untouched \u2014 the work is the gate's execute-vs-read classification and streaming rows back from a write statement. No replication risk." },
+    { id:"l26", status:"done", title:"RETURNING on INSERT / UPDATE / DELETE",
+      detail:"Statement validation classifies access (read/write) independently from output (rows/changes). Direct and prepared sync/async query paths route DML RETURNING through writable capture branches; execute rejects row-producing SQL. Returned rows never enter the logical op or wire frame. Coverage includes all three verbs, generated IPKs/defaults, managed multi-statement updates, mapper rollback, zero-row effects, UPSERT/REPLACE/cascades, STRICT composite WITHOUT ROWID tables, Remote rejection repair, and two-replica convergence." },
     { id:"l27", status:"todo", title:"Write ORDER BY / LIMIT (DELETE \u2026 LIMIT, UPDATE \u2026 LIMIT)",
       detail:"Queue-worker and batch-trim patterns. Safe to unlock under the capture model: which rows got selected is nondeterministic, but replicas receive the captured net effect, not the statement. Gate change plus convergence/pair coverage per the completion gate \u2014 no new operation shape." },
     { id:"l28", status:"done", title:"DROP TABLE IF EXISTS",

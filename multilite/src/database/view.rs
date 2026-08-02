@@ -62,7 +62,7 @@ impl<'a> TransactionStatement<'a> {
         Self::new_prevalidated(connection, sql)
     }
 
-    fn new_prevalidated(connection: &'a Connection, sql: &str) -> Result<Self> {
+    pub(super) fn new_prevalidated(connection: &'a Connection, sql: &str) -> Result<Self> {
         let statement = connection.prepare(sql)?;
         if !statement.readonly() {
             return Err(Error::PreparedWrite);

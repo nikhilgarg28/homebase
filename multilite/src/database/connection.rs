@@ -201,13 +201,18 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.database.update_with_async(options, operation).await
     }
 
-    /// Execute one read-only statement as an implicit managed view.
+    /// Execute one row-producing statement and eagerly map its results.
+    ///
+    /// Reads run on a pinned view. `INSERT`, `UPDATE`, and `DELETE` with a
+    /// `RETURNING` clause run as an implicit managed update. The mapper runs
+    /// against that speculative branch; the mapped values are returned only
+    /// after the branch commits under the configured sync policy.
     pub fn query<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<Vec<T>>
     where
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        self.view(|transaction| transaction.query(sql, params, map))
+        self.database.query(&self.runtime, sql, params, map)
     }
 
     /// Alias matching rusqlite's mapped-query vocabulary.
@@ -219,7 +224,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.query(sql, params, map)
     }
 
-    /// Asynchronously execute one read-only statement and return owned values.
+    /// Asynchronously execute one row-producing statement and return owned values.
     pub async fn query_async<T, P, F>(
         &self,
         sql: impl Into<String>,
@@ -231,9 +236,7 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         P: Params + Send + 'static,
         F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
     {
-        let sql = sql.into();
-        self.view_async(move |transaction| transaction.query(&sql, params, map))
-            .await
+        self.database.query_async(sql.into(), params, map).await
     }
 
     /// Async alias matching rusqlite's mapped-query vocabulary.
@@ -251,12 +254,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         self.query_async(sql, params, map).await
     }
 
-    /// Prepare one read-only statement.
+    /// Validate and prepare one reusable read or write statement.
     pub fn prepare(&self, sql: &str) -> Result<Statement<H>> {
         self.database.prepare(&self.runtime, sql)
     }
 
-    /// Asynchronously validate and prepare one reusable read-only statement.
+    /// Asynchronously validate and prepare one reusable read or write statement.
     pub async fn prepare_async(&self, sql: impl Into<String>) -> Result<Statement<H>> {
         self.database
             .prepare_async(Arc::clone(&self.runtime), sql.into())

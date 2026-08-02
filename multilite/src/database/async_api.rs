@@ -6,6 +6,7 @@ use std::time::Instant;
 use homebase_client::meta::{MetaStore, OplogCursors};
 use homebase_client::{ClientError, PushOutcome as HomebasePushOutcome, ServerHandle};
 use homebase_core::tag::DeviceSeq;
+use rusqlite::Row;
 
 use super::policy::RefreshTransition;
 use super::store::DatabaseMetaStore;
@@ -199,6 +200,49 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         Q: Params + Send + 'static,
     {
         self.update_async(move |update| update.execute_validated(&sql, params, validated))
+            .await
+    }
+
+    pub(crate) async fn query_async<T, P, F>(
+        self: &Arc<Self>,
+        sql: String,
+        params: P,
+        map: F,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        let validated = sql::validate_statement(&sql)?;
+        if validated.output() != sql::StatementOutput::Rows {
+            return Err(Error::PreparedWrite);
+        }
+        match validated {
+            sql::ValidatedStatement::Read => {
+                self.view_async(move |view| view.query_prevalidated(&sql, params, map))
+                    .await
+            }
+            sql::ValidatedStatement::Write(validated) => {
+                self.query_write_validated_async(sql, params, map, *validated)
+                    .await
+            }
+        }
+    }
+
+    pub(super) async fn query_write_validated_async<T, P, F>(
+        self: &Arc<Self>,
+        sql: String,
+        params: P,
+        map: F,
+        validated: sql::ValidatedExecute,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
+    {
+        self.update_async(move |update| update.query_validated(&sql, params, map, validated))
             .await
     }
 

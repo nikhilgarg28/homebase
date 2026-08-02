@@ -19,7 +19,8 @@ rusqlite-shaped connection wrapper with one-file/one-space bootstrap and
 Homebase metadata. Public SQL currently permits restricted persistent
 `CREATE TABLE`; table/column rename and column add/drop forms of `ALTER TABLE`;
 `CREATE [UNIQUE] INDEX` and `DROP INDEX`; read-only `SELECT`; and captured
-`INSERT`, `DELETE`, and `UPDATE` against non-reserved tables. Ordinary and
+`INSERT`, `DELETE`, and `UPDATE` (including `RETURNING`) against non-reserved
+tables. Ordinary and
 `STRICT` tables are supported. A rowid table must expose one exact `INTEGER
 PRIMARY KEY` alias; richer and composite primary keys use `WITHOUT ROWID`.
 Defaults, CHECK constraints, named constraints, ordered multi-column UNIQUE
@@ -161,8 +162,8 @@ immediate statement semantics, while its parent-prefix guard fences a child
 created concurrently on another replica.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
-optional `WITH` clause, SQLite predicate, and ordinary `INDEXED BY` or `NOT
-INDEXED` hint; `RETURNING`, `ORDER BY`, and `LIMIT` remain rejected. SQLite
+optional `WITH` clause, SQLite predicate, ordinary `INDEXED BY` or `NOT
+INDEXED` hint, and `RETURNING`; `ORDER BY` and `LIMIT` remain rejected. SQLite
 evaluates the predicate and the preupdate hook captures every complete old row
 image. `RowChanges` lowers those rows to exact Homebase point deletes with the
 same primary-index and write-revision guards as inserts. Remote apply verifies
@@ -243,8 +244,11 @@ isolation-dependent, and directional relationships.
 managed closures because the closure owns its outer lifecycle. Returning an
 error or unwinding a panic rolls back the complete local update before any
 Homebase submission survives. Direct `execute` and `query` remain convenient
-one-statement managed transactions, and the existing reusable read-only
-`prepare` surface retains its SQLite-shaped parameter and conversion behavior.
+one-statement managed transactions. SQL validation chooses a pinned read
+branch for SELECT and a writable capture branch for DML `RETURNING`; `execute`
+rejects statements that produce rows instead of silently discarding them.
+Reusable `prepare` supports the same distinction while retaining SQLite-shaped
+parameters and conversion.
 
 Every connection lifecycle and data operation also has a runtime-neutral async
 form: `open_async`, `open_with_async`, `execute_async`, `query_async`,

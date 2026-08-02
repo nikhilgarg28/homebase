@@ -34,13 +34,17 @@ and update transactions:
 use multilite::MultiliteConnection;
 
 let db = MultiliteConnection::open("example.sqlite")?;
-db.execute("CREATE TABLE example (value INTEGER)", ())?;
-let mut statement = db.prepare("SELECT value FROM example")?;
-let values = statement.query_map((), |row| row.get::<_, i64>(0))?;
+db.execute("CREATE TABLE example (id INTEGER PRIMARY KEY, value TEXT)", ())?;
+let rows = db.query(
+    "INSERT INTO example (value) VALUES ('hello') RETURNING id, value",
+    (),
+    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+)?;
 # Ok::<(), multilite::Error>(())
 ```
 
-Prepared statements are read-only and query results are eagerly collected.
+Prepared statements are classified as reads or writes from the parsed SQL;
+`query` eagerly collects rows from either SELECT or DML `RETURNING`.
 Managed updates execute native SQLite SQL on private branches, then send owned
 logical proposals through one canonical committer. The current grammar includes
 restricted table and index DDL plus INSERT, DELETE, and UPDATE. Homebase push,

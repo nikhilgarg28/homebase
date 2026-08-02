@@ -467,6 +467,48 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         })
     }
 
+    pub(crate) fn query<T, P, F>(
+        self: &Arc<Self>,
+        runtime: &DatabaseRuntime,
+        sql: &str,
+        params: P,
+        map: F,
+    ) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        let validated = sql::validate_statement(sql)?;
+        if validated.output() != sql::StatementOutput::Rows {
+            return Err(Error::PreparedWrite);
+        }
+        match validated {
+            sql::ValidatedStatement::Read => {
+                self.view(runtime, |view| view.query_prevalidated(sql, params, map))
+            }
+            sql::ValidatedStatement::Write(validated) => {
+                self.query_write_validated(runtime, sql, params, map, *validated)
+            }
+        }
+    }
+
+    fn query_write_validated<T, P, F>(
+        self: &Arc<Self>,
+        runtime: &DatabaseRuntime,
+        sql: &str,
+        params: P,
+        map: F,
+        validated: sql::ValidatedExecute,
+    ) -> Result<Vec<T>>
+    where
+        P: Params,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.update(runtime, |update| {
+            update.query_validated(sql, params, map, validated)
+        })
+    }
+
     pub(crate) fn push(self: &Arc<Self>) -> Result<PushOutcome> {
         block_on(self.push_async())
     }
@@ -487,15 +529,12 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
         sql: &str,
     ) -> Result<Statement<H>> {
         let _ = runtime;
-        let kind = match sql::validate_statement(sql)? {
-            sql::ValidatedStatement::Read => StatementKind::Read,
-            sql::ValidatedStatement::Execute(validated) => StatementKind::Execute(validated),
-        };
+        let validated = sql::validate_statement(sql)?;
         Ok(Statement {
             database: Arc::clone(self),
             runtime: Arc::clone(runtime),
             sql: sql.to_owned(),
-            kind,
+            validated,
         })
     }
 
@@ -661,37 +700,38 @@ where
     database: Arc<Database<H>>,
     runtime: Arc<DatabaseRuntime>,
     sql: String,
-    kind: StatementKind,
-}
-
-enum StatementKind {
-    Read,
-    Execute(Box<sql::ValidatedExecute>),
+    validated: sql::ValidatedStatement,
 }
 
 impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
     /// Whether this statement is read-only.
     pub fn readonly(&self) -> bool {
-        matches!(self.kind, StatementKind::Read)
+        self.validated.access() == sql::StatementAccess::Read
     }
 
-    /// Execute a prepared mutating statement.
+    /// Execute a prepared rowless mutating statement.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
-        let StatementKind::Execute(validated) = &self.kind else {
+        let sql::ValidatedStatement::Write(validated) = &self.validated else {
             return Err(Error::PreparedWrite);
         };
+        if validated.output() == sql::StatementOutput::Rows {
+            return Err(rusqlite::Error::ExecuteReturnedResults.into());
+        }
         self.database
             .execute_validated(&self.runtime, &self.sql, params, (**validated).clone())
     }
 
-    /// Asynchronously execute a prepared mutating statement.
+    /// Asynchronously execute a prepared rowless mutating statement.
     pub async fn execute_async<P>(&self, params: P) -> Result<usize>
     where
         P: Params + Send + 'static,
     {
-        let StatementKind::Execute(validated) = &self.kind else {
+        let sql::ValidatedStatement::Write(validated) = &self.validated else {
             return Err(Error::PreparedWrite);
         };
+        if validated.output() == sql::StatementOutput::Rows {
+            return Err(rusqlite::Error::ExecuteReturnedResults.into());
+        }
         self.database
             .execute_validated_async(self.sql.clone(), params, (**validated).clone())
             .await
@@ -703,12 +743,21 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         P: Params,
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
-        if !self.readonly() {
+        if self.validated.output() != sql::StatementOutput::Rows {
             return Err(Error::PreparedWrite);
         }
-        self.database.view(&self.runtime, |view| {
-            view.query_prevalidated(&self.sql, params, map)
-        })
+        match &self.validated {
+            sql::ValidatedStatement::Read => self.database.view(&self.runtime, |view| {
+                view.query_prevalidated(&self.sql, params, map)
+            }),
+            sql::ValidatedStatement::Write(validated) => self.database.query_write_validated(
+                &self.runtime,
+                &self.sql,
+                params,
+                map,
+                (**validated).clone(),
+            ),
+        }
     }
 
     /// Asynchronously execute this statement and return owned mapped values.
@@ -718,13 +767,22 @@ impl<H: ServerHandle + Send + Sync + 'static> Statement<H> {
         P: Params + Send + 'static,
         F: Send + 'static + for<'a> FnMut(&Row<'a>) -> rusqlite::Result<T>,
     {
-        if !self.readonly() {
+        let sql = self.sql.clone();
+        if self.validated.output() != sql::StatementOutput::Rows {
             return Err(Error::PreparedWrite);
         }
-        let sql = self.sql.clone();
-        self.database
-            .view_async(move |view| view.query_prevalidated(&sql, params, map))
-            .await
+        match &self.validated {
+            sql::ValidatedStatement::Read => {
+                self.database
+                    .view_async(move |view| view.query_prevalidated(&sql, params, map))
+                    .await
+            }
+            sql::ValidatedStatement::Write(validated) => {
+                self.database
+                    .query_write_validated_async(sql, params, map, (**validated).clone())
+                    .await
+            }
+        }
     }
 
     /// Async alias matching the connection's direct-query vocabulary.

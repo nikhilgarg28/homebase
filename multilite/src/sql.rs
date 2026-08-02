@@ -43,9 +43,39 @@ pub enum ValidatedExecute {
     CreateIndexIfNotExists(CreateIndexSpec),
     DropIndex(DropIndexSpec),
     DropIndexIfExists(DropIndexSpec),
-    Insert,
-    Delete,
-    Update,
+    Insert(StatementOutput),
+    Delete(StatementOutput),
+    Update(StatementOutput),
+}
+
+/// Result shape of one validated statement.
+///
+/// This is transient execution metadata. It is not part of the logical
+/// operation or its replicated encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementOutput {
+    Changes,
+    Rows,
+}
+
+impl ValidatedExecute {
+    pub fn output(&self) -> StatementOutput {
+        match self {
+            Self::Insert(output) | Self::Delete(output) | Self::Update(output) => *output,
+            Self::RenameTable(_)
+            | Self::RenameColumn(_)
+            | Self::AddColumn(_)
+            | Self::DropColumn(_)
+            | Self::CreateTable(_)
+            | Self::CreateTableIfNotExists(_)
+            | Self::DropTable(_)
+            | Self::DropTableIfExists(_)
+            | Self::CreateIndex(_)
+            | Self::CreateIndexIfNotExists(_)
+            | Self::DropIndex(_)
+            | Self::DropIndexIfExists(_) => StatementOutput::Changes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,13 +136,41 @@ pub struct DropIndexSpec {
     pub name: SqlName,
 }
 
+#[derive(Clone)]
 pub enum ValidatedStatement {
     Read,
-    Execute(Box<ValidatedExecute>),
+    Write(Box<ValidatedExecute>),
+}
+
+/// SQLite access required to execute one validated statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementAccess {
+    Read,
+    Write,
+}
+
+impl ValidatedStatement {
+    pub fn access(&self) -> StatementAccess {
+        match self {
+            Self::Read => StatementAccess::Read,
+            Self::Write(_) => StatementAccess::Write,
+        }
+    }
+
+    pub fn output(&self) -> StatementOutput {
+        match self {
+            Self::Read => StatementOutput::Rows,
+            Self::Write(validated) => validated.output(),
+        }
+    }
 }
 
 pub fn validate_execute(sql: &str) -> Result<ValidatedExecute> {
-    validate_execute_statement(parse_one(sql)?)
+    let validated = validate_execute_statement(parse_one(sql)?)?;
+    if validated.output() == StatementOutput::Rows {
+        return Err(rusqlite::Error::ExecuteReturnedResults.into());
+    }
+    Ok(validated)
 }
 
 fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
@@ -444,9 +502,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 InsertBody::Select(_, upsert) => upsert.as_deref(),
                 InsertBody::DefaultValues => None,
             };
-            if returning.is_some() {
-                return Err(Error::UnsupportedSql("INSERT RETURNING is not supported"));
-            }
+            let output = write_output(returning.as_deref());
             if tbl_name.db_name.is_some() || tbl_name.alias.is_some() {
                 return Err(Error::UnsupportedSql(
                     "qualified and aliased INSERT targets are not supported",
@@ -465,13 +521,14 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }) || match &body {
                 InsertBody::Select(select, _) => select_reads_reserved(select),
                 InsertBody::DefaultValues => false,
-            } || upsert.is_some_and(upsert_reads_reserved);
+            } || upsert.is_some_and(upsert_reads_reserved)
+                || returning_reads_reserved(returning.as_deref());
             if reads_reserved {
                 return Err(Error::UnsupportedSql(
                     "INSERT cannot read reserved Multilite tables",
                 ));
             }
-            Ok(ValidatedExecute::Insert)
+            Ok(ValidatedExecute::Insert(output))
         }
         Stmt::Delete {
             with,
@@ -494,9 +551,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_index_hint(indexed.as_ref())?;
-            if returning.is_some() {
-                return Err(Error::UnsupportedSql("DELETE RETURNING is not supported"));
-            }
+            let output = write_output(returning.as_deref());
             if order_by.is_some() || limit.is_some() {
                 return Err(Error::UnsupportedSql(
                     "DELETE ORDER BY and LIMIT are not supported",
@@ -504,12 +559,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
             }
             if with_reads_reserved(with.as_ref())
                 || where_clause.as_ref().is_some_and(expression_reads_reserved)
+                || returning_reads_reserved(returning.as_deref())
             {
                 return Err(Error::UnsupportedSql(
                     "DELETE cannot read reserved Multilite tables",
                 ));
             }
-            Ok(ValidatedExecute::Delete)
+            Ok(ValidatedExecute::Delete(output))
         }
         Stmt::Update {
             with,
@@ -543,9 +599,7 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 ));
             }
             validate_index_hint(indexed.as_ref())?;
-            if returning.is_some() {
-                return Err(Error::UnsupportedSql("UPDATE RETURNING is not supported"));
-            }
+            let output = write_output(returning.as_deref());
             if order_by.is_some() || limit.is_some() {
                 return Err(Error::UnsupportedSql(
                     "UPDATE ORDER BY and LIMIT are not supported",
@@ -555,12 +609,13 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 || sets.iter().any(|set| expression_reads_reserved(&set.expr))
                 || from.as_ref().is_some_and(from_reads_reserved)
                 || where_clause.as_ref().is_some_and(expression_reads_reserved)
+                || returning_reads_reserved(returning.as_deref())
             {
                 return Err(Error::UnsupportedSql(
                     "UPDATE cannot read reserved Multilite tables",
                 ));
             }
-            Ok(ValidatedExecute::Update)
+            Ok(ValidatedExecute::Update(output))
         }
         _ => Err(Error::UnsupportedSql(
             "execute accepts only supported schema changes, INSERT, DELETE, and UPDATE",
@@ -595,7 +650,7 @@ pub fn validate_statement(sql: &str) -> Result<ValidatedStatement> {
         )),
         Cmd::Stmt(statement) => validate_execute_statement(statement)
             .map(Box::new)
-            .map(ValidatedStatement::Execute),
+            .map(ValidatedStatement::Write),
         Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(Error::UnsupportedSql(
             "EXPLAIN is supported only for SELECT",
         )),
@@ -667,6 +722,29 @@ fn select_reads_reserved(select: &Select) -> bool {
         })
 }
 
+fn write_output(returning: Option<&[ResultColumn]>) -> StatementOutput {
+    if returning.is_some() {
+        StatementOutput::Rows
+    } else {
+        StatementOutput::Changes
+    }
+}
+
+fn returning_reads_reserved(returning: Option<&[ResultColumn]>) -> bool {
+    returning
+        .into_iter()
+        .flatten()
+        .any(result_column_reads_reserved)
+}
+
+fn result_column_reads_reserved(column: &ResultColumn) -> bool {
+    match column {
+        ResultColumn::Expr(expression, _) => expression_reads_reserved(expression),
+        ResultColumn::TableStar(name) => name_reads_reserved(name),
+        ResultColumn::Star => false,
+    }
+}
+
 fn one_select_reads_reserved(select: &OneSelect) -> bool {
     match select {
         OneSelect::Select {
@@ -678,10 +756,8 @@ fn one_select_reads_reserved(select: &OneSelect) -> bool {
             window_clause,
             ..
         } => {
-            columns.iter().any(|column| match column {
-                ResultColumn::Expr(expression, _) => expression_reads_reserved(expression),
-                ResultColumn::Star | ResultColumn::TableStar(_) => false,
-            }) || from.as_ref().is_some_and(from_reads_reserved)
+            columns.iter().any(result_column_reads_reserved)
+                || from.as_ref().is_some_and(from_reads_reserved)
                 || where_clause
                     .as_ref()
                     .is_some_and(|expression| expression_reads_reserved(expression))
@@ -2630,13 +2706,52 @@ mod tests {
     }
 
     #[test]
+    fn classifies_statement_access_and_output_independently() {
+        for sql in [
+            "INSERT INTO notes VALUES (1) RETURNING id",
+            "UPDATE notes SET body = 'x' RETURNING id, body",
+            "DELETE FROM notes RETURNING *",
+        ] {
+            let validated = validate_statement(sql).unwrap();
+            assert_eq!(validated.access(), StatementAccess::Write);
+            assert_eq!(validated.output(), StatementOutput::Rows);
+            assert!(matches!(
+                validate_execute(sql),
+                Err(Error::Sqlite(error))
+                    if matches!(error.as_ref(), rusqlite::Error::ExecuteReturnedResults)
+            ));
+        }
+
+        let read = validate_statement("SELECT id FROM notes").unwrap();
+        assert_eq!(read.access(), StatementAccess::Read);
+        assert_eq!(read.output(), StatementOutput::Rows);
+
+        let write = validate_statement("UPDATE notes SET body = 'x'").unwrap();
+        assert_eq!(write.access(), StatementAccess::Write);
+        assert_eq!(write.output(), StatementOutput::Changes);
+    }
+
+    #[test]
+    fn returning_expressions_cannot_read_reserved_tables() {
+        for sql in [
+            "INSERT INTO notes VALUES (1) RETURNING (SELECT value FROM __multilite__meta)",
+            "UPDATE notes SET body = 'x' RETURNING (SELECT count(*) FROM __multilite__pending)",
+            "DELETE FROM notes RETURNING (SELECT record FROM [__multilite__catalog] LIMIT 1)",
+        ] {
+            assert!(
+                matches!(validate_statement(sql), Err(Error::UnsupportedSql(_))),
+                "RETURNING gate accepted: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_delete_extensions_without_owned_semantics() {
         for sql in [
             "DELETE FROM main.notes",
             "DELETE FROM notes AS old",
             "DELETE FROM notes INDEXED BY __multilite__internal",
             "DELETE FROM notes INDEXED BY sqlite_autoindex_notes_1",
-            "DELETE FROM notes RETURNING id",
             "DELETE FROM notes ORDER BY id LIMIT 1",
             "DELETE FROM __multilite__pending",
         ] {
@@ -2651,7 +2766,6 @@ mod tests {
             "UPDATE notes AS old SET body = 'x'",
             "UPDATE notes INDEXED BY __multilite__internal SET body = 'x'",
             "UPDATE notes INDEXED BY sqlite_autoindex_notes_1 SET body = 'x'",
-            "UPDATE notes SET body = 'x' RETURNING id",
             "UPDATE notes SET body = 'x' ORDER BY id LIMIT 1",
             "UPDATE __multilite__pending SET record = x''",
         ] {
@@ -2666,7 +2780,6 @@ mod tests {
             "SELECT 1",
             "BEGIN",
             "EXPLAIN SELECT 1",
-            "INSERT INTO notes VALUES (1) RETURNING id",
             "CREATE TABLE one (id); CREATE TABLE two (id)",
         ] {
             assert_unsupported(sql);

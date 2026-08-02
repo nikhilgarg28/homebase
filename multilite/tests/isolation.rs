@@ -711,6 +711,101 @@ fn update_from_sources_are_reads_only_under_serializable_isolation() {
     }
 }
 
+#[test]
+fn returning_subqueries_are_reads_only_under_serializable_isolation() {
+    let directory = tempfile::tempdir().unwrap();
+    for (label, isolation, expect_rejection) in [
+        ("snapshot", IsolationLevel::Snapshot, false),
+        ("serializable", IsolationLevel::Serializable, true),
+    ] {
+        let authority = server();
+        let first = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-returning-first.sqlite")),
+            OpenOptions::new().server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+        assert!(authority.create_space(SpaceId(first.database_id().to_bytes())));
+        let second = MultiliteConnection::open_with(
+            directory
+                .path()
+                .join(format!("{label}-returning-second.sqlite")),
+            OpenOptions::new()
+                .invitation(first.replica_invitation())
+                .server(router(Arc::clone(&authority))),
+        )
+        .unwrap();
+
+        first.execute(CREATE_BOOKINGS, ()).unwrap();
+        first
+            .execute(
+                "CREATE TABLE calendar (id INTEGER PRIMARY KEY, label TEXT NOT NULL)",
+                (),
+            )
+            .unwrap();
+        first
+            .execute("INSERT INTO bookings VALUES (1, 'old')", ())
+            .unwrap();
+        first
+            .execute("INSERT INTO calendar VALUES (1, 'mon')", ())
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .update_with(UpdateOptions::new(isolation), |transaction| {
+                assert_eq!(
+                    transaction.query(
+                        "UPDATE bookings SET day = 'changed' WHERE id = 1
+                         RETURNING (SELECT label FROM calendar WHERE id = 1)",
+                        (),
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    ["mon"]
+                );
+                Ok(())
+            })
+            .unwrap();
+        second
+            .execute("UPDATE calendar SET label = 'tue' WHERE id = 1", ())
+            .unwrap();
+
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        if expect_rejection {
+            let rejection = rejected(first.push().unwrap());
+            assert_range_assertion_failed(&rejection);
+            first.rollback(&rejection).unwrap();
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        } else {
+            assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        }
+        converge(&first, &second);
+
+        let expected_day = if expect_rejection { "old" } else { "changed" };
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query("SELECT day FROM bookings", (), |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                [expected_day],
+                "{label}"
+            );
+            assert_eq!(
+                database
+                    .query("SELECT label FROM calendar", (), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                ["tue"],
+                "{label}"
+            );
+        }
+    }
+}
+
 fn synchronize_schema<H1, H2>(source: &MultiliteConnection<H1>, replica: &MultiliteConnection<H2>)
 where
     H1: ServerHandle + Send + Sync + 'static,
