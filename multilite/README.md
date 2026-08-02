@@ -67,8 +67,12 @@ after affinity and conflict handling have run. One SQL statement becomes one
 `RowChanges` operation: its ordered hook events are folded into deterministic
 net before/after images for one synchronized table, while immutable table,
 index, and relationship rules are stored once. `OR ABORT`, `OR IGNORE`, and
-UPSERT chains containing only `DO NOTHING` therefore lower only the rows SQLite
-actually changed. Row frames identify their schema revision and carry
+UPSERT chains containing `DO NOTHING` and/or `DO UPDATE` therefore lower only
+the rows SQLite actually changed. A replica applies the captured net row
+transition; it does not rerun the procedural conflict-selection program.
+Snapshot isolation validates the resulting row, UNIQUE, and foreign-key guards,
+while serializable isolation additionally retains the conflict handler's table
+reads. Row frames identify their schema revision and carry
 column-UUID/value pairs using lossless SQLite storage classes. Primary-key
 values become separate
 Homebase key components under the table and primary-index UUID. Submissions

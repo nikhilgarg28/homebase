@@ -650,6 +650,71 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logical::row::CapturedRow;
+    use crate::value::StoredValue;
+
+    fn captured_account(id: i64, email: &str, body: &str) -> CapturedRow {
+        CapturedRow {
+            table: "accounts".into(),
+            rowid: id,
+            values: vec![
+                StoredValue::Integer(id),
+                StoredValue::Text(email.as_bytes().to_vec()),
+                StoredValue::Text(body.as_bytes().to_vec()),
+            ],
+        }
+    }
+
+    #[test]
+    fn upsert_hook_stream_reports_only_sqlites_actual_row_effects_in_order() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::catalog::initialize(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    body TEXT NOT NULL
+                );
+                INSERT INTO accounts VALUES (1, 'one', 'start')",
+            )
+            .unwrap();
+        let hooks = BranchHooks::install(&connection, false).unwrap();
+
+        let (changed, events) = hooks
+            .run(
+                || {
+                    Ok(connection.execute(
+                        "INSERT INTO accounts VALUES
+                            (2, 'two', 'inserted'),
+                            (3, 'two', 'second-touch'),
+                            (9, 'one', 'updated-existing'),
+                            (10, 'one', 'where-false')
+                         ON CONFLICT(email) DO UPDATE SET body = excluded.body
+                         WHERE excluded.id <> 10",
+                        (),
+                    )?)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(changed, 3);
+        assert_eq!(
+            events,
+            vec![
+                CapturedChange::Insert(captured_account(2, "two", "inserted")),
+                CapturedChange::Update {
+                    before: captured_account(2, "two", "inserted"),
+                    after: captured_account(2, "two", "second-touch"),
+                },
+                CapturedChange::Update {
+                    before: captured_account(1, "one", "start"),
+                    after: captured_account(1, "one", "updated-existing"),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn capture_limit_rolls_back_the_complete_sqlite_statement() {

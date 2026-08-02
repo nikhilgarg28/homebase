@@ -3743,6 +3743,84 @@ mod tests {
     }
 
     #[test]
+    fn statement_delta_folds_upsert_insert_then_update_into_one_insert() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let inserted = note(7, "inserted");
+        let updated = note(7, "updated");
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Insert(inserted.clone()),
+                CapturedChange::Update {
+                    before: inserted,
+                    after: updated,
+                },
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(changes.table.rows.len(), 1);
+        assert!(changes.table.rows[0].before.is_none());
+        assert!(changes.table.rows[0].after.is_some());
+        assert!(matches!(
+            changes.to_homebase().unwrap().mutations.as_slice(),
+            [Mutation::Set { .. }]
+        ));
+
+        changes.apply(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM notes WHERE id = 7", (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "updated"
+        );
+        changes.restore_materialized(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM notes", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn statement_delta_discards_unchanged_and_transient_upsert_streams() {
+        let created = definition();
+        let connection = connection(&created);
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let unchanged = note(7, "same");
+        assert!(
+            RowChanges::from_catalog(
+                &catalog,
+                vec![CapturedChange::Update {
+                    before: unchanged.clone(),
+                    after: unchanged,
+                }],
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let transient = note(9, "transient");
+        assert!(
+            RowChanges::from_catalog(
+                &catalog,
+                vec![
+                    CapturedChange::Insert(transient.clone()),
+                    CapturedChange::Delete(transient),
+                ],
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn statement_delta_treats_delete_then_insert_as_one_replacement() {
         let created = definition();
         let connection = connection(&created);

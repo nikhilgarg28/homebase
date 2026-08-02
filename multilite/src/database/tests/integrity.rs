@@ -58,6 +58,7 @@ struct Coverage {
     insert_or_ignore: bool,
     update_or_ignore: bool,
     upsert_do_nothing: bool,
+    upsert_do_update: bool,
 }
 
 impl Coverage {
@@ -73,6 +74,7 @@ impl Coverage {
         self.insert_or_ignore |= other.insert_or_ignore;
         self.update_or_ignore |= other.update_or_ignore;
         self.upsert_do_nothing |= other.upsert_do_nothing;
+        self.upsert_do_update |= other.upsert_do_update;
     }
 }
 
@@ -97,6 +99,7 @@ fn seeded_two_replica_workloads_preserve_logical_and_sqlite_integrity() {
     assert!(coverage.insert_or_ignore);
     assert!(coverage.update_or_ignore);
     assert!(coverage.upsert_do_nothing);
+    assert!(coverage.upsert_do_update);
 }
 
 fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
@@ -222,6 +225,7 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
             }
             2 => {
                 coverage.update_or_ignore = true;
+                coverage.upsert_do_update = true;
                 first
                     .execute(
                         &first_runtime,
@@ -232,8 +236,9 @@ fn run_workload(isolation: IsolationLevel, seed: u64) -> Coverage {
                 second
                     .execute(
                         &second_runtime,
-                        "UPDATE OR IGNORE children SET body = 'second' WHERE id = ?1",
-                        [child],
+                        "INSERT INTO children VALUES (?1, ?2, 'second')
+                         ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+                        rusqlite::params![child, code_a],
                     )
                     .unwrap();
                 true

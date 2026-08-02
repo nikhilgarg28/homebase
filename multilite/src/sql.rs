@@ -408,9 +408,6 @@ fn validate_execute_statement(statement: Stmt) -> Result<ValidatedExecute> {
                 InsertBody::Select(_, upsert) => upsert.as_deref(),
                 InsertBody::DefaultValues => None,
             };
-            if upsert.is_some_and(|upsert| !upsert_is_do_nothing(upsert)) {
-                return Err(Error::UnsupportedSql("UPSERT DO UPDATE is not supported"));
-            }
             if returning.is_some() {
                 return Err(Error::UnsupportedSql("INSERT RETURNING is not supported"));
             }
@@ -669,11 +666,6 @@ fn with_reads_reserved(with: Option<&With>) -> bool {
     with.iter()
         .flat_map(|with| &with.ctes)
         .any(|cte| select_reads_reserved(&cte.select))
-}
-
-fn upsert_is_do_nothing(upsert: &Upsert) -> bool {
-    matches!(upsert.do_clause, UpsertDo::Nothing)
-        && upsert.next.as_deref().is_none_or(upsert_is_do_nothing)
 }
 
 fn upsert_reads_reserved(upsert: &Upsert) -> bool {
@@ -1882,6 +1874,11 @@ mod tests {
             "INSERT OR IGNORE INTO notes VALUES (1)",
             "INSERT INTO notes VALUES (1) ON CONFLICT DO NOTHING",
             "INSERT INTO notes VALUES (1) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO NOTHING
+             ON CONFLICT DO UPDATE SET body = excluded.body WHERE notes.body <> excluded.body",
             "UPDATE OR ABORT notes SET body = 'next'",
             "UPDATE OR IGNORE notes SET body = 'next'",
         ] {
@@ -1894,7 +1891,6 @@ mod tests {
         for sql in [
             "REPLACE INTO notes VALUES (1)",
             "INSERT OR REPLACE INTO notes VALUES (1)",
-            "INSERT INTO notes VALUES (1) ON CONFLICT(id) DO UPDATE SET id = 2",
             "WITH value(id) AS (SELECT 1) INSERT OR FAIL INTO notes SELECT id FROM value",
             "INSERT OR ROLLBACK INTO notes VALUES (1)",
             "UPDATE OR FAIL notes SET body = 'next'",
@@ -1914,6 +1910,19 @@ mod tests {
             "WITH hidden AS (SELECT value FROM __multilite__meta)
              INSERT INTO notes SELECT value FROM hidden",
             "INSERT INTO notes SELECT (SELECT value FROM __multilite__meta)",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO UPDATE
+             SET body = (SELECT value FROM __multilite__meta)",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body
+             WHERE EXISTS (SELECT 1 FROM __multilite__pending)",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) DO NOTHING
+             ON CONFLICT DO UPDATE
+             SET body = (SELECT value FROM __multilite__meta)",
+            "INSERT INTO notes VALUES (1, 'next')
+             ON CONFLICT(id) WHERE EXISTS (SELECT 1 FROM __multilite__pending)
+             DO UPDATE SET body = excluded.body",
         ] {
             assert_unsupported(sql);
         }

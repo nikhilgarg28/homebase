@@ -276,6 +276,182 @@ fn ignored_conflicts_compile_only_the_rows_sqlite_changed_and_converge() {
 }
 
 #[test]
+fn upsert_do_update_rejection_reopens_repairs_exact_net_effects_and_converges() {
+    for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
+        let directory = tempfile::tempdir().unwrap();
+        let server = server();
+        let first_path = directory.path().join("upsert-first.sqlite");
+        let second_path = directory.path().join("upsert-second.sqlite");
+        let first = MultiliteConnection::open_with(
+            &first_path,
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server))),
+        )
+        .unwrap();
+        assert!(server.create_space(SpaceId(first.database_id().to_bytes())));
+        let invitation = first.replica_invitation();
+        let second_options = || {
+            OpenOptions::new()
+                .isolation_level(isolation)
+                .server(router(Arc::clone(&server)))
+        };
+        let second =
+            MultiliteConnection::open_with(&second_path, second_options().invitation(invitation))
+                .unwrap();
+
+        first
+            .update(|transaction| {
+                transaction.execute(
+                    "CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE,
+                        body TEXT NOT NULL,
+                        revision INTEGER NOT NULL
+                    )",
+                    (),
+                )?;
+                transaction.execute(
+                    "INSERT INTO accounts VALUES
+                        (1, 'shared', 'base', 0),
+                        (5, 'five', 'five', 0)",
+                    (),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        second.pull().unwrap();
+        second.rebase().unwrap();
+
+        first
+            .execute(
+                "UPDATE accounts
+                 SET body = 'winner', revision = revision + 1
+                 WHERE id = 1",
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .execute(
+                    "INSERT INTO accounts VALUES
+                        (2, 'new', 'speculative-new', 0),
+                        (3, 'new', 'speculative-newer', 7),
+                        (9, 'shared', 'speculative-shared', 8),
+                        (10, 'shared', 'where-false', 9)
+                     ON CONFLICT(email) DO UPDATE SET
+                        body = excluded.body,
+                        revision = accounts.revision + 1
+                     WHERE excluded.id <> 10",
+                    (),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(first.push().unwrap(), PushOutcome::Drained);
+        let PushOutcome::Rejected(rejection) = second.push().unwrap() else {
+            panic!("conflicting UPSERT DO UPDATE was admitted under {isolation:?}")
+        };
+
+        drop(second);
+        let second = MultiliteConnection::open_with(&second_path, second_options()).unwrap();
+        assert_eq!(
+            second
+                .query(
+                    "SELECT id, email, body, revision FROM accounts ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            [
+                (1, "shared".into(), "speculative-shared".into(), 1),
+                (2, "new".into(), "speculative-newer".into(), 1),
+                (5, "five".into(), "five".into(), 0),
+            ]
+        );
+
+        second.rollback(&rejection).unwrap();
+        assert_eq!(
+            second
+                .query(
+                    "SELECT id, email, body, revision FROM accounts ORDER BY id",
+                    (),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            [
+                (1, "shared".into(), "base".into(), 0),
+                (5, "five".into(), "five".into(), 0),
+            ]
+        );
+        assert_eq!(second.push().unwrap(), PushOutcome::Drained);
+        first.pull().unwrap();
+        second.pull().unwrap();
+        first.rebase().unwrap();
+        second.rebase().unwrap();
+
+        let expected = [
+            (1, String::from("shared"), String::from("winner"), 1),
+            (5, String::from("five"), String::from("five"), 0),
+        ];
+        for database in [&first, &second] {
+            assert_eq!(
+                database
+                    .query(
+                        "SELECT id, email, body, revision FROM accounts ORDER BY id",
+                        (),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+
+        drop(first);
+        drop(second);
+        for path in [&first_path, &second_path] {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM __multilite__pending", (), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA integrity_check", (), |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
+    }
+}
+
+#[test]
 fn conflict_mode_rejection_repair_survives_reopen_and_restores_only_net_changes() {
     for isolation in [IsolationLevel::Snapshot, IsolationLevel::Serializable] {
         let directory = tempfile::tempdir().unwrap();

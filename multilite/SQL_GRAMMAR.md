@@ -11,9 +11,11 @@ SQLite statement does not imply that every SQLite spelling is supported.
 Captured INSERT, UPDATE, and DELETE syntax compiles through one statement-delta
 operation that folds repeated touches into deterministic before/after row
 images. `INSERT [OR ABORT|OR IGNORE]`, `UPDATE [OR ABORT|OR IGNORE]`, and UPSERT
-chains containing only `DO NOTHING` are supported. `REPLACE`, `OR FAIL`,
-`OR ROLLBACK`, UPSERT `DO UPDATE`, triggers, mutating foreign-key actions,
-`RETURNING`, and write `ORDER BY` / `LIMIT` remain outside the managed surface.
+chains containing `DO NOTHING` and/or `DO UPDATE` are supported. UPSERT stores
+SQLite's captured net row transition rather than replaying conflict selection
+on replicas. `REPLACE`, `OR FAIL`, `OR ROLLBACK`, triggers, mutating foreign-key
+actions, `RETURNING`, and write `ORDER BY` / `LIMIT` remain outside the managed
+surface.
 
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
 FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings

@@ -1734,12 +1734,18 @@ fn trigger_generated_update_effects_abort_the_whole_statement() {
         .unwrap();
     let db = MultiliteConnection::open(&path).unwrap();
 
-    assert!(matches!(
-        db.execute("UPDATE notes SET body = 'changed' WHERE id = 1", ()),
-        Err(Error::CaptureInvariant(
-            "writes caused by triggers are not supported"
-        ))
-    ));
+    for sql in [
+        "UPDATE notes SET body = 'changed' WHERE id = 1",
+        "INSERT INTO notes VALUES (1, 'changed')
+         ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+    ] {
+        assert!(matches!(
+            db.execute(sql, ()),
+            Err(Error::CaptureInvariant(
+                "writes caused by triggers are not supported"
+            ))
+        ));
+    }
     assert_eq!(read_note(&db), "note");
     assert_eq!(
         db.query("SELECT body FROM audit WHERE id = 1", (), |row| {
@@ -1764,8 +1770,6 @@ fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
         "INSERT OR REPLACE INTO notes VALUES (1, 'replaced')",
         "INSERT OR FAIL INTO notes VALUES (1, 'failed')",
         "INSERT OR ROLLBACK INTO notes VALUES (1, 'rolled-back')",
-        "INSERT INTO notes VALUES (1, 'updated')
-         ON CONFLICT(id) DO UPDATE SET body = excluded.body",
     ] {
         assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
         assert_eq!(read_note(&db), "original");
@@ -1808,6 +1812,488 @@ fn safe_row_conflict_modes_follow_sqlite_and_unsafe_modes_are_rejected() {
         )),)
             .unwrap(),
         [(1, "original".into()), (2, "second".into())]
+    );
+}
+
+#[test]
+fn upsert_do_update_uses_sqlites_net_row_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("upsert.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            body TEXT NOT NULL,
+            revisions INTEGER NOT NULL DEFAULT 0
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO accounts VALUES
+            (1, 'one', 'start', 0),
+            (5, 'five', 'keep', 0)",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO accounts VALUES
+                (2, 'two', 'inserted', 0),
+                (3, 'two', 'second-touch', 7),
+                (9, 'one', 'updated-existing', 8),
+                (10, 'one', 'where-false', 9)
+             ON CONFLICT(email) DO UPDATE SET
+                body = excluded.body,
+                revisions = accounts.revisions + 1
+             WHERE excluded.id <> 10",
+            (),
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, email, body, revisions FROM accounts ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            (1, "one".into(), "updated-existing".into(), 1),
+            (2, "two".into(), "second-touch".into(), 1),
+            (5, "five".into(), "keep".into(), 0),
+        ]
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO accounts VALUES
+                (1, 'unused', 'id-conflict', 0),
+                (12, 'five', 'email-conflict', 0),
+                (13, 'new', 'new-row', 0)
+             ON CONFLICT(id) DO NOTHING
+             ON CONFLICT(email) DO UPDATE SET
+                body = excluded.body,
+                revisions = accounts.revisions + 1
+             WHERE accounts.body <> excluded.body
+             ON CONFLICT DO NOTHING",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.execute(
+            "INSERT INTO accounts VALUES (99, 'one', 'ignored', 0)
+             ON CONFLICT(email) DO UPDATE SET body = excluded.body WHERE 0",
+            (),
+        )
+        .unwrap(),
+        0
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO accounts VALUES (10, 'one', 'moved', 0)
+             ON CONFLICT(email) DO UPDATE SET
+                id = excluded.id,
+                body = excluded.body",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "INSERT INTO accounts VALUES
+                (11, 'one', 'moved-again', 0),
+                (10, 'replacement', 'reused-key', 0)
+             ON CONFLICT(email) DO UPDATE SET
+                id = excluded.id,
+                body = excluded.body",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    let before_abort = db
+        .query(
+            "SELECT id, email, body, revisions FROM accounts ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO accounts VALUES
+                (20, 'transient', 'must-roll-back', 0),
+                (21, 'one', 'violates-update', 0)
+             ON CONFLICT(email) DO UPDATE SET email = 'two'",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query(
+            "SELECT id, email, body, revisions FROM accounts ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        before_abort
+    );
+}
+
+#[test]
+fn upsert_do_update_supports_composite_unique_targets_and_null_distinctness() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("composite-upsert.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE entries (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT,
+            slug TEXT,
+            body TEXT NOT NULL,
+            UNIQUE (tenant, slug)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO entries VALUES
+            (1, 'acme', 'home', 'old'),
+            (2, NULL, 'home', 'nullable-old')",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "WITH incoming(id, tenant, slug, body) AS (
+                VALUES
+                    (9, 'acme', 'home', 'updated'),
+                    (3, NULL, 'home', 'nullable-new')
+             )
+             INSERT INTO entries
+             SELECT id, tenant, slug, body FROM incoming WHERE true
+             ON CONFLICT(tenant, slug) DO UPDATE SET
+                body = (SELECT upper(excluded.body))",
+            (),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, tenant, slug, body FROM entries ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [
+            (1, Some("acme".into()), "home".into(), "UPDATED".into()),
+            (2, None, "home".into(), "nullable-old".into()),
+            (3, None, "home".into(), "nullable-new".into()),
+        ]
+    );
+}
+
+#[test]
+fn upsert_do_update_moves_foreign_keys_and_rejects_missing_parents_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("foreign-upsert.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE parents (
+                id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                parent_code TEXT NOT NULL REFERENCES parents(code),
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1, 'p1'), (2, 'p2')", ())?;
+        transaction.execute("INSERT INTO children VALUES (10, 'p1', 'original')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO children VALUES (10, 'p2', 'retargeted')
+             ON CONFLICT(id) DO UPDATE SET
+                parent_code = excluded.parent_code,
+                body = excluded.body",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO children VALUES (10, 'missing', 'invalid')
+             ON CONFLICT(id) DO UPDATE SET
+                parent_code = excluded.parent_code,
+                body = excluded.body",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id, parent_code, body FROM children", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },)
+            .unwrap(),
+        [(10, "p2".into(), "retargeted".into())]
+    );
+}
+
+#[test]
+fn upsert_do_update_secondary_constraint_failures_abort_outer_ignore_statements() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("upsert-abort.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE profiles (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL UNIQUE,
+            UNIQUE (tenant, username)
+        )",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO profiles VALUES
+            (1, 'acme', 'a@example.com', 'alpha'),
+            (2, 'acme', 'b@example.com', 'beta')",
+        (),
+    )
+    .unwrap();
+    let rows = || {
+        db.query(
+            "SELECT id, tenant, email, username FROM profiles ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    let before = rows();
+
+    assert!(matches!(
+        db.execute(
+            "INSERT OR IGNORE INTO profiles VALUES
+                (3, 'other', 'c@example.com', 'gamma'),
+                (9, 'acme', 'a@example.com', 'beta')
+             ON CONFLICT(email) DO UPDATE SET username = excluded.username",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(rows(), before);
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO profiles VALUES
+                (9, 'acme', 'a@example.com', 'gamma')
+             ON CONFLICT(email) DO UPDATE SET username = excluded.username",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        rows(),
+        [
+            (1, "acme".into(), "a@example.com".into(), "gamma".into()),
+            (2, "acme".into(), "b@example.com".into(), "beta".into()),
+        ]
+    );
+    let before_mismatch = rows();
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO profiles VALUES
+                (10, 'acme', 'new@example.com', 'new')
+             ON CONFLICT(tenant) DO UPDATE SET username = excluded.username",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(rows(), before_mismatch);
+}
+
+#[test]
+fn upsert_do_update_covers_strict_composite_and_affinity_key_shapes() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("upsert-key-shapes.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute(
+            "CREATE TABLE strict_values (
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            ) STRICT",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE memberships (
+                organization TEXT NOT NULL,
+                username TEXT NOT NULL,
+                next_username TEXT NOT NULL,
+                body TEXT NOT NULL,
+                PRIMARY KEY (organization, username)
+            ) WITHOUT ROWID",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE numeric_keys (
+                id INTEGER PRIMARY KEY,
+                code NUMERIC NOT NULL UNIQUE,
+                body TEXT NOT NULL
+            )",
+            (),
+        )?;
+        transaction.execute("INSERT INTO strict_values VALUES (1, 'old', 0)", ())?;
+        transaction.execute(
+            "INSERT INTO memberships VALUES ('acme', 'alice', 'alice', 'old')",
+            (),
+        )?;
+        transaction.execute("INSERT INTO numeric_keys VALUES (1, 1, 'old')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO strict_values VALUES (1, 'updated', 9)
+             ON CONFLICT(id) DO UPDATE SET
+                body = excluded.body,
+                revision = strict_values.revision + 1",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert!(matches!(
+        db.execute(
+            "INSERT INTO strict_values VALUES (1, x'01', 9)
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+            (),
+        ),
+        Err(Error::Sqlite(_))
+    ));
+    assert_eq!(
+        db.query("SELECT id, body, revision FROM strict_values", (), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },)
+            .unwrap(),
+        [(1, "updated".into(), 1)]
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO memberships VALUES ('acme', 'alice', 'bob', 'moved')
+             ON CONFLICT(organization, username) DO UPDATE SET
+                username = excluded.next_username,
+                next_username = excluded.next_username,
+                body = excluded.body",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT organization, username, next_username, body FROM memberships",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [("acme".into(), "bob".into(), "bob".into(), "moved".into())]
+    );
+
+    assert_eq!(
+        db.execute(
+            "INSERT INTO numeric_keys VALUES (9, 1.0, 'numeric-equivalent')
+             ON CONFLICT(code) DO UPDATE SET body = excluded.body",
+            (),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query(
+            "SELECT id, code, typeof(code), body FROM numeric_keys",
+            (),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap(),
+        [(1, 1, "integer".into(), "numeric-equivalent".into())]
     );
 }
 
@@ -2060,6 +2546,11 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
     };
     let initial_internal_tables = internal_tables();
 
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO notes VALUES (1, 'original')", ())
+        .unwrap();
+
     assert!(db.prepare("SELECT value FROM __multilite__meta").is_err());
     assert!(
         db.execute(
@@ -2083,8 +2574,19 @@ fn public_sql_cannot_access_or_create_reserved_tables() {
         )
         .is_err()
     );
+    for sql in [
+        "INSERT INTO notes VALUES (1, 'updated')
+         ON CONFLICT(id) DO UPDATE
+         SET body = (SELECT value FROM __multilite__meta)",
+        "INSERT INTO notes VALUES (1, 'updated')
+         ON CONFLICT(id) DO UPDATE SET body = excluded.body
+         WHERE EXISTS (SELECT 1 FROM __multilite__pending)",
+    ] {
+        assert!(matches!(db.execute(sql, ()), Err(Error::UnsupportedSql(_))));
+    }
 
     assert_eq!(internal_tables(), initial_internal_tables);
+    assert_eq!(read_note(&db), "original");
 }
 
 fn read_note(db: &MultiliteConnection) -> String {

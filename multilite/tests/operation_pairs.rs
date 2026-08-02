@@ -66,6 +66,7 @@ struct RegisteredOperation {
 enum SqlShape {
     CreateTable,
     Insert,
+    Upsert,
     Delete,
     Update,
     CreateIndex,
@@ -76,9 +77,10 @@ enum SqlShape {
     DropColumn,
 }
 
-const SQL_SHAPES: [SqlShape; 10] = [
+const SQL_SHAPES: [SqlShape; 11] = [
     SqlShape::CreateTable,
     SqlShape::Insert,
+    SqlShape::Upsert,
     SqlShape::Delete,
     SqlShape::Update,
     SqlShape::CreateIndex,
@@ -198,13 +200,93 @@ const PAIR_CASES: &[PairCase] = &[
         name: "upsert_do_nothing_same_unique_key",
         relationship: "UPSERT survivors claiming one unique owner",
         left: operation!(
-            Insert,
+            Upsert,
             "INSERT INTO notes VALUES (3, 'shared', 'left', 'd3') ON CONFLICT DO NOTHING"
         ),
         right: operation!(
-            Insert,
+            Upsert,
             "INSERT INTO notes VALUES (4, 'shared', 'right', 'd4') ON CONFLICT DO NOTHING"
         ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_do_update_disjoint_rows",
+        relationship: "different target rows with a shared procedural read table",
+        left: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-left'"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (2, 'two', 'unused', 'd2')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-right'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_do_update_same_row",
+        relationship: "two conflict updates to one row identity",
+        left: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'left', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'right', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_do_update_insert_path_same_unique_key",
+        relationship: "two UPSERT insert paths claiming one unique owner",
+        left: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (3, 'shared', 'left', 'd3')
+             ON CONFLICT(slug) DO UPDATE SET body = excluded.body"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (4, 'shared', 'right', 'd4')
+             ON CONFLICT(slug) DO UPDATE SET body = excluded.body"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_primary_key_move_and_destination_insert",
+        relationship: "UPSERT key movement and another write to its destination",
+        left: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (9, 'one', 'moved', 'd9')
+             ON CONFLICT(slug) DO UPDATE SET
+                id = excluded.id,
+                body = excluded.body,
+                detail = excluded.detail"
+        ),
+        right: operation!(
+            Insert,
+            "INSERT INTO notes VALUES (9, 'nine', 'destination', 'd9')"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "upsert_child_retarget_and_parent_delete",
+        relationship: "UPSERT foreign-key movement and deletion of its new parent",
+        left: operation!(
+            Upsert,
+            "INSERT INTO children VALUES (100, 'p20', 'retargeted')
+             ON CONFLICT(id) DO UPDATE SET
+                parent_code = excluded.parent_code,
+                body = excluded.body"
+        ),
+        right: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -421,6 +503,21 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::COMMUTE,
     },
     PairCase {
+        name: "secondary_index_and_stale_upsert",
+        relationship: "access-path DDL and an UPSERT reading the same table",
+        left: operation!(
+            CreateIndex,
+            "CREATE INDEX notes_detail_upsert_lookup ON notes (detail)"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-upsert'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::directional(Disposition::SecondRejects, Disposition::BothAdmit),
+    },
+    PairCase {
         name: "unique_index_and_stale_insert",
         relationship: "write-contract DDL and a row compiled against its predecessor",
         left: operation!(
@@ -428,6 +525,21 @@ const PAIR_CASES: &[PairCase] = &[
             "CREATE UNIQUE INDEX notes_detail_unique ON notes (detail)"
         ),
         right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "unique_index_and_stale_upsert",
+        relationship: "write-contract DDL and an UPSERT compiled against its predecessor",
+        left: operation!(
+            CreateIndex,
+            "CREATE UNIQUE INDEX notes_detail_upsert_unique ON notes (detail)"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = excluded.body"
+        ),
         snapshot: ExpectedPair::CONFLICT,
         serializable: ExpectedPair::CONFLICT,
     },
@@ -446,6 +558,48 @@ const PAIR_CASES: &[PairCase] = &[
         right: operation!(Insert, "INSERT INTO notes VALUES (3, 'three', 'row', 'd3')"),
         snapshot: ExpectedPair::COMMUTE,
         serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "table_rename_and_stale_upsert",
+        relationship: "stable table identity across a stale UPSERT name binding",
+        left: operation!(RenameTable, "ALTER TABLE notes RENAME TO archived_notes"),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-upsert'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::COMMUTE,
+    },
+    PairCase {
+        name: "column_rename_and_stale_upsert",
+        relationship: "stable column identity across a stale UPSERT name binding",
+        left: operation!(
+            RenameColumn,
+            "ALTER TABLE notes RENAME COLUMN body TO contents"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-upsert'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::directional(Disposition::SecondRejects, Disposition::BothAdmit),
+    },
+    PairCase {
+        name: "add_column_and_stale_upsert",
+        relationship: "compatible column evolution and an UPSERT reading the old schema",
+        left: operation!(
+            AddColumn,
+            "ALTER TABLE notes ADD COLUMN summary TEXT DEFAULT 'summary'"
+        ),
+        right: operation!(
+            Upsert,
+            "INSERT INTO notes VALUES (1, 'one', 'unused', 'd1')
+             ON CONFLICT(id) DO UPDATE SET body = notes.body || '-upsert'"
+        ),
+        snapshot: ExpectedPair::COMMUTE,
+        serializable: ExpectedPair::directional(Disposition::SecondRejects, Disposition::BothAdmit),
     },
 ];
 
