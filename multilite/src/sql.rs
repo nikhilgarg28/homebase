@@ -12,8 +12,8 @@ use sqlite3_parser::lexer::sql::Parser;
 
 use crate::logical::schema::{
     CreateCheckConstraint, CreateColumn, CreateForeignKey, CreateTableSpec, CreateUnique,
-    DefaultDefinition, ForeignKeyAction, IndexOrder, MAX_INDEX_COLUMNS, SqlExpression, SqlName,
-    TableMode, TableStorage, TypeDeclaration,
+    DefaultDefinition, IndexOrder, MAX_INDEX_COLUMNS, ReferentialAction, ReferentialActions,
+    SqlExpression, SqlName, TableMode, TableStorage, TypeDeclaration,
 };
 use crate::{Error, Result};
 
@@ -1516,14 +1516,14 @@ fn validate_foreign_key(
         ));
     }
     let mut on_delete = None;
-    let mut on_update = false;
+    let mut on_update = None;
     for argument in clause.args {
         match argument {
             RefArg::OnDelete(action) if on_delete.is_none() => {
                 on_delete = Some(match action {
-                    RefAct::NoAction => ForeignKeyAction::NoAction,
-                    RefAct::Cascade => ForeignKeyAction::Cascade,
-                    RefAct::SetNull => ForeignKeyAction::SetNull,
+                    RefAct::NoAction => ReferentialAction::NoAction,
+                    RefAct::Cascade => ReferentialAction::Cascade,
+                    RefAct::SetNull => ReferentialAction::SetNull,
                     RefAct::SetDefault | RefAct::Restrict => {
                         return Err(Error::UnsupportedSql(
                             "ON DELETE SET DEFAULT and RESTRICT are not supported",
@@ -1531,15 +1531,22 @@ fn validate_foreign_key(
                     }
                 });
             }
-            RefArg::OnUpdate(RefAct::NoAction) if !on_update => on_update = true,
+            RefArg::OnUpdate(RefAct::NoAction) if on_update.is_none() => {
+                on_update = Some(ReferentialAction::NoAction)
+            }
             RefArg::OnDelete(_) => {
                 return Err(Error::UnsupportedSql(
                     "foreign keys cannot contain more than one ON DELETE clause",
                 ));
             }
-            RefArg::OnUpdate(_) => {
+            RefArg::OnUpdate(_) if on_update.is_none() => {
                 return Err(Error::UnsupportedSql(
                     "foreign-key ON UPDATE actions other than NO ACTION are not supported",
+                ));
+            }
+            RefArg::OnUpdate(_) => {
+                return Err(Error::UnsupportedSql(
+                    "foreign keys cannot contain more than one ON UPDATE clause",
                 ));
             }
             RefArg::OnInsert(_) | RefArg::Match(_) => {
@@ -1566,7 +1573,10 @@ fn validate_foreign_key(
         columns,
         referenced_table: identifier(&clause.tbl_name)?,
         referenced_columns,
-        on_delete: on_delete.unwrap_or_default(),
+        actions: ReferentialActions {
+            on_delete: on_delete.unwrap_or_default(),
+            on_update: on_update.unwrap_or_default(),
+        },
     })
 }
 
@@ -2203,7 +2213,7 @@ mod tests {
         assert_eq!(spec.foreign_keys[0].columns[0].value(), "parent");
         assert_eq!(spec.foreign_keys[0].referenced_table.value(), "parents");
         assert!(spec.foreign_keys[0].referenced_columns.is_none());
-        assert_eq!(spec.foreign_keys[0].on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(spec.foreign_keys[0].actions, ReferentialActions::default());
         assert_eq!(
             spec.foreign_keys[1].name.as_ref().map(SqlName::value),
             Some("composite_parent")
@@ -2226,7 +2236,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tenant", "member"]
         );
-        assert_eq!(spec.foreign_keys[1].on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(spec.foreign_keys[1].actions, ReferentialActions::default());
     }
 
     #[test]
@@ -2234,17 +2244,21 @@ mod tests {
         for (sql, expected) in [
             (
                 "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
-                ForeignKeyAction::Cascade,
+                ReferentialAction::Cascade,
             ),
             (
                 "CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER, FOREIGN KEY (parent) REFERENCES parents(id) ON DELETE SET NULL ON UPDATE NO ACTION)",
-                ForeignKeyAction::SetNull,
+                ReferentialAction::SetNull,
             ),
         ] {
             let ValidatedExecute::CreateTable(spec) = validate_execute(sql).unwrap() else {
                 unreachable!()
             };
-            assert_eq!(spec.foreign_keys[0].on_delete, expected);
+            assert_eq!(spec.foreign_keys[0].actions.on_delete, expected);
+            assert_eq!(
+                spec.foreign_keys[0].actions.on_update,
+                ReferentialAction::NoAction
+            );
         }
     }
 

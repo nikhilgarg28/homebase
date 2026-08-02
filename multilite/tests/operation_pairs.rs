@@ -418,6 +418,47 @@ const PAIR_CASES: &[PairCase] = &[
         serializable: ExpectedPair::CONFLICT,
     },
     PairCase {
+        name: "cascade_parent_delete_and_child_retarget_into_parent",
+        relationship: "deleted parent range and a child reference moved into it",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 20"),
+        right: operation!(
+            Update,
+            "UPDATE children SET parent_code = 'p20' WHERE id = 100"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "cascade_parent_delete_and_child_retarget_away",
+        relationship: "deleted parent range and the same relationship marker retired by a child",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 10"),
+        right: operation!(
+            Update,
+            "UPDATE children SET parent_code = 'p20' WHERE id = 100"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "cascade_parent_delete_and_child_delete",
+        relationship: "cascaded row identity and an explicit delete of the same child",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 10"),
+        right: operation!(Delete, "DELETE FROM children WHERE id = 100"),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
+        name: "set_null_parent_delete_and_child_retarget",
+        relationship: "SET NULL row transition and a competing relationship retarget",
+        left: operation!(Delete, "DELETE FROM parents WHERE id = 10"),
+        right: operation!(
+            Update,
+            "UPDATE labels SET parent_code = 'p20' WHERE id = 200"
+        ),
+        snapshot: ExpectedPair::CONFLICT,
+        serializable: ExpectedPair::CONFLICT,
+    },
+    PairCase {
         name: "create_distinct_tables",
         relationship: "different schema-object names and table identities",
         left: operation!(CreateTable, "CREATE TABLE alpha (id INTEGER PRIMARY KEY)"),
@@ -923,6 +964,7 @@ where
                 (),
             )?;
             transaction.execute("INSERT INTO children VALUES (100, 'p10', 'base')", ())?;
+            transaction.execute("INSERT INTO labels VALUES (200, 'p10', 'base')", ())?;
             Ok(())
         })
         .unwrap();

@@ -76,8 +76,9 @@ behavior.
 SQLite's preupdate hook captures final inserted, deleted, and updated values
 after affinity and conflict handling have run. One SQL statement becomes one
 `RowChanges` operation: its ordered hook events are folded into deterministic
-net before/after images for one synchronized table, while immutable table,
-index, and relationship rules are stored once. `OR ABORT`, `OR IGNORE`,
+net before/after images for every synchronized table touched by the statement,
+canonically ordered by stable table identity. Immutable table, index, and
+relationship rules are stored once per affected table. `OR ABORT`, `OR IGNORE`,
 `INSERT OR REPLACE`, `REPLACE INTO`, `UPDATE OR REPLACE`, and UPSERT chains
 containing `DO NOTHING` and/or `DO UPDATE` therefore lower only the rows SQLite
 actually changed. Replacement captures every implicitly deleted UNIQUE/primary
@@ -153,7 +154,9 @@ write compiled against the older catalog cannot slip through. A referenced
 explicit UNIQUE index cannot be dropped until relationship evolution can
 durably retarget or remove the relationship. SQLite continues to establish
 immediate local existence and `MATCH SIMPLE` NULL behavior against the branch
-snapshot.
+snapshot. `ON DELETE CASCADE` and `SET NULL` use SQLite's complete nested
+transition; remote apply and rejection repair never rerun the referential
+action.
 
 `DELETE` currently accepts one unqualified, unaliased user table with an
 optional `WITH` clause, SQLite predicate, and ordinary `INDEXED BY` or `NOT

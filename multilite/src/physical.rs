@@ -167,7 +167,7 @@ fn same_foreign_key(actual: &CreateForeignKey, expected: &CreateForeignKey) -> b
     same_optional_name(actual.name.as_ref(), expected.name.as_ref())
         && same_names(&actual.columns, &expected.columns)
         && same_name(&actual.referenced_table, &expected.referenced_table)
-        && actual.on_delete == expected.on_delete
+        && actual.actions == expected.actions
         && match (
             actual.referenced_columns.as_deref(),
             expected.referenced_columns.as_deref(),

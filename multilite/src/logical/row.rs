@@ -296,8 +296,12 @@ pub struct UpdatedRowsFixture {
 /// Net row effects of one SQLite statement after repeated touches are folded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowChanges {
-    tables: Vec<TableChanges>,
+    tables: CanonicalTableChanges,
 }
+
+/// Non-empty table transitions in stable table-id order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalTableChanges(Vec<TableChanges>);
 
 /// One table's rules and row-lineage-preserving before/after images.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +314,51 @@ struct TableChanges {
 struct RowDelta {
     before: Option<Row>,
     after: Option<Row>,
+}
+
+impl CanonicalTableChanges {
+    fn new(tables: Vec<TableChanges>) -> std::result::Result<Self, RowCodecError> {
+        let canonical = Self(tables);
+        canonical.validate()?;
+        Ok(canonical)
+    }
+
+    fn singleton(table: TableChanges) -> Self {
+        debug_assert!(table.validate_structure().is_ok());
+        Self(vec![table])
+    }
+
+    fn validate(&self) -> std::result::Result<(), RowCodecError> {
+        if self.0.is_empty()
+            || self
+                .0
+                .windows(2)
+                .any(|pair| pair[0].rules.table.as_bytes() >= pair[1].rules.table.as_bytes())
+        {
+            return Err(RowCodecError::InvalidRow);
+        }
+        for table in &self.0 {
+            table.validate_structure()?;
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for CanonicalTableChanges {
+    type Target = [TableChanges];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a CanonicalTableChanges {
+    type Item = &'a TableChanges;
+    type IntoIter = std::slice::Iter<'a, TableChanges>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// Homebase mutations and conflict footprint for one row operation.
@@ -1526,7 +1575,7 @@ impl RowChanges {
     pub(crate) fn inserted(inserted: RowSet) -> Self {
         let rules = inserted.clone().without_rows();
         Self {
-            tables: vec![TableChanges {
+            tables: CanonicalTableChanges::singleton(TableChanges {
                 rules,
                 rows: inserted
                     .rows
@@ -1536,7 +1585,7 @@ impl RowChanges {
                         after: Some(after),
                     })
                     .collect(),
-            }],
+            }),
         }
     }
 
@@ -1544,7 +1593,7 @@ impl RowChanges {
     pub(crate) fn deleted(deleted: DeletedRowsFixture) -> Self {
         let rules = deleted.deleted.clone().without_rows();
         Self {
-            tables: vec![TableChanges {
+            tables: CanonicalTableChanges::singleton(TableChanges {
                 rules,
                 rows: deleted
                     .deleted
@@ -1555,7 +1604,7 @@ impl RowChanges {
                         after: None,
                     })
                     .collect(),
-            }],
+            }),
         }
     }
 
@@ -1563,7 +1612,7 @@ impl RowChanges {
     pub(crate) fn updated(updated: UpdatedRowsFixture) -> Self {
         let rules = updated.before.clone().without_rows();
         Self {
-            tables: vec![TableChanges {
+            tables: CanonicalTableChanges::singleton(TableChanges {
                 rules,
                 rows: updated
                     .before
@@ -1575,7 +1624,7 @@ impl RowChanges {
                         after: Some(after),
                     })
                     .collect(),
-            }],
+            }),
         }
     }
 
@@ -1642,10 +1691,10 @@ impl RowChanges {
         if tables.is_empty() {
             return Ok(None);
         }
-        let changes = Self { tables };
-        changes
-            .validate_structure()
-            .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?;
+        let changes = Self {
+            tables: CanonicalTableChanges::new(tables)
+                .map_err(|error| Error::InvalidMultiliteOp(error.to_string()))?,
+        };
         changes.validate_budget()?;
         Ok(Some(changes))
     }
@@ -1659,6 +1708,7 @@ impl RowChanges {
         for table in &self.tables {
             table.lower(&mut mutations, &mut guards)?;
         }
+        prune_redundant_point_deletes(&mut mutations);
         let footprint = guards.footprint();
         Ok(RowHomebaseOp {
             mutations,
@@ -1695,8 +1745,9 @@ impl RowChanges {
         if tables.is_empty() {
             return Err(RowCodecError::MissingField(TAG_CHANGED_TABLE));
         }
-        let changes = Self { tables };
-        changes.validate_structure()?;
+        let changes = Self {
+            tables: CanonicalTableChanges::new(tables)?,
+        };
         changes.validate_budget_codec()?;
         Ok(changes)
     }
@@ -1798,24 +1849,25 @@ impl RowChanges {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), RowCodecError> {
-        if self.tables.is_empty()
-            || self.tables.iter().enumerate().any(|(index, table)| {
-                self.tables[..index]
-                    .iter()
-                    .any(|seen| seen.rules.table == table.rules.table)
-            })
-            || self
-                .tables
-                .windows(2)
-                .any(|pair| pair[0].rules.table.as_bytes() >= pair[1].rules.table.as_bytes())
-        {
-            return Err(RowCodecError::InvalidRow);
-        }
-        for table in &self.tables {
-            table.validate_structure()?;
-        }
-        Ok(())
+        self.tables.validate()
     }
+}
+
+/// A parent-range retirement subsumes exact child-reference deletions captured
+/// in the same statement. Keep their guards for OCC auditability, but avoid
+/// sending redundant mutations to Homebase.
+fn prune_redundant_point_deletes(mutations: &mut Vec<Mutation>) {
+    let deleted_ranges = mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            Mutation::DeleteRange { range } => Some(range.clone()),
+            Mutation::Set { .. } | Mutation::Delete { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    mutations.retain(|mutation| match mutation {
+        Mutation::Delete { key } => !deleted_ranges.iter().any(|range| range.covers_key(key)),
+        Mutation::Set { .. } | Mutation::DeleteRange { .. } => true,
+    });
 }
 
 fn apply_final_row_state(
@@ -2399,6 +2451,7 @@ impl DeletedRowsFixture {
     fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
         let [table] = changes
             .tables
+            .0
             .try_into()
             .map_err(|_| RowCodecError::InvalidRow)?;
         let rows = table
@@ -2468,6 +2521,7 @@ impl UpdatedRowsFixture {
     fn from_changes(changes: RowChanges) -> std::result::Result<Self, RowCodecError> {
         let [table] = changes
             .tables
+            .0
             .try_into()
             .map_err(|_| RowCodecError::InvalidRow)?;
         let mut before = Vec::with_capacity(table.rows.len());
@@ -3356,6 +3410,54 @@ mod tests {
     use crate::logical::schema::{
         CreateColumn, CreateTableSpec, CreateUnique, SqlName, TypeDeclaration,
     };
+
+    #[test]
+    fn range_retirements_prune_only_redundant_point_deletes() {
+        let prefix = Key::from_bytes([b"foreign".as_slice(), b"parent".as_slice()]).unwrap();
+        let covered = Key::from_bytes([
+            b"foreign".as_slice(),
+            b"parent".as_slice(),
+            b"child".as_slice(),
+        ])
+        .unwrap();
+        let sibling = Key::from_bytes([
+            b"foreign".as_slice(),
+            b"other".as_slice(),
+            b"child".as_slice(),
+        ])
+        .unwrap();
+        let mut mutations = vec![
+            Mutation::Delete {
+                key: covered.clone(),
+            },
+            Mutation::Set {
+                key: covered.clone(),
+                value: b"replacement".to_vec(),
+            },
+            Mutation::Delete {
+                key: sibling.clone(),
+            },
+            Mutation::DeleteRange {
+                range: Range::Prefix(prefix.clone()),
+            },
+        ];
+
+        prune_redundant_point_deletes(&mut mutations);
+
+        assert_eq!(
+            mutations,
+            vec![
+                Mutation::Set {
+                    key: covered,
+                    value: b"replacement".to_vec(),
+                },
+                Mutation::Delete { key: sibling },
+                Mutation::DeleteRange {
+                    range: Range::Prefix(prefix),
+                },
+            ]
+        );
+    }
 
     fn definition() -> CreateTable {
         CreateTable::new(
@@ -4358,16 +4460,21 @@ mod tests {
         let catalog = CatalogSnapshot::load(&connection).unwrap();
         let mut task = note(8, "task");
         task.table = "tasks".into();
-        let changes = RowChanges::from_catalog(
-            &catalog,
-            vec![
-                CapturedChange::Insert(note(7, "note")),
-                CapturedChange::Insert(task),
-            ],
-        )
-        .unwrap()
-        .unwrap();
+        let note_insert = CapturedChange::Insert(note(7, "note"));
+        let task_insert = CapturedChange::Insert(task);
+        let changes =
+            RowChanges::from_catalog(&catalog, vec![note_insert.clone(), task_insert.clone()])
+                .unwrap()
+                .unwrap();
+        let reversed = RowChanges::from_catalog(&catalog, vec![task_insert, note_insert])
+            .unwrap()
+            .unwrap();
         assert_eq!(changes.tables.len(), 2);
+        assert_eq!(changes.encode(), reversed.encode());
+        assert_eq!(
+            changes.to_homebase().unwrap().mutations,
+            reversed.to_homebase().unwrap().mutations
+        );
         assert_eq!(RowChanges::decode(&changes.encode()).unwrap(), changes);
         let lowered = changes.to_homebase().unwrap();
         for table in &changes.tables {
@@ -4403,7 +4510,7 @@ mod tests {
         }
 
         let mut noncanonical = changes;
-        noncanonical.tables.reverse();
+        noncanonical.tables.0.reverse();
         assert_eq!(
             RowChanges::decode(&noncanonical.encode()),
             Err(RowCodecError::InvalidRow)
@@ -6401,6 +6508,100 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
             [(7, "before-7".into()), (9, "diverged".into())]
+        );
+    }
+
+    #[test]
+    fn multi_table_apply_failure_rolls_back_earlier_tables_and_restores_flags() {
+        let notes = definition();
+        let connection = connection(&notes);
+        let tasks_sql = "CREATE TABLE tasks (id INTEGER PRIMARY KEY, body TEXT, payload BLOB)";
+        let crate::sql::ValidatedExecute::CreateTable(tasks_spec) =
+            crate::sql::validate_execute(tasks_sql).unwrap()
+        else {
+            unreachable!()
+        };
+        let tasks = CreateTable::new(tasks_sql, tasks_spec);
+        connection.execute(tasks_sql, ()).unwrap();
+        catalog::insert(&connection, &tasks).unwrap();
+        connection
+            .execute("INSERT INTO notes VALUES (1, 'before', x'')", ())
+            .unwrap();
+        connection
+            .execute("INSERT INTO tasks VALUES (1, 'before', x'')", ())
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+            .unwrap();
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)
+            .unwrap();
+
+        let image = |table: &str, body: &str| CapturedRow {
+            table: table.into(),
+            rowid: 1,
+            values: vec![
+                StoredValue::Integer(1),
+                StoredValue::Text(body.as_bytes().to_vec()),
+                StoredValue::Blob(Vec::new()),
+            ],
+        };
+        let catalog = CatalogSnapshot::load(&connection).unwrap();
+        let changes = RowChanges::from_catalog(
+            &catalog,
+            vec![
+                CapturedChange::Update {
+                    before: image("notes", "before"),
+                    after: image("notes", "after"),
+                },
+                CapturedChange::Update {
+                    before: image("tasks", "before"),
+                    after: image("tasks", "after"),
+                },
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let (first, second) = if notes.table_id().as_bytes() < tasks.table_id().as_bytes() {
+            ("notes", "tasks")
+        } else {
+            ("tasks", "notes")
+        };
+        connection
+            .execute(&format!("UPDATE {second} SET body = 'diverged'"), ())
+            .unwrap();
+
+        assert!(matches!(
+            changes.apply(&connection),
+            Err(Error::InvalidDatabase(
+                "row changes no longer match SQLite state"
+            ))
+        ));
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT body FROM {first}"), (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "before"
+        );
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT body FROM {second}"), (), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "diverged"
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                .unwrap()
+        );
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)
+                .unwrap()
         );
     }
 

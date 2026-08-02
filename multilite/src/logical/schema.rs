@@ -84,6 +84,7 @@ const TAG_FOREIGN_KEY_PARENT_COLUMN_ID: u8 = 7;
 const TAG_FOREIGN_KEY_PARENT_COLUMN_NAME: u8 = 8;
 const TAG_FOREIGN_KEY_PARENT_INDEX_ID: u8 = 9;
 const TAG_FOREIGN_KEY_ON_DELETE: u8 = 10;
+const TAG_FOREIGN_KEY_ON_UPDATE: u8 = 11;
 const FOREIGN_KEY_NO_ACTION: u8 = 0;
 const FOREIGN_KEY_CASCADE: u8 = 1;
 const FOREIGN_KEY_SET_NULL: u8 = 2;
@@ -391,16 +392,16 @@ pub struct CreateUnique {
     pub columns: Vec<SqlName>,
 }
 
-/// Action applied to child rows when a referenced parent row is deleted.
+/// Action applied to child rows when a referenced parent identity changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ForeignKeyAction {
+pub enum ReferentialAction {
     #[default]
     NoAction,
     Cascade,
     SetNull,
 }
 
-impl ForeignKeyAction {
+impl ReferentialAction {
     fn to_u8(self) -> u8 {
         match self {
             Self::NoAction => FOREIGN_KEY_NO_ACTION,
@@ -427,6 +428,13 @@ impl ForeignKeyAction {
     }
 }
 
+/// Complete action policy of one immediate foreign-key relationship.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReferentialActions {
+    pub on_delete: ReferentialAction,
+    pub on_update: ReferentialAction,
+}
+
 /// One validated immediate foreign-key declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateForeignKey {
@@ -434,7 +442,7 @@ pub struct CreateForeignKey {
     pub columns: Vec<SqlName>,
     pub referenced_table: SqlName,
     pub referenced_columns: Option<Vec<SqlName>>,
-    pub on_delete: ForeignKeyAction,
+    pub actions: ReferentialActions,
 }
 
 /// One optional SQLite default owned by a column.
@@ -832,7 +840,7 @@ pub struct ForeignKeyDefinition {
     referenced_index: IndexId,
     referenced_columns: Vec<ColumnId>,
     referenced_column_names: Vec<SqlName>,
-    on_delete: ForeignKeyAction,
+    actions: ReferentialActions,
 }
 
 /// One SQLite CHECK declaration owned by a table schema.
@@ -1051,8 +1059,8 @@ impl ForeignKeyDefinition {
     }
 
     #[cfg(test)]
-    pub fn on_delete(&self) -> ForeignKeyAction {
-        self.on_delete
+    pub fn actions(&self) -> ReferentialActions {
+        self.actions
     }
 
     #[cfg(test)]
@@ -2254,9 +2262,13 @@ fn render_structural_create_table(table: &CreateTable, connection: &Connection) 
         declaration.push_str(" (");
         declaration.push_str(&parent_columns);
         declaration.push(')');
-        if foreign_key.on_delete != ForeignKeyAction::NoAction {
+        if foreign_key.actions.on_delete != ReferentialAction::NoAction {
             declaration.push_str(" ON DELETE ");
-            declaration.push_str(foreign_key.on_delete.sql());
+            declaration.push_str(foreign_key.actions.on_delete.sql());
+        }
+        if foreign_key.actions.on_update != ReferentialAction::NoAction {
+            declaration.push_str(" ON UPDATE ");
+            declaration.push_str(foreign_key.actions.on_update.sql());
         }
         declarations.push(declaration.trim_start().to_owned());
     }
@@ -2585,7 +2597,7 @@ fn build_create_table(
                     .iter()
                     .map(|column| column.name().clone())
                     .collect(),
-                on_delete: resolved.spec.on_delete,
+                actions: resolved.spec.actions,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3067,7 +3079,16 @@ fn encode_foreign_key_definition(foreign_key: &ForeignKeyDefinition) -> Vec<u8> 
         )
         .expect("foreign-key field length must fit in u32");
     writer
-        .field(TAG_FOREIGN_KEY_ON_DELETE, &[foreign_key.on_delete.to_u8()])
+        .field(
+            TAG_FOREIGN_KEY_ON_DELETE,
+            &[foreign_key.actions.on_delete.to_u8()],
+        )
+        .expect("foreign-key field length must fit in u32");
+    writer
+        .field(
+            TAG_FOREIGN_KEY_ON_UPDATE,
+            &[foreign_key.actions.on_update.to_u8()],
+        )
         .expect("foreign-key field length must fit in u32");
     for (column, name) in foreign_key
         .referenced_columns
@@ -3325,6 +3346,7 @@ fn decode_foreign_key_definition(
     let mut referenced_table_name = None;
     let mut referenced_index = None;
     let mut on_delete = None;
+    let mut on_update = None;
     let mut referenced_columns = Vec::new();
     let mut referenced_column_names = Vec::new();
     while let Some((tag, value)) = reader.field().map_err(|_| SchemaCodecError::Truncated)? {
@@ -3347,7 +3369,16 @@ fn decode_foreign_key_definition(
                 };
                 set_once(
                     &mut on_delete,
-                    ForeignKeyAction::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)?,
+                    ReferentialAction::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)?,
+                )?;
+            }
+            TAG_FOREIGN_KEY_ON_UPDATE => {
+                let [value] = value else {
+                    return Err(SchemaCodecError::InvalidLength);
+                };
+                set_once(
+                    &mut on_update,
+                    ReferentialAction::from_u8(*value).ok_or(SchemaCodecError::InvalidSchema)?,
                 )?;
             }
             TAG_FOREIGN_KEY_PARENT_COLUMN_ID => {
@@ -3379,7 +3410,12 @@ fn decode_foreign_key_definition(
         referenced_index,
         referenced_columns,
         referenced_column_names,
-        on_delete: on_delete.ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ON_DELETE))?,
+        actions: ReferentialActions {
+            on_delete: on_delete
+                .ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ON_DELETE))?,
+            on_update: on_update
+                .ok_or(SchemaCodecError::MissingField(TAG_FOREIGN_KEY_ON_UPDATE))?,
+        },
     })
 }
 
@@ -3853,7 +3889,7 @@ fn validate_initial_provenance_sql(
             .ok_or(SchemaCodecError::SqlMismatch)?;
         if parsed.name != encoded.name
             || parsed.columns.as_slice() != columns.as_slice()
-            || parsed.on_delete != encoded.on_delete
+            || parsed.actions != encoded.actions
             || parsed.referenced_table.canonical() != encoded.referenced_table_name.canonical()
             || parsed.referenced_columns.as_ref().is_some_and(|columns| {
                 columns.len() != encoded.referenced_column_names.len()
@@ -4510,7 +4546,13 @@ mod tests {
         assert_eq!(foreign_key.name().map(SqlName::value), Some("parent_fk"));
         assert_eq!(foreign_key.referenced_table(), parent.table_id());
         assert_eq!(foreign_key.referenced_index(), parent.primary_index_id());
-        assert_eq!(foreign_key.on_delete(), ForeignKeyAction::Cascade);
+        assert_eq!(
+            foreign_key.actions(),
+            ReferentialActions {
+                on_delete: ReferentialAction::Cascade,
+                on_update: ReferentialAction::NoAction,
+            }
+        );
         assert_eq!(
             foreign_key
                 .referenced_column_names()
@@ -4522,27 +4564,37 @@ mod tests {
         assert_eq!(CreateTable::decode(&child.encode()).unwrap(), child);
 
         let encoded_foreign_key = encode_foreign_key_definition(foreign_key);
-        let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
-        let mut malformed_action = Writer::new();
-        while let Some((tag, value)) = reader.field().unwrap() {
-            malformed_action
-                .field(
-                    tag,
-                    if tag == TAG_FOREIGN_KEY_ON_DELETE {
-                        &[99]
-                    } else {
-                        value
-                    },
-                )
-                .unwrap();
+        for malformed_tag in [TAG_FOREIGN_KEY_ON_DELETE, TAG_FOREIGN_KEY_ON_UPDATE] {
+            let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
+            let mut malformed_action = Writer::new();
+            while let Some((tag, value)) = reader.field().unwrap() {
+                malformed_action
+                    .field(tag, if tag == malformed_tag { &[99] } else { value })
+                    .unwrap();
+            }
+            assert_eq!(
+                decode_foreign_key_definition(&malformed_action.finish()),
+                Err(SchemaCodecError::InvalidSchema)
+            );
         }
-        assert_eq!(
-            decode_foreign_key_definition(&malformed_action.finish()),
-            Err(SchemaCodecError::InvalidSchema)
-        );
+        for missing_tag in [TAG_FOREIGN_KEY_ON_DELETE, TAG_FOREIGN_KEY_ON_UPDATE] {
+            let mut reader = homebase_core::reader::Reader::new(&encoded_foreign_key);
+            let mut missing_action = Writer::new();
+            while let Some((tag, value)) = reader.field().unwrap() {
+                if tag != missing_tag {
+                    missing_action.field(tag, value).unwrap();
+                }
+            }
+            assert_eq!(
+                decode_foreign_key_definition(&missing_action.finish()),
+                Err(SchemaCodecError::MissingField(missing_tag))
+            );
+        }
 
         let mut contradictory_action = child.clone();
-        contradictory_action.schema.foreign_keys[0].on_delete = ForeignKeyAction::SetNull;
+        contradictory_action.schema.foreign_keys[0]
+            .actions
+            .on_delete = ReferentialAction::SetNull;
         contradictory_action.refresh_schema_revision();
         assert_eq!(
             CreateTable::decode_operation(&contradictory_action.encode()),
@@ -4687,7 +4739,7 @@ mod tests {
                             .map(|index| SqlName::new(format!("key_{index}")))
                             .collect(),
                     ),
-                    on_delete: ForeignKeyAction::NoAction,
+                    actions: ReferentialActions::default(),
                 }],
                 primary_key_name: None,
                 checks: Vec::new(),

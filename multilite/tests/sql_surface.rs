@@ -965,6 +965,92 @@ fn delete_actions_capture_complete_multi_table_transitions() {
 }
 
 #[test]
+fn blocking_foreign_key_rolls_back_mixed_delete_actions_and_hook_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = MultiliteConnection::open(directory.path().join("mixed-actions.sqlite")).unwrap();
+    db.update(|transaction| {
+        transaction.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())?;
+        transaction.execute(
+            "CREATE TABLE cascaded (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON DELETE CASCADE
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE detached (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id) ON DELETE SET NULL
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE blockers (
+                id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parents(id)
+            )",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )?;
+        transaction.execute("INSERT INTO parents VALUES (1)", ())?;
+        transaction.execute("INSERT INTO cascaded VALUES (10, 1)", ())?;
+        transaction.execute("INSERT INTO detached VALUES (20, 1)", ())?;
+        transaction.execute("INSERT INTO blockers VALUES (30, 1)", ())?;
+        transaction.execute("INSERT INTO audit VALUES (1, 'before')", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.update(|transaction| {
+        assert!(matches!(
+            transaction.execute("DELETE FROM parents WHERE id = 1", ()),
+            Err(Error::Sqlite(_))
+        ));
+        transaction.execute("UPDATE audit SET body = 'after' WHERE id = 1", ())?;
+        Ok(())
+    })
+    .unwrap();
+
+    for table in ["parents", "cascaded", "detached", "blockers"] {
+        assert_eq!(
+            db.query(&format!("SELECT count(*) FROM {table}"), (), |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            [1],
+            "failed parent delete changed {table}"
+        );
+    }
+    assert_eq!(
+        db.query("SELECT body FROM audit", (), |row| row.get::<_, String>(0))
+            .unwrap(),
+        ["after"]
+    );
+
+    db.update(|transaction| {
+        transaction.execute("DELETE FROM blockers WHERE id = 30", ())?;
+        transaction.execute("DELETE FROM parents WHERE id = 1", ())?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        db.query("SELECT id FROM cascaded", (), |row| row.get::<_, i64>(0))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.query("SELECT id, parent FROM detached", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .unwrap(),
+        [(20, None)]
+    );
+}
+
+#[test]
 fn set_null_respects_child_not_null_constraints_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let db = MultiliteConnection::open(directory.path().join("set-null-not-null.sqlite")).unwrap();
@@ -2172,6 +2258,61 @@ fn trigger_generated_delete_effects_join_the_same_atomic_transition() {
             [0]
         );
     }
+}
+
+#[test]
+fn trigger_writes_to_unsynchronized_tables_rollback_the_outer_statement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("trigger-untracked.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE adopted (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE owned (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO owned VALUES (1, 'kept')", ())
+        .unwrap();
+    drop(db);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER leak_delete
+             AFTER DELETE ON owned
+             BEGIN
+                 INSERT INTO adopted VALUES (old.id, old.body);
+             END",
+        )
+        .unwrap();
+    let db = MultiliteConnection::open(&path).unwrap();
+
+    assert!(matches!(
+        db.execute("DELETE FROM owned WHERE id = 1", ()),
+        Err(Error::UnsupportedSql(
+            "INSERT target has no synchronized schema identity"
+        ))
+    ));
+    assert_eq!(
+        db.query("SELECT id, body FROM owned", (), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap(),
+        [(1, "kept".into())]
+    );
+    assert!(
+        db.query("SELECT id FROM adopted", (), |row| row.get::<_, i64>(0))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.execute("UPDATE owned SET body = 'still-usable' WHERE id = 1", ())
+            .unwrap(),
+        1
+    );
 }
 
 #[test]

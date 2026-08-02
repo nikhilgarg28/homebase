@@ -15,8 +15,10 @@ images. `INSERT [OR ABORT|OR IGNORE|OR REPLACE]`, `REPLACE INTO`,
 `DO NOTHING` and/or `DO UPDATE` are supported. UPSERT and replacement store
 SQLite's complete captured net row transition rather than replaying conflict
 selection on replicas. Replacement includes every implicitly deleted conflict
-victim. `OR FAIL`, `OR ROLLBACK`, triggers, mutating foreign-key actions,
-`RETURNING`, and write `ORDER BY` / `LIMIT` remain outside the managed surface.
+victim. `ON DELETE CASCADE` and `SET NULL` capture their complete multi-table
+transition. `OR FAIL`, `OR ROLLBACK`, public trigger creation, remaining
+referential actions, `RETURNING`, and write `ORDER BY` / `LIMIT` remain outside
+the managed surface.
 
 Captured UPDATE and DELETE syntax also includes CTE prefixes, `UPDATE ...
 FROM`, tuple assignments, and `INDEXED BY` / `NOT INDEXED`. These spellings
