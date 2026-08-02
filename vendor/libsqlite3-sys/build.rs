@@ -143,6 +143,13 @@ mod build_bundled {
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
 
+        // The standard bundled amalgamation is generated with the capable
+        // parser. Multilite relies on native selection for UPDATE/DELETE
+        // ORDER BY and LIMIT rather than reimplementing it above SQLite.
+        if !cfg!(feature = "bundled-sqlcipher") {
+            cfg.flag("-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT");
+        }
+
         if cfg!(feature = "bundled-sqlcipher") {
             cfg.flag("-DSQLITE_HAS_CODEC")
                 .flag("-DSQLITE_TEMP_STORE=2")
