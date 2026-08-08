@@ -8,8 +8,8 @@ use homebase_client::ServerHandle;
 
 use super::{
     Database, DatabaseId, DatabaseRuntime, IsolationLevel, OfflineServer, OpenOptions, PullOutcome,
-    PushOutcome, PushRejection, ReplicaInvitation, Statement, UpdateOptions, UpdateTransaction,
-    ViewTransaction,
+    PushOutcome, PushRejection, QueryTable, ReplicaInvitation, Statement, UpdateOptions,
+    UpdateTransaction, ViewTransaction,
 };
 use crate::{Params, Result};
 use rusqlite::Row;
@@ -222,6 +222,14 @@ impl<H: ServerHandle + Send + Sync + 'static> Connection<H> {
         F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
     {
         self.query(sql, params, map)
+    }
+
+    /// Execute one row-producing statement and return column names plus owned values.
+    ///
+    /// Reads use a pinned view. DML with `RETURNING` commits as an implicit managed
+    /// update, matching [`Self::query`].
+    pub fn query_table<P: Params>(&self, sql: &str, params: P) -> Result<QueryTable> {
+        self.database.query_table(&self.runtime, sql, params)
     }
 
     /// Asynchronously execute one row-producing statement and return owned values.

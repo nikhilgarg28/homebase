@@ -271,6 +271,23 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
         }
     }
 
+    /// Execute one prevalidated returning write as an owned [`QueryTable`].
+    pub(super) fn query_table_validated<P: Params>(
+        &mut self,
+        sql: &str,
+        params: P,
+        validated: ValidatedExecute,
+    ) -> Result<super::QueryTable> {
+        match validated {
+            ValidatedExecute::Insert(StatementOutput::Rows)
+            | ValidatedExecute::Delete(StatementOutput::Rows)
+            | ValidatedExecute::Update(StatementOutput::Rows) => {
+                self.query_table_captured(sql, params, compile_row_changes)
+            }
+            _ => Err(Error::StatementModeMismatch),
+        }
+    }
+
     fn execute_create_table<Q: Params>(
         &mut self,
         sql: &str,
@@ -614,6 +631,49 @@ impl<'a, H: ServerHandle + Send + Sync + 'static> UpdateTransaction<'a, H> {
                     mapped.push(map(row)?);
                 }
                 Ok(mapped)
+            },
+            compile,
+        )
+    }
+
+    fn query_table_captured<P: Params>(
+        &mut self,
+        sql: &str,
+        params: P,
+        compile: impl FnOnce(&CatalogSnapshot, Vec<CapturedChange>) -> Result<Option<CompiledOperation>>,
+    ) -> Result<super::QueryTable> {
+        use rusqlite::types::Value;
+
+        let hook_state = Arc::clone(&self.hooks.state);
+        self.run_captured(
+            move |connection| {
+                let mut statement = connection.prepare(sql)?;
+                if statement.readonly() || statement.column_count() == 0 {
+                    return Err(Error::StatementModeMismatch);
+                }
+                let columns = (0..statement.column_count())
+                    .map(|index| match statement.column_name(index) {
+                        Ok(name) if !name.is_empty() => name.to_owned(),
+                        _ => "?".to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                let width = columns.len();
+                let mut rows = statement.query(params)?;
+                let mut mapped = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if let Some(error) = lock(&hook_state).error.clone() {
+                        return Err(error);
+                    }
+                    mapped.push(
+                        (0..width)
+                            .map(|index| row.get::<_, Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                    );
+                }
+                Ok(super::QueryTable {
+                    columns,
+                    rows: mapped,
+                })
             },
             compile,
         )

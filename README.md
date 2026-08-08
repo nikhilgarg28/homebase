@@ -11,7 +11,8 @@ for the currently implemented surface and limitations.
 
 | Path | Package | Purpose |
 |------|---------|---------|
-| `multilite/` | [`multilite`](https://crates.io/crates/multilite) | Rust SQL layer |
+| `multilite/` | [`multilite`](https://crates.io/crates/multilite) | Rust SQL layer (library) |
+| `multilite-cli/` | `multilite` binary | sqlite3-style LocalOnly REPL |
 | `server/` | [`homebase`](https://crates.io/crates/homebase) | Kernel server library and binary |
 | `client/` | [`homebase-client`](https://crates.io/crates/homebase-client) | Kernel client SDK |
 | `core/` | [`homebase-core`](https://crates.io/crates/homebase-core) | Shared protocol vocabulary |

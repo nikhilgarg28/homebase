@@ -25,6 +25,7 @@ use homebase_core::space::SpaceId;
 use homebase_core::tag::{AdmissionSeq, DeviceId, DeviceSeq};
 use pollster::block_on;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, PreUpdateCase};
+use rusqlite::types::Value;
 use rusqlite::{Connection as SqliteConnection, Row};
 
 use crate::commit::committer::{CommitHistory, CommitSnapshot, Committer, WeakCommitter};
@@ -48,6 +49,15 @@ pub use self::policy::SyncPolicy;
 pub use self::update::UpdateTransaction;
 pub use self::view::{TransactionStatement, ViewTransaction};
 pub use crate::logical::isolation::{IsolationLevel, UpdateOptions};
+
+/// Eager row-producing query result with SQLite column names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryTable {
+    /// Result-column names in declaration order.
+    pub columns: Vec<String>,
+    /// Owned cell values for every returned row.
+    pub rows: Vec<Vec<Value>>,
+}
 
 const REPLICA_INVITATION_VERSION: u8 = 1;
 
@@ -489,6 +499,26 @@ impl<H: ServerHandle + Send + Sync + 'static> Database<H> {
             sql::ValidatedStatement::Write(validated) => {
                 self.query_write_validated(runtime, sql, params, map, *validated)
             }
+        }
+    }
+
+    pub(crate) fn query_table<P: Params>(
+        self: &Arc<Self>,
+        runtime: &DatabaseRuntime,
+        sql: &str,
+        params: P,
+    ) -> Result<QueryTable> {
+        let validated = sql::validate_statement(sql)?;
+        if validated.output() != sql::StatementOutput::Rows {
+            return Err(Error::StatementModeMismatch);
+        }
+        match validated {
+            sql::ValidatedStatement::Read(_) => {
+                self.view(runtime, |view| view.query_table_prevalidated(sql, params))
+            }
+            sql::ValidatedStatement::Write(validated) => self.update(runtime, |update| {
+                update.query_table_validated(sql, params, *validated)
+            }),
         }
     }
 

@@ -26,7 +26,7 @@ pub use database::{
 };
 pub use database::{
     DatabaseId, IsolationLevel, OfflineServer, OpenOptions, PullOutcome, PushOutcome,
-    PushRejection, ReplicaInvitation, SyncPolicy, UpdateOptions,
+    PushRejection, QueryTable, ReplicaInvitation, SyncPolicy, UpdateOptions,
 };
 pub use error::{Error, Result};
 pub use rusqlite::types::{FromSql, Type, Value, ValueRef};

@@ -365,6 +365,43 @@ fn policy_defaults_are_local_and_authority_requirements_fail_before_open() {
 }
 
 #[test]
+fn query_table_returns_column_names_and_owned_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let connection =
+        Connection::open(directory.path().join("query-table.sqlite")).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+    connection
+        .execute("INSERT INTO notes VALUES (1, 'hello')", ())
+        .unwrap();
+
+    let table = connection
+        .query_table("SELECT id, body FROM notes", ())
+        .unwrap();
+    assert_eq!(table.columns, ["id", "body"]);
+    assert_eq!(
+        table.rows,
+        [[Value::Integer(1), Value::Text("hello".into())]]
+    );
+
+    let returning = connection
+        .query_table(
+            "INSERT INTO notes VALUES (2, 'world') RETURNING id, body",
+            (),
+        )
+        .unwrap();
+    assert_eq!(returning.columns, ["id", "body"]);
+    assert_eq!(
+        returning.rows,
+        [[Value::Integer(2), Value::Text("world".into())]]
+    );
+}
+
+#[test]
 fn database_workers_release_the_client_after_the_last_handle_drops() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("worker-lifetime.sqlite")).unwrap();

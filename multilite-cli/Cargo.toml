@@ -1,0 +1,19 @@
+[package]
+name = "multilite-cli"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "sqlite3-style Multilite REPL — LocalOnly shell over the multilite library"
+publish = false
+
+[[bin]]
+name = "multilite"
+path = "src/main.rs"
+
+[dependencies]
+multilite = { path = "../multilite" }
+rustyline = "15"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,7 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["core", "server", "client", "sim", "multilite", "multilite-conformance"]
-default-members = ["core", "server", "client", "sim", "multilite"]
+members = [
+    "core",
+    "server",
+    "client",
+    "sim",
+    "multilite",
+    "multilite-cli",
+    "multilite-conformance",
+]
+default-members = ["core", "server", "client", "sim", "multilite", "multilite-cli"]
 
 [workspace.package]
 version = "0.1.1"
